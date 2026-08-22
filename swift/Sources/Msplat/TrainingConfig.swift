@@ -14,6 +14,8 @@ public struct TrainingConfig {
     public var densifyGradThresh: Float = 0.0002
     public var densifySizeThresh: Float = 0.01
     public var stopScreenSizeAt: Int32 = 4_000
+    /// Stop topology growth after this step. -1 uses half of the iteration budget.
+    public var stopDensifyAt: Int32 = -1
     public var splitScreenSize: Float = 0.05
     public var keepCrs: Bool = false
     public var downscaleFactor: Float = 1.0
@@ -37,6 +39,7 @@ public struct TrainingConfig {
         c.densifyGradThresh = densifyGradThresh
         c.densifySizeThresh = densifySizeThresh
         c.stopScreenSizeAt = stopScreenSizeAt
+        c.stopDensifyAt = stopDensifyAt
         c.splitScreenSize = splitScreenSize
         c.keepCrs = keepCrs
         c.downscaleFactor = downscaleFactor

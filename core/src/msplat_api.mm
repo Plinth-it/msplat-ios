@@ -121,7 +121,8 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.densifyGradThresh, config.densifySizeThresh,
         config.stopScreenSizeAt, config.splitScreenSize,
         config.iterations, config.keepCrs,
-        config.bgColor
+        config.bgColor,
+        config.stopDensifyAt
     );
 
     impl->camIndices.resize(impl->ds->trainIndices.size());
@@ -323,6 +324,7 @@ static msplat::Config configFromC(MsplatConfig c) {
     cfg.densifyGradThresh = c.densifyGradThresh;
     cfg.densifySizeThresh = c.densifySizeThresh;
     cfg.stopScreenSizeAt = c.stopScreenSizeAt;
+    cfg.stopDensifyAt = c.stopDensifyAt;
     cfg.splitScreenSize = c.splitScreenSize;
     cfg.keepCrs = c.keepCrs;
     cfg.downscaleFactor = c.downscaleFactor;

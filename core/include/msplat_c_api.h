@@ -26,6 +26,7 @@ typedef struct {
     float densifyGradThresh;
     float densifySizeThresh;
     int stopScreenSizeAt;
+    int stopDensifyAt;
     float splitScreenSize;
     bool keepCrs;
     float downscaleFactor;
@@ -46,6 +47,7 @@ static inline MsplatConfig msplat_default_config(void) {
     c.densifyGradThresh = 0.0002f;
     c.densifySizeThresh = 0.01f;
     c.stopScreenSizeAt = 4000;
+    c.stopDensifyAt = -1;
     c.splitScreenSize = 0.05f;
     c.keepCrs = false;
     c.downscaleFactor = 1.0f;

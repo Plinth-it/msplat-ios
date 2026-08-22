@@ -14,7 +14,8 @@ struct Model{
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
         int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
         int maxSteps, bool keepCrs,
-        const float* bgColor = nullptr);
+        const float* bgColor = nullptr,
+        int stopDensifyAt = -1);
 
   ~Model(){ releaseOptimizers(); }
 

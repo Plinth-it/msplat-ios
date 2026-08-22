@@ -26,6 +26,8 @@ struct Config {
     float densifyGradThresh = 0.0002f;
     float densifySizeThresh = 0.01f;
     int stopScreenSizeAt = 4000;
+    // Step after which the topology stops growing. -1 means half the budget.
+    int stopDensifyAt = -1;
     float splitScreenSize = 0.05f;
     bool keepCrs = false;
     float downscaleFactor = 1.0f;
