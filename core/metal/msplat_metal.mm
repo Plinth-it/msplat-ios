@@ -473,6 +473,19 @@ struct FusedTensorCache {
     }
 
     void ensure_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
+        if (K <= 1) {
+            // Chunking is off at this resolution. Whatever the previous level
+            // built can never be reused — on garden that is ~208MB, carried to
+            // the end of training — so hand it back. Only on a resolution
+            // change: within a level K_max climbs as the model densifies, so a
+            // dip to 1 there would just churn the allocation.
+            if (chunk_T.defined() && (ih != chunk_height || iw != chunk_width)) {
+                chunk_K_max = -1; chunk_height = -1; chunk_width = -1;
+                chunk_T.reset(); chunk_C.reset(); chunk_final_idx.reset();
+                prefix_T.reset(); after_C.reset();
+            }
+            return;
+        }
         // Compared against img_height/img_width until now, which ensure_forward
         // has already advanced to the new resolution by the time this runs — so
         // the guard was comparing ih to itself and the chunk buffers kept the
@@ -835,9 +848,7 @@ static void forward_pipeline(
         if (K_max > abs_max) K_max = abs_max;
     }
     g_tcache.current_K_max = K_max;
-    if (K_max > 1) {
-        g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
-    }
+    g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
 
     {
         id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
@@ -1009,9 +1020,7 @@ std::tuple<MTensor, float> msplat_train_step(
         if (K_max > abs_max) K_max = abs_max;
     }
     g_tcache.current_K_max = K_max;
-    if (K_max > 1) {
-        g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
-    }
+    g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
 
     uint32_t bwd_K_max = K_max;
     constexpr uint32_t BWD_CHUNK_SIZE = 512;
