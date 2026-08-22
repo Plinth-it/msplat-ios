@@ -59,6 +59,9 @@ struct Model{
   MTensor adam_exp_avg_buf[N_ADAM_GROUPS], adam_exp_avg_sq_buf[N_ADAM_GROUPS];
   int num_active = 0, buf_capacity = 0;
   void refreshViews();
+  /// Bytes held by the model's own GPU buffers — parameters, Adam state,
+  /// and the densification scratch. Sized by capacity, not active count.
+  size_t estimatedGpuBytes() const;
   void ensureCapacity(int needed);
 
   MTensor densify_split_flag, densify_dup_flag;

@@ -24,6 +24,10 @@ void msplat_commit();
 // Synchronize (commit + wait for completion)
 void msplat_gpu_sync();
 
+// Bytes held by the cached per-iteration intermediates (the "temp" line in
+// MSPLAT_MEM_LOG_EVERY). These dwarf the model at full resolution.
+size_t msplat_cached_tensor_bytes();
+
 // GPU timing — non-invasive, uses completion handlers on committed CBs
 void msplat_enable_gpu_timing(bool enable);
 // Drains accumulated GPU times (ms per CB) into the provided vector. Thread-safe.
