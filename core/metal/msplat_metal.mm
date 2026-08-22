@@ -7,6 +7,7 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <chrono>
+#import <cstdlib>
 #import <dlfcn.h>
 #import <unordered_map>
 #import <functional>
@@ -346,8 +347,15 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
 // Sizes only change at densification (every 100 steps); between densifications
 // this eliminates all per-iteration GPU allocations.
 struct FusedTensorCache {
-    int fwd_num_points = 0, capacity = 0, img_height = 0, img_width = 0, num_tiles = 0;
-    int bwd_num_points = 0, features_rest_bases = 0;
+    // -1 means "this group holds nothing usable" — the state a group is left in
+    // when one of its allocations fails partway through, so the next call
+    // rebuilds it instead of binding buffers that were never allocated.
+    int fwd_num_points = -1, img_height = -1, img_width = -1, num_tiles = -1;
+    int bwd_num_points = -1, features_rest_bases = -1;
+    int64_t capacity = -1;
+    // Intersections the GPU last reported needing (tile_offsets' final entry).
+    // Sizes the packed buffers — see intersection_capacity().
+    int64_t isect_need = 0;
 
     // Forward intermediates
     MTensor xys, depths, radii_out, conics, num_tiles_hit, colors, aabb;
@@ -371,7 +379,7 @@ struct FusedTensorCache {
 
     // Depth-chunked rasterization buffers
     uint32_t current_K_max = 1;
-    int chunk_K_max = 0;
+    int chunk_K_max = -1;
     MTensor chunk_T, chunk_C, chunk_final_idx;
     MTensor prefix_T, after_C;
 
@@ -398,10 +406,19 @@ struct FusedTensorCache {
         return bytes;
     }
 
+    // Each group releases the previous generation before allocating the new one.
+    // At the last resolution step-up the new set is roughly 4x the old, so
+    // holding both alive across the transition would raise the peak above what
+    // the device can hand back. The size tracker is invalidated first, so an
+    // allocation that throws partway leaves the group marked empty rather than
+    // leaving stale sizes claiming buffers that no longer exist.
     void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
                         id<MTLDevice> dev) {
         if (np != fwd_num_points) {
-            fwd_num_points = np;
+            fwd_num_points = -1;
+            xys.reset(); depths.reset(); radii_out.reset(); conics.reset();
+            num_tiles_hit.reset(); colors.reset(); aabb.reset(); block_totals.reset();
+
             xys = mtensor_empty(dev, {np, 2}, DType::Float32);
             depths = mtensor_empty(dev, {np}, DType::Float32);
             radii_out = mtensor_empty(dev, {np}, DType::Int32);
@@ -410,29 +427,42 @@ struct FusedTensorCache {
             colors = mtensor_empty(dev, {np, 3}, DType::Float32);
             aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
             block_totals = mtensor_empty(dev, {(np + 1023) / 1024}, DType::Int32);
+            fwd_num_points = np;
         }
         if (cap != capacity) {
-            capacity = cap;
+            capacity = -1;
+            gaussian_ids.reset(); packed_xy_opac.reset();
+            packed_conic.reset(); packed_rgb.reset();
+
             gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
             packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
+            capacity = cap;
         }
         if (ih != img_height || iw != img_width) {
-            img_height = ih; img_width = iw;
+            img_height = -1; img_width = -1;
+            out_img.reset(); final_Ts.reset(); final_idx.reset();
+            loss_intermediates.reset(); ssim_h_buf.reset(); v_rendered.reset();
+
             out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
             final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
             loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
             v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+            img_height = ih; img_width = iw;
         }
         if (nt != num_tiles) {
-            num_tiles = nt;
+            num_tiles = -1;
+            tile_bins.reset(); tile_offsets.reset();
+            tile_scatter_counters.reset(); prealloc_bins.reset();
+
             tile_bins = mtensor_empty(dev, {nt, 2}, DType::Int32);
             tile_offsets = mtensor_empty(dev, {nt}, DType::Int32);
             tile_scatter_counters = mtensor_empty(dev, {nt}, DType::Int32);
             prealloc_bins = mtensor_empty(dev, {(int64_t)nt * 2048}, DType::Int64);
+            num_tiles = nt;
         }
         if (!loss_sum.defined()) {
             loss_sum = mtensor_empty(dev, {1}, DType::Float32);
@@ -444,18 +474,25 @@ struct FusedTensorCache {
 
     void ensure_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
         if (K <= chunk_K_max && ih == img_height && iw == img_width) return;
-        chunk_K_max = K;
+        chunk_K_max = -1;
+        chunk_T.reset(); chunk_C.reset(); chunk_final_idx.reset();
+        prefix_T.reset(); after_C.reset();
+
         chunk_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
         chunk_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
         chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
         prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
         after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
+        chunk_K_max = K;
     }
 
     void ensure_backward(int np, int frb, id<MTLDevice> dev) {
         if (np != bwd_num_points || frb != features_rest_bases || !v_xy.defined()) {
-            bwd_num_points = np;
-            features_rest_bases = frb;
+            bwd_num_points = -1; features_rest_bases = -1;
+            v_xy.reset(); v_conic.reset(); v_colors_rast.reset(); v_opacity.reset();
+            v_depth.reset(); v_mean3d.reset(); v_scale.reset(); v_quat.reset();
+            v_features_dc.reset(); v_features_rest.reset();
+
             v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
             v_conic = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_colors_rast = mtensor_empty(dev, {np, 3}, DType::Float32);
@@ -466,6 +503,7 @@ struct FusedTensorCache {
             v_quat = mtensor_empty(dev, {np, 4}, DType::Float32);
             v_features_dc = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
+            bwd_num_points = np; features_rest_bases = frb;
         }
     }
 };
@@ -473,6 +511,61 @@ static FusedTensorCache g_tcache;
 
 size_t msplat_cached_tensor_bytes() {
     return g_tcache.estimatedBytes();
+}
+
+// Size of the packed intersection buffers (gaussian_ids, packed_xy_opac,
+// packed_conic, packed_rgb). These are indexed by tile_offsets, a prefix sum
+// over every tile — nothing about that sum is bounded by num_points, and the
+// intersections a single gaussian produces grow with the tile count, so the
+// fixed multiplier only holds at coarse resolutions. Measured on device:
+// 10.4 intersections per gaussian at 960x720 against 43.5 at 1920x1440, so the
+// x16 budget that fits at half resolution is short by 2.7x at full resolution.
+// Size from what the GPU last reported needing instead. The sort kernel clamps
+// its writes to whatever capacity it is handed, so an underestimate costs
+// dropped gaussians for one step rather than a write past the allocation.
+static int64_t intersection_capacity(MetalContext* ctx, int num_points, int num_tiles) {
+    static int calls = 0;
+    ++calls;
+    const bool tiles_changed = (num_tiles != g_tcache.num_tiles && g_tcache.num_tiles > 0);
+
+    // isect_need == 0 covers the cold start, including a checkpoint resumed
+    // straight into the finest resolution level, where waiting for the periodic
+    // sample would mean ~100 steps trained against a clamped frame.
+    if (g_tcache.num_tiles > 0 && g_tcache.tile_offsets.defined()
+        && (tiles_changed || g_tcache.isect_need == 0 || (calls % 100) == 1)) {
+        // No-op when the per-tile overflow check above already synced this step.
+        ctx->syncCB();
+        int64_t need = g_tcache.tile_offsets.data<int32_t>()[g_tcache.num_tiles - 1];
+        if (tiles_changed) {
+            // The reading belongs to the resolution being left behind. The count
+            // tracks the tile count closely enough to scale across a step-up
+            // (predicted 868K, actual 906K on the measured run), which beats
+            // spending a corrupted step at the new resolution to find out.
+            need = need * num_tiles / g_tcache.num_tiles;
+        }
+        g_tcache.isect_need = need;
+
+        static const bool log = std::getenv("MSPLAT_ISECT_LOG") != nullptr;
+        if (log) {
+            fprintf(stderr, "MSPLAT_ISECT tiles=%d->%d need=%lld capacity=%lld\n",
+                    g_tcache.num_tiles, num_tiles, (long long)need,
+                    (long long)g_tcache.capacity);
+            fflush(stderr);
+        }
+    }
+
+    int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
+    if (g_tcache.isect_need > 0) {
+        // 1.5x headroom: the reading is a step stale and the count keeps moving
+        // as the model densifies. Measured steady state sits at 97% of a x16
+        // budget, so a tight fit here would re-overflow constantly.
+        capacity = (std::max)(capacity, g_tcache.isect_need * 3 / 2);
+    }
+    // Grow-only within a resolution level. The per-step count jitters by tens of
+    // thousands, and reallocating ~50MB of packed buffers on that jitter would
+    // churn far more than the headroom costs.
+    if (!tiles_changed && capacity < g_tcache.capacity) capacity = g_tcache.capacity;
+    return capacity;
 }
 
 void cleanup_msplat_metal() {
@@ -509,12 +602,13 @@ static void forward_pipeline(
         ctx->syncCB();
         int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
         if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
-                    "Some gaussians were dropped from overfull tiles.\n");
+            fprintf(stderr, "WARNING: rasterizer overflow — a tile held >2048 gaussians, "
+                    "or the packed intersection buffers ran short. Some gaussians "
+                    "were dropped from this frame.\n");
             overflow_warned = true;
         }
     }
-    int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
+    int64_t capacity = intersection_capacity(ctx, num_points, num_tiles);
     uint32_t channels = 3;
 
     // --- Cached buffer pool: only reallocate on dimension change (densification) ---
@@ -629,6 +723,9 @@ static void forward_pipeline(
             ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
             ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
             ENC_BUF(enc, tile_bins, 12);
+            uint32_t capacity_u32 = (uint32_t)g_tcache.capacity;
+            ENC_SCALAR(enc, capacity_u32, 13);
+            ENC_BUF(enc, g_tcache.overflow_flag, 14);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
@@ -824,12 +921,13 @@ std::tuple<MTensor, float> msplat_train_step(
         ctx->syncCB();
         int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
         if (flag_val > 0) {
-            fprintf(stderr, "WARNING: per-tile overflow (>2048 gaussians in a tile). "
-                    "Some gaussians were dropped from overfull tiles.\n");
+            fprintf(stderr, "WARNING: rasterizer overflow — a tile held >2048 gaussians, "
+                    "or the packed intersection buffers ran short. Some gaussians "
+                    "were dropped from this frame.\n");
             overflow_warned = true;
         }
     }
-    int64_t capacity = (int64_t)num_points * g_tcache.capacity_multiplier;
+    int64_t capacity = intersection_capacity(ctx, num_points, num_tiles);
     uint32_t channels = 3;
 
     // --- Cached buffer pool ---
@@ -972,6 +1070,9 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
             ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
             ENC_BUF(enc, tile_bins, 12);
+            uint32_t capacity_u32 = (uint32_t)g_tcache.capacity;
+            ENC_SCALAR(enc, capacity_u32, 13);
+            ENC_BUF(enc, g_tcache.overflow_flag, 14);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };

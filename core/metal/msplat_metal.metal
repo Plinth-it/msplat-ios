@@ -2076,6 +2076,8 @@ kernel void bitonic_sort_per_tile_kernel(
     device float* packed_conic          [[buffer(10)]],
     device float* packed_rgb            [[buffer(11)]],
     device int* tile_bins               [[buffer(12)]],
+    constant uint& capacity             [[buffer(13)]],
+    device atomic_uint* overflow_flag   [[buffer(14)]],
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
@@ -2086,12 +2088,25 @@ kernel void bitonic_sort_per_tile_kernel(
     int end = tile_offsets[tg_id];
     int start = end - count;
 
-    // Write tile_bins for rasterizer
-    if (tid == 0) {
-        write_packed_int2(tile_bins, tg_id, int2(start, end));
+    // tile_offsets is a prefix sum over every tile and is not bounded by the
+    // size of the packed output buffers, so clamp the write range here. Without
+    // this a tile whose range runs past `capacity` writes into whatever buffer
+    // was allocated next — at full resolution that is the model itself.
+    // The sort below still runs on the full count (it works in threadgroup
+    // memory, bounded by MAX_TILE_ELEMS), so the entries kept after clamping are
+    // the front-most ones, which is the right half to keep for alpha compositing.
+    int cap = (int)capacity;
+    int writable = clamp(cap - start, 0, count);
+    if (writable < count && tid == 0) {
+        atomic_store_explicit(overflow_flag, 1u, memory_order_relaxed);
     }
 
-    if (count == 0) return;
+    // Write tile_bins for rasterizer
+    if (tid == 0) {
+        write_packed_int2(tile_bins, tg_id, int2(min(start, cap), min(start + writable, cap)));
+    }
+
+    if (count == 0 || writable == 0) return;
 
     // Round up to next power of 2
     int n = 1;
@@ -2125,7 +2140,7 @@ kernel void bitonic_sort_per_tile_kernel(
     }
 
     // Fused sort+pack: extract gaussian IDs, read per-gaussian data, write packed buffers
-    for (int i = (int)tid; i < count; i += SORT_TG_SIZE) {
+    for (int i = (int)tid; i < writable; i += SORT_TG_SIZE) {
         int32_t g_id = (int32_t)(data[i] & 0xFFFFFFFF);
         int global_idx = start + i;
         gaussian_ids_out[global_idx] = g_id;
