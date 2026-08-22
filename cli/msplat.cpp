@@ -178,7 +178,8 @@ int main(int argc, char *argv[]) {
             }
 
             if (!valRender.empty() && valCamIndex >= 0 && step % 10 == 0) {
-                MTensor rgb = model.render(inputData.cameras[valCamIndex], step);
+                MTensor rgb = model.render(
+                    images.ensureLoaded(inputData.cameras, (size_t)valCamIndex), step);
                 msplat_gpu_sync();
                 MTensor rgb_cpu = rgb.cpu();
                 Image valImg;
@@ -279,7 +280,9 @@ int main(int argc, char *argv[]) {
 
             std::cout << "\n=== Evaluation (" << nTest << " test views) ===" << std::endl;
             for (int i = 0; i < nTest; i++) {
-                Camera &testCam = inputData.cameras[testCams[i]];
+                // Load first: the intrinsic correction happens in the decode,
+                // and a test camera is never touched by the training loop.
+                Camera &testCam = images.ensureLoaded(inputData.cameras, testCams[i]);
                 MTensor rgb = model.render(testCam, numIters);
                 msplat_gpu_sync();
                 MTensor rgb_cpu = rgb.cpu();
@@ -303,7 +306,7 @@ int main(int argc, char *argv[]) {
 
         // Validation
         if (valCamIndex >= 0) {
-            Camera &validationCam = inputData.cameras[valCamIndex];
+            Camera &validationCam = images.ensureLoaded(inputData.cameras, (size_t)valCamIndex);
             MTensor rgb = model.render(validationCam, numIters);
             msplat_gpu_sync();
             MTensor rgb_cpu = rgb.cpu();

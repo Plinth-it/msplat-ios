@@ -34,6 +34,21 @@ struct Camera {
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
 
+    /// The intrinsics and distortion as the dataset declared them, captured
+    /// before loadImage first rewrites them. loadImage re-derives the effective
+    /// values from these on every call, so a camera whose image was evicted and
+    /// reloaded lands on the same numbers rather than compounding the
+    /// correction — and keeps its distortion coefficients, which the undistort
+    /// step would otherwise zero out permanently, leaving a reloaded image
+    /// distorted while its intrinsics claimed it was not.
+    struct DeclaredIntrinsics {
+        bool captured = false;
+        float fx = 0, fy = 0, cx = 0, cy = 0;
+        float k1 = 0, k2 = 0, k3 = 0, p1 = 0, p2 = 0;
+        int width = 0, height = 0;
+    };
+    DeclaredIntrinsics declared;
+
     void loadImage(float downscaleFactor);
     const Image& getImage(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
@@ -69,6 +84,13 @@ public:
     /// `downscaleFactor`, evicting other cameras to stay under budget. The
     /// camera being asked for is never the eviction victim.
     MTensor& gpuImage(std::vector<Camera> &cameras, size_t index, int downscaleFactor);
+
+    /// Decodes cameras[index] if it is not resident, and accounts for it, but
+    /// uploads nothing. Render paths need this: the correction from the
+    /// dataset's declared image size to the file's real one happens during the
+    /// decode, so a camera that has never been loaded renders at the wrong
+    /// scale.
+    Camera& ensureLoaded(std::vector<Camera> &cameras, size_t index);
 
     size_t cachedBytes() const;
     size_t budgetBytes() const { return _budgetBytes; }

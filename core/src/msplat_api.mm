@@ -30,12 +30,15 @@ struct Dataset::Impl {
     std::vector<size_t> testIndices;
     CameraImageCache images;
 
+    // Both load before returning: the correction from the dataset's declared
+    // image size to the file's real one happens during the decode, so a camera
+    // that has never been loaded carries the wrong intrinsics.
     Camera& trainCamera(size_t trainIndex) {
-        return data.cameras[trainIndices[trainIndex]];
+        return images.ensureLoaded(data.cameras, trainIndices[trainIndex]);
     }
 
     Camera& testCamera(size_t testIndex) {
-        return data.cameras[testIndices[testIndex]];
+        return images.ensureLoaded(data.cameras, testIndices[testIndex]);
     }
 
     MTensor& gpuImageForTrainCamera(size_t trainIndex, int downscaleFactor) {
@@ -201,7 +204,7 @@ PixelBuffer Trainer::render(int cameraIndex, bool useTest) {
     if (cameraIndex < 0 || cameraIndex >= (int)indices.size())
         return {};
 
-    Camera& cam = impl->ds->data.cameras[indices[cameraIndex]];
+    Camera& cam = impl->ds->images.ensureLoaded(impl->ds->data.cameras, indices[cameraIndex]);
     MTensor rgb = impl->model->render(cam, impl->currentStep);
     msplat_gpu_sync();
     MTensor rgbCpu = rgb.cpu();
@@ -220,7 +223,7 @@ PixelBuffer Trainer::renderFromPose(const float camToWorld[16], int refCameraInd
     if (refCameraIndex < 0 || refCameraIndex >= (int)indices.size())
         return {};
 
-    Camera cam = impl->ds->data.cameras[indices[refCameraIndex]];  // copy intrinsics
+    Camera cam = impl->ds->images.ensureLoaded(impl->ds->data.cameras, indices[refCameraIndex]);
     memcpy(cam.camToWorld, camToWorld, 16 * sizeof(float));
     // Invalidate cached matrices so prepareCam recomputes from the new pose
     cam.cachedViewMat = MTensor();
@@ -244,7 +247,7 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
         *outWidth = 0; *outHeight = 0; return;
     }
 
-    Camera cam = impl->ds->data.cameras[indices[refCameraIndex]];
+    Camera cam = impl->ds->images.ensureLoaded(impl->ds->data.cameras, indices[refCameraIndex]);
     memcpy(cam.camToWorld, camToWorld, 16 * sizeof(float));
     cam.cachedViewMat = MTensor();
     cam.cachedProjViewMat = MTensor();

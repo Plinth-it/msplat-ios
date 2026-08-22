@@ -21,6 +21,15 @@ void Camera::loadImage(float downscaleFactor) {
     if (!image.empty() && loadedImageDownscaleFactor == downscaleFactor) return;
     releaseImageMemory();
 
+    // Capture the dataset's own numbers once, then always derive from them.
+    if (!declared.captured) {
+        declared = {true, fx, fy, cx, cy, k1, k2, k3, p1, p2, width, height};
+    }
+    fx = declared.fx; fy = declared.fy; cx = declared.cx; cy = declared.cy;
+    k1 = declared.k1; k2 = declared.k2; k3 = declared.k3;
+    p1 = declared.p1; p2 = declared.p2;
+    width = declared.width; height = declared.height;
+
     Image raw = imreadRGB(filePath);
     if (raw.empty()) return;
 
@@ -137,6 +146,17 @@ MTensor& CameraImageCache::gpuImage(std::vector<Camera> &cameras, size_t index,
     entry.bytes = cam.cachedImageBytes();
     evict(cameras, index);
     return image;
+}
+
+Camera& CameraImageCache::ensureLoaded(std::vector<Camera> &cameras, size_t index) {
+    Camera &cam = cameras[index];
+    cam.loadImage(_downscaleFactor);
+
+    Entry &entry = _entries[index];
+    entry.lastUse = ++_clock;
+    entry.bytes = cam.cachedImageBytes();
+    evict(cameras, index);
+    return cam;
 }
 
 void CameraImageCache::evict(std::vector<Camera> &cameras, size_t protectedIndex) {

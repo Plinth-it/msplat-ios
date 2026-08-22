@@ -82,8 +82,9 @@ public:
         }
     }
 
-    Camera& train_camera(size_t i) { return data.cameras[train_cams[i]]; }
-    Camera& test_camera(size_t i) { return data.cameras[test_cams[i]]; }
+    // Both load before returning — the intrinsic correction happens in the decode.
+    Camera& train_camera(size_t i) { return images.ensureLoaded(data.cameras, train_cams[i]); }
+    Camera& test_camera(size_t i) { return images.ensureLoaded(data.cameras, test_cams[i]); }
     MTensor& train_image(size_t i, int downscale) {
         return images.gpuImage(data.cameras, train_cams[i], downscale);
     }
