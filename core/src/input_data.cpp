@@ -314,14 +314,15 @@ InputData inputDataFromX(const std::string &path, const std::string &colmapImage
     if (fs::exists(root / "transforms.json"))
         return loaders::loadNerfstudio(path);
 
-    // COLMAP: cameras.bin (direct or in sparse/0/)
-    if (fs::exists(root / "cameras.bin") || fs::exists(root / "sparse" / "0" / "cameras.bin"))
-        return loaders::loadColmap(path, colmapImagePath);
+    // COLMAP: cameras.bin or cameras.txt (direct or in sparse/0/)
+    for (const auto &name : {"cameras.bin", "cameras.txt"})
+        if (fs::exists(root / name) || fs::exists(root / "sparse" / "0" / name))
+            return loaders::loadColmap(path, colmapImagePath);
 
     // Polycam: keyframes/ directory or cameras.json
     if (fs::exists(root / "keyframes" / "corrected_cameras") || fs::exists(root / "cameras.json"))
         return loaders::loadPolycam(path);
 
     throw std::runtime_error("Unrecognized dataset format in: " + path +
-        "\nSupported: COLMAP (cameras.bin), Nerfstudio (transforms.json), Polycam (keyframes/)");
+        "\nSupported: COLMAP (cameras.bin or cameras.txt), Nerfstudio (transforms.json), Polycam (keyframes/)");
 }

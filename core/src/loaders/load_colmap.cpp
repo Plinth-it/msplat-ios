@@ -3,6 +3,7 @@
 #include <iostream>
 #include <filesystem>
 #include <algorithm>
+#include <sstream>
 
 namespace fs = std::filesystem;
 
@@ -96,6 +97,120 @@ static std::vector<ColmapImage> readImagesBin(const std::string &path) {
     return images;
 }
 
+// ── Text model ──────────────────────────────────────────────────────────────
+// COLMAP writes the same model as either .bin or .txt. The text form is what
+// tooling that assembles a reconstruction by hand tends to produce, and what
+// COLMAP itself writes with --output_type TXT.
+
+static bool nextRecord(std::istream &f, std::string &line) {
+    while (std::getline(f, line)) {
+        size_t start = line.find_first_not_of(" \t\r");
+        if (start == std::string::npos || line[start] == '#') continue;
+        return true;
+    }
+    return false;
+}
+
+static int colmapModelId(const std::string &name) {
+    if (name == "SIMPLE_PINHOLE") return SIMPLE_PINHOLE;
+    if (name == "PINHOLE")        return PINHOLE;
+    if (name == "SIMPLE_RADIAL")  return SIMPLE_RADIAL;
+    if (name == "RADIAL")         return RADIAL;
+    if (name == "OPENCV")         return OPENCV;
+    throw std::runtime_error("Unsupported COLMAP camera model: " + name);
+}
+
+static std::unordered_map<uint32_t, ColmapCamera> readCamerasText(const std::string &path) {
+    std::ifstream f(path);
+    if (!f.is_open()) throw std::runtime_error("Cannot open " + path);
+
+    std::unordered_map<uint32_t, ColmapCamera> cams;
+    std::string line;
+    while (nextRecord(f, line)) {
+        std::istringstream ls(line);
+        ColmapCamera c = {};
+        std::string model;
+        ls >> c.id >> model >> c.width >> c.height;
+        c.model = colmapModelId(model);
+
+        auto rd = [&]() -> float {
+            double v;
+            if (!(ls >> v)) throw std::runtime_error("Truncated camera record in " + path);
+            return (float)v;
+        };
+        switch (c.model) {
+            case SIMPLE_PINHOLE: c.fx = c.fy = rd(); c.cx = rd(); c.cy = rd(); break;
+            case PINHOLE:        c.fx = rd(); c.fy = rd(); c.cx = rd(); c.cy = rd(); break;
+            case SIMPLE_RADIAL:  c.fx = c.fy = rd(); c.cx = rd(); c.cy = rd(); c.k1 = rd(); break;
+            case RADIAL:         c.fx = c.fy = rd(); c.cx = rd(); c.cy = rd(); c.k1 = rd(); c.k2 = rd(); break;
+            case OPENCV:         c.fx = rd(); c.fy = rd(); c.cx = rd(); c.cy = rd();
+                                 c.k1 = rd(); c.k2 = rd(); c.p1 = rd(); c.p2 = rd(); break;
+        }
+        cams[c.id] = c;
+    }
+    return cams;
+}
+
+static std::vector<ColmapImage> readImagesText(const std::string &path) {
+    std::ifstream f(path);
+    if (!f.is_open()) throw std::runtime_error("Cannot open " + path);
+
+    std::vector<ColmapImage> images;
+    std::string line;
+    while (nextRecord(f, line)) {
+        std::istringstream ls(line);
+        ColmapImage img;
+        uint32_t imageId;
+        ls >> imageId
+           >> img.quat[0] >> img.quat[1] >> img.quat[2] >> img.quat[3]
+           >> img.t[0] >> img.t[1] >> img.t[2]
+           >> img.camId;
+        if (!ls) throw std::runtime_error("Truncated image record in " + path);
+
+        // The name is the rest of the line, not a token — COLMAP permits
+        // spaces in it and writes it unquoted.
+        std::getline(ls, img.filename);
+        size_t start = img.filename.find_first_not_of(" \t");
+        size_t end = img.filename.find_last_not_of(" \t\r");
+        img.filename = (start == std::string::npos)
+            ? std::string() : img.filename.substr(start, end - start + 1);
+
+        // Every record is two lines. The second holds the 2D observations,
+        // which are not needed here, and is blank for an image with none —
+        // so it has to be consumed unconditionally rather than skipped as
+        // whitespace by the next nextRecord().
+        std::getline(f, line);
+
+        images.push_back(img);
+    }
+    return images;
+}
+
+static Points readPointsText(const std::string &path) {
+    std::ifstream f(path);
+    if (!f.is_open()) throw std::runtime_error("Cannot open " + path);
+
+    Points pts;
+    std::string line;
+    while (nextRecord(f, line)) {
+        std::istringstream ls(line);
+        uint64_t pointId;
+        double x, y, z;
+        int r, g, b;
+        ls >> pointId >> x >> y >> z >> r >> g >> b;
+        if (!ls) throw std::runtime_error("Truncated point record in " + path);
+
+        pts.xyz.push_back((float)x);
+        pts.xyz.push_back((float)y);
+        pts.xyz.push_back((float)z);
+        pts.rgb.push_back((uint8_t)r);
+        pts.rgb.push_back((uint8_t)g);
+        pts.rgb.push_back((uint8_t)b);
+    }
+    pts.count = (int64_t)(pts.xyz.size() / 3);
+    return pts;
+}
+
 // w2c rotation + translation → 4x4 c2w row-major with OpenGL Y/Z flip
 static void w2cToCamToWorld(const double quat[4], const double t[3], float out[16]) {
     float R[9];
@@ -119,18 +234,25 @@ static void w2cToCamToWorld(const double quat[4], const double t[3], float out[1
 }
 
 InputData loaders::loadColmap(const std::string &projectRoot, const std::string &imageSourcePath) {
-    // Find sparse dir — dispatcher already confirmed cameras.bin exists
+    // Find sparse dir — dispatcher already confirmed a cameras file exists
     fs::path root(projectRoot);
-    std::string sparseDir = fs::exists(root / "cameras.bin")
-        ? projectRoot
-        : (root / "sparse" / "0").string();
+    auto hasModel = [](const fs::path &dir) {
+        return fs::exists(dir / "cameras.bin") || fs::exists(dir / "cameras.txt");
+    };
+    fs::path sparse = hasModel(root) ? root : root / "sparse" / "0";
 
     std::string imageDir = !imageSourcePath.empty() ? imageSourcePath
         : fs::exists(root / "images") ? (root / "images").string()
         : projectRoot;
 
-    auto cameras = readCamerasBin(sparseDir + "/cameras.bin");
-    auto images = readImagesBin(sparseDir + "/images.bin");
+    // Chosen per file rather than once for the model: COLMAP writes all three
+    // in the same format, but a dataset assembled by hand often mixes them.
+    auto cameras = fs::exists(sparse / "cameras.bin")
+        ? readCamerasBin((sparse / "cameras.bin").string())
+        : readCamerasText((sparse / "cameras.txt").string());
+    auto images = fs::exists(sparse / "images.bin")
+        ? readImagesBin((sparse / "images.bin").string())
+        : readImagesText((sparse / "images.txt").string());
 
     std::sort(images.begin(), images.end(),
         [](const ColmapImage &a, const ColmapImage &b) { return a.filename < b.filename; });
@@ -153,11 +275,12 @@ InputData loaders::loadColmap(const std::string &projectRoot, const std::string 
     }
 
     // Point cloud
-    std::string ptsPath = sparseDir + "/points3D.bin";
-    if (fs::exists(ptsPath))
-        data.points = readColmapPoints(ptsPath);
-    else if (fs::exists(sparseDir + "/points3D.ply"))
-        data.points = readPly(sparseDir + "/points3D.ply");
+    if (fs::exists(sparse / "points3D.bin"))
+        data.points = readColmapPoints((sparse / "points3D.bin").string());
+    else if (fs::exists(sparse / "points3D.txt"))
+        data.points = readPointsText((sparse / "points3D.txt").string());
+    else if (fs::exists(sparse / "points3D.ply"))
+        data.points = readPly((sparse / "points3D.ply").string());
 
     autoScaleAndCenter(data);
     return data;
