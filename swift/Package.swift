@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "Msplat",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v15), .iOS(.v18)],
     products: [
         .library(name: "Msplat", targets: ["Msplat"]),
     ],
@@ -19,7 +19,11 @@ let package = Package(
             name: "Msplat",
             dependencies: ["MsplatCore"],
             path: "Sources/Msplat",
-            resources: [.copy("Resources/default.metallib")],
+            resources: [
+                .copy("Resources/default-macos.metallib"),
+                .copy("Resources/default-ios.metallib"),
+                .copy("Resources/default-iossimulator.metallib"),
+            ],
             linkerSettings: [
                 .linkedFramework("Metal"),
                 .linkedFramework("MetalKit"),

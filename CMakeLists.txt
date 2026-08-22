@@ -54,20 +54,49 @@ find_library(COREGRAPHICS_FRAMEWORK CoreGraphics REQUIRED)
 
 # --- Compile Metal shaders ---
 
+# A metallib is per-platform: the device, the simulator and macOS each need
+# their own, compiled against their own SDK. CMAKE_SYSTEM_NAME does not
+# distinguish device from simulator, so the sysroot decides and the choice
+# stays overridable for callers that know which slice they are building.
+set(MSPLAT_METAL_LANGUAGE_STANDARD "metal4.0" CACHE STRING "Metal language standard for precompiled shader libraries")
+set(MSPLAT_METAL_IOS_DEPLOYMENT_TARGET "18.0" CACHE STRING "Minimum iOS version for precompiled shader libraries")
+set(MSPLAT_METAL_MACOS_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version for precompiled shader libraries")
+
+if(NOT DEFINED MSPLAT_METAL_SDK)
+    if(CMAKE_SYSTEM_NAME STREQUAL "iOS")
+        if(CMAKE_OSX_SYSROOT MATCHES "[Ss]imulator")
+            set(MSPLAT_METAL_SDK "iphonesimulator")
+        else()
+            set(MSPLAT_METAL_SDK "iphoneos")
+        endif()
+    else()
+        set(MSPLAT_METAL_SDK "macosx")
+    endif()
+endif()
+
+if(MSPLAT_METAL_SDK STREQUAL "macosx")
+    set(MSPLAT_METAL_DEPLOYMENT_FLAG "-mmacosx-version-min=${MSPLAT_METAL_MACOS_DEPLOYMENT_TARGET}")
+elseif(MSPLAT_METAL_SDK STREQUAL "iphonesimulator")
+    set(MSPLAT_METAL_DEPLOYMENT_FLAG "-mios-simulator-version-min=${MSPLAT_METAL_IOS_DEPLOYMENT_TARGET}")
+else()
+    set(MSPLAT_METAL_DEPLOYMENT_FLAG "-mios-version-min=${MSPLAT_METAL_IOS_DEPLOYMENT_TARGET}")
+endif()
+message(STATUS "msplat metal SDK: ${MSPLAT_METAL_SDK} ${MSPLAT_METAL_DEPLOYMENT_FLAG}")
+
 set(METAL_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/msplat_metal.metal)
 configure_file(${METAL_SOURCE} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal COPYONLY)
 add_custom_command(
     OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
-    COMMAND xcrun -sdk macosx metal -O3 -c
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal -O3 -std=${MSPLAT_METAL_LANGUAGE_STANDARD} ${MSPLAT_METAL_DEPLOYMENT_FLAG} -c
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
-    COMMAND xcrun -sdk macosx metallib
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metallib
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
     DEPENDS ${METAL_SOURCE}
-    COMMENT "Compiling Metal kernels → default.metallib"
+    COMMENT "Compiling Metal kernels -> default.metallib"
 )
 add_custom_target(metallib ALL
     DEPENDS ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib)
@@ -107,14 +136,17 @@ add_dependencies(msplat_core metallib)
 
 # --- CLI binary ---
 
-add_executable(msplat cli/msplat.cpp)
-target_link_libraries(msplat PRIVATE
-    msplat_core
-    CLI11::CLI11
-    pthread
-)
-target_compile_definitions(msplat PRIVATE USE_MPS)
-install(TARGETS msplat DESTINATION bin)
+# The CLI is a desktop tool; an iOS build only wants the static library.
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
+    add_executable(msplat cli/msplat.cpp)
+    target_link_libraries(msplat PRIVATE
+        msplat_core
+        CLI11::CLI11
+        pthread
+    )
+    target_compile_definitions(msplat PRIVATE USE_MPS)
+    install(TARGETS msplat DESTINATION bin)
+endif()
 
 # --- Python bindings (optional, enabled when building via scikit-build-core) ---
 

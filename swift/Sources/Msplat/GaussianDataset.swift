@@ -3,10 +3,22 @@ import Foundation
 
 nonisolated(unsafe) private var _metallibConfigured = false
 
+/// A metallib is compiled against one SDK and will not load on another, so the
+/// package ships one per platform and picks here rather than at build time.
+private var metallibResourceName: String {
+    #if os(macOS)
+    return "default-macos"
+    #elseif targetEnvironment(simulator)
+    return "default-iossimulator"
+    #else
+    return "default-ios"
+    #endif
+}
+
 func ensureMetallibConfigured() {
     guard !_metallibConfigured else { return }
     _metallibConfigured = true
-    if let path = Bundle.module.path(forResource: "default", ofType: "metallib") {
+    if let path = Bundle.module.path(forResource: metallibResourceName, ofType: "metallib") {
         msplat_set_metallib_path(path)
     }
 }
