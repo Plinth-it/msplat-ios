@@ -4,7 +4,15 @@
 #include <vector>
 #include <cstdint>
 #include <cassert>
+#include <cstdio>
 #include <cstring>
+#include <stdexcept>
+#include <utility>
+#include <CoreFoundation/CoreFoundation.h>
+#include <TargetConditionals.h>
+#if TARGET_OS_IPHONE
+#include <os/proc.h>
+#endif
 
 // Forward-declare the Metal buffer type for C++ compatibility.
 // Full Metal/Metal.h is only needed in .mm files.
@@ -36,6 +44,31 @@ inline size_t dtypeSize(DType dt) {
 class MTensor {
 public:
     MTensor() = default;
+    ~MTensor() { reset(); }
+
+    MTensor(const MTensor& other) {
+        copyFrom(other);
+    }
+
+    MTensor& operator=(const MTensor& other) {
+        if (this != &other) {
+            reset();
+            copyFrom(other);
+        }
+        return *this;
+    }
+
+    MTensor(MTensor&& other) noexcept {
+        moveFrom(std::move(other));
+    }
+
+    MTensor& operator=(MTensor&& other) noexcept {
+        if (this != &other) {
+            reset();
+            moveFrom(std::move(other));
+        }
+        return *this;
+    }
 
 #ifdef __OBJC__
     // GPU allocation (Objective-C++ only)
@@ -46,7 +79,13 @@ public:
         size_t bytes = _numel * dtypeSize(_dtype);
         if (bytes == 0) bytes = 4;
         id<MTLBuffer> buf = [device newBufferWithLength:bytes options:MTLResourceStorageModeShared];
+        if (!buf) throwAllocationFailure(bytes);
+#if __has_feature(objc_arc)
         _buffer = (__bridge_retained void*)buf;
+#else
+        _buffer = (void*)buf;
+#endif
+        _ownsBuffer = true;
         _data = [buf contents];  // cache CPU-accessible pointer for C++ access
     }
 
@@ -100,11 +139,10 @@ public:
     }
 
     void reset() {
-#ifdef __OBJC__
-        if (_buffer) { CFRelease(_buffer); }
-#endif
+        if (_buffer && _ownsBuffer) CFRelease(_buffer);
         _buffer = nullptr;
         _data = nullptr;
+        _ownsBuffer = false;
         _cpu_data.clear();
         _shape.clear();
         _numel = 0;
@@ -126,6 +164,7 @@ public:
         MTensor v;
         v._buffer = _buffer;  // shares the buffer (non-owning)
         v._data = _data;      // shares the CPU-accessible pointer
+        v._ownsBuffer = false;
         v._shape = _shape;
         v._shape[0] = n;
         v._dtype = _dtype;
@@ -134,8 +173,72 @@ public:
     }
 
 private:
+    // Metal returns nil rather than raising when a buffer allocation cannot be
+    // satisfied. Callers here treat the result as valid, so an unchecked nil
+    // reaches a compute encoder and the kernel faults dereferencing null — the
+    // failure then surfaces as GPU corruption rather than as an allocation
+    // error, and takes the process's GPU context down with it. Fail here, while
+    // we still know what was being asked for.
+    [[noreturn]] void throwAllocationFailure(size_t bytes) const {
+        char shapeText[128] = "scalar";
+        int n = 0;
+        for (size_t i = 0; i < _shape.size() && n < (int)sizeof(shapeText) - 24; i++) {
+            n += snprintf(shapeText + n, sizeof(shapeText) - n, "%s%lld",
+                          i ? "x" : "", (long long)_shape[i]);
+        }
+
+        char message[320];
+#if TARGET_OS_IPHONE
+        snprintf(message, sizeof(message),
+                 "MTLBuffer allocation failed: [%s] %.1f MB requested, "
+                 "%.1f MB available before jetsam",
+                 shapeText, (double)bytes / (1024.0 * 1024.0),
+                 (double)os_proc_available_memory() / (1024.0 * 1024.0));
+#else
+        snprintf(message, sizeof(message),
+                 "MTLBuffer allocation failed: [%s] %.1f MB requested",
+                 shapeText, (double)bytes / (1024.0 * 1024.0));
+#endif
+        // Printed as well as thrown: nothing catches this yet, so stderr is the
+        // only place the detail survives the resulting terminate().
+        fprintf(stderr, "MSPLAT_ALLOC_FAIL %s\n", message);
+        fflush(stderr);
+        throw std::runtime_error(message);
+    }
+
+    void copyFrom(const MTensor& other) {
+        _shape = other._shape;
+        _dtype = other._dtype;
+        _numel = other._numel;
+        _data = other._data;
+        _buffer = other._buffer;
+        _cpu_data = other._cpu_data;
+        _ownsBuffer = false;
+        if (_buffer) {
+            CFRetain(_buffer);
+            _ownsBuffer = true;
+        }
+    }
+
+    void moveFrom(MTensor&& other) {
+        _buffer = other._buffer;
+        _data = other._data;
+        _cpu_data = std::move(other._cpu_data);
+        _shape = std::move(other._shape);
+        _dtype = other._dtype;
+        _numel = other._numel;
+        _ownsBuffer = other._ownsBuffer;
+
+        other._buffer = nullptr;
+        other._data = nullptr;
+        other._shape.clear();
+        other._numel = 0;
+        other._ownsBuffer = false;
+    }
+
     void* _buffer = nullptr;  // retained id<MTLBuffer> as void*
     void* _data = nullptr;    // cached CPU-accessible pointer (shared memory on Apple Silicon)
+    bool _ownsBuffer = false;
     std::vector<uint8_t> _cpu_data;
     std::vector<int64_t> _shape;
     DType _dtype = DType::Float32;
