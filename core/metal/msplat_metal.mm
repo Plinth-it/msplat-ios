@@ -379,7 +379,7 @@ struct FusedTensorCache {
 
     // Depth-chunked rasterization buffers
     uint32_t current_K_max = 1;
-    int chunk_K_max = -1;
+    int chunk_K_max = -1, chunk_height = -1, chunk_width = -1;
     MTensor chunk_T, chunk_C, chunk_final_idx;
     MTensor prefix_T, after_C;
 
@@ -473,8 +473,13 @@ struct FusedTensorCache {
     }
 
     void ensure_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
-        if (K <= chunk_K_max && ih == img_height && iw == img_width) return;
-        chunk_K_max = -1;
+        // Compared against img_height/img_width until now, which ensure_forward
+        // has already advanced to the new resolution by the time this runs — so
+        // the guard was comparing ih to itself and the chunk buffers kept the
+        // previous level's dimensions while the kernels indexed them at the new
+        // one. Track the dimensions this group was actually built for.
+        if (K <= chunk_K_max && ih == chunk_height && iw == chunk_width) return;
+        chunk_K_max = -1; chunk_height = -1; chunk_width = -1;
         chunk_T.reset(); chunk_C.reset(); chunk_final_idx.reset();
         prefix_T.reset(); after_C.reset();
 
@@ -483,7 +488,7 @@ struct FusedTensorCache {
         chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
         prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
         after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
-        chunk_K_max = K;
+        chunk_K_max = K; chunk_height = ih; chunk_width = iw;
     }
 
     void ensure_backward(int np, int frb, id<MTLDevice> dev) {
