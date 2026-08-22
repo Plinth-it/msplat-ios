@@ -82,4 +82,28 @@ final class MsplatTests: XCTestCase {
 
         try FileManager.default.removeItem(atPath: tmpPath)
     }
+
+    func testExportSpz() throws {
+        let dataset = GaussianDataset(
+            path: Self.gardenPath,
+            downscaleFactor: 4.0
+        )
+        var config = TrainingConfig()
+        config.iterations = 5
+        config.numDownscales = 0
+
+        let trainer = GaussianTrainer(dataset: dataset, config: config)
+        for _ in 0..<5 { trainer.step() }
+
+        let tmpPath = NSTemporaryDirectory() + "msplat_test_export.spz"
+        trainer.exportSpz(to: tmpPath)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tmpPath))
+
+        let data = try Data(contentsOf: URL(fileURLWithPath: tmpPath))
+        XCTAssertGreaterThan(data.count, 100)
+        XCTAssertEqual(data[0], 0x1f)
+        XCTAssertEqual(data[1], 0x8b)
+
+        try FileManager.default.removeItem(atPath: tmpPath)
+    }
 }

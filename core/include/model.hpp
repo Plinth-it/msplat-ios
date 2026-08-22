@@ -28,6 +28,7 @@ struct Model{
   void save(const std::string &filename, int step);
   void savePly(const std::string &filename, int step);
   void saveSplat(const std::string &filename);
+  void saveSpz(const std::string &filename);
   int loadPly(const std::string &filename);
   void saveCheckpoint(const std::string &filename, int step);
   int loadCheckpoint(const std::string &filename);

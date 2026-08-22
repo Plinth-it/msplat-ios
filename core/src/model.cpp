@@ -383,6 +383,8 @@ void Model::save(const std::string &filename, int step) {
     std::string ext = fs::path(filename).extension().string();
     if (ext == ".splat")
         saveSplat(filename);
+    else if (ext == ".spz")
+        saveSpz(filename);
     else
         savePly(filename, step);
     fprintf(stderr, "Saved %s\n", filename.c_str());
@@ -398,6 +400,12 @@ void Model::saveSplat(const std::string &filename){
     GaussianParams p{means, scales, quats, featuresDc, featuresRest, opacities,
                      scale, {translation[0], translation[1], translation[2]}, keepCrs};
     saveGaussianSplat(filename, p);
+}
+
+void Model::saveSpz(const std::string &filename){
+    GaussianParams p{means, scales, quats, featuresDc, featuresRest, opacities,
+                     scale, {translation[0], translation[1], translation[2]}, keepCrs};
+    saveGaussianSpz(filename, p);
 }
 
 int Model::loadPly(const std::string &filename){

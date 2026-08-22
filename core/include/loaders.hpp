@@ -44,6 +44,7 @@ struct GaussianParams {
 
 void saveGaussianPly(const std::string &path, GaussianParams &p, int step);
 void saveGaussianSplat(const std::string &path, GaussianParams &p);
+void saveGaussianSpz(const std::string &path, GaussianParams &p);
 
 struct LoadedGaussians {
     MTensor means, scales, quats, featuresDc, featuresRest, opacities;

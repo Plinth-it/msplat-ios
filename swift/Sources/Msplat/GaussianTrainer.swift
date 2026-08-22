@@ -82,6 +82,11 @@ public class GaussianTrainer {
         msplat_trainer_export_splat(handle, path)
     }
 
+    /// Export scene as .spz.
+    public func exportSpz(to path: String) {
+        msplat_trainer_export_spz(handle, path)
+    }
+
     /// Save full training state for resume.
     public func saveCheckpoint(to path: String) {
         msplat_trainer_save_checkpoint(handle, path)

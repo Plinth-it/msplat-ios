@@ -4,8 +4,103 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <cstring>
+#include <sstream>
+#include <zlib.h>
 
 static const double C0 = 0.28209479177387814;
+static constexpr float kSpzColorScale = 0.15f;
+static constexpr float kSpzSqrtHalf = 0.7071067811865475f;
+static constexpr uint32_t kSpzMagic = 0x5053474e; // "NGSP"
+static constexpr uint32_t kSpzVersion = 3;
+static constexpr int kSpzFractionalBits = 12;
+
+struct SpzLegacyHeader {
+    uint32_t magic = kSpzMagic;
+    uint32_t version = kSpzVersion;
+    uint32_t numPoints = 0;
+    uint8_t shDegree = 0;
+    uint8_t fractionalBits = kSpzFractionalBits;
+    uint8_t flags = 0;
+    uint8_t reserved = 0;
+};
+static_assert(sizeof(SpzLegacyHeader) == 16, "SPZ legacy header must be 16 bytes");
+
+static float spzSigmoid(float x) {
+    return 1.0f / (1.0f + std::exp(-x));
+}
+
+static uint8_t byteClamp(float x) {
+    return (uint8_t)std::clamp(std::round(x), 0.0f, 255.0f);
+}
+
+static uint8_t quantizeSh(float x, int bucketSize) {
+    int q = (int)(std::round(x * 128.0f) + 128.0f);
+    q = (q + bucketSize / 2) / bucketSize * bucketSize;
+    return (uint8_t)std::clamp(q, 0, 255);
+}
+
+static int shDegreeForDim(int dim) {
+    if (dim >= 24) return 4;
+    if (dim >= 15) return 3;
+    if (dim >= 8) return 2;
+    if (dim >= 3) return 1;
+    return 0;
+}
+
+static bool gzipBytes(const std::string &plain, std::vector<uint8_t> &out) {
+    z_stream stream = {};
+    if (deflateInit2(&stream, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15 + 16, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+        return false;
+
+    out.resize(std::max<size_t>(128, deflateBound(&stream, plain.size())));
+    stream.next_in = (Bytef*)plain.data();
+    stream.avail_in = (uInt)plain.size();
+
+    int res;
+    do {
+        if (stream.total_out == out.size()) out.resize(out.size() * 2);
+        stream.next_out = out.data() + stream.total_out;
+        stream.avail_out = (uInt)(out.size() - stream.total_out);
+        res = deflate(&stream, Z_FINISH);
+    } while (res == Z_OK);
+
+    bool ok = res == Z_STREAM_END;
+    out.resize(stream.total_out);
+    deflateEnd(&stream);
+    return ok;
+}
+
+// SPZ stores a quaternion as its three smallest components at 10 bits each,
+// plus 2 bits naming the one that was dropped — which is recovered from the
+// unit-norm constraint, so the largest is the one worth dropping.
+static void packSpzQuaternion(uint8_t out[4], float x, float y, float z, float w) {
+    float norm = std::sqrt(x*x + y*y + z*z + w*w);
+    if (norm <= 0.0f || !std::isfinite(norm)) {
+        x = y = z = 0.0f; w = 1.0f;
+    } else {
+        x /= norm; y /= norm; z /= norm; w /= norm;
+    }
+
+    float q[4] = {x, y, z, w};
+    int largest = 0;
+    for (int i = 1; i < 4; i++)
+        if (std::abs(q[i]) > std::abs(q[largest])) largest = i;
+
+    bool negate = q[largest] < 0.0f;
+    uint32_t packed = (uint32_t)largest;
+    for (int i = 0; i < 4; i++) {
+        if (i == largest) continue;
+        uint32_t negbit = (q[i] < 0.0f) ^ negate;
+        uint32_t mag = (uint32_t)(511.0f * (std::abs(q[i]) / kSpzSqrtHalf) + 0.5f);
+        packed = (packed << 10u) | (negbit << 9u) | std::min<uint32_t>(mag, 511u);
+    }
+
+    out[0] = packed & 0xff;
+    out[1] = (packed >> 8) & 0xff;
+    out[2] = (packed >> 16) & 0xff;
+    out[3] = (packed >> 24) & 0xff;
+}
 
 void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
     msplat_gpu_sync();
@@ -94,6 +189,80 @@ void saveGaussianSplat(const std::string &path, GaussianParams &p) {
         for (int j = 0; j < 4; j++) q[j] = (uint8_t)std::clamp(qp[i*4+j] * 128.0f + 128.0f, 0.0f, 255.0f);
         o.write(reinterpret_cast<const char*>(q), 4);
     }
+}
+
+void saveGaussianSpz(const std::string &path, GaussianParams &p) {
+    msplat_gpu_sync();
+
+    int64_t N = p.means.size(0);
+    int frBases = (int)p.featuresRest.size(-2);
+    int shDegree = shDegreeForDim(frBases);
+    int shDim = shDegree == 0 ? 0 : (shDegree == 1 ? 3 : (shDegree == 2 ? 8 : (shDegree == 3 ? 15 : 24)));
+
+    const float *mp = p.means.data<float>(), *sp = p.scales.data<float>(), *qp = p.quats.data<float>();
+    const float *dp = p.featuresDc.data<float>(), *op = p.opacities.data<float>();
+    const float *frp = p.featuresRest.data<float>();
+
+    int32_t count = (int32_t)N;
+    std::vector<uint8_t> positions((size_t)count * 9);
+    std::vector<uint8_t> alphas(count);
+    std::vector<uint8_t> colors((size_t)count * 3);
+    std::vector<uint8_t> scales((size_t)count * 3);
+    std::vector<uint8_t> rotations((size_t)count * 4);
+    std::vector<uint8_t> sh((size_t)count * shDim * 3);
+
+    const float posScale = (float)(1 << kSpzFractionalBits);
+    for (int32_t outIdx = 0; outIdx < count; outIdx++) {
+        size_t i = (size_t)outIdx;
+        float pos[3];
+        for (int j = 0; j < 3; j++)
+            pos[j] = p.keepCrs ? (mp[i*3+j] / p.scale + p.translation[j]) : mp[i*3+j];
+
+        for (int j = 0; j < 3; j++) {
+            int32_t fixed = (int32_t)std::round(pos[j] * posScale);
+            positions[((size_t)outIdx*3 + j) * 3 + 0] = fixed & 0xff;
+            positions[((size_t)outIdx*3 + j) * 3 + 1] = (fixed >> 8) & 0xff;
+            positions[((size_t)outIdx*3 + j) * 3 + 2] = (fixed >> 16) & 0xff;
+        }
+
+        alphas[outIdx] = byteClamp(spzSigmoid(op[i]) * 255.0f);
+        for (int j = 0; j < 3; j++) {
+            colors[(size_t)outIdx*3 + j] = byteClamp(dp[i*3+j] * (kSpzColorScale * 255.0f) + 127.5f);
+            float s = p.keepCrs ? std::log(std::exp(sp[i*3+j]) / p.scale) : sp[i*3+j];
+            scales[(size_t)outIdx*3 + j] = byteClamp((s + 10.0f) * 16.0f);
+        }
+
+        packSpzQuaternion(&rotations[(size_t)outIdx*4], qp[i*4+1], qp[i*4+2], qp[i*4+3], qp[i*4]);
+
+        for (int b = 0; b < shDim; b++) {
+            for (int ch = 0; ch < 3; ch++) {
+                int bucket = b < 3 ? 8 : 16;
+                sh[((size_t)outIdx * shDim + b) * 3 + ch] =
+                    quantizeSh(frp[i*frBases*3 + b*3 + ch], bucket);
+            }
+        }
+    }
+
+    SpzLegacyHeader header;
+    header.numPoints = (uint32_t)count;
+    header.shDegree = (uint8_t)shDegree;
+
+    std::ostringstream plain(std::ios::binary);
+    plain.write(reinterpret_cast<const char*>(&header), sizeof(header));
+    plain.write(reinterpret_cast<const char*>(positions.data()), positions.size());
+    plain.write(reinterpret_cast<const char*>(alphas.data()), alphas.size());
+    plain.write(reinterpret_cast<const char*>(colors.data()), colors.size());
+    plain.write(reinterpret_cast<const char*>(scales.data()), scales.size());
+    plain.write(reinterpret_cast<const char*>(rotations.data()), rotations.size());
+    plain.write(reinterpret_cast<const char*>(sh.data()), sh.size());
+
+    std::vector<uint8_t> compressed;
+    std::string bytes = plain.str();
+    if (!gzipBytes(bytes, compressed)) throw std::runtime_error("Failed to gzip SPZ data");
+
+    std::ofstream o(path, std::ios::binary);
+    if (!o.is_open()) throw std::runtime_error("Cannot open SPZ file for writing: " + path);
+    o.write(reinterpret_cast<const char*>(compressed.data()), compressed.size());
 }
 
 LoadedGaussians loadGaussianPly(const std::string &path, float scale, const float translation[3], bool keepCrs) {

@@ -280,6 +280,10 @@ void Trainer::exportSplat(const std::string& path) {
     impl->model->saveSplat(path);
 }
 
+void Trainer::exportSpz(const std::string& path) {
+    impl->model->saveSpz(path);
+}
+
 void Trainer::saveCheckpoint(const std::string& path) {
     impl->model->saveCheckpoint(path, impl->currentStep);
 }
@@ -406,6 +410,10 @@ void msplat_trainer_export_ply(MsplatTrainer t, const char* path) {
 
 void msplat_trainer_export_splat(MsplatTrainer t, const char* path) {
     static_cast<msplat::Trainer*>(t)->exportSplat(std::string(path));
+}
+
+void msplat_trainer_export_spz(MsplatTrainer t, const char* path) {
+    static_cast<msplat::Trainer*>(t)->exportSpz(std::string(path));
 }
 
 void msplat_trainer_save_checkpoint(MsplatTrainer t, const char* path) {

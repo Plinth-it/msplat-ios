@@ -31,6 +31,7 @@ let package = Package(
                 .linkedFramework("Foundation"),
                 .linkedFramework("ImageIO"),
                 .linkedFramework("CoreGraphics"),
+                .linkedLibrary("z"),
                 .unsafeFlags(["-lc++"]),
             ]
         ),

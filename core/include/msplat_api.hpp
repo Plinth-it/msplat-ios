@@ -141,6 +141,9 @@ public:
     /// Export scene to .splat format.
     void exportSplat(const std::string& path);
 
+    /// Export scene to .spz format.
+    void exportSpz(const std::string& path);
+
     /// Save full training state (params + optimizer) for resume.
     void saveCheckpoint(const std::string& path);
 

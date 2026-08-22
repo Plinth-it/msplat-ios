@@ -110,6 +110,7 @@ void msplat_trainer_render_pose_to_buffer(MsplatTrainer t, const float camToWorl
                                       int* outWidth, int* outHeight);
 void msplat_trainer_export_ply(MsplatTrainer t, const char* path);
 void msplat_trainer_export_splat(MsplatTrainer t, const char* path);
+void msplat_trainer_export_spz(MsplatTrainer t, const char* path);
 void msplat_trainer_save_checkpoint(MsplatTrainer t, const char* path);
 int msplat_trainer_load_checkpoint(MsplatTrainer t, const char* path);
 int msplat_trainer_splat_count(MsplatTrainer t);
