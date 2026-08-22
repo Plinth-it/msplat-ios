@@ -1356,53 +1356,27 @@ std::tuple<MTensor, float> msplat_train_step(
 // Entire classify → grow → cull → compact pipeline in one compute encoder.
 // Returns new num_active after densification.
 // ============================================================================
-int msplat_densify(
-    int N, int buf_capacity,
+// Classification and its prefix sums, split out so the caller learns how many
+// gaussians will actually be written before it allocates room for them.
+// Growing to the theoretical 3*N worst case instead costs three times the
+// parameter and Adam buffers at every refine step, which is the difference
+// between fitting on a phone and not.
+void msplat_prepare_densify(
+    int N,
     float grad_thresh, float size_thresh, float screen_thresh, int check_screen,
-    float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size, int check_huge,
     MTensor &xys_grad_norm, MTensor &vis_counts, MTensor &max_2d_size,
     float half_max_dim,
-    MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
-    MTensor &featuresDc_buf, MTensor &featuresRest_buf, MTensor &opacities_buf,
-    int fr_stride,
-    MTensor adam_exp_avg_buf[], MTensor adam_exp_avg_sq_buf[],
+    MTensor &scales_buf,
     MTensor &split_flag, MTensor &dup_flag,
     MTensor &split_prefix, MTensor &dup_prefix,
-    MTensor &keep_flag, MTensor &keep_prefix,
-    MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    MTensor &block_totals,
+    int &num_splits, int &num_dups
 ) {
     MetalContext* ctx = get_global_context();
 
-    // Worst case: each of N gaussians splits (2 children) + dups (1 copy) = 3N
-    int worst_case = 3 * N;
-    assert(worst_case <= buf_capacity && "gpu_densify: 3*N exceeds buf_capacity");
-
-    float log_size_fac = std::log(1.6f);
-
-    // Strides for each of the 18 buffers (6 params + 12 optimizer states)
-    // Order: means(3), scales(3), quats(4), featuresDc(3), featuresRest(fr_stride), opacities(1)
-    int strides[6] = {3, 3, 4, 3, fr_stride, 1};
-    int max_stride = fr_stride;  // featuresRest has the largest stride
-
-    // Collect all 18 buffers in order for compact loops (std::array for block capture)
-    std::array<MTensor*, 18> all_bufs = {{
-        &means_buf, &scales_buf, &quats_buf, &featuresDc_buf, &featuresRest_buf, &opacities_buf,
-        &adam_exp_avg_buf[0], &adam_exp_avg_buf[1], &adam_exp_avg_buf[2],
-        &adam_exp_avg_buf[3], &adam_exp_avg_buf[4], &adam_exp_avg_buf[5],
-        &adam_exp_avg_sq_buf[0], &adam_exp_avg_sq_buf[1], &adam_exp_avg_sq_buf[2],
-        &adam_exp_avg_sq_buf[3], &adam_exp_avg_sq_buf[4], &adam_exp_avg_sq_buf[5]
-    }};
-    std::array<int, 18> all_strides = {{
-        3, 3, 4, 3, fr_stride, 1,
-        3, 3, 4, 3, fr_stride, 1,
-        3, 3, 4, 3, fr_stride, 1
-    }};
-
     uint32_t N_u32 = (uint32_t)N;
-    uint32_t K = (uint32_t)((N + 1023) / 1024);  // threadgroups for prefix sum on N elements
+    uint32_t K = (uint32_t)((N + 1023) / 1024);
     int check_screen_int = check_screen;
-    int check_huge_int = check_huge;
 
     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
     assert(command_buffer && "Failed to retrieve command buffer reference");
@@ -1462,6 +1436,70 @@ int msplat_densify(
             [enc dispatchThreadgroups:MTLSizeMake(K, 1, 1) threadsPerThreadgroup:MTLSizeMake(1024, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [enc endEncoding];
+    });
+
+    // The one readback: totals live in the last prefix entry.
+    ctx->syncCB();
+    num_splits = N > 0 ? split_prefix.data<int32_t>()[N - 1] : 0;
+    num_dups = N > 0 ? dup_prefix.data<int32_t>()[N - 1] : 0;
+}
+
+// Runs the prepared grow -> cull -> compact pipeline. `population` is
+// N + 2*splits + dups as reported by msplat_prepare_densify; the buffers must
+// already be that large. Returns the active count after culling.
+int msplat_densify(
+    int N, int population,
+    float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size,
+    int check_screen, int check_huge,
+    MTensor &max_2d_size,
+    MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
+    MTensor &featuresDc_buf, MTensor &featuresRest_buf, MTensor &opacities_buf,
+    int fr_stride,
+    MTensor adam_exp_avg_buf[], MTensor adam_exp_avg_sq_buf[],
+    MTensor &split_flag, MTensor &dup_flag,
+    MTensor &split_prefix, MTensor &dup_prefix,
+    MTensor &keep_flag, MTensor &keep_prefix,
+    MTensor &block_totals, MTensor &compact_scratch,
+    MTensor &random_samples
+) {
+    MetalContext* ctx = get_global_context();
+
+    int worst_case = population;
+
+    float log_size_fac = std::log(1.6f);
+
+    // Strides for each of the 18 buffers (6 params + 12 optimizer states)
+    // Order: means(3), scales(3), quats(4), featuresDc(3), featuresRest(fr_stride), opacities(1)
+    int strides[6] = {3, 3, 4, 3, fr_stride, 1};
+    int max_stride = fr_stride;  // featuresRest has the largest stride
+
+    // Collect all 18 buffers in order for compact loops (std::array for block capture)
+    std::array<MTensor*, 18> all_bufs = {{
+        &means_buf, &scales_buf, &quats_buf, &featuresDc_buf, &featuresRest_buf, &opacities_buf,
+        &adam_exp_avg_buf[0], &adam_exp_avg_buf[1], &adam_exp_avg_buf[2],
+        &adam_exp_avg_buf[3], &adam_exp_avg_buf[4], &adam_exp_avg_buf[5],
+        &adam_exp_avg_sq_buf[0], &adam_exp_avg_sq_buf[1], &adam_exp_avg_sq_buf[2],
+        &adam_exp_avg_sq_buf[3], &adam_exp_avg_sq_buf[4], &adam_exp_avg_sq_buf[5]
+    }};
+    std::array<int, 18> all_strides = {{
+        3, 3, 4, 3, fr_stride, 1,
+        3, 3, 4, 3, fr_stride, 1,
+        3, 3, 4, 3, fr_stride, 1
+    }};
+
+    uint32_t N_u32 = (uint32_t)N;
+    uint32_t K = (uint32_t)((N + 1023) / 1024);  // threadgroups for prefix sum on N elements
+    int check_screen_int = check_screen;
+    int check_huge_int = check_huge;
+
+    id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
+    assert(command_buffer && "Failed to retrieve command buffer reference");
+
+    dispatch_sync(ctx->d_queue, ^(){
+        id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
+        assert(enc && "Failed to create compute command encoder");
 
         // ---- Stage 4: Append split children ----
         {

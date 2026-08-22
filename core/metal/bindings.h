@@ -70,12 +70,27 @@ std::tuple<MTensor, float> msplat_train_step(
     float inv_max_dim
 );
 
-int msplat_densify(
-    int N, int buf_capacity,
+// Classification and its prefix sums, split out so the caller learns how many
+// gaussians will actually be written before it allocates room for them.
+void msplat_prepare_densify(
+    int N,
     float grad_thresh, float size_thresh, float screen_thresh, int check_screen,
-    float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size, int check_huge,
     MTensor &xys_grad_norm, MTensor &vis_counts, MTensor &max_2d_size,
     float half_max_dim,
+    MTensor &scales_buf,
+    MTensor &split_flag, MTensor &dup_flag,
+    MTensor &split_prefix, MTensor &dup_prefix,
+    MTensor &block_totals,
+    int &num_splits, int &num_dups
+);
+
+// Runs the prepared grow -> cull -> compact pipeline. `population` is
+// N + 2*splits + dups as reported by msplat_prepare_densify.
+int msplat_densify(
+    int N, int population,
+    float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size,
+    int check_screen, int check_huge,
+    MTensor &max_2d_size,
     MTensor &means_buf, MTensor &scales_buf, MTensor &quats_buf,
     MTensor &featuresDc_buf, MTensor &featuresRest_buf, MTensor &opacities_buf,
     int fr_stride,

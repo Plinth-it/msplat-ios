@@ -1,6 +1,9 @@
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <algorithm>
+#include <limits>
+#include <stdexcept>
 #include <random>
 #include "model.hpp"
 #include "kdtree_tensor.hpp"
@@ -10,6 +13,20 @@
 namespace fs = std::filesystem;
 
 static const double C0 = 0.28209479177387814;
+
+namespace {
+
+// Densification grows the population in bursts, so a tight fit means a
+// reallocation almost every refine step. Doubling instead leaves half the
+// largest allocation the process ever makes sitting unused. A quarter is the
+// compromise, with a floor so small scenes are not reallocating constantly.
+int capacityWithSlack(int required) {
+    int64_t slack = std::max<int64_t>(required / 4, 4096);
+    int64_t capacity = static_cast<int64_t>(required) + slack;
+    return static_cast<int>(std::min<int64_t>(capacity, std::numeric_limits<int>::max()));
+}
+
+} // namespace
 
 int numShBases(int degree){
     switch(degree){
@@ -121,7 +138,7 @@ void Model::setupOptimizers(){
 
 
     num_active = means.size(0);
-    buf_capacity = num_active * 4;
+    buf_capacity = capacityWithSlack(num_active);
     auto allocBuf = [&](MTensor &buf, const MTensor &param) {
         auto shape = param.shape();
         shape[0] = buf_capacity;
@@ -215,33 +232,61 @@ size_t Model::estimatedGpuBytes() const {
 
 void Model::ensureCapacity(int needed){
     if (needed <= buf_capacity) return;
-    int new_cap = std::max(needed, buf_capacity * 2);
+    int new_cap = std::max(needed, capacityWithSlack(buf_capacity));
 
-    auto grow = [&](MTensor &buf) {
-        auto shape = buf.shape();
-        shape[0] = new_cap;
-        MTensor new_buf = gpu_zeros(shape, DType::Float32);
-        size_t copy_bytes = num_active * buf.stride0() * sizeof(float);
-        memcpy(new_buf.data_ptr(), buf.data_ptr(), copy_bytes);
-        buf = new_buf;
+    struct ResizeTask {
+        MTensor* tensor;
+        std::vector<int64_t> shape;
+        bool preserveActive;
     };
-    grow(means_buf); grow(scales_buf); grow(quats_buf);
-    grow(featuresDc_buf); grow(featuresRest_buf); grow(opacities_buf);
+    std::vector<ResizeTask> tasks;
+    auto addLeadingCapacityTask = [&](MTensor &tensor, bool preserveActive) {
+        auto shape = tensor.shape();
+        shape[0] = new_cap;
+        tasks.push_back({&tensor, std::move(shape), preserveActive});
+    };
+
+    MTensor* parameterBuffers[] = {
+        &means_buf, &scales_buf, &quats_buf,
+        &featuresDc_buf, &featuresRest_buf, &opacities_buf
+    };
+    for (MTensor* tensor : parameterBuffers) addLeadingCapacityTask(*tensor, true);
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
-        grow(adam_exp_avg_buf[g]);
-        grow(adam_exp_avg_sq_buf[g]);
+        addLeadingCapacityTask(adam_exp_avg_buf[g], true);
+        addLeadingCapacityTask(adam_exp_avg_sq_buf[g], true);
     }
-    densify_split_flag = gpu_zeros({new_cap}, DType::Int32);
-    densify_dup_flag = gpu_zeros({new_cap}, DType::Int32);
-    densify_split_prefix = gpu_zeros({new_cap}, DType::Int32);
-    densify_dup_prefix = gpu_zeros({new_cap}, DType::Int32);
-    densify_keep_flag = gpu_zeros({new_cap}, DType::Int32);
-    densify_keep_prefix = gpu_zeros({new_cap}, DType::Int32);
+
+    // These four already hold this step's classification when the grow happens
+    // — the population is only known after the classify pass — so their
+    // contents have to survive it. keep_* are written later and do not.
+    MTensor* preparedDensifyBuffers[] = {
+        &densify_split_flag, &densify_dup_flag,
+        &densify_split_prefix, &densify_dup_prefix
+    };
+    for (MTensor* tensor : preparedDensifyBuffers) addLeadingCapacityTask(*tensor, true);
+    addLeadingCapacityTask(densify_keep_flag, false);
+    addLeadingCapacityTask(densify_keep_prefix, false);
+
     int max_blocks = (new_cap + 1023) / 1024;
-    densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest_buf.stride0();
-    densify_compact_scratch = gpu_zeros({(int64_t)new_cap * fr_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
+    tasks.push_back({&densify_block_totals, {max_blocks}, false});
+    tasks.push_back({&densify_compact_scratch, {(int64_t)new_cap * fr_stride}, false});
+    tasks.push_back({&densify_random_samples, {new_cap, 3}, false});
+
+    // Replacing the largest allocations first minimizes the final transient:
+    // by the time most new buffers exist, only small old buffers remain.
+    std::sort(tasks.begin(), tasks.end(), [](const ResizeTask &lhs, const ResizeTask &rhs) {
+        return lhs.tensor->nbytes() > rhs.tensor->nbytes();
+    });
+    for (const ResizeTask &task : tasks) {
+        MTensor replacement = gpu_zeros(task.shape, task.tensor->dtype());
+        if (task.preserveActive) {
+            size_t copy_bytes = static_cast<size_t>(num_active) *
+                task.tensor->stride0() * task.tensor->elementSize();
+            memcpy(replacement.data_ptr(), task.tensor->data_ptr(), copy_bytes);
+        }
+        *task.tensor = std::move(replacement);
+    }
 
     buf_capacity = new_cap;
     refreshViews();
@@ -261,26 +306,46 @@ void Model::afterTrain(int step){
 
         if (doDensification){
             int numPointsBefore = num_active;
-            ensureCapacity(3 * num_active);  // worst case: every gaussian splits
+            float half_max_dim = 0.5f * static_cast<float>((std::max)(lastWidth, lastHeight));
+            int check_screen = (step < stopScreenSizeAt) ? 1 : 0;
+            bool checkHuge = step > refineEvery * resetAlphaEvery;
+
+            // Classify first, so the grow below asks for the population that
+            // will actually be written rather than the 3*N that never is.
+            int numSplits = 0;
+            int numDups = 0;
+            msplat_prepare_densify(
+                num_active,
+                densifyGradThresh, densifySizeThresh, splitScreenSize, check_screen,
+                xysGradNorm, visCounts, max2DSize, half_max_dim,
+                scales_buf,
+                densify_split_flag, densify_dup_flag,
+                densify_split_prefix, densify_dup_prefix,
+                densify_block_totals,
+                numSplits, numDups
+            );
+
+            int64_t population64 = static_cast<int64_t>(num_active) +
+                2LL * numSplits + numDups;
+            if (population64 > std::numeric_limits<int>::max()) {
+                throw std::runtime_error("Densified population exceeds supported size");
+            }
+            int population = static_cast<int>(population64);
+            ensureCapacity(population);
 
             // Fill random samples for splits (CPU randn, shared memory)
             {
                 std::mt19937 rng(step);
                 std::normal_distribution<float> dist(0.0f, 1.0f);
                 float *p = densify_random_samples.data<float>();
-                for (int64_t i = 0; i < 2 * num_active * 3; i++) p[i] = dist(rng);
+                for (int64_t i = 0; i < 2LL * numSplits * 3; i++) p[i] = dist(rng);
             }
 
-            float half_max_dim = 0.5f * static_cast<float>((std::max)(lastWidth, lastHeight));
-            int check_screen = (step < stopScreenSizeAt) ? 1 : 0;
-            bool checkHuge = step > refineEvery * resetAlphaEvery;
             int fr_stride = (int)featuresRest_buf.stride0();
-
-            int new_count = msplat_densify(
-                num_active, buf_capacity,
-                densifyGradThresh, densifySizeThresh, splitScreenSize, check_screen,
-                0.1f, 0.5f, 0.15f, checkHuge ? 1 : 0,
-                xysGradNorm, visCounts, max2DSize, half_max_dim,
+            num_active = msplat_densify(
+                num_active, population,
+                0.1f, 0.5f, 0.15f, check_screen, checkHuge ? 1 : 0,
+                max2DSize,
                 means_buf, scales_buf, quats_buf,
                 featuresDc_buf, featuresRest_buf, opacities_buf, fr_stride,
                 adam_exp_avg_buf, adam_exp_avg_sq_buf,
@@ -291,7 +356,6 @@ void Model::afterTrain(int step){
                 densify_random_samples
             );
 
-            num_active = new_count;
             refreshViews();
             std::cout << "Densified: " << numPointsBefore << " -> " << num_active << " gaussians" << std::endl;
         }
@@ -457,7 +521,7 @@ int Model::loadCheckpoint(const std::string &filename) {
     // Rebuild backing buffers with loaded data (don't call setupOptimizers —
     // it would zero the optimizer state we just loaded)
     num_active = (int)numPts;
-    buf_capacity = num_active * 4;
+    buf_capacity = capacityWithSlack(num_active);
 
     // Copy gaussian params into oversized backing buffers
     auto allocBuf = [&](MTensor &buf, const MTensor &param) {
