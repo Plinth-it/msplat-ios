@@ -45,3 +45,8 @@ cameras.json
 
 # Demo
 demo/.build/
+
+# Xcode per-user state
+xcuserdata/
+*.xcuserstate
+.swiftpm/

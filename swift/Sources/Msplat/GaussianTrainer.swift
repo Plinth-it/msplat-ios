@@ -106,7 +106,7 @@ public class GaussianTrainer {
 }
 
 /// RGB float32 pixel data from a render.
-public struct PixelData {
+public struct PixelData: Sendable {
     public let pixels: [Float]  // RGB, HWC layout
     public let width: Int
     public let height: Int

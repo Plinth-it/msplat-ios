@@ -3,9 +3,10 @@
 # package ships as resources.
 #
 # A metallib is compiled against one SDK and will not load on another, so each
-# slice is configured and built separately rather than lipo'd together. Device
-# and simulator are arm64 only; an Intel Mac running the simulator needs
-# x86_64 added to CMAKE_OSX_ARCHITECTURES for that slice.
+# slice is configured and built separately rather than lipo'd together. The
+# simulator slice is built for both architectures, because Xcode's generic
+# simulator destination asks for both and there is nothing architecture-specific
+# in the sources; a metallib is AIR, so the one file serves both.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -26,14 +27,14 @@ if [[ -z "${DEVELOPER_DIR:-}" ]]; then
     fi
 fi
 
-# slice <build-dir> <metal-sdk> [<sdk-for-sysroot>]
+# slice <build-dir> <metal-sdk> [<sdk-for-sysroot> <archs>]
 build_slice() {
-    local dir="build/$1" metal_sdk="$2" sdk="${3:-}"
+    local dir="build/$1" metal_sdk="$2" sdk="${3:-}" archs="${4:-arm64}"
     local args=(-B "$dir" -DCMAKE_BUILD_TYPE=Release -DMSPLAT_METAL_SDK="$metal_sdk")
 
     if [[ -n "$sdk" ]]; then
         args+=(-DCMAKE_SYSTEM_NAME=iOS
-               -DCMAKE_OSX_ARCHITECTURES=arm64
+               -DCMAKE_OSX_ARCHITECTURES="$archs"
                -DCMAKE_OSX_SYSROOT="$(xcrun --sdk "$sdk" --show-sdk-path)"
                -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET"
                -DMSPLAT_METAL_IOS_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET")
@@ -53,7 +54,7 @@ build_slice() {
 
 build_slice macos         macosx
 build_slice ios-device    iphoneos        iphoneos
-build_slice ios-simulator iphonesimulator iphonesimulator
+build_slice ios-simulator iphonesimulator iphonesimulator "arm64;x86_64"
 
 echo "=== Preparing XCFramework headers ==="
 rm -rf "$HEADERS_DIR"

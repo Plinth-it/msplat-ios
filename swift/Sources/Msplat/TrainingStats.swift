@@ -1,7 +1,7 @@
 import MsplatCore
 
 /// Statistics from a single training step.
-public struct TrainingStats {
+public struct TrainingStats: Sendable {
     public let iteration: Int
     public let splatCount: Int
     public let msPerStep: Float
@@ -14,7 +14,7 @@ public struct TrainingStats {
 }
 
 /// Evaluation metrics from held-out test views.
-public struct EvalMetrics {
+public struct EvalMetrics: Sendable {
     public let psnr: Float
     public let ssim: Float
     public let l1: Float
