@@ -1,206 +1,165 @@
-# msplat
+# msplat-ios
 
-A 3D Gaussian Splatting training engine for Apple Silicon, built entirely on Metal. No external dependencies beyond system frameworks.
+3D Gaussian Splatting training on iPhone. A fork of
+[rayanht/msplat](https://github.com/rayanht/msplat), which built the engine:
+the full training pipeline as fused Metal compute kernels, with no dependency
+beyond system frameworks.
 
-The entire training pipeline: projection, sorting, rasterization, SSIM loss, backward pass, Adam optimizer, and densification runs as fused Metal compute shaders.
+This fork adds bounded memory, three correctness fixes, an iOS build, and an
+example app that takes a COLMAP folder and returns a PLY.
 
-The result is a self-contained engine that trains a full-resolution Mip-NeRF 360 scene in ~70 seconds and renders it at ~350 FPS on an M4 Max.
+## Memory
 
-Python and Swift bindings are provided, as well as a standalone C++ CLI.
+| | Before | After | Measured on |
+|---|---|---|---|
+| Model buffers | 979.1 MB | 239.7 MB | garden, 2000 iters, 2 downscales |
+| Transient buffers | 561.4 MB | 353.5 MB | garden, 4 resolution levels, step 600+ |
+| Training images | whole dataset | 512 MB budget (iOS default) | `MSPLAT_IMAGE_CACHE_MB` |
 
-<div align="center">
-  <video src="https://github.com/user-attachments/assets/cb942a38-cf6a-4b06-9899-675396550c57" />
-</div>
+- Densification reserved `3 × num_active` for the case where every gaussian
+  splits. The real population after a refine step is about 1.2× the count
+  before it. Classification now runs first, so the grow asks for what will be
+  written.
+- Depth-chunk buffers were carried to the end of training after chunking turned
+  off. They are released.
+- Training images were all decoded up front. A byte-budgeted LRU holds what fits
+  and reloads the rest.
 
-## Why this exists
+## Correctness
 
-The original [3D Gaussian Splatting](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) implementation is CUDA-only. Ports to other frameworks (gsplat, taichi-3dgs, etc.) still depend on PyTorch for autograd, optimizer state, and tensor management. This means ~2GB of framework overhead, Python GIL contention, and no straightforward path to native macOS/iOS integration.
+**Rasterizer intersection overflow.** The packed buffers were sized
+`num_points × 16`; the sort kernel wrote at offsets from a prefix sum over
+every tile, bounded by nothing about `num_points`. The overflow landed in the
+model, and far enough out faulted the GPU and killed the process's Metal
+context. iPhone 15 Pro, 20852 gaussians: 906292 slots needed against 333136
+allocated. The kernel now takes a capacity and clamps; buffers are sized from
+what the GPU last reported needing.
 
-## Architecture
+**Chunk buffers across a resolution change.** The guard compared against a
+dimension already updated earlier in the same step, so kernels addressed
+6056760 elements of a 5749380-element buffer. PSNR 20.56 → 21.68.
 
-```
-core/metal/msplat_metal.metal    ← Compute kernels
-core/src/                        ← C++ training loop, dataset loaders, SSIM eval
-core/include/                    ← MTensor (lightweight GPU tensor), Model, API headers
-python/bindings.cpp              ← nanobind Python module
-swift/Sources/Msplat/            ← Swift package (via C API bridge)
-cli/msplat.cpp                   ← C++ CLI
-```
+**Non-idempotent intrinsics.** `loadImage` rewrote focal lengths and distortion
+coefficients in place, zeroing the coefficients after undistorting — harmless
+until a cache evicts and reloads. Intrinsics are re-derived from what the
+dataset declared on every call.
 
-### Training pipeline (single iteration)
+## Additions
 
-Each training step dispatches all work into one Metal command encoder:
+- COLMAP text models (`cameras.txt` / `images.txt` / `points3D.txt`)
+- `.spz` export
+- `--stop-densify-at`, capping the gaussian count independently of run length
+- XCFramework slices for `macos-arm64`, `ios-arm64` and
+  `ios-arm64_x86_64-simulator`, each with its own metallib
 
-```
-Forward:
-  project_and_sh_forward     ← fused 3D→2D projection + spherical harmonics
-  prefix_sum + scatter       ← gaussian→tile intersection mapping
-  bitonic_sort_per_tile      ← tile-local depth sort + inline data packing
-  nd_rasterize_forward       ← per-pixel alpha compositing (16x16 tiles)
-  ssim_h_fwd + ssim_v_fwd   ← separable 11-tap SSIM + L1 loss
+## Quick start
 
-Backward:
-  ssim_h_bwd + ssim_v_bwd   ← separable SSIM gradient
-  rasterize_backward         ← per-pixel backward compositing
-  project_and_sh_backward    ← fused projection + SH VJP + SH Adam update
-  fused_adam (×4 groups)     ← optimizer step (means, scales, quats, opacity)
-  accumulate_grad_stats      ← gradient norms for densification
-```
-
-### Key design decisions
-
-**Tile-local bitonic sort** instead of global radix sort. Each 16x16 tile independently sorts its gaussians (up to 2048) in threadgroup shared memory. The sort kernel also packs per-gaussian data (xy, opacity, conic, color) inline, eliminating a separate scatter dispatch.
-
-**GPU-resident densification.** The split/clone/cull cycle never leaves the GPU. Classification, growth, and compaction are all compute kernels operating on device buffers. No CPU readback of gradient statistics or gaussian counts.
-
-**Fused kernels.** Projection and spherical harmonic evaluation share registers (avoid a device memory round-trip for world-space position). The backward pass recomputes 3D covariance from scales/quaternions on-the-fly rather than storing it. SH backward gradients are computed in registers and fed directly into Adam updates, eliminating a separate gradient buffer write/read cycle. The remaining four parameter groups use fused Adam dispatches.
-
-**Separable SSIM.** The 11x11 Gaussian-weighted SSIM window decomposes into two 1D passes (horizontal then vertical), reducing per-pixel work from 121 to 22 multiply-adds. Forward and backward each take two kernels, using threadgroup shared memory for the intermediate statistics.
-
-**Depth-chunked rasterization.** For tiles with extreme gaussian counts, the forward pass splits into 512-gaussian chunks with a merge kernel that reconstructs absolute transmittance. The backward pass uses precomputed prefix/suffix transmittance to avoid re-traversal.
-
-## Installation & Usage
-
-### Python
-
-```bash
-pip install msplat
+```sh
+./scripts/build-xcframework.sh
+open examples/ios/MsplatExample.xcodeproj
 ```
 
-```python
-import msplat
+See [examples/ios/README.md](examples/ios/README.md).
 
-dataset = msplat.load_dataset("path/to/colmap/", eval_mode=True)
-config = msplat.TrainingConfig(iterations=7000, num_downscales=0)
-trainer = msplat.GaussianTrainer(dataset, config)
-
-trainer.train(lambda s: print(f"step={s.iteration} splats={s.splat_count:,}"),
-              callback_every=100)
-
-trainer.export_ply("output.ply")
-trainer.save_checkpoint("checkpoint.msplat")  # save/resume training
-metrics = trainer.evaluate()
-print(f"PSNR: {metrics['psnr']:.2f}  SSIM: {metrics['ssim']:.3f}")
-
-# Render from arbitrary viewpoints
-pose = dataset.camera_pose(0)   # (4, 4) cam-to-world matrix
-img = trainer.render_from_pose(pose)  # numpy (H, W, 3) float32
-```
-
-Supported dataset formats: COLMAP, Nerfstudio, Polycam.
-
-Type stubs (`_core.pyi`) are included for IDE autocompletion.
-
-#### CLI
-
-```bash
-pip install msplat[cli]
-msplat-train path/to/dataset -n 7000 --eval
-```
-
-### Swift
-
-Requires Xcode and CMake (`brew install cmake`).
+Swift:
 
 ```swift
-// Package.swift
-dependencies: [
-    .package(url: "https://github.com/rayanht/msplat.git", from: "1.1.0")
-]
-```
-
-Build the XCFramework (one-time, from repo root):
-
-```bash
-./scripts/build-xcframework.sh
+.package(url: "https://github.com/frs0n/msplat-ios.git", branch: "main")
 ```
 
 ```swift
 import Msplat
 
-let dataset = GaussianDataset(path: "path/to/colmap/", downscaleFactor: 4.0)
-let trainer = GaussianTrainer(dataset: dataset)
+let dataset = GaussianDataset(path: "path/to/colmap/", downscaleFactor: 2.0)
+var config = TrainingConfig()
+config.iterations = 2_000
+config.stopDensifyAt = 750
 
-for _ in 0..<1000 {
+let trainer = GaussianTrainer(dataset: dataset, config: config)
+for _ in 0..<2_000 {
     let stats = trainer.step()
     print("step=\(stats.iteration) splats=\(stats.splatCount)")
 }
-
 trainer.exportPly(to: "output.ply")
-
-// Render from arbitrary viewpoints
-let pose = dataset.cameraPose(at: 0)  // [Float] cam-to-world matrix
-let img = trainer.renderFromPose(camToWorld: pose)
 ```
 
-### C++ CLI
+CLI:
 
-```bash
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build -j
+```sh
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 ./build/msplat path/to/dataset -n 7000 --eval
 ```
 
-### Build from source
+## Reference
 
-```bash
-git clone https://github.com/rayanht/msplat.git && cd msplat
+Input: COLMAP (binary or text), Nerfstudio, Polycam.
+Output: `.ply`, `.splat`, `.spz`.
 
-# Python
-pip install -e .
+| Variable | Effect |
+|---|---|
+| `MSPLAT_IMAGE_CACHE_MB` | Image cache budget. Default 512 on iOS, 2048 elsewhere. |
+| `MSPLAT_MEM_LOG_EVERY` | Memory breakdown every N steps. |
+| `MSPLAT_ISECT_LOG` | Intersection count against capacity at each sample. |
 
-# C++ CLI + static lib
-cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
-
-# Swift XCFramework
-./scripts/build-xcframework.sh
-cd swift && swift build
+```
+MSPLAT_MEM step=1000 splats=232313 phys=2908.4MB accounted=2863.5MB \
+           model=239.7MB temp=576.1MB images=2047.7MB imageBudget=2048.0MB
 ```
 
-Requires macOS 14+, Apple Silicon. No external dependencies.
+`phys` is `phys_footprint`, what jetsam counts. `model` is gaussian parameters
+and Adam state, `temp` the cached per-iteration buffers, `images` the decoded
+training images.
 
-## Benchmarks
+## Building
 
-mipnerf360, M4 Max. msplat runs 7K iterations with no downscales:
+```sh
+git clone https://github.com/frs0n/msplat-ios.git && cd msplat-ios
 
-```bash
-msplat-train path/to/scene -n 7000 --num-downscales 0 --eval
+cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j  # CLI + static lib
+pip install -e .                                                     # Python module
+./scripts/build-xcframework.sh                                       # XCFramework + metallibs
 ```
 
-| Scene | msplat PSNR | msplat SSIM | msplat wall time | gsplat PSNR | gsplat SSIM | gsplat wall time
-|-------|-------------|-------------|-----------|-------------|-------------|-------------|
-| bicycle | 23.23 | 0.602 | 59s | 23.71 | 0.668 | ~335s
-| counter | 27.45 | 0.880 | 80s | 27.14 | 0.878 | ~335s
-| garden | 25.68 | 0.783 | 77s | 26.30 | 0.833 | ~335s
-| room | 30.12 | 0.897 | 74s | 29.21 | 0.893 | ~335s
+macOS 15+ and Xcode; iOS builds target 18.0. zlib, used for `.spz`, ships with
+the OS.
 
-### 30K iterations (garden)
+`MsplatCore.xcframework` and the metallibs are build outputs, not committed. Run
+`scripts/build-xcframework.sh` before building the Swift package or the example
+app, and again after any C API change — the Swift side otherwise links a stale
+header without complaint.
 
-```bash
-msplat-train path/to/garden -n 30000 --num-downscales 0 --eval
+## Reproducibility
+
+Training is not bit-reproducible: the rasterizer backward scatters gradients
+with relaxed float atomics, so accumulation order varies between runs and
+gaussians sitting exactly on `densifyGradThresh` flip. Over seven runs of garden
+at 2000 iterations, PSNR fell in 26.75–26.93 and the final gaussian count in
+231.6K–237.1K.
+
+## Engine
+
+One training step, dispatched into a single Metal command encoder:
+
+```
+Forward:
+  project_and_sh_forward     fused 3D→2D projection + spherical harmonics
+  prefix_sum + scatter       gaussian→tile intersection mapping
+  bitonic_sort_per_tile      tile-local depth sort + inline data packing
+  nd_rasterize_forward       per-pixel alpha compositing (16×16 tiles)
+  ssim_h_fwd + ssim_v_fwd    separable 11-tap SSIM + L1 loss
+
+Backward:
+  ssim_h_bwd + ssim_v_bwd    separable SSIM gradient
+  rasterize_backward         per-pixel backward compositing
+  project_and_sh_backward    fused projection + SH VJP + SH Adam update
+  fused_adam (×4 groups)     optimizer step
+  accumulate_grad_stats      gradient norms for densification
 ```
 
-| | msplat | gsplat |
-|---|---|---|
-| PSNR | 27.14 | 27.32 |
-| SSIM | 0.853 | 0.865 |
-| Gaussians | 3.51M | — |
-| Wall time | 700s | ~2149s |
-
-gsplat numbers from [docs.gsplat.studio](https://docs.gsplat.studio/main/tests/eval.html) (TITAN RTX). gsplat wall times are the reported average across *all* mipnerf360 scenes (per-scene times not published).
-
-### Performance history (wall time, M4 Max)
-
-| Scene | v1.0 | v1.1.3 | Speedup |
-|-------|------|--------|---------|
-| bicycle 7K | 82s | 59s | 1.39x |
-| counter 7K | 91s | 80s | 1.14x |
-| garden 7K | 107s | 77s | 1.39x |
-| room 7K | 85s | 74s | 1.15x |
-| garden 30K | 1039s | 700s | 1.48x |
-
-v1.1.3 fuses SH backward gradients into Adam optimizer updates, fuses the SSIM vertical-forward and horizontal-backward passes into a single kernel, and replaces the count→prefix-sum→scatter intersection pipeline with pre-allocated per-tile bins. Speedup scales with gaussian count.
+Upstream's [README](https://github.com/rayanht/msplat) covers the design behind
+this and carries M4 Max benchmarks against gsplat. This fork has not re-run
+them.
 
 ## License
 
-Apache 2.0
+Apache 2.0, as upstream, whose copyright the LICENSE file carries.
