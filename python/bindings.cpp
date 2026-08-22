@@ -7,6 +7,7 @@
 
 #include "model.hpp"
 #include "input_data.hpp"
+#include "memory_report.hpp"
 #include "msplat.hpp"
 #include "ssim.hpp"
 
@@ -58,27 +59,36 @@ struct TrainingStats {
 class Dataset {
 public:
     InputData data;
-    std::vector<Camera> train_cams;
-    std::vector<Camera> test_cams;
+    // Indices into data.cameras. Holding copies meant a second full set of
+    // decoded images for as long as the dataset lived.
+    std::vector<size_t> train_cams;
+    std::vector<size_t> test_cams;
+    CameraImageCache images;
 
     Dataset(const std::string &path, float downscale_factor,
             bool eval_mode, int test_every)
     {
         data = inputDataFromX(path);
+        images = CameraImageCache(downscale_factor, CameraImageCache::defaultBudgetBytes());
 
-        // Load images (parallel)
-        for (auto &cam : data.cameras) {
-            cam.loadImage(downscale_factor);
-        }
-
+        // No image is decoded here; the first step that needs one loads it.
         if (eval_mode) {
-            auto split = data.splitTrainTest(test_every);
+            auto split = data.splitTrainTestIndices(test_every);
             train_cams = std::get<0>(split);
             test_cams = std::get<1>(split);
         } else {
-            auto t = data.getCameras(false);
+            auto t = data.trainIndices(false);
             train_cams = std::get<0>(t);
         }
+    }
+
+    Camera& train_camera(size_t i) { return data.cameras[train_cams[i]]; }
+    Camera& test_camera(size_t i) { return data.cameras[test_cams[i]]; }
+    MTensor& train_image(size_t i, int downscale) {
+        return images.gpuImage(data.cameras, train_cams[i], downscale);
+    }
+    MTensor& test_image(size_t i, int downscale) {
+        return images.gpuImage(data.cameras, test_cams[i], downscale);
     }
 
     size_t num_train() const { return train_cams.size(); }
@@ -89,7 +99,7 @@ public:
         if (index < 0 || index >= (int)train_cams.size())
             throw std::runtime_error("Camera index out of range");
         float *buf = new float[16];
-        memcpy(buf, train_cams[index].camToWorld, 16 * sizeof(float));
+        memcpy(buf, data.cameras[train_cams[index]].camToWorld, 16 * sizeof(float));
         nb::capsule deleter(buf, [](void *p) noexcept { delete[] static_cast<float*>(p); });
         size_t shape[2] = {4, 4};
         return nb::cast(nb::ndarray<nb::numpy, float>(buf, 2, shape, deleter));
@@ -144,10 +154,10 @@ public:
     TrainingStats step() {
         current_step++;
         size_t cam_idx = next_camera();
-        Camera &cam = dataset_ptr->train_cams[cam_idx];
+        Camera &cam = dataset_ptr->train_camera(cam_idx);
 
         int ds = model->getDownscaleFactor(current_step);
-        MTensor &gt = cam.getGPUImage(ds);
+        MTensor &gt = dataset_ptr->train_image(cam_idx, ds);
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -155,6 +165,11 @@ public:
         model->schedulersStep(current_step);
         model->afterTrain(current_step);
         msplat_commit();
+
+        msplat::reportMemory(current_step, (int)model->means.size(0),
+                             model->estimatedGpuBytes(),
+                             dataset_ptr->images.cachedBytes(),
+                             dataset_ptr->images.budgetBytes());
 
         auto t1 = std::chrono::high_resolution_clock::now();
         float ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0f;
@@ -186,13 +201,13 @@ public:
         int n = dataset_ptr->test_cams.size();
 
         for (int i = 0; i < n; i++) {
-            Camera &cam = dataset_ptr->test_cams[i];
+            Camera &cam = dataset_ptr->test_camera(i);
             MTensor rgb = model->render(cam, config.iterations);
             msplat_gpu_sync();
 
             MTensor rgb_cpu = rgb.cpu();
             int ds = model->getDownscaleFactor(config.iterations);
-            MTensor gt_cpu = cam.getGPUImage(ds).cpu();
+            MTensor gt_cpu = dataset_ptr->test_image(i, ds).cpu();
 
             sum_psnr += psnr(rgb_cpu, gt_cpu);
             sum_ssim += ssim_eval(rgb_cpu, gt_cpu);
@@ -239,7 +254,7 @@ public:
         if (ref_cam_idx < 0 || ref_cam_idx >= (int)dataset_ptr->train_cams.size())
             throw std::runtime_error("ref_cam_idx out of range");
 
-        Camera cam = dataset_ptr->train_cams[ref_cam_idx];
+        Camera cam = dataset_ptr->train_camera(ref_cam_idx);
         memcpy(cam.camToWorld, cam_to_world.data(), 16 * sizeof(float));
         cam.cachedViewMat = MTensor();
         cam.cachedProjViewMat = MTensor();

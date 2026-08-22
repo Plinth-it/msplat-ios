@@ -8,6 +8,7 @@
 #include <CLI/CLI.hpp>
 #include "model.hpp"
 #include "input_data.hpp"
+#include "memory_report.hpp"
 #include "random_iter.hpp"
 #include "loaders.hpp"
 #include "msplat.hpp"
@@ -101,20 +102,21 @@ int main(int argc, char *argv[]) {
     try {
         InputData inputData = inputDataFromX(projectRoot, colmapImagePath);
 
-        for (auto &cam : inputData.cameras)
-            cam.loadImage(downScaleFactor);
+        // Images are decoded on demand under a byte budget — nothing is loaded here.
+        CameraImageCache images(downScaleFactor, CameraImageCache::defaultBudgetBytes());
 
-        std::vector<Camera> cams;
-        std::vector<Camera> testCams;
-        Camera *valCam = nullptr;
+        std::vector<size_t> cams;
+        std::vector<size_t> testCams;
+        int valCamIndex = -1;
 
         if (evalMode) {
-            auto [train, test] = inputData.splitTrainTest(testEvery);
+            auto [train, test] = inputData.splitTrainTestIndices(testEvery);
             cams = train; testCams = test;
             std::cout << "Eval mode: " << cams.size() << " train, " << testCams.size() << " test" << std::endl;
         } else {
-            auto [train, val] = inputData.getCameras(validate, valImage);
-            cams = train; valCam = val;
+            auto [train, valIdx] = inputData.trainIndices(validate, valImage);
+            cams = train;
+            valCamIndex = valIdx;
         }
 
         Model model(inputData, cams.size(),
@@ -143,14 +145,20 @@ int main(int argc, char *argv[]) {
 
         auto bench_start = cpu_now();
         for (; step <= (size_t)numIters; step++) {
-            Camera &cam = cams[camsIter.next()];
+            size_t camIdx = camsIter.next();
+            Camera &cam = inputData.cameras[cams[camIdx]];
 
             auto iter_start = cpu_now();
-            MTensor gt = cam.getGPUImage(model.getDownscaleFactor(step));
+            MTensor gt = images.gpuImage(inputData.cameras, cams[camIdx],
+                                         model.getDownscaleFactor(step));
             model.fullIteration(cam, step, gt, ssimWeight);
             model.schedulersStep(step);
             model.afterTrain(step);
             msplat_commit();
+
+            msplat::reportMemory((int)step, (int)model.means.size(0),
+                                 model.estimatedGpuBytes(),
+                                 images.cachedBytes(), images.budgetBytes());
 
             if (benchmarking && step > (size_t)bench_warmup) {
                 auto pre_sync = cpu_now();
@@ -169,8 +177,8 @@ int main(int argc, char *argv[]) {
                 model.save(p.replace_filename(fs::path(p.stem().string() + "_" + std::to_string(step) + p.extension().string())).string(), step);
             }
 
-            if (!valRender.empty() && step % 10 == 0) {
-                MTensor rgb = model.render(*valCam, step);
+            if (!valRender.empty() && valCamIndex >= 0 && step % 10 == 0) {
+                MTensor rgb = model.render(inputData.cameras[valCamIndex], step);
                 msplat_gpu_sync();
                 MTensor rgb_cpu = rgb.cpu();
                 Image valImg;
@@ -271,10 +279,12 @@ int main(int argc, char *argv[]) {
 
             std::cout << "\n=== Evaluation (" << nTest << " test views) ===" << std::endl;
             for (int i = 0; i < nTest; i++) {
-                MTensor rgb = model.render(testCams[i], numIters);
+                Camera &testCam = inputData.cameras[testCams[i]];
+                MTensor rgb = model.render(testCam, numIters);
                 msplat_gpu_sync();
                 MTensor rgb_cpu = rgb.cpu();
-                MTensor gt_cpu = testCams[i].getGPUImage(model.getDownscaleFactor(numIters)).cpu();
+                MTensor gt_cpu = images.gpuImage(inputData.cameras, testCams[i],
+                                                 model.getDownscaleFactor(numIters)).cpu();
 
                 float p = psnr(rgb_cpu, gt_cpu);
                 float s = ssim_eval(rgb_cpu, gt_cpu);
@@ -282,7 +292,7 @@ int main(int argc, char *argv[]) {
                 sumPsnr += p; sumSsim += s; sumL1 += l;
 
                 std::cout << "  [" << (i+1) << "/" << nTest << "] "
-                          << fs::path(testCams[i].filePath).filename().string()
+                          << fs::path(testCam.filePath).filename().string()
                           << "  PSNR=" << p << "  SSIM=" << s << "  L1=" << l << std::endl;
             }
             std::cout << "\n  PSNR:  " << (sumPsnr / nTest)
@@ -292,13 +302,15 @@ int main(int argc, char *argv[]) {
         }
 
         // Validation
-        if (valCam) {
-            MTensor rgb = model.render(*valCam, numIters);
+        if (valCamIndex >= 0) {
+            Camera &validationCam = inputData.cameras[valCamIndex];
+            MTensor rgb = model.render(validationCam, numIters);
             msplat_gpu_sync();
             MTensor rgb_cpu = rgb.cpu();
-            MTensor gt_cpu = valCam->getGPUImage(model.getDownscaleFactor(numIters)).cpu();
+            MTensor gt_cpu = images.gpuImage(inputData.cameras, (size_t)valCamIndex,
+                                             model.getDownscaleFactor(numIters)).cpu();
 
-            std::cout << "\n=== Validation (" << valCam->filePath << ") ===" << std::endl;
+            std::cout << "\n=== Validation (" << validationCam.filePath << ") ===" << std::endl;
             std::cout << "  PSNR:  " << psnr(rgb_cpu, gt_cpu)
                       << "  SSIM:  " << ssim_eval(rgb_cpu, gt_cpu)
                       << "  L1:  " << l1_loss(rgb_cpu, gt_cpu)

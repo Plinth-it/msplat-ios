@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <random>
 #include <cmath>
+#include <stdexcept>
+#include <cstdlib>
+#include <TargetConditionals.h>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -15,6 +18,9 @@ using json = nlohmann::json;
 // ── Image loading ───────────────────────────────────────────────────────────
 
 void Camera::loadImage(float downscaleFactor) {
+    if (!image.empty() && loadedImageDownscaleFactor == downscaleFactor) return;
+    releaseImageMemory();
+
     Image raw = imreadRGB(filePath);
     if (raw.empty()) return;
 
@@ -49,9 +55,11 @@ void Camera::loadImage(float downscaleFactor) {
     }
 
     image = std::move(raw);
+    loadedImageDownscaleFactor = downscaleFactor;
 }
 
-Image Camera::getImage(int downscaleFactor) {
+const Image& Camera::getImage(int downscaleFactor) {
+    if (image.empty()) loadImage(1.0f);
     if (downscaleFactor <= 1) return image;
 
     auto it = imagePyramids.find(downscaleFactor);
@@ -60,18 +68,97 @@ Image Camera::getImage(int downscaleFactor) {
     int newW = image.width / downscaleFactor;
     int newH = image.height / downscaleFactor;
     Image scaled = resizeArea(image, newW, newH);
-    imagePyramids[downscaleFactor] = scaled;
-    return scaled;
+    auto inserted = imagePyramids.emplace(downscaleFactor, std::move(scaled));
+    return inserted.first->second;
 }
 
 MTensor& Camera::getGPUImage(int downscaleFactor) {
     auto it = mtensorImageCache.find(downscaleFactor);
     if (it != mtensorImageCache.end()) return it->second;
-    Image img = getImage(downscaleFactor);
+
+    // The training resolution only moves from coarse to fine. Keeping GPU and
+    // CPU pyramid copies for earlier stages makes an uninterrupted run retain
+    // substantially more memory than a checkpoint resume at the same step.
+    for (auto& item : mtensorImageCache) item.second.reset();
+    mtensorImageCache.clear();
+    imagePyramids.clear();
+
+    const Image& img = getImage(downscaleFactor);
+    if (img.empty()) throw std::runtime_error("Failed to load image: " + filePath);
     MTensor mt = gpu_empty({img.height, img.width, 3}, DType::Float32);
     memcpy(mt.data_ptr(), img.ptr(), img.width * img.height * 3 * sizeof(float));
     mtensorImageCache[downscaleFactor] = mt;
     return mtensorImageCache[downscaleFactor];
+}
+
+void Camera::releaseImageMemory() {
+    image = Image();
+    imagePyramids.clear();
+    for (auto& item : mtensorImageCache) {
+        item.second.reset();
+    }
+    mtensorImageCache.clear();
+    loadedImageDownscaleFactor = 0.0f;
+}
+
+size_t Camera::cachedImageBytes() const {
+    size_t bytes = image.data.size() * sizeof(float);
+    for (const auto& item : imagePyramids) {
+        bytes += item.second.data.size() * sizeof(float);
+    }
+    for (const auto& item : mtensorImageCache) {
+        bytes += item.second.nbytes();
+    }
+    return bytes;
+}
+
+// ── Image cache ─────────────────────────────────────────────────────────────
+
+size_t CameraImageCache::defaultBudgetBytes() {
+    if (const char *env = std::getenv("MSPLAT_IMAGE_CACHE_MB")) {
+        int mb = std::atoi(env);
+        if (mb > 0) return (size_t)mb * 1024 * 1024;
+    }
+#if TARGET_OS_IPHONE
+    return (size_t)512 * 1024 * 1024;
+#else
+    return (size_t)2048 * 1024 * 1024;
+#endif
+}
+
+MTensor& CameraImageCache::gpuImage(std::vector<Camera> &cameras, size_t index,
+                                    int downscaleFactor) {
+    Camera &cam = cameras[index];
+    cam.loadImage(_downscaleFactor);
+    MTensor &image = cam.getGPUImage(downscaleFactor);
+
+    Entry &entry = _entries[index];
+    entry.lastUse = ++_clock;
+    entry.bytes = cam.cachedImageBytes();
+    evict(cameras, index);
+    return image;
+}
+
+void CameraImageCache::evict(std::vector<Camera> &cameras, size_t protectedIndex) {
+    while (cachedBytes() > _budgetBytes && _entries.size() > 1) {
+        auto victim = _entries.end();
+        for (auto it = _entries.begin(); it != _entries.end(); ++it) {
+            if (it->first == protectedIndex) continue;
+            if (victim == _entries.end() || it->second.lastUse < victim->second.lastUse) {
+                victim = it;
+            }
+        }
+        if (victim == _entries.end()) break;
+
+        cameras[victim->first].releaseImageMemory();
+        _entries.erase(victim);
+    }
+}
+
+size_t CameraImageCache::cachedBytes() const {
+    size_t bytes = 0;
+    for (const auto &item : _entries) bytes += item.second.bytes;
+    return bytes;
 }
 
 // ── Scale & center ──────────────────────────────────────────────────────────
@@ -126,8 +213,13 @@ void autoScaleAndCenter(InputData &data) {
 
 // ── Train/test split ────────────────────────────────────────────────────────
 
-std::tuple<std::vector<Camera>, Camera*> InputData::getCameras(bool validate, const std::string &valImage) {
-    if (!validate) return {cameras, nullptr};
+std::tuple<std::vector<size_t>, int> InputData::trainIndices(bool validate, const std::string &valImage) const {
+    std::vector<size_t> train;
+    if (!validate) {
+        train.reserve(cameras.size());
+        for (size_t i = 0; i < cameras.size(); i++) train.push_back(i);
+        return {train, -1};
+    }
 
     // Find validation camera
     int valIdx = -1;
@@ -141,21 +233,19 @@ std::tuple<std::vector<Camera>, Camera*> InputData::getCameras(bool validate, co
     }
     if (valIdx < 0) valIdx = 0;
 
-    Camera *valCam = &cameras[valIdx];
-    std::vector<Camera> train;
     for (int i = 0; i < (int)cameras.size(); i++)
-        if (i != valIdx) train.push_back(cameras[i]);
+        if (i != valIdx) train.push_back((size_t)i);
 
-    return {train, valCam};
+    return {train, valIdx};
 }
 
-std::tuple<std::vector<Camera>, std::vector<Camera>> InputData::splitTrainTest(int testEvery) {
-    std::vector<Camera> train, test;
+std::tuple<std::vector<size_t>, std::vector<size_t>> InputData::splitTrainTestIndices(int testEvery) const {
+    std::vector<size_t> train, test;
     for (int i = 0; i < (int)cameras.size(); i++) {
         if (i % testEvery == 0)
-            test.push_back(cameras[i]);
+            test.push_back((size_t)i);
         else
-            train.push_back(cameras[i]);
+            train.push_back((size_t)i);
     }
     return {train, test};
 }
