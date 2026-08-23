@@ -3,6 +3,7 @@
 #include <iostream>
 #include <algorithm>
 #include <array>
+#include <iterator>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -31,6 +32,61 @@ int capacityWithSlack(int required) {
     int64_t slack = std::max<int64_t>(required / 4, 4096);
     int64_t capacity = static_cast<int64_t>(required) + slack;
     return static_cast<int>(std::min<int64_t>(capacity, std::numeric_limits<int>::max()));
+}
+
+constexpr bool collectsDensificationStats(int64_t step, int64_t stopStep) {
+    return step < stopStep;
+}
+
+constexpr bool needsDensificationAfterStep(int64_t completedStep,
+                                           int64_t stopStep) {
+    return completedStep + 1 < stopStep;
+}
+
+static_assert(!collectsDensificationStats(1, 0));
+static_assert(!collectsDensificationStats(1, 1));
+static_assert(collectsDensificationStats(1, 2));
+static_assert(!needsDensificationAfterStep(0, 1));
+static_assert(needsDensificationAfterStep(0, 2));
+static_assert(!needsDensificationAfterStep(1, 2));
+static_assert(needsDensificationAfterStep(
+    static_cast<int64_t>(std::numeric_limits<int>::max()) - 2,
+    std::numeric_limits<int>::max()));
+static_assert(!needsDensificationAfterStep(
+    static_cast<int64_t>(std::numeric_limits<int>::max()) - 1,
+    std::numeric_limits<int>::max()));
+
+struct DensificationScratch {
+    MTensor splitFlag, dupFlag;
+    MTensor splitPrefix, dupPrefix;
+    MTensor keepFlag, keepPrefix;
+    MTensor blockTotals;
+    MTensor compactScratch;
+    MTensor randomSamples;
+};
+
+DensificationScratch makeDensificationScratch(int capacity,
+                                               int64_t compactStride) {
+    if (capacity <= 0 || compactStride < 4 ||
+        static_cast<int64_t>(capacity) >
+            std::numeric_limits<int64_t>::max() / compactStride) {
+        throw std::invalid_argument("Invalid densification scratch dimensions");
+    }
+
+    DensificationScratch scratch;
+    scratch.compactScratch = gpu_zeros(
+        {static_cast<int64_t>(capacity) * compactStride}, DType::Float32);
+    scratch.splitFlag = gpu_zeros({capacity}, DType::Int32);
+    scratch.dupFlag = gpu_zeros({capacity}, DType::Int32);
+    scratch.splitPrefix = gpu_zeros({capacity}, DType::Int32);
+    scratch.dupPrefix = gpu_zeros({capacity}, DType::Int32);
+    scratch.keepFlag = gpu_zeros({capacity}, DType::Int32);
+    scratch.keepPrefix = gpu_zeros({capacity}, DType::Int32);
+    const int64_t maxBlocks =
+        (static_cast<int64_t>(capacity) + 1023) / 1024;
+    scratch.blockTotals = gpu_zeros({maxBlocks}, DType::Int32);
+    scratch.randomSamples = gpu_zeros({capacity, 3}, DType::Float32);
+    return scratch;
 }
 
 } // namespace
@@ -218,22 +274,59 @@ void Model::setupOptimizers(){
     means_lr_init = 0.00016f;
     means_lr_final = 0.0000016f;
 
-    densify_split_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_split_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_keep_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    int max_blocks = static_cast<int>(
-        (static_cast<int64_t>(buf_capacity) + 1023) / 1024);
-    densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
-    int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
-    int64_t compact_stride = std::max<int64_t>(fr_stride, 4);
-    densify_compact_scratch = gpu_zeros(
-        {static_cast<int64_t>(buf_capacity) * compact_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
-
     refreshViews();
+}
+
+void Model::allocateDensificationScratch() {
+    DensificationScratch scratch = makeDensificationScratch(
+        buf_capacity, std::max<int64_t>(featuresRest_buf.stride0(), 4));
+
+    densify_split_flag = std::move(scratch.splitFlag);
+    densify_dup_flag = std::move(scratch.dupFlag);
+    densify_split_prefix = std::move(scratch.splitPrefix);
+    densify_dup_prefix = std::move(scratch.dupPrefix);
+    densify_keep_flag = std::move(scratch.keepFlag);
+    densify_keep_prefix = std::move(scratch.keepPrefix);
+    densify_block_totals = std::move(scratch.blockTotals);
+    densify_compact_scratch = std::move(scratch.compactScratch);
+    densify_random_samples = std::move(scratch.randomSamples);
+}
+
+bool Model::hasDensificationScratch() const {
+    return densify_split_flag.defined() && densify_dup_flag.defined() &&
+        densify_split_prefix.defined() && densify_dup_prefix.defined() &&
+        densify_keep_flag.defined() && densify_keep_prefix.defined() &&
+        densify_block_totals.defined() && densify_compact_scratch.defined() &&
+        densify_random_samples.defined();
+}
+
+void Model::resetDensificationScratch() {
+    densify_split_flag.reset(); densify_dup_flag.reset();
+    densify_split_prefix.reset(); densify_dup_prefix.reset();
+    densify_keep_flag.reset(); densify_keep_prefix.reset();
+    densify_block_totals.reset(); densify_compact_scratch.reset();
+    densify_random_samples.reset();
+}
+
+void Model::retireDensificationState() {
+    const MTensor* tensors[] = {
+        &densify_split_flag, &densify_dup_flag,
+        &densify_split_prefix, &densify_dup_prefix,
+        &densify_keep_flag, &densify_keep_prefix,
+        &densify_block_totals, &densify_compact_scratch,
+        &densify_random_samples, &radii, &xysGradNorm, &visCounts, &max2DSize
+    };
+    if (std::none_of(std::begin(tensors), std::end(tensors),
+                     [](const MTensor* tensor) { return tensor->defined(); })) {
+        return;
+    }
+
+    // The previous step may still reference its stats or scratch through a
+    // non-blocking command buffer. Synchronize before releasing those buffers.
+    msplat_gpu_sync();
+    resetDensificationScratch();
+    radii.reset();
+    xysGradNorm.reset(); visCounts.reset(); max2DSize.reset();
 }
 
 void Model::releaseOptimizers(){
@@ -243,10 +336,7 @@ void Model::releaseOptimizers(){
     }
     means_buf.reset(); scales_buf.reset(); quats_buf.reset();
     featuresDc_buf.reset(); featuresRest_buf.reset(); opacities_buf.reset();
-    densify_split_flag.reset(); densify_dup_flag.reset();
-    densify_split_prefix.reset(); densify_dup_prefix.reset();
-    densify_keep_flag.reset(); densify_keep_prefix.reset();
-    densify_block_totals.reset(); densify_compact_scratch.reset(); densify_random_samples.reset();
+    resetDensificationScratch();
 }
 
 void Model::schedulersStep(int step){
@@ -287,6 +377,9 @@ size_t Model::estimatedGpuBytes() const {
 }
 
 void Model::ensureCapacity(int needed){
+    if (!hasDensificationScratch())
+        throw std::logic_error(
+            "Densification capacity changed without live scratch buffers");
     if (needed <= buf_capacity) return;
     if (maxGaussians > 0 && needed > maxGaussians)
         throw std::runtime_error("Gaussian population exceeds maxGaussians");
@@ -883,30 +976,25 @@ int Model::loadCheckpoint(const std::string &filename) {
             std::string("adam_exp_avg_sq.") + parameterNames[group]);
     }
 
-    MTensor newDensifySplitFlag = gpu_zeros({capacity}, DType::Int32);
-    MTensor newDensifyDupFlag = gpu_zeros({capacity}, DType::Int32);
-    MTensor newDensifySplitPrefix = gpu_zeros({capacity}, DType::Int32);
-    MTensor newDensifyDupPrefix = gpu_zeros({capacity}, DType::Int32);
-    MTensor newDensifyKeepFlag = gpu_zeros({capacity}, DType::Int32);
-    MTensor newDensifyKeepPrefix = gpu_zeros({capacity}, DType::Int32);
-
-    const int64_t maxBlocks = (static_cast<int64_t>(capacity) + 1023) / 1024;
-    MTensor newDensifyBlockTotals = gpu_zeros({maxBlocks}, DType::Int32);
-
-    const auto &featuresRestShape = checkpoint.parameters[4].shape;
-    const uint64_t featuresRestStride = checkedMultiply(
-        static_cast<uint64_t>(featuresRestShape[1]),
-        static_cast<uint64_t>(featuresRestShape[2]),
-        "features_rest stride");
-    const uint64_t compactStride = std::max<uint64_t>(featuresRestStride, 4);
-    const uint64_t compactElements = checkedMultiply(
-        static_cast<uint64_t>(capacity), compactStride,
-        "densification compact scratch");
-    if (compactElements > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
-        checkpointError("densification compact scratch exceeds the supported range");
-    MTensor newDensifyCompactScratch = gpu_zeros(
-        {static_cast<int64_t>(compactElements)}, DType::Float32);
-    MTensor newDensifyRandomSamples = gpu_zeros({capacity, 3}, DType::Float32);
+    DensificationScratch newDensificationScratch;
+    if (needsDensificationAfterStep(checkpoint.step, stopSplitAt)) {
+        const auto &featuresRestShape = checkpoint.parameters[4].shape;
+        const uint64_t featuresRestStride = checkedMultiply(
+            static_cast<uint64_t>(featuresRestShape[1]),
+            static_cast<uint64_t>(featuresRestShape[2]),
+            "features_rest stride");
+        const uint64_t compactStride = std::max<uint64_t>(featuresRestStride, 4);
+        const uint64_t compactElements = checkedMultiply(
+            static_cast<uint64_t>(capacity), compactStride,
+            "densification compact scratch");
+        if (compactElements >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            checkpointError(
+                "densification compact scratch exceeds the supported range");
+        }
+        newDensificationScratch = makeDensificationScratch(
+            capacity, static_cast<int64_t>(compactStride));
+    }
 
     // Constructing views copies shape metadata and can allocate. Do that before
     // the no-throw state swap as part of the transactional preparation.
@@ -940,15 +1028,16 @@ int Model::loadCheckpoint(const std::string &filename) {
         adam_exp_avg_sq[group] = std::move(newAdamExpAvgSqViews[group]);
     }
 
-    densify_split_flag = std::move(newDensifySplitFlag);
-    densify_dup_flag = std::move(newDensifyDupFlag);
-    densify_split_prefix = std::move(newDensifySplitPrefix);
-    densify_dup_prefix = std::move(newDensifyDupPrefix);
-    densify_keep_flag = std::move(newDensifyKeepFlag);
-    densify_keep_prefix = std::move(newDensifyKeepPrefix);
-    densify_block_totals = std::move(newDensifyBlockTotals);
-    densify_compact_scratch = std::move(newDensifyCompactScratch);
-    densify_random_samples = std::move(newDensifyRandomSamples);
+    densify_split_flag = std::move(newDensificationScratch.splitFlag);
+    densify_dup_flag = std::move(newDensificationScratch.dupFlag);
+    densify_split_prefix = std::move(newDensificationScratch.splitPrefix);
+    densify_dup_prefix = std::move(newDensificationScratch.dupPrefix);
+    densify_keep_flag = std::move(newDensificationScratch.keepFlag);
+    densify_keep_prefix = std::move(newDensificationScratch.keepPrefix);
+    densify_block_totals = std::move(newDensificationScratch.blockTotals);
+    densify_compact_scratch =
+        std::move(newDensificationScratch.compactScratch);
+    densify_random_samples = std::move(newDensificationScratch.randomSamples);
 
     num_active = activeCount;
     buf_capacity = capacity;
@@ -1040,9 +1129,30 @@ MTensor Model::render(Camera& cam, int step){
 }
 
 void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
+    const bool collectDensificationStats =
+        collectsDensificationStats(step, stopSplitAt);
+    if (!collectDensificationStats) {
+        retireDensificationState();
+    }
+
     auto s = prepareCam(cam, step);
     lastHeight = s.height; lastWidth = s.width;
     int numPoints = means.size(0);
+
+    if (collectDensificationStats && !hasDensificationScratch()) {
+        allocateDensificationScratch();
+    }
+    const bool validStats = xysGradNorm.defined() && visCounts.defined() &&
+        max2DSize.defined() && xysGradNorm.numel() == numPoints &&
+        visCounts.numel() == numPoints && max2DSize.numel() == numPoints;
+    if (collectDensificationStats && !validStats) {
+        MTensor newXysGradNorm = gpu_zeros({numPoints}, DType::Float32);
+        MTensor newVisCounts = gpu_zeros({numPoints}, DType::Float32);
+        MTensor newMax2DSize = gpu_zeros({numPoints}, DType::Float32);
+        xysGradNorm = std::move(newXysGradNorm);
+        visCounts = std::move(newVisCounts);
+        max2DSize = std::move(newMax2DSize);
+    }
 
     if (adam_step_count == std::numeric_limits<int>::max())
         throw std::overflow_error("Adam step count cannot be incremented further");
@@ -1061,13 +1171,6 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         adam_bc2s[i] = std::sqrt(bc2);
     }
 
-    if (!xysGradNorm.defined()) {
-    
-        xysGradNorm = gpu_zeros({numPoints}, DType::Float32);
-        visCounts = gpu_zeros({numPoints}, DType::Float32);
-        max2DSize = gpu_zeros({numPoints}, DType::Float32);
-    }
-
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     float lossInvN = 1.0f / (float)(s.height * s.width * 3);
 
@@ -1082,7 +1185,8 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         adam_p, adam_ea, adam_eas,
         adam_ss, adam_bc2s,
         adam_beta1, adam_beta2, adam_eps,
+        collectDensificationStats,
         visCounts, xysGradNorm, max2DSize, invMaxDim);
 
-    radii = r;
+    if (collectDensificationStats) radii = r;
 }

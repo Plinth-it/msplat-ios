@@ -23,6 +23,10 @@ peak-memory estimate before a session is created.
   splits. The real population after a refine step is about 1.2× the count
   before it. Classification now runs first, so the grow asks for what will be
   written.
+- Densification flags, prefixes, compact scratch, random samples, and gradient
+  statistics are released after topology growth stops. They are never
+  allocated for a cutoff at the first step, including checkpoint resumes that
+  have already crossed the boundary.
 - Depth-chunk buffers were carried to the end of training after chunking turned
   off. They are released.
 - Render-only calls retain just the shared forward cache. Loss, SSIM, and
@@ -45,6 +49,8 @@ not a jetsam guarantee: codec-private surfaces, Metal driver state, framework
 allocations, other process memory, and changing system pressure are outside the
 model. A valid `MSPLAT_IMAGE_CACHE_MB` override is reflected automatically; use
 `memoryEstimate(imageCacheBudgetBytes:)` to evaluate another budget explicitly.
+The model term remains the topology-enabled peak; runtime model storage falls
+after the densification cutoff.
 
 ## Correctness
 

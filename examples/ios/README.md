@@ -48,7 +48,9 @@ skips this comparison).
 
 This check is a planning aid, not a jetsam guarantee. Metal driver state,
 framework allocations, other process memory, and changing system pressure are
-not fully modeled. ImageIO now requests the selected input resolution directly,
+not fully modeled. The model term intentionally covers the pre-cutoff peak;
+densification-only state is released later. ImageIO now requests the selected
+input resolution directly,
 but a codec may still use private decoder surfaces that the estimate cannot
 observe. COLMAP camera calibration uses encoded raster coordinates, so valid
 EXIF orientation metadata is checked but intentionally not applied; an oriented

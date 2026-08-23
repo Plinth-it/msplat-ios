@@ -1288,6 +1288,7 @@ std::tuple<MTensor, float> msplat_train_step(
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
+    bool collect_densification_stats,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
     float inv_max_dim
 ) {
@@ -1653,6 +1654,7 @@ std::tuple<MTensor, float> msplat_train_step(
 
     // Encode accumulate_grad_stats as a lambda (shared by both paths)
     auto encode_grad_stats = [&](id<MTLComputeCommandEncoder> enc) {
+        if (!collect_densification_stats) return;
         NSUInteger tpg = MIN(ctx->accumulate_grad_stats_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
         [enc setComputePipelineState:ctx->accumulate_grad_stats_kernel_cpso];
         ENC_SCALAR(enc, num_points, 0);
@@ -1787,7 +1789,8 @@ std::tuple<MTensor, float> msplat_train_step(
             encode_proj_sh_bwd_adam(enc);
             [enc endEncoding];
 
-            // Stage 7: grad_stats
+            // Stage 7: grad_stats. Keep an empty encoder after the cutoff so
+            // the fixed counter-sample indices remain stable.
             enc = make_profiled_encoder(6);
             if (!enc) {
                 encodingFailure = "msplat: failed to create a profiled Metal compute encoder";

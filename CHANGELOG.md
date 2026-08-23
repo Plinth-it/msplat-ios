@@ -28,6 +28,10 @@
   and backward buffers are added lazily by training, while unused transient
   prefix, spherical-harmonics gradient, and SSIM-window storage was removed;
   `TrainingPlan` memory estimates reflect the smaller live set.
+- Densification scratch and gradient-stat buffers are now omitted when topology
+  growth is disabled from the first step and released, after GPU completion, at
+  the configured cutoff. Checkpoint resumes past that cutoff do not recreate
+  them.
 - Checkpoint restore now requires the saved SH degree to match the configured
   training degree, preventing a planned memory/quality contract from changing
   silently during resume.

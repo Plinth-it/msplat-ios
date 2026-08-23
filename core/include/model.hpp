@@ -68,6 +68,10 @@ struct Model{
   /// Bytes held by the model's own GPU buffers — parameters, Adam state,
   /// and the densification scratch. Sized by capacity, not active count.
   size_t estimatedGpuBytes() const;
+  void allocateDensificationScratch();
+  void resetDensificationScratch();
+  void retireDensificationState();
+  bool hasDensificationScratch() const;
   void ensureCapacity(int needed);
   int capacityFor(int needed) const;
 
