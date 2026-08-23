@@ -46,6 +46,7 @@ jobs:
         run: |
           cmake -B build -DCMAKE_BUILD_TYPE=Release
           cmake --build build -j
+          ctest --test-dir build --output-on-failure
 
       - name: Verify outputs
         run: |
@@ -125,3 +126,12 @@ jobs:
           cd swift
           swift build
           swift test
+
+      - name: Build iOS example
+        run: |
+          xcodebuild \
+            -project examples/ios/MsplatExample.xcodeproj \
+            -scheme MsplatExample \
+            -destination 'generic/platform=iOS Simulator' \
+            CODE_SIGNING_ALLOWED=NO \
+            build

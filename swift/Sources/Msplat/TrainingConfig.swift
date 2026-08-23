@@ -1,7 +1,7 @@
 import MsplatCore
 
 /// Configuration for Gaussian splatting training.
-public struct TrainingConfig {
+public struct TrainingConfig: Sendable {
     public var iterations: Int32 = 30_000
     public var shDegree: Int32 = 3
     public var shDegreeInterval: Int32 = 1_000
@@ -18,12 +18,71 @@ public struct TrainingConfig {
     public var stopDensifyAt: Int32 = -1
     public var splitScreenSize: Float = 0.05
     public var keepCrs: Bool = false
+    /// Legacy ABI field. Use `DatasetOptions.downscaleFactor`; this value does
+    /// not affect training resolution.
     public var downscaleFactor: Float = 1.0
     /// Background color as (R, G, B) in [0, 1]. Default magenta — high contrast
     /// against typical scenes, makes under-reconstructed regions obvious.
     public var bgColor: (Float, Float, Float) = (0.6130, 0.0101, 0.3984)
 
     public init() {}
+
+    /// Validate values before they reach native division, modulo, shifts, or allocations.
+    public func validate() throws {
+        guard (1...1_000_000).contains(iterations) else {
+            throw MsplatError.invalidArgument("iterations must be in 1...1000000")
+        }
+        guard (0...4).contains(shDegree) else {
+            throw MsplatError.invalidArgument("shDegree must be in 0...4")
+        }
+        guard shDegreeInterval > 0 else {
+            throw MsplatError.invalidArgument("shDegreeInterval must be greater than zero")
+        }
+        guard ssimWeight.isFinite, (0...1).contains(ssimWeight) else {
+            throw MsplatError.invalidArgument("ssimWeight must be finite and in 0...1")
+        }
+        guard (0...30).contains(numDownscales) else {
+            throw MsplatError.invalidArgument("numDownscales must be in 0...30")
+        }
+        guard resolutionSchedule > 0 else {
+            throw MsplatError.invalidArgument("resolutionSchedule must be greater than zero")
+        }
+        guard refineEvery > 0 else {
+            throw MsplatError.invalidArgument("refineEvery must be greater than zero")
+        }
+        guard warmupLength >= 0 else {
+            throw MsplatError.invalidArgument("warmupLength must not be negative")
+        }
+        guard resetAlphaEvery > 0 else {
+            throw MsplatError.invalidArgument("resetAlphaEvery must be greater than zero")
+        }
+        let (_, resetOverflow) = resetAlphaEvery.multipliedReportingOverflow(by: refineEvery)
+        guard !resetOverflow else {
+            throw MsplatError.invalidArgument("resetAlphaEvery * refineEvery is too large")
+        }
+        guard densifyGradThresh.isFinite, densifyGradThresh >= 0 else {
+            throw MsplatError.invalidArgument("densifyGradThresh must be finite and non-negative")
+        }
+        guard densifySizeThresh.isFinite, densifySizeThresh >= 0 else {
+            throw MsplatError.invalidArgument("densifySizeThresh must be finite and non-negative")
+        }
+        guard stopScreenSizeAt >= 0 else {
+            throw MsplatError.invalidArgument("stopScreenSizeAt must not be negative")
+        }
+        guard stopDensifyAt >= -1 else {
+            throw MsplatError.invalidArgument("stopDensifyAt must be -1 or non-negative")
+        }
+        guard splitScreenSize.isFinite, splitScreenSize >= 0 else {
+            throw MsplatError.invalidArgument("splitScreenSize must be finite and non-negative")
+        }
+        guard downscaleFactor.isFinite, (1...32).contains(downscaleFactor) else {
+            throw MsplatError.invalidArgument("downscaleFactor must be finite and in 1...32")
+        }
+        let components = [bgColor.0, bgColor.1, bgColor.2]
+        guard components.allSatisfy({ $0.isFinite && (0...1).contains($0) }) else {
+            throw MsplatError.invalidArgument("bgColor components must be finite and in 0...1")
+        }
+    }
 
     func toC() -> MsplatConfig {
         var c = msplat_default_config()

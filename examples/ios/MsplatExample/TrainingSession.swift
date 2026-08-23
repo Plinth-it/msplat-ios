@@ -6,7 +6,7 @@ import os
 @MainActor
 final class TrainingSession: ObservableObject {
     enum Phase: Equatable {
-        case idle, loading, training, finished, failed(String)
+        case idle, loading, training, cancelled, finished, failed(String)
     }
 
     @Published private(set) var phase: Phase = .idle
@@ -26,118 +26,125 @@ final class TrainingSession: ObservableObject {
     /// where a phone runs out of memory first, so the default halves them.
     @Published var downscale: Float = 2
 
-    private var worker: Thread?
-
-    /// Written from the UI and read from the worker thread on every step, so
-    /// it lives outside the actor — hopping to the main actor once per step
-    /// just to ask whether to stop would serialise training against the UI.
-    private final class CancelFlag: @unchecked Sendable {
-        private let lock = NSLock()
-        private var value = false
-        var isSet: Bool { lock.withLock { value } }
-        func set() { lock.withLock { value = true } }
-        func reset() { lock.withLock { value = false } }
-    }
-    private nonisolated let cancelFlag = CancelFlag()
+    private var worker: Task<Void, Never>?
 
     func start(folder: DatasetFolder) {
-        guard phase == .idle || phase == .finished || isFailed else { return }
+        guard phase == .idle || phase == .cancelled || phase == .finished || isFailed else { return }
         phase = .loading
         iteration = 0
         exportedPly = nil
-        cancelFlag.reset()
 
-        let path = folder.url.path(percentEncoded: false)
+        let datasetURL = folder.url
         let steps = iterations
         let scale = downscale
 
-        let thread = Thread { [weak self] in
-            self?.run(path: path, steps: steps, downscale: scale)
+        worker = Task { [weak self] in
+            guard let self else { return }
+            await self.run(datasetURL: datasetURL, steps: steps, downscale: scale)
         }
-        // The default 512KB secondary-thread stack is enough, but the loaders
-        // recurse over directory trees; give them room.
-        thread.stackSize = 4 << 20
-        worker = thread
-        thread.start()
     }
 
-    func cancel() { cancelFlag.set() }
+    func cancel() { worker?.cancel() }
 
     private var isFailed: Bool { if case .failed = phase { return true }; return false }
 
-    private nonisolated func run(path: String, steps: Int, downscale: Float) {
-        autoreleasepool {
-            let dataset = GaussianDataset(path: path, downscaleFactor: downscale)
-            let cameras = dataset.numTrain
-            guard cameras > 0 else {
-                Task { @MainActor in self.phase = .failed("No training cameras in that folder.") }
-                return
-            }
+    private func run(datasetURL: URL, steps: Int, downscale: Float) async {
+        var session: MsplatSession?
+        var resultURL: URL?
+        var finalSplatCount = 0
+        var failureMessage: String?
+        var wasCancelled = false
 
+        do {
             var config = TrainingConfig()
             config.iterations = Int32(steps)
-            config.downscaleFactor = downscale
-            let trainer = GaussianTrainer(dataset: dataset, config: config)
+            // The UI's Full/Half/Quarter choice is the complete resolution
+            // policy for this short mobile preview; do not apply the desktop
+            // trainer's additional progressive 4x downscale.
+            config.numDownscales = 0
 
-            Task { @MainActor in
-                self.trainingCameras = cameras
-                self.phase = .training
+            let activeSession = try await MsplatSession(
+                datasetURL: datasetURL,
+                options: DatasetOptions(downscaleFactor: downscale),
+                config: config
+            )
+            session = activeSession
+            try Task.checkCancellation()
+
+            let cameras = try await activeSession.numTrain
+            guard cameras > 0 else {
+                throw MsplatError.invalidDataset("No training cameras in that folder.")
             }
+            trainingCameras = cameras
+            phase = .training
+            let previewPose = try await activeSession.cameraPose(at: 0)
 
             // Rendering a preview costs a full forward pass, so it is sampled
             // rather than done every step.
             let previewEvery = max(steps / 40, 10)
 
             for i in 0..<steps {
-                if cancelFlag.isSet { break }
-                let stats = trainer.step()
+                try Task.checkCancellation()
+                let stats = try await activeSession.step()
 
                 if i % previewEvery == 0 || i == steps - 1 {
-                    let image = Self.image(from: trainer.render(cameraIndex: 0))
-                    let footprint = Self.footprintMB()
-                    let available = Self.availableMB()
-                    Task { @MainActor in
-                        self.iteration = stats.iteration
-                        self.splatCount = stats.splatCount
-                        self.msPerStep = stats.msPerStep
-                        self.preview = image
-                        self.footprintMB = footprint
-                        self.availableMB = available
-                    }
+                    let frame = try await activeSession.renderRGBA(
+                        pose: previewPose,
+                        referenceCamera: 0
+                    )
+                    iteration = stats.iteration
+                    splatCount = stats.splatCount
+                    msPerStep = stats.cpuSubmitMs
+                    preview = Self.image(from: frame)
+                    footprintMB = Self.footprintMB()
+                    availableMB = Self.availableMB()
                 }
             }
 
+            try Task.checkCancellation()
             let url = URL.documentsDirectory.appending(path: "msplat-scene.ply")
-            try? FileManager.default.removeItem(at: url)
-            trainer.exportPly(to: url.path(percentEncoded: false))
-            let finalCount = trainer.splatCount
+            try await activeSession.exportPLY(to: url)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw MsplatError.ioFailure("Training finished, but the PLY file was not created.")
+            }
+            finalSplatCount = try await activeSession.splatCount
+            resultURL = url
+        } catch is CancellationError {
+            // A cancelled run deliberately does not export a partial scene.
+            wasCancelled = true
+        } catch {
+            failureMessage = error.localizedDescription
+        }
 
-            Task { @MainActor in
-                self.splatCount = finalCount
-                self.exportedPly = FileManager.default.fileExists(atPath: url.path(percentEncoded: false)) ? url : nil
-                self.phase = .finished
+        if let session {
+            do {
+                try await session.close()
+            } catch {
+                let closeMessage = "Could not release the training session: \(error.localizedDescription)"
+                failureMessage = failureMessage.map { "\($0) \(closeMessage)" } ?? closeMessage
             }
         }
+
+        if let failureMessage {
+            phase = .failed(failureMessage)
+        } else if wasCancelled {
+            phase = .cancelled
+        } else {
+            splatCount = finalSplatCount
+            exportedPly = resultURL
+            phase = .finished
+        }
+        worker = nil
     }
 
     // MARK: - Helpers
 
-    private nonisolated static func image(from pd: PixelData) -> UIImage? {
-        let count = pd.width * pd.height
-        guard count > 0 else { return nil }
-
-        var rgba = [UInt8](repeating: 255, count: count * 4)
-        pd.pixels.withUnsafeBufferPointer { src in
-            for i in 0..<count {
-                for c in 0..<3 {
-                    rgba[i * 4 + c] = UInt8(min(max(src[i * 3 + c], 0), 1) * 255)
-                }
-            }
-        }
-        guard let provider = CGDataProvider(data: Data(rgba) as CFData),
-              let cg = CGImage(width: pd.width, height: pd.height,
+    private nonisolated static func image(from frame: RGBAFrame) -> UIImage? {
+        guard frame.width > 0, frame.height > 0,
+              let provider = CGDataProvider(data: frame.data as CFData),
+              let cg = CGImage(width: frame.width, height: frame.height,
                                bitsPerComponent: 8, bitsPerPixel: 32,
-                               bytesPerRow: pd.width * 4,
+                               bytesPerRow: frame.bytesPerRow,
                                space: CGColorSpaceCreateDeviceRGB(),
                                bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
                                provider: provider, decode: nil,

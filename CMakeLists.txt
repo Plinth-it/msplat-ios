@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.21)
 project(msplat LANGUAGES CXX OBJCXX)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
@@ -34,13 +36,16 @@ endif()
 
 include(FetchContent)
 FetchContent_Declare(nlohmann_json
-    URL https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.zip)
+    URL https://github.com/nlohmann/json/archive/refs/tags/v3.11.3.zip
+    URL_HASH SHA256=04022b05d806eb5ff73023c280b68697d12b93e1b7267a0b22a1a39ec7578069)
 set(NANOFLANN_BUILD_EXAMPLES OFF)
 set(NANOFLANN_BUILD_TESTS OFF)
 FetchContent_Declare(nanoflann
-    URL https://github.com/jlblancoc/nanoflann/archive/refs/tags/v1.5.5.zip)
+    URL https://github.com/jlblancoc/nanoflann/archive/refs/tags/v1.5.5.zip
+    URL_HASH SHA256=57496cb27e1310a77a367e5a902c8f1c700496d91ac54ccc87fbe9ccc28bc6cc)
 FetchContent_Declare(cli11
-    URL https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.4.2.zip)
+    URL https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.4.2.zip
+    URL_HASH SHA256=43e650d5e1a3acaaf419d1e61a81f77b408d0696f472be0599ddf877d40984b0)
 FetchContent_MakeAvailable(nlohmann_json nanoflann cli11)
 
 # Metal frameworks
@@ -148,6 +153,16 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     )
     target_compile_definitions(msplat PRIVATE USE_MPS)
     install(TARGETS msplat DESTINATION bin)
+
+    if(BUILD_TESTING)
+        add_executable(msplat_c_api_tests tests/test_c_api.cpp)
+        target_link_libraries(msplat_c_api_tests PRIVATE msplat_core)
+        add_test(NAME msplat_c_api_errors COMMAND msplat_c_api_tests)
+
+        add_executable(msplat_checkpoint_tests tests/test_checkpoint.cpp)
+        target_link_libraries(msplat_checkpoint_tests PRIVATE msplat_core)
+        add_test(NAME msplat_checkpoint_validation COMMAND msplat_checkpoint_tests)
+    endif()
 endif()
 
 # --- Python bindings (optional, enabled when building via scikit-build-core) ---

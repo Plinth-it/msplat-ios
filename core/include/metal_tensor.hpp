@@ -199,8 +199,8 @@ private:
                  "MTLBuffer allocation failed: [%s] %.1f MB requested",
                  shapeText, (double)bytes / (1024.0 * 1024.0));
 #endif
-        // Printed as well as thrown: nothing catches this yet, so stderr is the
-        // only place the detail survives the resulting terminate().
+        // Keep the diagnostic for native/CLI callers; the checked C ABI also
+        // translates this exception into MSPLAT_STATUS_OUT_OF_MEMORY.
         fprintf(stderr, "MSPLAT_ALLOC_FAIL %s\n", message);
         fflush(stderr);
         throw std::runtime_error(message);

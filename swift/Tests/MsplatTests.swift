@@ -10,6 +10,59 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(config.iterations, 30_000)
         XCTAssertEqual(config.shDegree, 3)
         XCTAssertEqual(config.ssimWeight, 0.2, accuracy: 0.001)
+        XCTAssertNoThrow(try config.validate())
+    }
+
+    func testInvalidConfigIsRejected() {
+        var invalidConfigs: [TrainingConfig] = []
+
+        var config = TrainingConfig()
+        config.iterations = 0
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.shDegreeInterval = 0
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.resolutionSchedule = 0
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.refineEvery = 0
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.resetAlphaEvery = 0
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.numDownscales = 31
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.ssimWeight = .nan
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.bgColor = (0, .infinity, 0)
+        invalidConfigs.append(config)
+
+        for invalidConfig in invalidConfigs {
+            XCTAssertThrowsError(try invalidConfig.validate())
+        }
+    }
+
+    func testCameraPoseValidation() throws {
+        XCTAssertNoThrow(
+            try CameraPose(elements: [Float](repeating: 0, count: 16))
+        )
+        XCTAssertThrowsError(
+            try CameraPose(elements: [Float](repeating: 0, count: 15))
+        )
+        var nonFinite = [Float](repeating: 0, count: 16)
+        nonFinite[3] = .nan
+        XCTAssertThrowsError(try CameraPose(elements: nonFinite))
     }
 
     func testLoadDataset() throws {

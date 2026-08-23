@@ -28,11 +28,11 @@ root or under `sparse/0`, alongside an `images` directory.
 
 ## What it shows
 
-Training reports the step, the gaussian count, milliseconds per step, and the
-memory figures that matter on a phone: `phys_footprint`, which is what jetsam
-counts, and `os_proc_available_memory`, which is how much headroom is left
-before the app is killed. Resolution defaults to half, because full-resolution
-captures are where a phone runs out of memory first.
+Training reports the step, the gaussian count, CPU encode/submission time, and
+the memory figures that matter on a phone: `phys_footprint`, which is what
+jetsam counts, and `os_proc_available_memory`, which is how much headroom is
+left before the app is killed. Resolution defaults to half, because
+full-resolution captures are where a phone runs out of memory first.
 
 The exported PLY goes to the app's Documents folder and is offered through the
 share sheet.

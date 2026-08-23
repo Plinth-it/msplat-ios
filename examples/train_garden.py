@@ -22,7 +22,7 @@ def on_step(stats):
     print(
         f"step={stats.iteration:>6}  "
         f"splats={stats.splat_count:>8,}  "
-        f"ms={stats.ms_per_step:.1f}"
+        f"cpu_submit_ms={stats.ms_per_step:.1f}"
     )
 
 trainer.train(on_step, callback_every=100)

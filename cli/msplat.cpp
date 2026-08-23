@@ -324,11 +324,13 @@ int main(int argc, char *argv[]) {
         }
 
         cleanup_msplat_metal();
-        msplat_gpu_sync();
     } catch (const std::exception &e) {
         std::cerr << e.what() << std::endl;
-        cleanup_msplat_metal();
-        msplat_gpu_sync();
+        try {
+            cleanup_msplat_metal();
+        } catch (const std::exception &cleanupError) {
+            std::cerr << "msplat cleanup failed: " << cleanupError.what() << std::endl;
+        }
         return 1;
     }
 }

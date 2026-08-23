@@ -1,0 +1,566 @@
+import Foundation
+import MsplatCore
+import Synchronization
+
+/// Serializes access to msplat's process-global Metal state.
+@globalActor
+public actor MsplatRuntimeActor {
+    public static let shared = MsplatRuntimeActor()
+}
+
+/// Dataset loading and evaluation-split options.
+public struct DatasetOptions: Sendable, Equatable {
+    public var downscaleFactor: Float
+    public var evalMode: Bool
+    public var testEvery: Int32
+
+    public init(
+        downscaleFactor: Float = 1.0,
+        evalMode: Bool = false,
+        testEvery: Int32 = 8
+    ) {
+        self.downscaleFactor = downscaleFactor
+        self.evalMode = evalMode
+        self.testEvery = testEvery
+    }
+}
+
+/// A validated 4-by-4, row-major camera-to-world transform.
+public struct CameraPose: Sendable, Equatable {
+    public static let elementCount = 16
+    public let elements: [Float]
+
+    public init(elements: [Float]) throws {
+        guard elements.count == Self.elementCount else {
+            throw MsplatError.invalidArgument(
+                "A camera pose must contain exactly \(Self.elementCount) values"
+            )
+        }
+        guard elements.allSatisfy(\.isFinite) else {
+            throw MsplatError.invalidArgument("A camera pose must contain only finite values")
+        }
+        self.elements = elements
+    }
+}
+
+/// An immutable, tightly packed RGBA8 render.
+public struct RGBAFrame: Sendable, Equatable {
+    public let data: Data
+    public let width: Int
+    public let height: Int
+    public let bytesPerRow: Int
+
+    fileprivate init(data: Data, width: Int, height: Int, bytesPerRow: Int) {
+        self.data = data
+        self.width = width
+        self.height = height
+        self.bytesPerRow = bytesPerRow
+    }
+}
+
+/// An ownership-safe facade over one native dataset and trainer.
+///
+/// Only one session may be open because the native Metal resources are still
+/// process-global. Legacy `GaussianDataset` and `GaussianTrainer` remain
+/// source-compatible, but must not be used concurrently with this facade.
+@MsplatRuntimeActor
+public final class MsplatSession {
+    private let resources: SessionResources
+
+    /// Creates the native dataset and trainer and retains the dataset URL's
+    /// security scope until ``close()`` completes.
+    public init(
+        datasetURL: URL,
+        options: DatasetOptions = DatasetOptions(),
+        config: TrainingConfig = TrainingConfig()
+    ) throws {
+        try config.validate()
+        guard datasetURL.isFileURL, !datasetURL.path.isEmpty else {
+            throw MsplatError.invalidArgument(
+                "The dataset URL must be a file URL with a non-empty path"
+            )
+        }
+        try reserveNativeSession()
+        var lease = SecurityScopedURLLease(url: datasetURL)
+
+        do {
+            let handles = try Self.createHandles(
+                path: datasetURL.path,
+                options: options,
+                config: config
+            )
+            resources = SessionResources(
+                dataset: handles.dataset,
+                trainer: handles.trainer,
+                securityScope: lease
+            )
+        } catch {
+            lease.close()
+            releaseNativeSession()
+            throw error
+        }
+    }
+
+    @discardableResult
+    public func step() throws -> TrainingStats {
+        try withTrainer { trainer in
+            var stats = MsplatStats()
+            var nativeError = MsplatErrorInfo()
+            let status = msplat_trainer_step_v2(trainer, &stats, &nativeError)
+            try checkNativeStatus(status, error: &nativeError)
+            return TrainingStats(from: stats)
+        }
+    }
+
+    public func evaluate() throws -> EvalMetrics {
+        try withTrainer { trainer in
+            var metrics = MsplatEvalMetrics()
+            var nativeError = MsplatErrorInfo()
+            let status = msplat_trainer_evaluate_v2(trainer, &metrics, &nativeError)
+            try checkNativeStatus(status, error: &nativeError)
+            return EvalMetrics(from: metrics)
+        }
+    }
+
+    /// Renders a train or test camera as RGB float32 data.
+    public func render(camera index: Int, useTest: Bool = false) throws -> PixelData {
+        let index = try nativeIndex(index)
+        return try withTrainer { trainer in
+            var buffer = MsplatPixelBuffer()
+            var nativeError = MsplatErrorInfo()
+            let status = msplat_trainer_render_v2(
+                trainer, index, useTest, &buffer, &nativeError
+            )
+            try checkNativeStatus(status, error: &nativeError)
+            return try Self.takePixelData(&buffer)
+        }
+    }
+
+    /// Renders from an arbitrary pose as RGB float32 data.
+    public func render(
+        pose: CameraPose,
+        referenceCamera: Int = 0
+    ) throws -> PixelData {
+        let referenceCamera = try nativeIndex(referenceCamera)
+        return try withTrainer { trainer in
+            var buffer = MsplatPixelBuffer()
+            var nativeError = MsplatErrorInfo()
+            let status = pose.elements.withUnsafeBufferPointer { elements in
+                msplat_trainer_render_pose_v2(
+                    trainer,
+                    elements.baseAddress,
+                    referenceCamera,
+                    &buffer,
+                    &nativeError
+                )
+            }
+            try checkNativeStatus(status, error: &nativeError)
+            return try Self.takePixelData(&buffer)
+        }
+    }
+
+    /// Renders from an arbitrary pose as tightly packed RGBA8 data.
+    public func renderRGBA(
+        pose: CameraPose,
+        referenceCamera: Int = 0
+    ) throws -> RGBAFrame {
+        let referenceCamera = try nativeIndex(referenceCamera)
+        return try withTrainer { trainer in
+            var width: Int32 = 0
+            var height: Int32 = 0
+            var nativeError = MsplatErrorInfo()
+            let queryStatus = pose.elements.withUnsafeBufferPointer { elements in
+                msplat_trainer_render_pose_to_buffer_v2(
+                    trainer,
+                    elements.baseAddress,
+                    referenceCamera,
+                    nil,
+                    0,
+                    &width,
+                    &height,
+                    &nativeError
+                )
+            }
+            try checkNativeStatus(queryStatus, error: &nativeError)
+
+            let frameWidth = Int(width)
+            let frameHeight = Int(height)
+            let layout = try checkedImageLayout(
+                width: frameWidth,
+                height: frameHeight,
+                components: 4
+            )
+            var data = Data(count: layout.elementCount)
+            var renderedWidth: Int32 = 0
+            var renderedHeight: Int32 = 0
+
+            try data.withUnsafeMutableBytes { bytes in
+                guard bytes.count >= layout.elementCount,
+                      let destination = bytes.baseAddress else {
+                    throw MsplatError.internalFailure("Could not allocate RGBA storage")
+                }
+                var renderError = MsplatErrorInfo()
+                let renderStatus = pose.elements.withUnsafeBufferPointer { elements in
+                    msplat_trainer_render_pose_to_buffer_v2(
+                        trainer,
+                        elements.baseAddress,
+                        referenceCamera,
+                        destination.assumingMemoryBound(to: UInt8.self),
+                        bytes.count,
+                        &renderedWidth,
+                        &renderedHeight,
+                        &renderError
+                    )
+                }
+                try checkNativeStatus(renderStatus, error: &renderError)
+            }
+
+            guard renderedWidth == width, renderedHeight == height else {
+                throw MsplatError.internalFailure(
+                    "Render dimensions changed while filling the RGBA buffer"
+                )
+            }
+            return RGBAFrame(
+                data: data,
+                width: frameWidth,
+                height: frameHeight,
+                bytesPerRow: layout.elementsPerRow
+            )
+        }
+    }
+
+    public func cameraPose(at index: Int) throws -> CameraPose {
+        let index = try nativeIndex(index)
+        return try withDataset { dataset in
+            var elements = [Float](repeating: 0, count: CameraPose.elementCount)
+            var nativeError = MsplatErrorInfo()
+            let status = elements.withUnsafeMutableBufferPointer { values in
+                msplat_dataset_camera_pose_v2(
+                    dataset, index, values.baseAddress, &nativeError
+                )
+            }
+            try checkNativeStatus(status, error: &nativeError)
+            return try CameraPose(elements: elements)
+        }
+    }
+
+    public func exportPLY(to url: URL) throws {
+        let path = try filePath(url)
+        try withTrainer { trainer in
+            var nativeError = MsplatErrorInfo()
+            let status = msplat_trainer_export_ply_v2(trainer, path, &nativeError)
+            try checkNativeStatus(status, error: &nativeError)
+        }
+    }
+
+    public func saveCheckpoint(to url: URL) throws {
+        let path = try filePath(url)
+        try withTrainer { trainer in
+            var nativeError = MsplatErrorInfo()
+            let status = msplat_trainer_save_checkpoint_v2(trainer, path, &nativeError)
+            try checkNativeStatus(status, error: &nativeError)
+        }
+    }
+
+    @discardableResult
+    public func loadCheckpoint(from url: URL) throws -> Int {
+        let path = try filePath(url)
+        return try withTrainer { trainer in
+            var iteration: Int32 = 0
+            var nativeError = MsplatErrorInfo()
+            let status = msplat_trainer_load_checkpoint_v2(
+                trainer, path, &iteration, &nativeError
+            )
+            try checkNativeStatus(status, error: &nativeError)
+            return Int(iteration)
+        }
+    }
+
+    public var numTrain: Int {
+        get throws {
+            try withDataset { dataset in
+                var count: Int32 = 0
+                var nativeError = MsplatErrorInfo()
+                let status = msplat_dataset_num_train_v2(dataset, &count, &nativeError)
+                try checkNativeStatus(status, error: &nativeError)
+                return Int(count)
+            }
+        }
+    }
+
+    public var splatCount: Int {
+        get throws {
+            try withTrainer { trainer in
+                var count: Int32 = 0
+                var nativeError = MsplatErrorInfo()
+                let status = msplat_trainer_splat_count_v2(trainer, &count, &nativeError)
+                try checkNativeStatus(status, error: &nativeError)
+                return Int(count)
+            }
+        }
+    }
+
+    public var iteration: Int {
+        get throws {
+            try withTrainer { trainer in
+                var value: Int32 = 0
+                var nativeError = MsplatErrorInfo()
+                let status = msplat_trainer_iteration_v2(trainer, &value, &nativeError)
+                try checkNativeStatus(status, error: &nativeError)
+                return Int(value)
+            }
+        }
+    }
+
+    /// Idempotently destroys the trainer before the dataset.
+    public func close() throws {
+        try resources.close()
+    }
+
+    private static func createHandles(
+        path: String,
+        options: DatasetOptions,
+        config: TrainingConfig
+    ) throws -> (dataset: MsplatDataset, trainer: MsplatTrainer) {
+        try withConfiguredNativeEngine(metallibResourceName) {
+            var dataset: MsplatDataset?
+            var nativeError = MsplatErrorInfo()
+            let datasetStatus = msplat_dataset_create_v2(
+                path,
+                options.downscaleFactor,
+                options.evalMode,
+                options.testEvery,
+                &dataset,
+                &nativeError
+            )
+            try checkNativeStatus(datasetStatus, error: &nativeError)
+            guard let dataset else {
+                throw MsplatError.internalFailure("Native dataset creation returned no handle")
+            }
+
+            do {
+                var config = config.toC()
+                var trainer: MsplatTrainer?
+                let trainerStatus = msplat_trainer_create_v2(
+                    dataset,
+                    &config,
+                    MemoryLayout<MsplatConfig>.size,
+                    &trainer,
+                    &nativeError
+                )
+                try checkNativeStatus(trainerStatus, error: &nativeError)
+                guard let trainer else {
+                    throw MsplatError.internalFailure(
+                        "Native trainer creation returned no handle"
+                    )
+                }
+                return (dataset, trainer)
+            } catch {
+                var destroyError = MsplatErrorInfo()
+                _ = msplat_dataset_destroy_v2(dataset, &destroyError)
+                throw error
+            }
+        }
+    }
+
+    private static func takePixelData(_ buffer: inout MsplatPixelBuffer) throws -> PixelData {
+        defer { msplat_pixel_buffer_free(&buffer) }
+        let width = Int(buffer.width)
+        let height = Int(buffer.height)
+        let layout = try checkedImageLayout(width: width, height: height, components: 3)
+        guard let data = buffer.data else {
+            throw MsplatError.internalFailure("Native rendering returned no pixel data")
+        }
+        return PixelData(
+            pixels: Array(UnsafeBufferPointer(start: data, count: layout.elementCount)),
+            width: width,
+            height: height
+        )
+    }
+
+    private func withDataset<Result>(
+        _ operation: (MsplatDataset) throws -> Result
+    ) throws -> Result {
+        try resources.withDataset(operation)
+    }
+
+    private func withTrainer<Result>(
+        _ operation: (MsplatTrainer) throws -> Result
+    ) throws -> Result {
+        try resources.withTrainer(operation)
+    }
+}
+
+/// Owns native handles independently of global-actor deinitializer support.
+private final class SessionResources: @unchecked Sendable {
+    private struct DatasetHandle: @unchecked Sendable {
+        let rawValue: MsplatDataset
+    }
+
+    private struct TrainerHandle: @unchecked Sendable {
+        let rawValue: MsplatTrainer
+    }
+
+    private struct State: @unchecked Sendable {
+        var dataset: DatasetHandle?
+        var trainer: TrainerHandle?
+        var securityScope: SecurityScopedURLLease?
+        var ownsSessionReservation = true
+    }
+
+    private struct DetachedResources: @unchecked Sendable {
+        let dataset: DatasetHandle?
+        let trainer: TrainerHandle?
+        let securityScope: SecurityScopedURLLease?
+        let ownsSessionReservation: Bool
+    }
+
+    private let state: Mutex<State>
+
+    init(
+        dataset: MsplatDataset,
+        trainer: MsplatTrainer,
+        securityScope: SecurityScopedURLLease
+    ) {
+        state = Mutex(State(
+            dataset: DatasetHandle(rawValue: dataset),
+            trainer: TrainerHandle(rawValue: trainer),
+            securityScope: securityScope
+        ))
+    }
+
+    func withDataset<Result>(
+        _ operation: (MsplatDataset) throws -> Result
+    ) throws -> Result {
+        try withNativeEngineLock {
+            let handle = try state.withLock { state in
+                guard let dataset = state.dataset else {
+                    throw MsplatError.invalidArgument("MsplatSession is closed")
+                }
+                return dataset
+            }
+            return try operation(handle.rawValue)
+        }
+    }
+
+    func withTrainer<Result>(
+        _ operation: (MsplatTrainer) throws -> Result
+    ) throws -> Result {
+        try withNativeEngineLock {
+            let handle = try state.withLock { state in
+                guard let trainer = state.trainer else {
+                    throw MsplatError.invalidArgument("MsplatSession is closed")
+                }
+                return trainer
+            }
+            return try operation(handle.rawValue)
+        }
+    }
+
+    func close() throws {
+        var firstError: Error?
+        let detached = state.withLock { state in
+            let resources = DetachedResources(
+                dataset: state.dataset,
+                trainer: state.trainer,
+                securityScope: state.securityScope,
+                ownsSessionReservation: state.ownsSessionReservation
+            )
+            state.dataset = nil
+            state.trainer = nil
+            state.securityScope = nil
+            state.ownsSessionReservation = false
+            return resources
+        }
+
+        if let trainer = detached.trainer {
+            do {
+                try withNativeEngineLock {
+                    var nativeError = MsplatErrorInfo()
+                    let status = msplat_trainer_destroy_v2(trainer.rawValue, &nativeError)
+                    try checkNativeStatus(status, error: &nativeError)
+                }
+            } catch {
+                firstError = error
+            }
+        }
+
+        if let dataset = detached.dataset {
+            do {
+                try withNativeEngineLock {
+                    var nativeError = MsplatErrorInfo()
+                    let status = msplat_dataset_destroy_v2(dataset.rawValue, &nativeError)
+                    try checkNativeStatus(status, error: &nativeError)
+                }
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+
+        var securityScope = detached.securityScope
+        securityScope?.close()
+        if detached.ownsSessionReservation { releaseNativeSession() }
+
+        if let firstError { throw firstError }
+    }
+
+    deinit {
+        try? close()
+    }
+}
+
+private struct SecurityScopedURLLease: Sendable {
+    let url: URL
+    private var isActive: Bool
+
+    init(url: URL) {
+        self.url = url
+        isActive = url.startAccessingSecurityScopedResource()
+    }
+
+    mutating func close() {
+        guard isActive else { return }
+        isActive = false
+        url.stopAccessingSecurityScopedResource()
+    }
+}
+
+private var metallibResourceName: String {
+    #if os(macOS)
+    return "default-macos"
+    #elseif targetEnvironment(simulator)
+    return "default-iossimulator"
+    #else
+    return "default-ios"
+    #endif
+}
+
+private func nativeIndex(_ value: Int) throws -> Int32 {
+    guard let value = Int32(exactly: value) else {
+        throw MsplatError.invalidArgument("Camera index is outside the supported range")
+    }
+    return value
+}
+
+private func filePath(_ url: URL) throws -> String {
+    guard url.isFileURL, !url.path.isEmpty else {
+        throw MsplatError.invalidArgument("Output must be a file URL with a non-empty path")
+    }
+    return url.path
+}
+
+private func checkedImageLayout(
+    width: Int,
+    height: Int,
+    components: Int
+) throws -> (elementsPerRow: Int, elementCount: Int) {
+    guard width > 0, height > 0 else {
+        throw MsplatError.internalFailure("Native rendering returned invalid dimensions")
+    }
+    let (elementsPerRow, rowOverflow) = width.multipliedReportingOverflow(by: components)
+    let (elementCount, countOverflow) = elementsPerRow.multipliedReportingOverflow(by: height)
+    guard !rowOverflow, !countOverflow else {
+        throw MsplatError.outOfMemory("Render dimensions exceed Swift buffer limits")
+    }
+    return (elementsPerRow, elementCount)
+}

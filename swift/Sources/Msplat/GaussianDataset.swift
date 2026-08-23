@@ -1,8 +1,6 @@
 import MsplatCore
 import Foundation
 
-nonisolated(unsafe) private var _metallibConfigured = false
-
 /// A metallib is compiled against one SDK and will not load on another, so the
 /// package ships one per platform and picks here rather than at build time.
 private var metallibResourceName: String {
@@ -15,17 +13,9 @@ private var metallibResourceName: String {
     #endif
 }
 
-func ensureMetallibConfigured() {
-    guard !_metallibConfigured else { return }
-    _metallibConfigured = true
-    if let path = Bundle.module.path(forResource: metallibResourceName, ofType: "metallib") {
-        msplat_set_metallib_path(path)
-    }
-}
-
 /// A loaded dataset of camera views for training.
 public class GaussianDataset {
-    let handle: MsplatDataset
+    let handle: MsplatDataset?
 
     /// Load a dataset from disk.
     /// - Parameters:
@@ -35,25 +25,39 @@ public class GaussianDataset {
     ///   - testEvery: Hold out every Nth image for evaluation.
     public init(path: String, downscaleFactor: Float = 1.0,
                 evalMode: Bool = false, testEvery: Int32 = 8) {
-        ensureMetallibConfigured()
-        handle = msplat_dataset_create(path, downscaleFactor, evalMode, testEvery)
+        try? withConfiguredNativeEngine(metallibResourceName) {}
+        handle = withNativeEngineLock {
+            msplat_dataset_create(path, downscaleFactor, evalMode, testEvery)
+        }
     }
 
     deinit {
-        msplat_dataset_destroy(handle)
+        guard let handle else { return }
+        withNativeEngineLock { msplat_dataset_destroy(handle) }
     }
 
     /// Number of training cameras.
-    public var numTrain: Int { Int(msplat_dataset_num_train(handle)) }
+    public var numTrain: Int {
+        withNativeEngineLock {
+            Int(msplat_dataset_num_train(handle))
+        }
+    }
 
     /// Number of test cameras (0 if evalMode was false).
-    public var numTest: Int { Int(msplat_dataset_num_test(handle)) }
+    public var numTest: Int {
+        withNativeEngineLock {
+            Int(msplat_dataset_num_test(handle))
+        }
+    }
 
     /// Get the camera-to-world pose (4x4 row-major, OpenGL convention) for a training camera.
     public func cameraPose(at index: Int) -> [Float] {
         var pose = [Float](repeating: 0, count: 16)
-        pose.withUnsafeMutableBufferPointer { ptr in
-            msplat_dataset_camera_pose(handle, Int32(index), ptr.baseAddress!)
+        guard let nativeIndex = Int32(exactly: index) else { return pose }
+        withNativeEngineLock {
+            pose.withUnsafeMutableBufferPointer { pointer in
+                msplat_dataset_camera_pose(handle, nativeIndex, pointer.baseAddress)
+            }
         }
         return pose
     }

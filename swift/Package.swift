@@ -32,7 +32,7 @@ let package = Package(
                 .linkedFramework("ImageIO"),
                 .linkedFramework("CoreGraphics"),
                 .linkedLibrary("z"),
-                .unsafeFlags(["-lc++"]),
+                .linkedLibrary("c++"),
             ]
         ),
 

@@ -5,8 +5,9 @@
 the full training pipeline as fused Metal compute kernels, with no dependency
 beyond system frameworks.
 
-This fork adds bounded memory, three correctness fixes, an iOS build, and an
-example app that takes a COLMAP folder and returns a PLY.
+This fork reduces model and transient growth, adds a byte-budgeted image cache,
+fixes three correctness bugs, and provides an iOS build plus a COLMAP-to-PLY
+example app. It does not yet impose a hard model-memory or Gaussian-count cap.
 
 ## Memory
 
@@ -48,7 +49,8 @@ dataset declared on every call.
 
 - COLMAP text models (`cameras.txt` / `images.txt` / `points3D.txt`)
 - `.spz` export
-- `--stop-densify-at`, capping the gaussian count independently of run length
+- `--stop-densify-at`, stopping topology growth after a chosen step (not a hard
+  Gaussian-count or memory cap)
 - XCFramework slices for `macos-arm64`, `ios-arm64` and
   `ios-arm64_x86_64-simulator`, each with its own metallib
 
@@ -61,27 +63,39 @@ open examples/ios/MsplatExample.xcodeproj
 
 See [examples/ios/README.md](examples/ios/README.md).
 
-Swift:
+Swift currently uses the locally built `MsplatCore.xcframework`: add the
+package at `msplat-ios/swift` after running the build script above. Tagged
+remote SwiftPM distribution still needs a release URL and checksum.
 
 ```swift
-.package(url: "https://github.com/frs0n/msplat-ios.git", branch: "main")
-```
-
-```swift
+import Foundation
 import Msplat
 
-let dataset = GaussianDataset(path: "path/to/colmap/", downscaleFactor: 2.0)
-var config = TrainingConfig()
-config.iterations = 2_000
-config.stopDensifyAt = 750
+@MsplatRuntimeActor
+func train() throws {
+    var config = TrainingConfig()
+    config.iterations = 2_000
+    config.numDownscales = 0 // train at the dataset's selected decode scale
+    config.stopDensifyAt = 750
 
-let trainer = GaussianTrainer(dataset: dataset, config: config)
-for _ in 0..<2_000 {
-    let stats = trainer.step()
-    print("step=\(stats.iteration) splats=\(stats.splatCount)")
+    let session = try MsplatSession(
+        datasetURL: URL(fileURLWithPath: "path/to/colmap/"),
+        options: DatasetOptions(downscaleFactor: 2.0),
+        config: config
+    )
+    defer { try? session.close() }
+
+    for _ in 0..<2_000 {
+        let stats = try session.step()
+        print("step=\(stats.iteration) splats=\(stats.splatCount)")
+    }
+    try session.exportPLY(to: URL(fileURLWithPath: "output.ply"))
 }
-trainer.exportPly(to: "output.ply")
 ```
+
+`MsplatSession` is the checked, throwing API and serializes the engine's
+process-global Metal state. The legacy `GaussianDataset` and `GaussianTrainer`
+types remain available for source compatibility.
 
 CLI:
 

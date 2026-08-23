@@ -6,6 +6,7 @@
 // Internal types hidden via PIMPL.
 
 #include <cstdint>
+#include <cstddef>
 #include <memory>
 #include <string>
 
@@ -30,7 +31,7 @@ struct Config {
     int stopDensifyAt = -1;
     float splitScreenSize = 0.05f;
     bool keepCrs = false;
-    float downscaleFactor = 1.0f;
+    float downscaleFactor = 1.0f; // Legacy field retained for ABI compatibility; unused.
     float bgColor[3] = {0.6130f, 0.0101f, 0.3984f};  // magenta — high contrast for debugging
 };
 
@@ -39,7 +40,7 @@ struct Config {
 struct Stats {
     int iteration = 0;
     int splatCount = 0;
-    float msPerStep = 0.0f;
+    float msPerStep = 0.0f; // CPU encode + submission; not completed GPU time.
 };
 
 struct EvalMetrics {
@@ -105,6 +106,9 @@ private:
 
 class Trainer {
 public:
+    // The current Metal engine is process-global. Trainer operations are
+    // serialized across instances, and the referenced Dataset must outlive
+    // this object. The C ABI owns that relationship automatically.
     Trainer(Dataset& dataset, const Config& config);
     ~Trainer();
 
@@ -134,6 +138,11 @@ public:
     /// Call with outRGBA=nullptr to query dimensions only.
     void renderFromPoseToBuffer(const float camToWorld[16], int refCameraIndex,
                             uint8_t* outRGBA, int* outWidth, int* outHeight);
+
+    /// Capacity-checked overload used by ABI v2.
+    void renderFromPoseToBuffer(const float camToWorld[16], int refCameraIndex,
+                            uint8_t* outRGBA, size_t outCapacity,
+                            int* outWidth, int* outHeight);
 
     /// Export scene to PLY format.
     void exportPly(const std::string& path);

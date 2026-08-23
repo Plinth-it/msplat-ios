@@ -78,6 +78,8 @@ struct ContentView: View {
             switch session.phase {
             case .loading:
                 LabeledContent("Status", value: "Loading dataset…")
+            case .cancelled:
+                LabeledContent("Status", value: "Cancelled")
             case .failed(let message):
                 Text(message).foregroundStyle(.red)
             default:
@@ -92,7 +94,7 @@ struct ContentView: View {
                              total: Double(max(session.iterations, 1)))
                 LabeledContent("Step", value: "\(session.iteration) / \(session.iterations)")
                 LabeledContent("Gaussians", value: session.splatCount.formatted())
-                LabeledContent("Per step", value: String(format: "%.1f ms", session.msPerStep))
+                LabeledContent("CPU submit", value: String(format: "%.1f ms", session.msPerStep))
                 LabeledContent("Cameras", value: "\(session.trainingCameras)")
                 // os_proc_available_memory reports 0 in the simulator, which
                 // has no jetsam limit — showing "0 MB left" there would read

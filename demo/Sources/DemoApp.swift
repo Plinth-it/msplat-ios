@@ -381,7 +381,7 @@ struct ContentView: View {
             case .training:
                 Text("step \(engine.iteration) / \(engine.totalIterations)")
                 Text("\(fmtCount(engine.splatCount)) splats")
-                Text(String(format: "%.1f ms/step", engine.msPerStep))
+                Text(String(format: "%.1f ms CPU submit", engine.msPerStep))
             case .orbiting:
                 Text("\(fmtCount(engine.splatCount)) splats")
                 Text(String(format: "%.0f fps", engine.fps))

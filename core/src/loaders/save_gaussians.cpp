@@ -1,12 +1,17 @@
 #include "loaders.hpp"
 #include "msplat.hpp"
+#include "atomic_output.hpp"
 #include <fstream>
 #include <algorithm>
 #include <numeric>
 #include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <sstream>
+#include <stdexcept>
 #include <zlib.h>
+
+namespace fs = std::filesystem;
 
 static const double C0 = 0.28209479177387814;
 static constexpr float kSpzColorScale = 0.15f;
@@ -105,7 +110,9 @@ static void packSpzQuaternion(uint8_t out[4], float x, float y, float z, float w
 void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
     msplat_gpu_sync();
 
-    std::ofstream o(path, std::ios::binary);
+    msplat::detail::AtomicOutputFile output(path);
+    std::ofstream o(output.temporary(), std::ios::binary | std::ios::trunc);
+    if (!o.is_open()) throw std::runtime_error("Cannot open PLY file for writing: " + path);
     int64_t N = p.means.size(0);
     int numDc = (int)p.featuresDc.size(1);
     int frBases = (int)p.featuresRest.size(-2);
@@ -146,12 +153,19 @@ void saveGaussianPly(const std::string &path, GaussianParams &p, int step) {
 
         o.write(reinterpret_cast<const char*>(row.data()), floatsPerRow * sizeof(float));
     }
+    o.flush();
+    if (!o) throw std::runtime_error("Failed while writing PLY file: " + path);
+    o.close();
+    if (!o) throw std::runtime_error("Failed to close PLY file: " + path);
+    output.commit("PLY");
 }
 
 void saveGaussianSplat(const std::string &path, GaussianParams &p) {
     msplat_gpu_sync();
 
-    std::ofstream o(path, std::ios::binary);
+    msplat::detail::AtomicOutputFile output(path);
+    std::ofstream o(output.temporary(), std::ios::binary | std::ios::trunc);
+    if (!o.is_open()) throw std::runtime_error("Cannot open splat file for writing: " + path);
     int64_t N = p.means.size(0);
     const float *mp = p.means.data<float>(), *sp = p.scales.data<float>(), *qp = p.quats.data<float>();
     const float *dp = p.featuresDc.data<float>(), *op = p.opacities.data<float>();
@@ -189,6 +203,11 @@ void saveGaussianSplat(const std::string &path, GaussianParams &p) {
         for (int j = 0; j < 4; j++) q[j] = (uint8_t)std::clamp(qp[i*4+j] * 128.0f + 128.0f, 0.0f, 255.0f);
         o.write(reinterpret_cast<const char*>(q), 4);
     }
+    o.flush();
+    if (!o) throw std::runtime_error("Failed while writing splat file: " + path);
+    o.close();
+    if (!o) throw std::runtime_error("Failed to close splat file: " + path);
+    output.commit("splat");
 }
 
 void saveGaussianSpz(const std::string &path, GaussianParams &p) {
@@ -260,9 +279,15 @@ void saveGaussianSpz(const std::string &path, GaussianParams &p) {
     std::string bytes = plain.str();
     if (!gzipBytes(bytes, compressed)) throw std::runtime_error("Failed to gzip SPZ data");
 
-    std::ofstream o(path, std::ios::binary);
+    msplat::detail::AtomicOutputFile output(path);
+    std::ofstream o(output.temporary(), std::ios::binary | std::ios::trunc);
     if (!o.is_open()) throw std::runtime_error("Cannot open SPZ file for writing: " + path);
     o.write(reinterpret_cast<const char*>(compressed.data()), compressed.size());
+    o.flush();
+    if (!o) throw std::runtime_error("Failed while writing SPZ file: " + path);
+    o.close();
+    if (!o) throw std::runtime_error("Failed to close SPZ file: " + path);
+    output.commit("SPZ");
 }
 
 LoadedGaussians loadGaussianPly(const std::string &path, float scale, const float translation[3], bool keepCrs) {

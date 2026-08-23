@@ -61,7 +61,7 @@ class TrainingStats:
 
     @property
     def ms_per_step(self) -> float:
-        """Wall-clock time for this step in milliseconds."""
+        """CPU encoding and command-submission time; not completed GPU time."""
         ...
 
 class Dataset:

@@ -4,6 +4,10 @@
 #include <tuple>
 #include "metal_tensor.hpp"
 
+// Configure the precompiled shader library before the first Metal operation.
+// Throws when the path cannot be copied or initialization has already started.
+void msplat_set_metallib_path_checked(const char* path);
+
 // Release all cached GPU tensors (call before exit to prevent GPU memory leak)
 void cleanup_msplat_metal();
 

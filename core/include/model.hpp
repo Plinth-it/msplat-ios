@@ -8,6 +8,9 @@
 int numShBases(int degree);
 float psnr(const MTensor& rendered, const MTensor& gt);
 float l1_loss(const MTensor& rendered, const MTensor& gt);
+/// Validate checkpoint structure and tensor metadata without allocating Metal
+/// buffers or changing model state. Throws std::runtime_error when invalid.
+void validateCheckpointFile(const std::string &filename);
 
 struct Model{
   Model(const InputData &inputData, int numCameras,

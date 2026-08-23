@@ -2,10 +2,17 @@
 #include <fstream>
 #include <iostream>
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <random>
+#include <string>
+#include <vector>
 #include "model.hpp"
+#include "atomic_output.hpp"
 #include "kdtree_tensor.hpp"
 #include "msplat.hpp"
 #include "loaders.hpp"
@@ -69,6 +76,42 @@ Model::Model(const InputData &inputData, int numCameras,
       stopSplitAt(stopDensifyAt >= 0 ? stopDensifyAt : maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
       maxSteps(maxSteps), keepCrs(keepCrs) {
+
+    if (inputData.points.count <= 0)
+        throw std::invalid_argument("Dataset must contain sparse points");
+    if (numCameras <= 0)
+        throw std::invalid_argument("Dataset must contain training cameras");
+    if (numDownscales < 0 || numDownscales > 30)
+        throw std::invalid_argument("numDownscales must be in 0...30");
+    if (resolutionSchedule <= 0)
+        throw std::invalid_argument("resolutionSchedule must be greater than zero");
+    if (shDegree < 0 || shDegree > 4)
+        throw std::invalid_argument("shDegree must be in 0...4");
+    if (shDegreeInterval <= 0)
+        throw std::invalid_argument("shDegreeInterval must be greater than zero");
+    if (refineEvery <= 0)
+        throw std::invalid_argument("refineEvery must be greater than zero");
+    if (warmupLength < 0)
+        throw std::invalid_argument("warmupLength must not be negative");
+    if (resetAlphaEvery <= 0 ||
+        resetAlphaEvery > std::numeric_limits<int>::max() / refineEvery)
+        throw std::invalid_argument("resetAlphaEvery * refineEvery is invalid");
+    if (!std::isfinite(densifyGradThresh) || densifyGradThresh < 0.0f ||
+        !std::isfinite(densifySizeThresh) || densifySizeThresh < 0.0f)
+        throw std::invalid_argument("Densification thresholds must be finite and non-negative");
+    if (stopScreenSizeAt < 0 || stopDensifyAt < -1)
+        throw std::invalid_argument("Densification stop steps are invalid");
+    if (!std::isfinite(splitScreenSize) || splitScreenSize < 0.0f)
+        throw std::invalid_argument("splitScreenSize must be finite and non-negative");
+    if (maxSteps <= 0 || maxSteps > 1000000)
+        throw std::invalid_argument("iterations must be in 1...1000000");
+    if (bgColor) {
+        for (int component = 0; component < 3; ++component) {
+            if (!std::isfinite(bgColor[component]) || bgColor[component] < 0.0f ||
+                bgColor[component] > 1.0f)
+                throw std::invalid_argument("Background components must be finite and in 0...1");
+        }
+    }
 
     int64_t numPoints = inputData.points.count;
     scale = inputData.scale;
@@ -425,6 +468,8 @@ int Model::loadPly(const std::string &filename){
 static constexpr uint32_t CKPT_MAGIC = 0x4C50534D; // "MSPL"
 static constexpr uint32_t CKPT_VERSION = 1;
 
+static_assert(sizeof(float) == 4, "Checkpoint v1 requires 32-bit floats");
+
 static void writeTensor(std::ofstream &f, MTensor &t) {
     uint32_t ndim = t.ndim();
     f.write(reinterpret_cast<const char*>(&ndim), sizeof(ndim));
@@ -437,23 +482,265 @@ static void writeTensor(std::ofstream &f, MTensor &t) {
     f.write(reinterpret_cast<const char*>(t.data_ptr()), bytes);
 }
 
-static MTensor readTensor(std::ifstream &f) {
-    uint32_t ndim;
-    f.read(reinterpret_cast<char*>(&ndim), sizeof(ndim));
-    std::vector<int64_t> shape(ndim);
-    for (uint32_t i = 0; i < ndim; i++)
-        f.read(reinterpret_cast<char*>(&shape[i]), sizeof(int64_t));
-    uint64_t bytes;
-    f.read(reinterpret_cast<char*>(&bytes), sizeof(bytes));
-    MTensor t = gpu_empty(shape, DType::Float32);
-    f.read(reinterpret_cast<char*>(t.data_ptr()), bytes);
-    return t;
+namespace {
+
+[[noreturn]] void checkpointError(const std::string &message) {
+    throw std::runtime_error("Invalid msplat checkpoint: " + message);
+}
+
+uint64_t checkedMultiply(uint64_t lhs, uint64_t rhs, const std::string &field) {
+    if (lhs != 0 && rhs > std::numeric_limits<uint64_t>::max() / lhs)
+        checkpointError(field + " size overflows");
+    return lhs * rhs;
+}
+
+uint64_t tensorByteCount(const std::vector<int64_t> &shape,
+                         const std::string &name) {
+    uint64_t elements = 1;
+    for (int64_t dimension : shape) {
+        if (dimension < 0)
+            checkpointError(name + " has a negative dimension");
+        elements = checkedMultiply(elements, static_cast<uint64_t>(dimension), name);
+    }
+    return checkedMultiply(elements, sizeof(float), name);
+}
+
+class CheckpointReader {
+public:
+    explicit CheckpointReader(const std::string &filename)
+        : stream(filename, std::ios::binary | std::ios::ate) {
+        if (!stream.is_open())
+            throw std::runtime_error("Cannot open checkpoint file: " + filename);
+
+        const std::streampos end = stream.tellg();
+        if (end == std::streampos(-1))
+            throw std::runtime_error("Cannot determine checkpoint file size: " + filename);
+        const std::streamoff endOffset = static_cast<std::streamoff>(end);
+        if (endOffset < 0)
+            throw std::runtime_error("Invalid checkpoint file size: " + filename);
+
+        totalBytes = static_cast<uint64_t>(endOffset);
+        stream.seekg(0, std::ios::beg);
+        if (!stream)
+            throw std::runtime_error("Cannot seek checkpoint file: " + filename);
+    }
+
+    template <typename T>
+    T scalar(const std::string &field) {
+        T value{};
+        bytes(&value, sizeof(value), field);
+        return value;
+    }
+
+    void bytes(void *destination, uint64_t byteCount, const std::string &field) {
+        requireAvailable(byteCount, field);
+        readInto(destination, byteCount, field);
+        cursor += byteCount;
+    }
+
+    void skip(uint64_t byteCount, const std::string &field) {
+        requireAvailable(byteCount, field);
+        if (byteCount > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max()))
+            checkpointError(field + " is too large to seek");
+        stream.seekg(static_cast<std::streamoff>(byteCount), std::ios::cur);
+        if (!stream)
+            checkpointError("could not seek past " + field);
+        cursor += byteCount;
+    }
+
+    void readAt(uint64_t offset, void *destination, uint64_t byteCount,
+                const std::string &field) {
+        if (offset > totalBytes || byteCount > totalBytes - offset)
+            checkpointError(field + " extends past the end of the file");
+        if (offset > static_cast<uint64_t>(std::numeric_limits<std::streamoff>::max()))
+            checkpointError(field + " offset is too large to seek");
+
+        stream.clear();
+        stream.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!stream)
+            checkpointError("could not seek to " + field);
+        readInto(destination, byteCount, field);
+    }
+
+    uint64_t offset() const { return cursor; }
+
+    void requireFullyConsumed() const {
+        if (cursor != totalBytes)
+            checkpointError("unexpected trailing data");
+    }
+
+private:
+    void requireAvailable(uint64_t byteCount, const std::string &field) const {
+        if (cursor > totalBytes || byteCount > totalBytes - cursor)
+            checkpointError("truncated while reading " + field);
+    }
+
+    void readInto(void *destination, uint64_t byteCount, const std::string &field) {
+        auto *output = static_cast<char*>(destination);
+        uint64_t remaining = byteCount;
+        constexpr uint64_t maxChunk = 1ULL << 30;
+        while (remaining > 0) {
+            const uint64_t chunk = std::min(remaining, maxChunk);
+            stream.read(output, static_cast<std::streamsize>(chunk));
+            if (stream.gcount() != static_cast<std::streamsize>(chunk))
+                checkpointError("truncated while reading " + field);
+            output += static_cast<size_t>(chunk);
+            remaining -= chunk;
+        }
+    }
+
+    std::ifstream stream;
+    uint64_t totalBytes = 0;
+    uint64_t cursor = 0;
+};
+
+struct CheckpointTensorRecord {
+    std::vector<int64_t> shape;
+    uint64_t dataOffset = 0;
+    uint64_t byteCount = 0;
+};
+
+CheckpointTensorRecord readTensorRecord(CheckpointReader &reader,
+                                        const std::vector<int64_t> &expectedShape,
+                                        const std::string &name) {
+    const uint32_t ndim = reader.scalar<uint32_t>(name + ".ndim");
+    if (ndim != expectedShape.size())
+        checkpointError(name + " has the wrong rank");
+
+    for (uint32_t i = 0; i < ndim; ++i) {
+        const int64_t dimension = reader.scalar<int64_t>(name + ".shape");
+        if (dimension != expectedShape[i])
+            checkpointError(name + " has an incompatible shape");
+    }
+
+    // Checkpoint v1 stores Float32 tensors without a separate dtype tag. An
+    // exact shape-derived byte count is therefore also its dtype validation.
+    const uint64_t expectedBytes = tensorByteCount(expectedShape, name);
+    const uint64_t declaredBytes = reader.scalar<uint64_t>(name + ".bytes");
+    if (declaredBytes != expectedBytes)
+        checkpointError(name + " byte count does not match its Float32 shape");
+
+    CheckpointTensorRecord record;
+    record.shape = expectedShape;
+    record.dataOffset = reader.offset();
+    record.byteCount = declaredBytes;
+    reader.skip(declaredBytes, name + ".data");
+    return record;
+}
+
+struct ParsedCheckpoint {
+    uint32_t step = 0;
+    uint32_t numPoints = 0;
+    uint32_t shDegree = 0;
+    uint32_t adamSteps = 0;
+    std::array<float, Model::N_ADAM_GROUPS> adamLearningRates{};
+    float meansLearningRateInitial = 0.0f;
+    float meansLearningRateFinal = 0.0f;
+    std::array<CheckpointTensorRecord, Model::N_ADAM_GROUPS> parameters;
+    std::array<CheckpointTensorRecord, Model::N_ADAM_GROUPS> adamExpAvg;
+    std::array<CheckpointTensorRecord, Model::N_ADAM_GROUPS> adamExpAvgSq;
+};
+
+ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
+    const uint32_t magic = reader.scalar<uint32_t>("magic");
+    const uint32_t version = reader.scalar<uint32_t>("version");
+    if (magic != CKPT_MAGIC)
+        throw std::runtime_error("Not a valid msplat checkpoint file");
+    if (version != CKPT_VERSION)
+        throw std::runtime_error("Unsupported checkpoint version: " +
+                                 std::to_string(version));
+
+    ParsedCheckpoint checkpoint;
+    checkpoint.step = reader.scalar<uint32_t>("step");
+    checkpoint.numPoints = reader.scalar<uint32_t>("num_points");
+    checkpoint.shDegree = reader.scalar<uint32_t>("sh_degree");
+    checkpoint.adamSteps = reader.scalar<uint32_t>("adam_steps");
+
+    if (checkpoint.step >= static_cast<uint32_t>(std::numeric_limits<int>::max()))
+        checkpointError("step exceeds the supported range");
+    if (checkpoint.numPoints == 0 ||
+        checkpoint.numPoints > static_cast<uint32_t>(std::numeric_limits<int>::max()))
+        checkpointError("Gaussian count is outside the supported range");
+    if (checkpoint.shDegree > 4)
+        checkpointError("SH degree is outside the supported range");
+    if (checkpoint.adamSteps >= static_cast<uint32_t>(std::numeric_limits<int>::max()))
+        checkpointError("Adam step count exceeds the supported range");
+
+    reader.bytes(checkpoint.adamLearningRates.data(),
+                 sizeof(checkpoint.adamLearningRates), "Adam learning rates");
+    checkpoint.meansLearningRateInitial = reader.scalar<float>("initial means learning rate");
+    checkpoint.meansLearningRateFinal = reader.scalar<float>("final means learning rate");
+
+    for (float rate : checkpoint.adamLearningRates) {
+        if (!std::isfinite(rate) || rate < 0.0f)
+            checkpointError("Adam learning rates must be finite and non-negative");
+    }
+    if (!std::isfinite(checkpoint.meansLearningRateInitial) ||
+        checkpoint.meansLearningRateInitial <= 0.0f ||
+        !std::isfinite(checkpoint.meansLearningRateFinal) ||
+        checkpoint.meansLearningRateFinal <= 0.0f)
+        checkpointError("means learning rates must be finite and positive");
+
+    const int64_t n = static_cast<int64_t>(checkpoint.numPoints);
+    const int64_t restBases = numShBases(static_cast<int>(checkpoint.shDegree)) - 1;
+    const std::array<std::vector<int64_t>, Model::N_ADAM_GROUPS> expectedShapes = {{
+        {n, 3},
+        {n, 3},
+        {n, 4},
+        {n, 3},
+        {n, restBases, 3},
+        {n, 1},
+    }};
+    static constexpr const char *parameterNames[Model::N_ADAM_GROUPS] = {
+        "means", "scales", "quats", "features_dc", "features_rest", "opacities"
+    };
+
+    for (int group = 0; group < Model::N_ADAM_GROUPS; ++group)
+        checkpoint.parameters[group] = readTensorRecord(
+            reader, expectedShapes[group], parameterNames[group]);
+    for (int group = 0; group < Model::N_ADAM_GROUPS; ++group)
+        checkpoint.adamExpAvg[group] = readTensorRecord(
+            reader, expectedShapes[group],
+            std::string("adam_exp_avg.") + parameterNames[group]);
+    for (int group = 0; group < Model::N_ADAM_GROUPS; ++group)
+        checkpoint.adamExpAvgSq[group] = readTensorRecord(
+            reader, expectedShapes[group],
+            std::string("adam_exp_avg_sq.") + parameterNames[group]);
+
+    reader.requireFullyConsumed();
+    return checkpoint;
+}
+
+MTensor loadCheckpointBuffer(CheckpointReader &reader,
+                             const CheckpointTensorRecord &record,
+                             int capacity,
+                             const std::string &name) {
+    std::vector<int64_t> allocationShape = record.shape;
+    allocationShape[0] = capacity;
+    const uint64_t allocationBytes = tensorByteCount(allocationShape, name + " allocation");
+    if (record.byteCount > allocationBytes)
+        checkpointError(name + " payload exceeds its destination allocation");
+    if (allocationBytes > std::numeric_limits<size_t>::max())
+        checkpointError(name + " allocation exceeds the platform size limit");
+
+    MTensor buffer = gpu_zeros(allocationShape, DType::Float32);
+    if (record.byteCount > 0)
+        reader.readAt(record.dataOffset, buffer.data_ptr(), record.byteCount, name + ".data");
+    return buffer;
+}
+
+} // namespace
+
+void validateCheckpointFile(const std::string &filename) {
+    CheckpointReader reader(filename);
+    (void)parseCheckpointMetadata(reader);
 }
 
 void Model::saveCheckpoint(const std::string &filename, int step) {
     msplat_gpu_sync();
 
-    std::ofstream f(filename, std::ios::binary);
+    msplat::detail::AtomicOutputFile output(filename);
+    std::ofstream f(output.temporary(), std::ios::binary | std::ios::trunc);
     if (!f.is_open()) throw std::runtime_error("Cannot open checkpoint file for writing: " + filename);
 
     // Header
@@ -484,103 +771,146 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
     for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg[g]);
     for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg_sq[g]);
 
+    f.flush();
+    if (!f) throw std::runtime_error("Failed while writing checkpoint file: " + filename);
     f.close();
+    if (!f) throw std::runtime_error("Failed to close checkpoint file: " + filename);
+
+    output.commit("checkpoint");
+
+    std::error_code sizeError;
+    const uintmax_t checkpointBytes = fs::file_size(filename, sizeError);
     std::cout << "Checkpoint saved: " << filename << " (step " << step
-              << ", " << num_active << " gaussians, "
-              << fs::file_size(filename) / (1024*1024) << " MB)" << std::endl;
+              << ", " << num_active << " gaussians";
+    if (!sizeError) std::cout << ", " << checkpointBytes / (1024*1024) << " MB";
+    std::cout << ")" << std::endl;
 }
 
 int Model::loadCheckpoint(const std::string &filename) {
-    std::ifstream f(filename, std::ios::binary);
-    if (!f.is_open()) throw std::runtime_error("Cannot open checkpoint file: " + filename);
+    CheckpointReader reader(filename);
+    const ParsedCheckpoint checkpoint = parseCheckpointMetadata(reader);
+    const int activeCount = static_cast<int>(checkpoint.numPoints);
+    const int capacity = capacityWithSlack(activeCount);
+    if (capacity < activeCount)
+        checkpointError("Gaussian capacity calculation overflowed");
 
-    // Header
-    uint32_t magic, version;
-    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    f.read(reinterpret_cast<char*>(&version), sizeof(version));
-    if (magic != CKPT_MAGIC) throw std::runtime_error("Not a valid msplat checkpoint file");
-    if (version != CKPT_VERSION) throw std::runtime_error("Unsupported checkpoint version: " + std::to_string(version));
-
-    // Scalar state
-    uint32_t step, numPts, shDeg, adamSteps;
-    f.read(reinterpret_cast<char*>(&step), sizeof(step));
-    f.read(reinterpret_cast<char*>(&numPts), sizeof(numPts));
-    f.read(reinterpret_cast<char*>(&shDeg), sizeof(shDeg));
-    f.read(reinterpret_cast<char*>(&adamSteps), sizeof(adamSteps));
-
-    f.read(reinterpret_cast<char*>(adam_lr), sizeof(adam_lr));
-    f.read(reinterpret_cast<char*>(&means_lr_init), sizeof(means_lr_init));
-    f.read(reinterpret_cast<char*>(&means_lr_final), sizeof(means_lr_final));
-    adam_step_count = (int)adamSteps;
-
-    // Gaussian parameters — read into fresh tensors
-    means = readTensor(f);
-    scales = readTensor(f);
-    quats = readTensor(f);
-    featuresDc = readTensor(f);
-    featuresRest = readTensor(f);
-    opacities = readTensor(f);
-
-    // Optimizer state
-    for (int g = 0; g < N_ADAM_GROUPS; g++) adam_exp_avg[g] = readTensor(f);
-    for (int g = 0; g < N_ADAM_GROUPS; g++) adam_exp_avg_sq[g] = readTensor(f);
-
-    f.close();
-
-    // Rebuild backing buffers with loaded data (don't call setupOptimizers —
-    // it would zero the optimizer state we just loaded)
-    num_active = (int)numPts;
-    buf_capacity = capacityWithSlack(num_active);
-
-    // Copy gaussian params into oversized backing buffers
-    auto allocBuf = [&](MTensor &buf, const MTensor &param) {
-        auto shape = param.shape();
-        shape[0] = buf_capacity;
-        buf = gpu_zeros(shape, DType::Float32);
-        memcpy(buf.data_ptr(), param.data_ptr(), param.nbytes());
+    static constexpr const char *parameterNames[N_ADAM_GROUPS] = {
+        "means", "scales", "quats", "features_dc", "features_rest", "opacities"
     };
-    allocBuf(means_buf, means);
-    allocBuf(scales_buf, scales);
-    allocBuf(quats_buf, quats);
-    allocBuf(featuresDc_buf, featuresDc);
-    allocBuf(featuresRest_buf, featuresRest);
-    allocBuf(opacities_buf, opacities);
 
-    // Copy optimizer state into oversized backing buffers
-    for (int g = 0; g < N_ADAM_GROUPS; g++) {
-        auto shape = adam_exp_avg[g].shape();
-        shape[0] = buf_capacity;
-        MTensor avg_buf = gpu_zeros(shape, DType::Float32);
-        MTensor sq_buf = gpu_zeros(shape, DType::Float32);
-        memcpy(avg_buf.data_ptr(), adam_exp_avg[g].data_ptr(), adam_exp_avg[g].nbytes());
-        memcpy(sq_buf.data_ptr(), adam_exp_avg_sq[g].data_ptr(), adam_exp_avg_sq[g].nbytes());
-        adam_exp_avg_buf[g] = avg_buf;
-        adam_exp_avg_sq_buf[g] = sq_buf;
+    // Load everything into independent buffers before changing the live model.
+    // A malformed/truncated file or an allocation failure therefore leaves the
+    // existing parameters and optimizer state intact.
+    std::array<MTensor, N_ADAM_GROUPS> newParameterBuffers;
+    std::array<MTensor, N_ADAM_GROUPS> newAdamExpAvgBuffers;
+    std::array<MTensor, N_ADAM_GROUPS> newAdamExpAvgSqBuffers;
+    for (int group = 0; group < N_ADAM_GROUPS; ++group) {
+        newParameterBuffers[group] = loadCheckpointBuffer(
+            reader, checkpoint.parameters[group], capacity, parameterNames[group]);
+        newAdamExpAvgBuffers[group] = loadCheckpointBuffer(
+            reader, checkpoint.adamExpAvg[group], capacity,
+            std::string("adam_exp_avg.") + parameterNames[group]);
+        newAdamExpAvgSqBuffers[group] = loadCheckpointBuffer(
+            reader, checkpoint.adamExpAvgSq[group], capacity,
+            std::string("adam_exp_avg_sq.") + parameterNames[group]);
     }
 
-    // Allocate densification scratch buffers
-    densify_split_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_split_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_dup_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_keep_flag = gpu_zeros({buf_capacity}, DType::Int32);
-    densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    int max_blocks = (buf_capacity + 1023) / 1024;
-    densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
-    int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
-    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
-    densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
+    MTensor newDensifySplitFlag = gpu_zeros({capacity}, DType::Int32);
+    MTensor newDensifyDupFlag = gpu_zeros({capacity}, DType::Int32);
+    MTensor newDensifySplitPrefix = gpu_zeros({capacity}, DType::Int32);
+    MTensor newDensifyDupPrefix = gpu_zeros({capacity}, DType::Int32);
+    MTensor newDensifyKeepFlag = gpu_zeros({capacity}, DType::Int32);
+    MTensor newDensifyKeepPrefix = gpu_zeros({capacity}, DType::Int32);
 
-    refreshViews();
+    const int64_t maxBlocks = (static_cast<int64_t>(capacity) + 1023) / 1024;
+    MTensor newDensifyBlockTotals = gpu_zeros({maxBlocks}, DType::Int32);
 
-    std::cout << "Checkpoint loaded: " << filename << " (step " << step
+    const auto &featuresRestShape = checkpoint.parameters[4].shape;
+    const uint64_t featuresRestStride = checkedMultiply(
+        static_cast<uint64_t>(featuresRestShape[1]),
+        static_cast<uint64_t>(featuresRestShape[2]),
+        "features_rest stride");
+    const uint64_t compactElements = checkedMultiply(
+        static_cast<uint64_t>(capacity), featuresRestStride,
+        "densification compact scratch");
+    if (compactElements > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        checkpointError("densification compact scratch exceeds the supported range");
+    MTensor newDensifyCompactScratch = gpu_zeros(
+        {static_cast<int64_t>(compactElements)}, DType::Float32);
+    MTensor newDensifyRandomSamples = gpu_zeros({capacity, 3}, DType::Float32);
+
+    // Constructing views copies shape metadata and can allocate. Do that before
+    // the no-throw state swap as part of the transactional preparation.
+    std::array<MTensor, N_ADAM_GROUPS> newParameterViews;
+    std::array<MTensor, N_ADAM_GROUPS> newAdamExpAvgViews;
+    std::array<MTensor, N_ADAM_GROUPS> newAdamExpAvgSqViews;
+    for (int group = 0; group < N_ADAM_GROUPS; ++group) {
+        newParameterViews[group] = newParameterBuffers[group].view(activeCount);
+        newAdamExpAvgViews[group] = newAdamExpAvgBuffers[group].view(activeCount);
+        newAdamExpAvgSqViews[group] = newAdamExpAvgSqBuffers[group].view(activeCount);
+    }
+
+    // Do not release buffers that might still be referenced by an outstanding
+    // command buffer. Validation and all new allocations remain non-mutating.
+    msplat_gpu_sync();
+    releaseOptimizers();
+
+    MTensor *parameterBufferDestinations[N_ADAM_GROUPS] = {
+        &means_buf, &scales_buf, &quats_buf,
+        &featuresDc_buf, &featuresRest_buf, &opacities_buf
+    };
+    MTensor *parameterViewDestinations[N_ADAM_GROUPS] = {
+        &means, &scales, &quats, &featuresDc, &featuresRest, &opacities
+    };
+    for (int group = 0; group < N_ADAM_GROUPS; ++group) {
+        *parameterBufferDestinations[group] = std::move(newParameterBuffers[group]);
+        *parameterViewDestinations[group] = std::move(newParameterViews[group]);
+        adam_exp_avg_buf[group] = std::move(newAdamExpAvgBuffers[group]);
+        adam_exp_avg[group] = std::move(newAdamExpAvgViews[group]);
+        adam_exp_avg_sq_buf[group] = std::move(newAdamExpAvgSqBuffers[group]);
+        adam_exp_avg_sq[group] = std::move(newAdamExpAvgSqViews[group]);
+    }
+
+    densify_split_flag = std::move(newDensifySplitFlag);
+    densify_dup_flag = std::move(newDensifyDupFlag);
+    densify_split_prefix = std::move(newDensifySplitPrefix);
+    densify_dup_prefix = std::move(newDensifyDupPrefix);
+    densify_keep_flag = std::move(newDensifyKeepFlag);
+    densify_keep_prefix = std::move(newDensifyKeepPrefix);
+    densify_block_totals = std::move(newDensifyBlockTotals);
+    densify_compact_scratch = std::move(newDensifyCompactScratch);
+    densify_random_samples = std::move(newDensifyRandomSamples);
+
+    num_active = activeCount;
+    buf_capacity = capacity;
+    shDegree = static_cast<int>(checkpoint.shDegree);
+    adam_step_count = static_cast<int>(checkpoint.adamSteps);
+    std::copy(checkpoint.adamLearningRates.begin(),
+              checkpoint.adamLearningRates.end(), adam_lr);
+    means_lr_init = checkpoint.meansLearningRateInitial;
+    means_lr_final = checkpoint.meansLearningRateFinal;
+
+    // These are derived from the previous population or image and must be
+    // rebuilt on the next training iteration.
+    radii.reset();
+    xysGradNorm.reset();
+    visCounts.reset();
+    max2DSize.reset();
+    lastHeight = 0;
+    lastWidth = 0;
+
+    std::cout << "Checkpoint loaded: " << filename << " (step " << checkpoint.step
               << ", " << num_active << " gaussians)" << std::endl;
 
-    return (int)step;
+    return static_cast<int>(checkpoint.step);
 }
 
 Model::CamSetup Model::prepareCam(Camera& cam, int step) {
-    const float sf = getDownscaleFactor(step);
+    const int downscale = getDownscaleFactor(step);
+    if (cam.width < downscale || cam.height < downscale)
+        throw std::invalid_argument(
+            "Training downscale produces a zero-sized image; reduce numDownscales");
+    const float sf = static_cast<float>(downscale);
     CamSetup s;
     s.fx = cam.fx / sf; s.fy = cam.fy / sf;
     s.cx = cam.cx / sf; s.cy = cam.cy / sf;
@@ -647,6 +977,8 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         memcpy(window2d.data_ptr(), w.data(), w.size() * sizeof(float));
     }
 
+    if (adam_step_count == std::numeric_limits<int>::max())
+        throw std::overflow_error("Adam step count cannot be incremented further");
     adam_step_count++;
     float bc1 = 1.0f - std::pow(adam_beta1, adam_step_count);
     float bc2 = 1.0f - std::pow(adam_beta2, adam_step_count);

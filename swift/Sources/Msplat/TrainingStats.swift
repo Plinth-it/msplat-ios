@@ -4,12 +4,16 @@ import MsplatCore
 public struct TrainingStats: Sendable {
     public let iteration: Int
     public let splatCount: Int
-    public let msPerStep: Float
+    /// CPU encoding and command-submission time. This is not completed GPU time.
+    public let cpuSubmitMs: Float
+
+    @available(*, deprecated, renamed: "cpuSubmitMs", message: "This value measures CPU submission, not completed GPU step time.")
+    public var msPerStep: Float { cpuSubmitMs }
 
     init(from c: MsplatStats) {
         self.iteration = Int(c.iteration)
         self.splatCount = Int(c.splatCount)
-        self.msPerStep = c.msPerStep
+        self.cpuSubmitMs = c.msPerStep
     }
 }
 

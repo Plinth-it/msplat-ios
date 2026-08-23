@@ -7,12 +7,18 @@
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
 #import <chrono>
+#import <atomic>
+#import <condition_variable>
 #import <cstdlib>
 #import <dlfcn.h>
 #import <unordered_map>
 #import <functional>
 #import <array>
+#import <memory>
 #import <mutex>
+#import <new>
+#import <stdexcept>
+#import <string>
 #import <mach/mach_time.h>
 
 // GPU profiling infrastructure.
@@ -39,46 +45,202 @@ static std::mutex g_stage_timing_mutex;
 static std::vector<double> g_stage_times[N_TRAIN_STAGES];
 static int g_stage_report_count = 0;
 
+// The command buffer and transient tensor cache are process-global. Serialize
+// every operation that touches either so cleanup, rendering, and training cannot
+// mutate their shared lifecycle concurrently.
+static std::mutex g_engine_mutex;
+
+struct ScopedObjCRelease {
+    id object = nil;
+
+    ~ScopedObjCRelease() {
+        [object release];
+    }
+};
+
+struct CommandCompletionState {
+    void beginSubmission() {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++pendingSubmissions;
+    }
+
+    void cancelSubmission() noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (pendingSubmissions > 0) --pendingSubmissions;
+            completed.notify_all();
+        } catch (...) {
+            // Mutex failures indicate process-level corruption; there is no
+            // useful recovery work a Metal completion callback can perform.
+        }
+    }
+
+    void finishSubmission(id<MTLCommandBuffer> commandBuffer) noexcept {
+        char failure[1024] = {};
+        const MTLCommandBufferStatus status = commandBuffer.status;
+        if (status != MTLCommandBufferStatusCompleted) {
+            NSError* error = commandBuffer.error;
+            const char* description = error.localizedDescription.UTF8String;
+            if (description) {
+                snprintf(failure, sizeof(failure),
+                         "msplat: Metal command buffer did not complete: %s",
+                         description);
+            } else {
+                snprintf(failure, sizeof(failure),
+                         "msplat: Metal command buffer did not complete (status %ld)",
+                         static_cast<long>(status));
+            }
+        }
+
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (failure[0] && firstFailure[0] == '\0')
+                snprintf(firstFailure, sizeof(firstFailure), "%s", failure);
+            if (pendingSubmissions > 0) --pendingSubmissions;
+            completed.notify_all();
+        } catch (...) {
+            // Do not let a C++ exception escape a Metal completion handler.
+        }
+    }
+
+    void waitAndConsumeFailure(char* destination, size_t capacity) {
+        std::unique_lock<std::mutex> lock(mutex);
+        completed.wait(lock, [&] { return pendingSubmissions == 0; });
+        if (destination[0] == '\0' && firstFailure[0] != '\0')
+            snprintf(destination, capacity, "%s", firstFailure);
+        firstFailure[0] = '\0';
+    }
+
+private:
+    std::mutex mutex;
+    std::condition_variable completed;
+    size_t pendingSubmissions = 0;
+    char firstFailure[1024] = {};
+};
+
 struct MetalContext {
-    id<MTLDevice>       device;
-    id<MTLCommandQueue> queue;
-    dispatch_queue_t d_queue;
+    id<MTLDevice>       device = nil;
+    id<MTLCommandQueue> queue = nil;
+    dispatch_queue_t d_queue = nullptr;
 
     // Command buffer lifecycle using MPSCommandBuffer for commitAndContinue support.
     MPSCommandBuffer* _currentCB = nil;
+    // Completion handlers accumulate the first error from every root submitted
+    // through commitAndContinue without retaining thousands of completed
+    // command buffers during long training runs.
+    std::shared_ptr<CommandCompletionState> commandCompletionState =
+        std::make_shared<CommandCompletionState>();
 
     id<MTLCommandBuffer> getCommandBuffer() {
         if (!_currentCB) {
             _currentCB = [MPSCommandBuffer commandBufferFromCommandQueue:queue];
+            if (!_currentCB) {
+                throw std::runtime_error("msplat: failed to create a Metal command buffer");
+            }
             [_currentCB retain];
         }
         return _currentCB;
     }
     void commitCB() {
         if (_currentCB) {
-            if (g_gpu_timing_enabled) {
-                [_currentCB addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+            id<MTLCommandBuffer> submitted = _currentCB.rootCommandBuffer;
+            if (!submitted) {
+                throw std::runtime_error(
+                    "msplat: MPS command buffer has no root command buffer");
+            }
+            auto completionState = commandCompletionState;
+            const bool collectTiming = g_gpu_timing_enabled;
+            completionState->beginSubmission();
+            @try {
+                [submitted addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                    completionState->finishSubmission(cb);
+                    if (!collectTiming) return;
                     double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
                     if (gpu_ms > 0) {
                         std::lock_guard<std::mutex> lock(g_gpu_timing_mutex);
                         g_gpu_times_ms.push_back(gpu_ms);
                     }
                 }];
+                [_currentCB commitAndContinue];
+            } @catch (NSException *exception) {
+                const char* reason = exception.reason.UTF8String;
+                std::string message = "msplat: Metal commitAndContinue failed";
+                if (reason) message += std::string(": ") + reason;
+                completionState->cancelSubmission();
+                throw std::runtime_error(message);
             }
-            [_currentCB commitAndContinue];
         }
     }
-    void syncCB() {
+    void discardCB() noexcept {
         if (_currentCB) {
-            [_currentCB commit];
-            [_currentCB waitUntilCompleted];
             [_currentCB release];
             _currentCB = nil;
         }
     }
+    void syncCB() {
+        char failure[1024] = {};
+        MPSCommandBuffer* commandBuffer = _currentCB;
+        id<MTLCommandBuffer> finalCommandBuffer = nil;
+        bool finalWasCommitted = false;
+        if (commandBuffer) {
+            finalCommandBuffer = commandBuffer.rootCommandBuffer;
+            if (!finalCommandBuffer) {
+                throw std::runtime_error(
+                    "msplat: MPS command buffer has no root command buffer");
+            }
+            [finalCommandBuffer retain];
+            _currentCB = nil;
+
+            @try {
+                [commandBuffer commit];
+                finalWasCommitted = true;
+            } @catch (NSException *exception) {
+                const char* reason = exception.reason.UTF8String;
+                snprintf(failure, sizeof(failure),
+                         "msplat: Metal command buffer commit failed%s%s",
+                         reason ? ": " : "", reason ? reason : "");
+            }
+        }
+
+        auto waitAndRecordFailure = [&](id<MTLCommandBuffer> submitted) {
+            [submitted waitUntilCompleted];
+            const MTLCommandBufferStatus status = submitted.status;
+            if (status != MTLCommandBufferStatusCompleted && failure[0] == '\0') {
+                NSError* error = submitted.error;
+                const char* description = error.localizedDescription.UTF8String;
+                if (description) {
+                    snprintf(failure, sizeof(failure),
+                             "msplat: Metal command buffer did not complete: %s",
+                             description);
+                } else {
+                    snprintf(failure, sizeof(failure),
+                             "msplat: Metal command buffer did not complete (status %ld)",
+                             static_cast<long>(status));
+                }
+            }
+            [submitted release];
+        };
+
+        if (finalCommandBuffer) {
+            if (finalWasCommitted)
+                waitAndRecordFailure(finalCommandBuffer);
+            else
+                [finalCommandBuffer release];
+        }
+        if (commandBuffer)
+            [commandBuffer release];
+
+        // The final command buffer is ordered after all roots previously
+        // submitted on this queue. Wait for their completion handlers too so
+        // errors from any earlier step are deterministically visible here.
+        commandCompletionState->waitAndConsumeFailure(failure, sizeof(failure));
+
+        if (failure[0])
+            throw std::runtime_error(failure);
+    }
 
     // Per-stage GPU timestamp profiling (Metal counter sample buffer)
-    id<MTLCounterSampleBuffer> counterSampleBuffer;
+    id<MTLCounterSampleBuffer> counterSampleBuffer = nil;
     bool counterSamplingAvailable = false;
     double ticksToMs = 0.0;  // conversion factor from GPU ticks to milliseconds
 
@@ -106,6 +268,7 @@ struct MetalContext {
         }
 
         MTLCounterSampleBufferDescriptor *desc = [MTLCounterSampleBufferDescriptor new];
+        ScopedObjCRelease descOwner{desc};
         desc.counterSet = timestampSet;
         desc.sampleCount = sampleCount;
         desc.storageMode = MTLStorageModeShared;
@@ -130,63 +293,175 @@ struct MetalContext {
     }
 
     // Forward pipeline kernels
-    id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso;
-    id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso;
+    id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso = nil;
+    id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso = nil;
     // Tile-local sorting
-    id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso;
-    id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso;
+    id<MTLComputePipelineState> scatter_to_prealloc_bins_kernel_cpso = nil;
+    id<MTLComputePipelineState> bitonic_sort_per_tile_kernel_cpso = nil;
     // Prefix sum
-    id<MTLComputePipelineState> prefix_sum_kernel_cpso;
-    id<MTLComputePipelineState> block_reduce_kernel_cpso;
-    id<MTLComputePipelineState> block_scan_propagate_kernel_cpso;
+    id<MTLComputePipelineState> prefix_sum_kernel_cpso = nil;
+    id<MTLComputePipelineState> block_reduce_kernel_cpso = nil;
+    id<MTLComputePipelineState> block_scan_propagate_kernel_cpso = nil;
     // Depth-chunked rasterization
-    id<MTLComputePipelineState> rasterize_forward_chunked_kernel_cpso;
-    id<MTLComputePipelineState> rasterize_forward_merge_kernel_cpso;
-    id<MTLComputePipelineState> compute_chunk_prefix_suffix_kernel_cpso;
-    id<MTLComputePipelineState> rasterize_backward_chunked_kernel_cpso;
-    id<MTLComputePipelineState> rasterize_backward_kernel_cpso;
+    id<MTLComputePipelineState> rasterize_forward_chunked_kernel_cpso = nil;
+    id<MTLComputePipelineState> rasterize_forward_merge_kernel_cpso = nil;
+    id<MTLComputePipelineState> compute_chunk_prefix_suffix_kernel_cpso = nil;
+    id<MTLComputePipelineState> rasterize_backward_chunked_kernel_cpso = nil;
+    id<MTLComputePipelineState> rasterize_backward_kernel_cpso = nil;
     // Separable SSIM loss kernels
-    id<MTLComputePipelineState> ssim_h_fwd_kernel_cpso;
-    id<MTLComputePipelineState> ssim_v_fwd_kernel_cpso;
-    id<MTLComputePipelineState> ssim_fused_v_fwd_h_bwd_kernel_cpso;
-    id<MTLComputePipelineState> ssim_v_bwd_kernel_cpso;
+    id<MTLComputePipelineState> ssim_h_fwd_kernel_cpso = nil;
+    id<MTLComputePipelineState> ssim_v_fwd_kernel_cpso = nil;
+    id<MTLComputePipelineState> ssim_fused_v_fwd_h_bwd_kernel_cpso = nil;
+    id<MTLComputePipelineState> ssim_v_bwd_kernel_cpso = nil;
     // Backward pipeline kernels
-    id<MTLComputePipelineState> project_and_sh_backward_kernel_cpso;
-    id<MTLComputePipelineState> fused_adam_kernel_cpso;
-    id<MTLComputePipelineState> accumulate_grad_stats_kernel_cpso;
+    id<MTLComputePipelineState> project_and_sh_backward_kernel_cpso = nil;
+    id<MTLComputePipelineState> fused_adam_kernel_cpso = nil;
+    id<MTLComputePipelineState> accumulate_grad_stats_kernel_cpso = nil;
     // GPU densification kernels
-    id<MTLComputePipelineState> densify_classify_kernel_cpso;
-    id<MTLComputePipelineState> densify_append_split_kernel_cpso;
-    id<MTLComputePipelineState> densify_append_dup_kernel_cpso;
-    id<MTLComputePipelineState> densify_cull_classify_kernel_cpso;
-    id<MTLComputePipelineState> compact_scatter_kernel_cpso;
-    id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
+    id<MTLComputePipelineState> densify_classify_kernel_cpso = nil;
+    id<MTLComputePipelineState> densify_append_split_kernel_cpso = nil;
+    id<MTLComputePipelineState> densify_append_dup_kernel_cpso = nil;
+    id<MTLComputePipelineState> densify_cull_classify_kernel_cpso = nil;
+    id<MTLComputePipelineState> compact_scatter_kernel_cpso = nil;
+    id<MTLComputePipelineState> compact_copy_back_kernel_cpso = nil;
+
+    ~MetalContext() noexcept {
+        try {
+            syncCB();
+        } catch (const std::exception& error) {
+            fprintf(stderr, "msplat: Metal teardown sync failed: %s\n", error.what());
+        }
+
+        id resources[] = {
+            counterSampleBuffer,
+            project_and_sh_forward_kernel_cpso,
+            nd_rasterize_forward_kernel_cpso,
+            scatter_to_prealloc_bins_kernel_cpso,
+            bitonic_sort_per_tile_kernel_cpso,
+            prefix_sum_kernel_cpso,
+            block_reduce_kernel_cpso,
+            block_scan_propagate_kernel_cpso,
+            rasterize_forward_chunked_kernel_cpso,
+            rasterize_forward_merge_kernel_cpso,
+            compute_chunk_prefix_suffix_kernel_cpso,
+            rasterize_backward_chunked_kernel_cpso,
+            rasterize_backward_kernel_cpso,
+            ssim_h_fwd_kernel_cpso,
+            ssim_v_fwd_kernel_cpso,
+            ssim_fused_v_fwd_h_bwd_kernel_cpso,
+            ssim_v_bwd_kernel_cpso,
+            project_and_sh_backward_kernel_cpso,
+            fused_adam_kernel_cpso,
+            accumulate_grad_stats_kernel_cpso,
+            densify_classify_kernel_cpso,
+            densify_append_split_kernel_cpso,
+            densify_append_dup_kernel_cpso,
+            densify_cull_classify_kernel_cpso,
+            compact_scatter_kernel_cpso,
+            compact_copy_back_kernel_cpso,
+        };
+        for (id resource : resources) {
+            [resource release];
+        }
+
+        if (d_queue) dispatch_release(d_queue);
+        [queue release];
+        [device release];
+    }
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
 static char* g_metallib_path = NULL;
+static std::mutex g_context_config_mutex;
+static bool g_context_config_frozen = false;
+static std::atomic<MetalContext*> g_context_instance{nullptr};
+
+struct ContextConfigurationSnapshot {
+    bool hasExplicitMetallibPath = false;
+    std::string metallibPath;
+    bool succeeded = false;
+
+    ContextConfigurationSnapshot() {
+        std::lock_guard<std::mutex> lock(g_context_config_mutex);
+        if (g_metallib_path) {
+            metallibPath = g_metallib_path;
+            hasExplicitMetallibPath = true;
+        }
+        g_context_config_frozen = true;
+    }
+
+    ContextConfigurationSnapshot(const ContextConfigurationSnapshot&) = delete;
+    ContextConfigurationSnapshot& operator=(const ContextConfigurationSnapshot&) = delete;
+
+    ~ContextConfigurationSnapshot() {
+        std::lock_guard<std::mutex> lock(g_context_config_mutex);
+        if (succeeded) {
+            free(g_metallib_path);
+            g_metallib_path = nullptr;
+        } else {
+            g_context_config_frozen = false;
+        }
+    }
+};
+
+void msplat_set_metallib_path_checked(const char* path) {
+    char* replacement = path ? strdup(path) : NULL;
+    if (path && !replacement) {
+        throw std::bad_alloc();
+    }
+
+    std::lock_guard<std::mutex> lock(g_context_config_mutex);
+    if (g_context_config_frozen) {
+        free(replacement);
+        throw std::invalid_argument(
+            "msplat: metallib path must be set before first Metal use");
+    }
+
+    free(g_metallib_path);
+    g_metallib_path = replacement;
+}
 
 extern "C" void msplat_set_metallib_path(const char* path) {
-    free(g_metallib_path);
-    g_metallib_path = path ? strdup(path) : NULL;
+    try {
+        msplat_set_metallib_path_checked(path);
+    } catch (const std::exception& error) {
+        fprintf(stderr, "%s\n", error.what());
+    } catch (...) {
+        fprintf(stderr, "msplat: failed to configure metallib path\n");
+    }
 }
 
 MetalContext* init_msplat_metal_context() {
-    MetalContext* ctx = (MetalContext*)malloc(sizeof(MetalContext));
-    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    ContextConfigurationSnapshot configuration;
+    auto ctx = std::make_unique<MetalContext>();
 
-    ctx->device = device;
+    ctx->device = MTLCreateSystemDefaultDevice();
+    if (!ctx->device) {
+        throw std::runtime_error("msplat: no Metal device is available");
+    }
+
     ctx->queue  = [ctx->device newCommandQueue];
+    if (!ctx->queue) {
+        throw std::runtime_error("msplat: failed to create the Metal command queue");
+    }
+
     ctx->d_queue = dispatch_queue_create("com.msplat.metal", DISPATCH_QUEUE_SERIAL);
+    if (!ctx->d_queue) {
+        throw std::runtime_error("msplat: failed to create the Metal encoding queue");
+    }
 
     // Find precompiled metallib: explicit path (XCFramework/Python) or auto-discover
     NSError *error = nil;
     id<MTLLibrary> metal_library = nil;
 
-    if (g_metallib_path) {
+    if (configuration.hasExplicitMetallibPath) {
         // Explicit path (set by XCFramework / Swift wrapper)
-        NSURL *url = [NSURL fileURLWithPath:[NSString stringWithUTF8String:g_metallib_path]];
-        metal_library = [device newLibraryWithURL:url error:&error];
+        NSString *path = [NSString stringWithUTF8String:configuration.metallibPath.c_str()];
+        if (!path) {
+            throw std::runtime_error("msplat: metallib path is not valid UTF-8");
+        }
+        NSURL *url = [NSURL fileURLWithPath:path];
+        metal_library = [ctx->device newLibraryWithURL:url error:&error];
     } else {
         // Auto-discover default.metallib next to this library or the executable
         NSFileManager *fm = [NSFileManager defaultManager];
@@ -197,7 +472,7 @@ MetalContext* init_msplat_metal_context() {
             NSString *dir = [[NSString stringWithUTF8String:dl_info.dli_fname] stringByDeletingLastPathComponent];
             NSString *path = [dir stringByAppendingPathComponent:@"default.metallib"];
             if ([fm fileExistsAtPath:path]) {
-                metal_library = [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+                metal_library = [ctx->device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
             }
         }
         // 2. Next to the main executable (CLI build)
@@ -205,29 +480,51 @@ MetalContext* init_msplat_metal_context() {
             NSString *dir = [[[NSBundle mainBundle] executablePath] stringByDeletingLastPathComponent];
             NSString *path = [dir stringByAppendingPathComponent:@"default.metallib"];
             if (dir && [fm fileExistsAtPath:path]) {
-                metal_library = [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+                metal_library = [ctx->device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
             }
         }
     }
 
     if (!metal_library) {
-        fprintf(stderr, "msplat: failed to load metallib: %s\n",
-                error ? [[error description] UTF8String] : "default.metallib not found");
-        free(ctx);
-        return NULL;
+        const char* description = error ? error.localizedDescription.UTF8String : nullptr;
+        std::string failure = "msplat: failed to load metallib: ";
+        failure += description ? description : "default.metallib not found";
+        fprintf(stderr, "%s\n", failure.c_str());
+        throw std::runtime_error(failure);
     }
+    ScopedObjCRelease metalLibraryOwner{metal_library};
 
+    bool pipelineLoadFailed = false;
+    std::string pipelineFailure;
     auto load = [&](NSString* name) -> id<MTLComputePipelineState> {
         id<MTLFunction> fn = [metal_library newFunctionWithName:name];
         if (!fn) {
             fprintf(stderr, "msplat: kernel not found: %s\n", [name UTF8String]);
+            if (!pipelineLoadFailed) {
+                pipelineFailure = "msplat: kernel not found: ";
+                pipelineFailure += name.UTF8String;
+            }
+            pipelineLoadFailed = true;
             return nil;
         }
-        id<MTLComputePipelineState> pso = [ctx->device newComputePipelineStateWithFunction:fn error:&error];
+        NSError* pipelineError = nil;
+        id<MTLComputePipelineState> pso =
+            [ctx->device newComputePipelineStateWithFunction:fn error:&pipelineError];
         [fn release];
-        if (error) {
+        if (!pso) {
             fprintf(stderr, "msplat: failed to create pipeline for %s: %s\n",
-                    [name UTF8String], [[error description] UTF8String]);
+                    name.UTF8String,
+                    pipelineError ? pipelineError.localizedDescription.UTF8String : "unknown error");
+            if (!pipelineLoadFailed) {
+                pipelineFailure = "msplat: failed to create pipeline for ";
+                pipelineFailure += name.UTF8String;
+                const char* description = pipelineError.localizedDescription.UTF8String;
+                if (description) {
+                    pipelineFailure += ": ";
+                    pipelineFailure += description;
+                }
+            }
+            pipelineLoadFailed = true;
         }
         return pso;
     };
@@ -265,7 +562,9 @@ MetalContext* init_msplat_metal_context() {
     ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
 
-    [metal_library release];
+    if (pipelineLoadFailed) {
+        throw std::runtime_error(pipelineFailure);
+    }
 
     // Initialize counter sampling if PROFILE_STAGES is set
     ctx->counterSampleBuffer = nil;
@@ -277,15 +576,27 @@ MetalContext* init_msplat_metal_context() {
         ctx->initCounterSampling();
     }
 
-    return ctx;
+    configuration.succeeded = true;
+    return ctx.release();
 }
 
-MetalContext* get_global_context() {
-    static MetalContext* ctx = NULL;
-    if (ctx == NULL) {
-        ctx = init_msplat_metal_context();
+struct GlobalMetalContext {
+    std::unique_ptr<MetalContext> context;
+
+    GlobalMetalContext() : context(init_msplat_metal_context()) {
+        g_context_instance.store(context.get(), std::memory_order_release);
     }
-    return ctx;
+
+    ~GlobalMetalContext() {
+        std::lock_guard<std::mutex> lock(g_engine_mutex);
+        g_context_instance.store(nullptr, std::memory_order_release);
+        context.reset();
+    }
+};
+
+MetalContext* get_global_context() {
+    static GlobalMetalContext globalContext;
+    return globalContext.context.get();
 }
 
 
@@ -307,6 +618,7 @@ MTensor gpu_empty(std::vector<int64_t> shape, DType dtype) {
 }
 
 void msplat_commit() {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
     if (!g_gpu_timing_checked) {
         g_gpu_timing_enabled = std::getenv("PROFILE_GPU") != nullptr;
         g_gpu_timing_checked = true;
@@ -315,10 +627,12 @@ void msplat_commit() {
 }
 
 void msplat_gpu_sync() {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
     get_global_context()->syncCB();
 }
 
 void msplat_enable_gpu_timing(bool enable) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
     g_gpu_timing_enabled = enable;
     g_gpu_timing_checked = true;
 }
@@ -528,6 +842,7 @@ struct FusedTensorCache {
 static FusedTensorCache g_tcache;
 
 size_t msplat_cached_tensor_bytes() {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
     return g_tcache.estimatedBytes();
 }
 
@@ -587,6 +902,15 @@ static int64_t intersection_capacity(MetalContext* ctx, int num_points, int num_
 }
 
 void cleanup_msplat_metal() {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    if (MetalContext* ctx = g_context_instance.load(std::memory_order_acquire)) {
+        try {
+            ctx->syncCB();
+        } catch (...) {
+            g_tcache = FusedTensorCache{};
+            throw;
+        }
+    }
     g_tcache = FusedTensorCache{};
 }
 
@@ -852,12 +1176,16 @@ static void forward_pipeline(
 
     {
         id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
-        assert(command_buffer && "Failed to retrieve command buffer reference");
+        __block const char* encodingFailure = nullptr;
 
         dispatch_sync(ctx->d_queue, ^(){
             // Blit-zero buffers that accumulate across gaussians (must be GPU-side
             // to avoid racing with previous CB's reads on pipelined execution)
             id<MTLBlitCommandEncoder> blit = [command_buffer blitCommandEncoder];
+            if (!blit) {
+                encodingFailure = "msplat: failed to create a Metal blit encoder";
+                return;
+            }
             // tile_bins written by sort kernel, tile_counts no longer used
             [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
             [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
@@ -865,7 +1193,10 @@ static void forward_pipeline(
             [blit endEncoding];
 
             id<MTLComputeCommandEncoder> encoder = [command_buffer computeCommandEncoder];
-            assert(encoder && "Failed to create compute command encoder");
+            if (!encoder) {
+                encodingFailure = "msplat: failed to create a Metal compute encoder";
+                return;
+            }
 
             encode_proj_sh(encoder);
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -879,6 +1210,10 @@ static void forward_pipeline(
 
             [encoder endEncoding];
         });
+        if (encodingFailure) {
+            ctx->discardCB();
+            throw std::runtime_error(encodingFailure);
+        }
     }
 
     // All outputs are in g_tcache — no return needed
@@ -894,6 +1229,7 @@ MTensor msplat_render(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background
 ) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
     MTensor dummyGt, dummyWindow;
     forward_pipeline(num_points, means3d, scales, glob_scale,
         quats, viewmat, projmat, fx, fy, cx, cy,
@@ -921,6 +1257,7 @@ std::tuple<MTensor, float> msplat_train_step(
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
     float inv_max_dim
 ) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);
@@ -1292,8 +1629,9 @@ std::tuple<MTensor, float> msplat_train_step(
     };
 
     // Blit-zero helper (shared by both paths)
-    auto do_blit_zero = [&](id<MTLCommandBuffer> cb) {
+    auto do_blit_zero = [&](id<MTLCommandBuffer> cb) -> bool {
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        if (!blit) return false;
         // tile_bins written by sort kernel, tile_counts no longer used
         [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
         [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
@@ -1308,6 +1646,7 @@ std::tuple<MTensor, float> msplat_train_step(
         [blit fillBuffer:v_quat.buffer() range:NSMakeRange(0, v_quat.nbytes()) value:0];
         // v_features_dc and v_features_rest no longer needed — SH grads fused into Adam
         [blit endEncoding];
+        return true;
     };
 
     if (!g_profile_stages_checked) {
@@ -1320,7 +1659,7 @@ std::tuple<MTensor, float> msplat_train_step(
         // each with start/end timestamp sampling via the pass descriptor.
         // Metal handles inter-encoder resource hazard tracking automatically.
         id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
-        assert(command_buffer && "Failed to retrieve command buffer reference");
+        __block const char* encodingFailure = nullptr;
 
         id<MTLCounterSampleBuffer> csb = ctx->counterSampleBuffer;
         double ticksToMs = ctx->ticksToMs;
@@ -1340,7 +1679,10 @@ std::tuple<MTensor, float> msplat_train_step(
             // encoder with timestamps before and after.
 
             // -- Blit zero (no direct timestamp, included in first compute stage overhead) --
-            do_blit_zero(command_buffer);
+            if (!do_blit_zero(command_buffer)) {
+                encodingFailure = "msplat: failed to create a Metal blit encoder";
+                return;
+            }
 
             // Stage encoders with timestamps
             // We have 8 compute stages (indices 0-7 in counter sample buffer)
@@ -1357,39 +1699,72 @@ std::tuple<MTensor, float> msplat_train_step(
 
             // Stage 1: proj_sh_fwd
             enc = make_profiled_encoder(0);
+            if (!enc) {
+                encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
+                return;
+            }
             encode_proj_sh(enc);
             [enc endEncoding];
 
             // Stage 2: prefix_sort_pack
             enc = make_profiled_encoder(1);
+            if (!enc) {
+                encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
+                return;
+            }
             encode_prefix_map(enc);
             [enc endEncoding];
 
             // Stage 3: rast_fwd
             enc = make_profiled_encoder(2);
+            if (!enc) {
+                encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
+                return;
+            }
             encode_rast_fwd(enc);
             [enc endEncoding];
 
             // Stage 4+5: loss_fwd_bwd (fused)
             enc = make_profiled_encoder(3);
+            if (!enc) {
+                encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
+                return;
+            }
             encode_loss_fwd_bwd(enc);
             [enc endEncoding];
 
             // Stage 5: rast_bwd
             enc = make_profiled_encoder(4);
+            if (!enc) {
+                encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
+                return;
+            }
             encode_rast_bwd(enc);
             [enc endEncoding];
 
             // Stage 6: proj_sh_bwd + Adam
             enc = make_profiled_encoder(5);
+            if (!enc) {
+                encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
+                return;
+            }
             encode_proj_sh_bwd_adam(enc);
             [enc endEncoding];
 
             // Stage 7: grad_stats
             enc = make_profiled_encoder(6);
+            if (!enc) {
+                encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
+                return;
+            }
             encode_grad_stats(enc);
             [enc endEncoding];
         });
+
+        if (encodingFailure) {
+            ctx->discardCB();
+            throw std::runtime_error(encodingFailure);
+        }
 
         // Add completion handler to read timestamps after GPU finishes
         [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
@@ -1432,13 +1807,19 @@ std::tuple<MTensor, float> msplat_train_step(
     } else {
         // Production: single encoder for everything
         id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
-        assert(command_buffer && "Failed to retrieve command buffer reference");
+        __block const char* encodingFailure = nullptr;
 
         dispatch_sync(ctx->d_queue, ^(){
-            do_blit_zero(command_buffer);
+            if (!do_blit_zero(command_buffer)) {
+                encodingFailure = "msplat: failed to create a Metal blit encoder";
+                return;
+            }
 
             id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
-            assert(enc && "Failed to create compute command encoder");
+            if (!enc) {
+                encodingFailure = "msplat: failed to create a Metal compute encoder";
+                return;
+            }
 
             // --- Forward: proj_sh → prefix_map → rast_fwd → loss_fwd ---
             encode_proj_sh(enc);
@@ -1460,6 +1841,10 @@ std::tuple<MTensor, float> msplat_train_step(
 
             [enc endEncoding];
         });
+        if (encodingFailure) {
+            ctx->discardCB();
+            throw std::runtime_error(encodingFailure);
+        }
     }
 
     float loss_val = *loss_sum.data<float>() / (float)(img_height * img_width);
@@ -1487,6 +1872,7 @@ void msplat_prepare_densify(
     MTensor &block_totals,
     int &num_splits, int &num_dups
 ) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
     MetalContext* ctx = get_global_context();
 
     uint32_t N_u32 = (uint32_t)N;
@@ -1494,11 +1880,14 @@ void msplat_prepare_densify(
     int check_screen_int = check_screen;
 
     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
-    assert(command_buffer && "Failed to retrieve command buffer reference");
+    __block bool encoderCreationFailed = false;
 
     dispatch_sync(ctx->d_queue, ^(){
         id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
-        assert(enc && "Failed to create compute command encoder");
+        if (!enc) {
+            encoderCreationFailed = true;
+            return;
+        }
 
         // ---- Stage 1: Classify (split/dup) ----
         {
@@ -1555,6 +1944,11 @@ void msplat_prepare_densify(
         [enc endEncoding];
     });
 
+    if (encoderCreationFailed) {
+        ctx->discardCB();
+        throw std::runtime_error("msplat: failed to create a Metal compute encoder");
+    }
+
     // The one readback: totals live in the last prefix entry.
     ctx->syncCB();
     num_splits = N > 0 ? split_prefix.data<int32_t>()[N - 1] : 0;
@@ -1579,6 +1973,7 @@ int msplat_densify(
     MTensor &block_totals, MTensor &compact_scratch,
     MTensor &random_samples
 ) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
     MetalContext* ctx = get_global_context();
 
     int worst_case = population;
@@ -1610,11 +2005,14 @@ int msplat_densify(
     int check_huge_int = check_huge;
 
     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
-    assert(command_buffer && "Failed to retrieve command buffer reference");
+    __block bool encoderCreationFailed = false;
 
     dispatch_sync(ctx->d_queue, ^(){
         id<MTLComputeCommandEncoder> enc = [command_buffer computeCommandEncoder];
-        assert(enc && "Failed to create compute command encoder");
+        if (!enc) {
+            encoderCreationFailed = true;
+            return;
+        }
 
         // ---- Stage 4: Append split children ----
         {
@@ -1759,6 +2157,11 @@ int msplat_densify(
 
         [enc endEncoding];
     });
+
+    if (encoderCreationFailed) {
+        ctx->discardCB();
+        throw std::runtime_error("msplat: failed to create a Metal compute encoder");
+    }
 
     // Single GPU→CPU sync: read new_count from keep_prefix[worst_case - 1]
     ctx->syncCB();

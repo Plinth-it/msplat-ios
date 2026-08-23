@@ -11,9 +11,16 @@
 
 #include <chrono>
 #include <algorithm>
+#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <mutex>
+#include <new>
 #include <numeric>
 #include <random>
 #include <cstdlib>
+#include <stdexcept>
 #include <unordered_map>
 
 #include <TargetConditionals.h>
@@ -55,6 +62,10 @@ Dataset::Dataset(const std::string& path, float downscaleFactor,
     : impl(std::make_unique<Impl>())
 {
     impl->data = inputDataFromX(path);
+    if (impl->data.cameras.empty())
+        throw std::runtime_error("Dataset has no cameras: " + path);
+    if (impl->data.points.count <= 0)
+        throw std::runtime_error("Dataset has no sparse points: " + path);
     impl->images = CameraImageCache(downscaleFactor, CameraImageCache::defaultBudgetBytes());
 
     // No image is decoded here. The first step that needs a camera loads it.
@@ -81,6 +92,40 @@ void Dataset::cameraPose(int index, float camToWorld[16]) const {
                16 * sizeof(float));
 }
 void* Dataset::_handle() const { return impl.get(); }
+
+namespace {
+
+// The Metal engine and tensor cache are process-global. Keep each public C++
+// trainer operation atomic so a second trainer cannot reuse shared outputs
+// between render submission, synchronization, and readback.
+std::mutex g_trainerTransactionMutex;
+
+float* allocatePixels(int width, int height) {
+    if (width <= 0 || height <= 0)
+        throw std::runtime_error("Renderer returned invalid image dimensions");
+
+    const size_t w = static_cast<size_t>(width);
+    const size_t h = static_cast<size_t>(height);
+    if (w > std::numeric_limits<size_t>::max() / h / 3 / sizeof(float))
+        throw std::bad_alloc();
+
+    auto* pixels = static_cast<float*>(std::malloc(w * h * 3 * sizeof(float)));
+    if (!pixels) throw std::bad_alloc();
+    return pixels;
+}
+
+size_t rgbaCapacityRequired(int width, int height) {
+    if (width <= 0 || height <= 0)
+        throw std::runtime_error("Renderer returned invalid image dimensions");
+
+    const size_t w = static_cast<size_t>(width);
+    const size_t h = static_cast<size_t>(height);
+    if (w > std::numeric_limits<size_t>::max() / h / 4)
+        throw std::bad_alloc();
+    return w * h * 4;
+}
+
+} // namespace
 
 // ── Trainer::Impl ───────────────────────────────────────────────────────────
 
@@ -109,6 +154,7 @@ struct Trainer::Impl {
 Trainer::Trainer(Dataset& dataset, const Config& config)
     : impl(std::make_unique<Impl>())
 {
+    std::lock_guard lock(g_trainerTransactionMutex);
     impl->config = config;
     impl->ds = static_cast<Dataset::Impl*>(dataset._handle());
 
@@ -130,9 +176,15 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
     impl->shuffleCameras();
 }
 
-Trainer::~Trainer() = default;
+Trainer::~Trainer() {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    impl.reset();
+}
 
 Stats Trainer::step() {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    if (impl->currentStep == std::numeric_limits<int>::max())
+        throw std::overflow_error("Training iteration cannot be incremented further");
     impl->currentStep++;
     size_t camIdx = impl->nextCamera();
     Camera& cam = impl->ds->trainCamera(camIdx);
@@ -171,6 +223,7 @@ void Trainer::train(int callbackEvery) {
 }
 
 EvalMetrics Trainer::evaluate() {
+    std::lock_guard lock(g_trainerTransactionMutex);
     auto& testIndices = impl->ds->testIndices;
     if (testIndices.empty())
         return {};
@@ -201,6 +254,7 @@ EvalMetrics Trainer::evaluate() {
 }
 
 PixelBuffer Trainer::render(int cameraIndex, bool useTest) {
+    std::lock_guard lock(g_trainerTransactionMutex);
     auto& indices = useTest ? impl->ds->testIndices : impl->ds->trainIndices;
     if (cameraIndex < 0 || cameraIndex >= (int)indices.size())
         return {};
@@ -213,13 +267,14 @@ PixelBuffer Trainer::render(int cameraIndex, bool useTest) {
     int h = (int)rgbCpu.size(0);
     int w = (int)rgbCpu.size(1);
     // Use malloc so callers can free() — PixelBuffer destructor handles both
-    float* buf = (float*)malloc(h * w * 3 * sizeof(float));
-    memcpy(buf, rgbCpu.data_ptr(), h * w * 3 * sizeof(float));
+    float* buf = allocatePixels(w, h);
+    memcpy(buf, rgbCpu.data_ptr(), static_cast<size_t>(h) * w * 3 * sizeof(float));
 
     return PixelBuffer(buf, w, h);
 }
 
 PixelBuffer Trainer::renderFromPose(const float camToWorld[16], int refCameraIndex) {
+    std::lock_guard lock(g_trainerTransactionMutex);
     auto& indices = impl->ds->trainIndices;
     if (refCameraIndex < 0 || refCameraIndex >= (int)indices.size())
         return {};
@@ -236,19 +291,44 @@ PixelBuffer Trainer::renderFromPose(const float camToWorld[16], int refCameraInd
 
     int h = (int)rgbCpu.size(0);
     int w = (int)rgbCpu.size(1);
-    float* buf = (float*)malloc(h * w * 3 * sizeof(float));
-    memcpy(buf, rgbCpu.data_ptr(), h * w * 3 * sizeof(float));
+    float* buf = allocatePixels(w, h);
+    memcpy(buf, rgbCpu.data_ptr(), static_cast<size_t>(h) * w * 3 * sizeof(float));
     return PixelBuffer(buf, w, h);
 }
 
 void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIndex,
-                                  uint8_t* outRGBA, int* outWidth, int* outHeight) {
+                                  uint8_t* outRGBA,
+                                  int* outWidth, int* outHeight) {
+    renderFromPoseToBuffer(
+        camToWorld, refCameraIndex, outRGBA,
+        outRGBA ? std::numeric_limits<size_t>::max() : 0,
+        outWidth, outHeight);
+}
+
+void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIndex,
+                                  uint8_t* outRGBA, size_t outCapacity,
+                                  int* outWidth, int* outHeight) {
+    std::lock_guard lock(g_trainerTransactionMutex);
     auto& indices = impl->ds->trainIndices;
     if (refCameraIndex < 0 || refCameraIndex >= (int)indices.size()) {
         *outWidth = 0; *outHeight = 0; return;
     }
 
     Camera cam = impl->ds->images.ensureLoaded(impl->ds->data.cameras, indices[refCameraIndex]);
+    const int downscale = impl->model->getDownscaleFactor(impl->currentStep);
+    if (cam.width < downscale || cam.height < downscale)
+        throw std::invalid_argument(
+            "Training downscale produces a zero-sized image; reduce numDownscales");
+    const int expectedWidth = cam.width / downscale;
+    const int expectedHeight = cam.height / downscale;
+    *outWidth = expectedWidth;
+    *outHeight = expectedHeight;
+    if (!outRGBA) return;
+
+    const size_t required = rgbaCapacityRequired(expectedWidth, expectedHeight);
+    if (outCapacity < required)
+        throw std::invalid_argument("RGBA output buffer is too small");
+
     memcpy(cam.camToWorld, camToWorld, 16 * sizeof(float));
     cam.cachedViewMat = MTensor();
     cam.cachedProjViewMat = MTensor();
@@ -257,14 +337,13 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
     msplat_gpu_sync();
 
     int h = (int)rgb.size(0), w = (int)rgb.size(1);
-    *outWidth = w;
-    *outHeight = h;
-    if (!outRGBA) return;
+    if (w != expectedWidth || h != expectedHeight)
+        throw std::runtime_error("Rendered image dimensions changed unexpectedly");
 
     // Read directly from GPU tensor (unified memory on Apple Silicon)
     const float* src = (const float*)rgb.data_ptr();
-    int n = w * h;
-    for (int i = 0; i < n; i++) {
+    const size_t n = static_cast<size_t>(w) * static_cast<size_t>(h);
+    for (size_t i = 0; i < n; i++) {
         outRGBA[i * 4]     = (uint8_t)(fminf(fmaxf(src[i*3],   0.f), 1.f) * 255.f);
         outRGBA[i * 4 + 1] = (uint8_t)(fminf(fmaxf(src[i*3+1], 0.f), 1.f) * 255.f);
         outRGBA[i * 4 + 2] = (uint8_t)(fminf(fmaxf(src[i*3+2], 0.f), 1.f) * 255.f);
@@ -273,22 +352,27 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
 }
 
 void Trainer::exportPly(const std::string& path) {
+    std::lock_guard lock(g_trainerTransactionMutex);
     impl->model->savePly(path, impl->currentStep);
 }
 
 void Trainer::exportSplat(const std::string& path) {
+    std::lock_guard lock(g_trainerTransactionMutex);
     impl->model->saveSplat(path);
 }
 
 void Trainer::exportSpz(const std::string& path) {
+    std::lock_guard lock(g_trainerTransactionMutex);
     impl->model->saveSpz(path);
 }
 
 void Trainer::saveCheckpoint(const std::string& path) {
+    std::lock_guard lock(g_trainerTransactionMutex);
     impl->model->saveCheckpoint(path, impl->currentStep);
 }
 
 int Trainer::loadCheckpoint(const std::string& path) {
+    std::lock_guard lock(g_trainerTransactionMutex);
     impl->currentStep = impl->model->loadCheckpoint(path);
     // Re-shuffle cameras for resumed training
     impl->shuffleCameras();
@@ -296,17 +380,25 @@ int Trainer::loadCheckpoint(const std::string& path) {
 }
 
 int Trainer::splatCount() const {
+    std::lock_guard lock(g_trainerTransactionMutex);
     return (int)impl->model->means.size(0);
 }
 
 int Trainer::iteration() const {
+    std::lock_guard lock(g_trainerTransactionMutex);
     return impl->currentStep;
 }
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
 
-void sync() { msplat_gpu_sync(); }
-void cleanup() { cleanup_msplat_metal(); }
+void sync() {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    msplat_gpu_sync();
+}
+void cleanup() {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    cleanup_msplat_metal();
+}
 
 } // namespace msplat
 
@@ -314,7 +406,135 @@ void cleanup() { cleanup_msplat_metal(); }
 
 #include "msplat_c_api.h"
 
-static msplat::Config configFromC(MsplatConfig c) {
+namespace {
+
+thread_local MsplatErrorInfo g_lastError = {MSPLAT_STATUS_OK, {0}};
+std::mutex g_cApiMutex;
+
+// C handles own small wrappers rather than exposing the C++ object address.
+// A trainer shares its dataset ownership, so destroying the public dataset
+// handle cannot invalidate the native pointer retained by Trainer::Impl.
+struct CApiDatasetHandle {
+    std::shared_ptr<msplat::Dataset> dataset;
+};
+
+struct CApiTrainerHandle {
+    std::shared_ptr<msplat::Dataset> dataset;
+    std::unique_ptr<msplat::Trainer> trainer;
+};
+
+CApiDatasetHandle& datasetHandle(MsplatDataset handle) noexcept {
+    return *static_cast<CApiDatasetHandle*>(handle);
+}
+
+CApiTrainerHandle& trainerHandle(MsplatTrainer handle) noexcept {
+    return *static_cast<CApiTrainerHandle*>(handle);
+}
+
+void storeError(MsplatStatus status, const char* message,
+                MsplatErrorInfo* outError) noexcept {
+    g_lastError.status = status;
+    std::snprintf(g_lastError.message, sizeof(g_lastError.message), "%s",
+                  message ? message : "");
+    if (outError) *outError = g_lastError;
+}
+
+void clearError(MsplatErrorInfo* outError) noexcept {
+    storeError(MSPLAT_STATUS_OK, "", outError);
+}
+
+MsplatStatus classifyException(const std::exception& exception,
+                               MsplatStatus fallback) noexcept {
+    const char* message = exception.what();
+    if (message && std::strstr(message, "MTLBuffer allocation failed"))
+        return MSPLAT_STATUS_OUT_OF_MEMORY;
+    if (message && (std::strstr(message, "Metal") ||
+                    std::strstr(message, "metallib") ||
+                    std::strstr(message, "GPU")))
+        return MSPLAT_STATUS_GPU_ERROR;
+    return fallback;
+}
+
+template <typename Fn>
+MsplatStatus guarded(MsplatErrorInfo* outError, MsplatStatus fallback,
+                     Fn&& operation) noexcept {
+    @try {
+        try {
+            // Serialize complete C API transactions.  Acquiring a mutex can
+            // itself throw, so keep it inside this exception boundary too.
+            std::lock_guard<std::mutex> lock(g_cApiMutex);
+            clearError(outError);
+            operation();
+            return MSPLAT_STATUS_OK;
+        } catch (const std::invalid_argument& exception) {
+            storeError(MSPLAT_STATUS_INVALID_ARGUMENT, exception.what(), outError);
+            return MSPLAT_STATUS_INVALID_ARGUMENT;
+        } catch (const std::bad_alloc&) {
+            storeError(MSPLAT_STATUS_OUT_OF_MEMORY, "Memory allocation failed", outError);
+            return MSPLAT_STATUS_OUT_OF_MEMORY;
+        } catch (const std::exception& exception) {
+            MsplatStatus status = classifyException(exception, fallback);
+            storeError(status, exception.what(), outError);
+            return status;
+        } catch (...) {
+            storeError(MSPLAT_STATUS_INTERNAL_ERROR, "Unknown native exception", outError);
+            return MSPLAT_STATUS_INTERNAL_ERROR;
+        }
+    } @catch (NSException* exception) {
+        const char* message = exception.reason.UTF8String;
+        storeError(MSPLAT_STATUS_INTERNAL_ERROR,
+                   message ? message : "Objective-C exception", outError);
+        return MSPLAT_STATUS_INTERNAL_ERROR;
+    }
+}
+
+void require(bool condition, const char* message) {
+    if (!condition) throw std::invalid_argument(message);
+}
+
+void requirePath(const char* path) {
+    require(path && path[0] != '\0', "Path must not be null or empty");
+}
+
+void requirePose(const float* pose) {
+    require(pose != nullptr, "Camera pose must not be null");
+    for (int i = 0; i < 16; ++i)
+        require(std::isfinite(pose[i]), "Camera pose must contain only finite values");
+}
+
+void validateConfig(const MsplatConfig& c) {
+    require(c.iterations > 0 && c.iterations <= 1000000,
+            "iterations must be in 1...1000000");
+    require(c.shDegree >= 0 && c.shDegree <= 4,
+            "shDegree must be in 0...4");
+    require(c.shDegreeInterval > 0, "shDegreeInterval must be greater than zero");
+    require(std::isfinite(c.ssimWeight) && c.ssimWeight >= 0.0f && c.ssimWeight <= 1.0f,
+            "ssimWeight must be finite and in 0...1");
+    require(c.numDownscales >= 0 && c.numDownscales <= 30,
+            "numDownscales must be in 0...30");
+    require(c.resolutionSchedule > 0, "resolutionSchedule must be greater than zero");
+    require(c.refineEvery > 0, "refineEvery must be greater than zero");
+    require(c.warmupLength >= 0, "warmupLength must not be negative");
+    require(c.resetAlphaEvery > 0, "resetAlphaEvery must be greater than zero");
+    require(c.resetAlphaEvery <= std::numeric_limits<int>::max() / c.refineEvery,
+            "resetAlphaEvery * refineEvery is too large");
+    require(std::isfinite(c.densifyGradThresh) && c.densifyGradThresh >= 0.0f,
+            "densifyGradThresh must be finite and non-negative");
+    require(std::isfinite(c.densifySizeThresh) && c.densifySizeThresh >= 0.0f,
+            "densifySizeThresh must be finite and non-negative");
+    require(c.stopScreenSizeAt >= 0, "stopScreenSizeAt must not be negative");
+    require(c.stopDensifyAt >= -1, "stopDensifyAt must be -1 or non-negative");
+    require(std::isfinite(c.splitScreenSize) && c.splitScreenSize >= 0.0f,
+            "splitScreenSize must be finite and non-negative");
+    require(std::isfinite(c.downscaleFactor) && c.downscaleFactor >= 1.0f &&
+                c.downscaleFactor <= 32.0f,
+            "downscaleFactor must be finite and in 1...32");
+    for (float component : c.bgColor)
+        require(std::isfinite(component) && component >= 0.0f && component <= 1.0f,
+                "bgColor components must be finite and in 0...1");
+}
+
+msplat::Config configFromC(const MsplatConfig& c) {
     msplat::Config cfg;
     cfg.iterations = c.iterations;
     cfg.shDegree = c.shDegree;
@@ -336,101 +556,403 @@ static msplat::Config configFromC(MsplatConfig c) {
     return cfg;
 }
 
+} // namespace
+
+uint32_t msplat_abi_version(void) { return MSPLAT_ABI_VERSION; }
+
+MsplatStatus msplat_last_status(void) { return g_lastError.status; }
+
+const char* msplat_last_error_message(void) { return g_lastError.message; }
+
+MsplatStatus msplat_dataset_create_v2(const char* path, float downscaleFactor,
+                                      bool evalMode, int testEvery,
+                                      MsplatDataset* outDataset,
+                                      MsplatErrorInfo* error) {
+    if (outDataset) *outDataset = nullptr;
+    return guarded(error, MSPLAT_STATUS_INVALID_DATASET, [&] {
+        require(outDataset != nullptr, "outDataset must not be null");
+        requirePath(path);
+        require(std::isfinite(downscaleFactor) && downscaleFactor >= 1.0f &&
+                    downscaleFactor <= 32.0f,
+                "downscaleFactor must be finite and in 1...32");
+        require(testEvery > 0, "testEvery must be greater than zero");
+        if (evalMode) require(testEvery >= 2, "testEvery must be at least 2 in eval mode");
+        auto handle = std::make_unique<CApiDatasetHandle>();
+        handle->dataset = std::make_shared<msplat::Dataset>(
+            std::string(path), downscaleFactor, evalMode, testEvery);
+        *outDataset = static_cast<MsplatDataset>(handle.release());
+    });
+}
+
+MsplatStatus msplat_dataset_destroy_v2(MsplatDataset ds, MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(ds != nullptr, "Dataset handle must not be null");
+        delete static_cast<CApiDatasetHandle*>(ds);
+    });
+}
+
+MsplatStatus msplat_dataset_num_train_v2(MsplatDataset ds, int* outCount,
+                                         MsplatErrorInfo* error) {
+    if (outCount) *outCount = 0;
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(ds != nullptr, "Dataset handle must not be null");
+        require(outCount != nullptr, "outCount must not be null");
+        *outCount = datasetHandle(ds).dataset->numTrain();
+    });
+}
+
+MsplatStatus msplat_dataset_num_test_v2(MsplatDataset ds, int* outCount,
+                                        MsplatErrorInfo* error) {
+    if (outCount) *outCount = 0;
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(ds != nullptr, "Dataset handle must not be null");
+        require(outCount != nullptr, "outCount must not be null");
+        *outCount = datasetHandle(ds).dataset->numTest();
+    });
+}
+
+MsplatStatus msplat_dataset_camera_pose_v2(MsplatDataset ds, int cameraIndex,
+                                           float camToWorld[16],
+                                           MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(ds != nullptr, "Dataset handle must not be null");
+        require(camToWorld != nullptr, "camToWorld must not be null");
+        auto& dataset = *datasetHandle(ds).dataset;
+        require(cameraIndex >= 0 && cameraIndex < dataset.numTrain(),
+                "Training camera index is out of range");
+        dataset.cameraPose(cameraIndex, camToWorld);
+    });
+}
+
+MsplatStatus msplat_config_validate_v2(const MsplatConfig* config,
+                                       size_t configSize,
+                                       MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INVALID_ARGUMENT, [&] {
+        require(config != nullptr, "Training config must not be null");
+        require(configSize == sizeof(MsplatConfig),
+                "Training config size does not match this msplat ABI");
+        validateConfig(*config);
+    });
+}
+
+MsplatStatus msplat_trainer_create_v2(MsplatDataset ds,
+                                      const MsplatConfig* config,
+                                      size_t configSize,
+                                      MsplatTrainer* outTrainer,
+                                      MsplatErrorInfo* error) {
+    if (outTrainer) *outTrainer = nullptr;
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(ds != nullptr, "Dataset handle must not be null");
+        require(config != nullptr, "Training config must not be null");
+        require(configSize == sizeof(MsplatConfig),
+                "Training config size does not match this msplat ABI");
+        require(outTrainer != nullptr, "outTrainer must not be null");
+        validateConfig(*config);
+        auto dataset = datasetHandle(ds).dataset;
+        require(dataset->numTrain() > 0, "Dataset has no training cameras");
+        auto cfg = configFromC(*config);
+        auto handle = std::make_unique<CApiTrainerHandle>();
+        handle->dataset = std::move(dataset);
+        handle->trainer = std::make_unique<msplat::Trainer>(*handle->dataset, cfg);
+        *outTrainer = static_cast<MsplatTrainer>(handle.release());
+    });
+}
+
+MsplatStatus msplat_trainer_destroy_v2(MsplatTrainer t, MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        delete static_cast<CApiTrainerHandle*>(t);
+    });
+}
+
+MsplatStatus msplat_trainer_step_v2(MsplatTrainer t, MsplatStats* outStats,
+                                    MsplatErrorInfo* error) {
+    if (outStats) *outStats = {};
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        require(outStats != nullptr, "outStats must not be null");
+        auto stats = trainerHandle(t).trainer->step();
+        *outStats = {stats.iteration, stats.splatCount, stats.msPerStep};
+    });
+}
+
+MsplatStatus msplat_trainer_train_v2(MsplatTrainer t, MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        trainerHandle(t).trainer->train(0);
+    });
+}
+
+MsplatStatus msplat_trainer_evaluate_v2(MsplatTrainer t,
+                                        MsplatEvalMetrics* outMetrics,
+                                        MsplatErrorInfo* error) {
+    if (outMetrics) *outMetrics = {};
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        require(outMetrics != nullptr, "outMetrics must not be null");
+        auto metrics = trainerHandle(t).trainer->evaluate();
+        require(metrics.numTest > 0, "Dataset has no held-out test cameras");
+        *outMetrics = {metrics.psnr, metrics.ssim, metrics.l1,
+                       metrics.numTest, metrics.numGaussians};
+    });
+}
+
+MsplatStatus msplat_trainer_render_v2(MsplatTrainer t, int cameraIndex,
+                                      bool useTest, MsplatPixelBuffer* outBuffer,
+                                      MsplatErrorInfo* error) {
+    if (outBuffer) *outBuffer = {};
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        require(outBuffer != nullptr, "outBuffer must not be null");
+        auto buffer = trainerHandle(t).trainer->render(cameraIndex, useTest);
+        require(buffer.data != nullptr, "Camera index is out of range");
+        *outBuffer = {buffer.data, buffer.width, buffer.height};
+        buffer.data = nullptr;
+    });
+}
+
+MsplatStatus msplat_trainer_render_pose_v2(MsplatTrainer t,
+                                           const float camToWorld[16],
+                                           int refCameraIndex,
+                                           MsplatPixelBuffer* outBuffer,
+                                           MsplatErrorInfo* error) {
+    if (outBuffer) *outBuffer = {};
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        require(outBuffer != nullptr, "outBuffer must not be null");
+        requirePose(camToWorld);
+        auto buffer = trainerHandle(t).trainer->renderFromPose(
+            camToWorld, refCameraIndex);
+        require(buffer.data != nullptr, "Reference camera index is out of range");
+        *outBuffer = {buffer.data, buffer.width, buffer.height};
+        buffer.data = nullptr;
+    });
+}
+
+MsplatStatus msplat_trainer_render_pose_to_buffer_v2(
+    MsplatTrainer t, const float camToWorld[16], int refCameraIndex,
+    uint8_t* outRGBA, size_t outCapacity, int* outWidth, int* outHeight,
+    MsplatErrorInfo* error) {
+    if (outWidth) *outWidth = 0;
+    if (outHeight) *outHeight = 0;
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        requirePose(camToWorld);
+        require(outWidth != nullptr && outHeight != nullptr,
+                "Output dimensions must not be null");
+        require(outRGBA != nullptr || outCapacity == 0,
+                "outCapacity must be zero when querying dimensions");
+        trainerHandle(t).trainer->renderFromPoseToBuffer(
+            camToWorld, refCameraIndex, outRGBA, outCapacity, outWidth, outHeight);
+        require(*outWidth > 0 && *outHeight > 0,
+                "Reference camera index is out of range");
+    });
+}
+
+namespace {
+
+template <typename Fn>
+MsplatStatus withTrainerAndPath(MsplatTrainer t, const char* path,
+                                MsplatErrorInfo* error, Fn&& operation) {
+    return guarded(error, MSPLAT_STATUS_IO_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        requirePath(path);
+        operation(*trainerHandle(t).trainer, std::string(path));
+    });
+}
+
+} // namespace
+
+MsplatStatus msplat_trainer_export_ply_v2(MsplatTrainer t, const char* path,
+                                          MsplatErrorInfo* error) {
+    return withTrainerAndPath(t, path, error,
+        [](msplat::Trainer& trainer, const std::string& value) { trainer.exportPly(value); });
+}
+
+MsplatStatus msplat_trainer_export_splat_v2(MsplatTrainer t, const char* path,
+                                            MsplatErrorInfo* error) {
+    return withTrainerAndPath(t, path, error,
+        [](msplat::Trainer& trainer, const std::string& value) { trainer.exportSplat(value); });
+}
+
+MsplatStatus msplat_trainer_export_spz_v2(MsplatTrainer t, const char* path,
+                                          MsplatErrorInfo* error) {
+    return withTrainerAndPath(t, path, error,
+        [](msplat::Trainer& trainer, const std::string& value) { trainer.exportSpz(value); });
+}
+
+MsplatStatus msplat_trainer_save_checkpoint_v2(MsplatTrainer t,
+                                               const char* path,
+                                               MsplatErrorInfo* error) {
+    return withTrainerAndPath(t, path, error,
+        [](msplat::Trainer& trainer, const std::string& value) { trainer.saveCheckpoint(value); });
+}
+
+MsplatStatus msplat_trainer_load_checkpoint_v2(MsplatTrainer t,
+                                               const char* path,
+                                               int* outIteration,
+                                               MsplatErrorInfo* error) {
+    if (outIteration) *outIteration = 0;
+    return guarded(error, MSPLAT_STATUS_IO_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        requirePath(path);
+        require(outIteration != nullptr, "outIteration must not be null");
+        *outIteration = trainerHandle(t).trainer->loadCheckpoint(path);
+    });
+}
+
+MsplatStatus msplat_trainer_splat_count_v2(MsplatTrainer t, int* outCount,
+                                           MsplatErrorInfo* error) {
+    if (outCount) *outCount = 0;
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        require(outCount != nullptr, "outCount must not be null");
+        *outCount = trainerHandle(t).trainer->splatCount();
+    });
+}
+
+MsplatStatus msplat_trainer_iteration_v2(MsplatTrainer t, int* outIteration,
+                                         MsplatErrorInfo* error) {
+    if (outIteration) *outIteration = 0;
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        require(outIteration != nullptr, "outIteration must not be null");
+        *outIteration = trainerHandle(t).trainer->iteration();
+    });
+}
+
+void msplat_pixel_buffer_free(MsplatPixelBuffer* buffer) {
+    if (!buffer) return;
+    std::free(buffer->data);
+    *buffer = {};
+}
+
+MsplatStatus msplat_set_metallib_path_v2(const char* path,
+                                         MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        requirePath(path);
+        msplat_set_metallib_path_checked(path);
+    });
+}
+
+MsplatStatus msplat_sync_v2(MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [] { msplat::sync(); });
+}
+
+MsplatStatus msplat_cleanup_v2(MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [] { msplat::cleanup(); });
+}
+
+// ABI v1 compatibility. These wrappers never allow a C++ exception to cross
+// the C boundary; callers can inspect msplat_last_status/message on failure.
+
 MsplatDataset msplat_dataset_create(const char* path, float downscaleFactor,
                                      bool evalMode, int testEvery) {
-    auto* ds = new msplat::Dataset(std::string(path), downscaleFactor, evalMode, testEvery);
-    return static_cast<MsplatDataset>(ds);
+    MsplatDataset dataset = nullptr;
+    msplat_dataset_create_v2(path, downscaleFactor, evalMode, testEvery, &dataset, nullptr);
+    return dataset;
 }
 
 void msplat_dataset_destroy(MsplatDataset ds) {
-    delete static_cast<msplat::Dataset*>(ds);
+    msplat_dataset_destroy_v2(ds, nullptr);
 }
 
 int msplat_dataset_num_train(MsplatDataset ds) {
-    return static_cast<msplat::Dataset*>(ds)->numTrain();
+    int count = 0;
+    msplat_dataset_num_train_v2(ds, &count, nullptr);
+    return count;
 }
 
 int msplat_dataset_num_test(MsplatDataset ds) {
-    return static_cast<msplat::Dataset*>(ds)->numTest();
+    int count = 0;
+    msplat_dataset_num_test_v2(ds, &count, nullptr);
+    return count;
 }
 
 void msplat_dataset_camera_pose(MsplatDataset ds, int cameraIndex, float camToWorld[16]) {
-    static_cast<msplat::Dataset*>(ds)->cameraPose(cameraIndex, camToWorld);
+    msplat_dataset_camera_pose_v2(ds, cameraIndex, camToWorld, nullptr);
 }
 
 MsplatTrainer msplat_trainer_create(MsplatDataset ds, MsplatConfig config) {
-    auto* dataset = static_cast<msplat::Dataset*>(ds);
-    auto cfg = configFromC(config);
-    auto* trainer = new msplat::Trainer(*dataset, cfg);
-    return static_cast<MsplatTrainer>(trainer);
+    MsplatTrainer trainer = nullptr;
+    msplat_trainer_create_v2(ds, &config, sizeof(config), &trainer, nullptr);
+    return trainer;
 }
 
 void msplat_trainer_destroy(MsplatTrainer t) {
-    delete static_cast<msplat::Trainer*>(t);
+    msplat_trainer_destroy_v2(t, nullptr);
 }
 
 MsplatStats msplat_trainer_step(MsplatTrainer t) {
-    auto stats = static_cast<msplat::Trainer*>(t)->step();
-    return MsplatStats{stats.iteration, stats.splatCount, stats.msPerStep};
+    MsplatStats stats{};
+    msplat_trainer_step_v2(t, &stats, nullptr);
+    return stats;
 }
 
 void msplat_trainer_train(MsplatTrainer t) {
-    static_cast<msplat::Trainer*>(t)->train(0);
+    msplat_trainer_train_v2(t, nullptr);
 }
 
 MsplatEvalMetrics msplat_trainer_evaluate(MsplatTrainer t) {
-    auto m = static_cast<msplat::Trainer*>(t)->evaluate();
-    return MsplatEvalMetrics{m.psnr, m.ssim, m.l1, m.numTest, m.numGaussians};
+    MsplatEvalMetrics metrics{};
+    msplat_trainer_evaluate_v2(t, &metrics, nullptr);
+    return metrics;
 }
 
 MsplatPixelBuffer msplat_trainer_render(MsplatTrainer t, int cameraIndex, bool useTest) {
-    auto buf = static_cast<msplat::Trainer*>(t)->render(cameraIndex, useTest);
-    MsplatPixelBuffer result{buf.data, buf.width, buf.height};
-    buf.data = nullptr; // Transfer ownership to caller
-    return result;
+    MsplatPixelBuffer buffer{};
+    msplat_trainer_render_v2(t, cameraIndex, useTest, &buffer, nullptr);
+    return buffer;
 }
 
 MsplatPixelBuffer msplat_trainer_render_pose(MsplatTrainer t, const float camToWorld[16], int refCameraIndex) {
-    auto buf = static_cast<msplat::Trainer*>(t)->renderFromPose(camToWorld, refCameraIndex);
-    MsplatPixelBuffer result{buf.data, buf.width, buf.height};
-    buf.data = nullptr;
-    return result;
+    MsplatPixelBuffer buffer{};
+    msplat_trainer_render_pose_v2(t, camToWorld, refCameraIndex, &buffer, nullptr);
+    return buffer;
 }
 
 void msplat_trainer_render_pose_to_buffer(MsplatTrainer t, const float camToWorld[16],
                                       int refCameraIndex, uint8_t* outRGBA,
                                       int* outWidth, int* outHeight) {
-    static_cast<msplat::Trainer*>(t)->renderFromPoseToBuffer(
-        camToWorld, refCameraIndex, outRGBA, outWidth, outHeight);
+    msplat_trainer_render_pose_to_buffer_v2(
+        t, camToWorld, refCameraIndex, outRGBA,
+        outRGBA ? std::numeric_limits<size_t>::max() : 0,
+        outWidth, outHeight, nullptr);
 }
 
 void msplat_trainer_export_ply(MsplatTrainer t, const char* path) {
-    static_cast<msplat::Trainer*>(t)->exportPly(std::string(path));
+    msplat_trainer_export_ply_v2(t, path, nullptr);
 }
 
 void msplat_trainer_export_splat(MsplatTrainer t, const char* path) {
-    static_cast<msplat::Trainer*>(t)->exportSplat(std::string(path));
+    msplat_trainer_export_splat_v2(t, path, nullptr);
 }
 
 void msplat_trainer_export_spz(MsplatTrainer t, const char* path) {
-    static_cast<msplat::Trainer*>(t)->exportSpz(std::string(path));
+    msplat_trainer_export_spz_v2(t, path, nullptr);
 }
 
 void msplat_trainer_save_checkpoint(MsplatTrainer t, const char* path) {
-    static_cast<msplat::Trainer*>(t)->saveCheckpoint(std::string(path));
+    msplat_trainer_save_checkpoint_v2(t, path, nullptr);
 }
 
 int msplat_trainer_load_checkpoint(MsplatTrainer t, const char* path) {
-    return static_cast<msplat::Trainer*>(t)->loadCheckpoint(std::string(path));
+    int iteration = -1;
+    msplat_trainer_load_checkpoint_v2(t, path, &iteration, nullptr);
+    return iteration;
 }
 
 int msplat_trainer_splat_count(MsplatTrainer t) {
-    return static_cast<msplat::Trainer*>(t)->splatCount();
+    int count = 0;
+    msplat_trainer_splat_count_v2(t, &count, nullptr);
+    return count;
 }
 
 int msplat_trainer_iteration(MsplatTrainer t) {
-    return static_cast<msplat::Trainer*>(t)->iteration();
+    int iteration = 0;
+    msplat_trainer_iteration_v2(t, &iteration, nullptr);
+    return iteration;
 }
 
-void msplat_sync(void) { msplat::sync(); }
-void msplat_cleanup(void) { msplat::cleanup(); }
+void msplat_sync(void) { msplat_sync_v2(nullptr); }
+void msplat_cleanup(void) { msplat_cleanup_v2(nullptr); }

@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- Added ABI v2 checked C entry points with structured errors, input and buffer
+  validation, ABI/config-size checks, and exception containment.
+- Added the actor-isolated, throwing `MsplatSession` Swift API while preserving
+  the existing Swift and C symbols for source compatibility.
+- Fixed Metal context construction, initialization races, resource teardown,
+  full submitted-chain command completion checks, and recoverable encoder
+  failures.
+- Retained datasets for trainer lifetimes and removed automatic global cache
+  cleanup from individual Swift trainer destruction; serialized native trainer
+  transactions while the Metal engine remains process-global.
+- Hardened checkpoint loading against corrupt shapes, sizes, truncation, and
+  partial state replacement; checkpoint and model exports now use atomic
+  temporary-file replacement, with native regression tests for invalid inputs.
+- Made the iOS preview's single-resolution policy and CPU submission timing
+  explicit, pinned CMake downloads by hash, and added an iOS simulator build to CI.
+
 ## v1.1.3 — Fused kernels + pre-allocated tile bins
 
 - **Fused SH backward into Adam optimizer** — spherical harmonics gradients are now

@@ -4,6 +4,7 @@ import pytest
 import numpy as np
 import tempfile
 import os
+import struct
 
 GARDEN = os.path.join(os.path.dirname(__file__), "..", "datasets", "mipnerf360", "garden")
 HAS_GARDEN = os.path.isdir(GARDEN)
@@ -276,5 +277,36 @@ def test_checkpoint_resume_training():
         assert trainer2.iteration == 100
         assert stats.splat_count > 0
         assert stats.ms_per_step > 0
+    finally:
+        os.unlink(ckpt_path)
+
+
+@pytest.mark.skipif(not HAS_GARDEN, reason="garden dataset not found")
+def test_checkpoint_iteration_overflow_is_rejected():
+    """A resumed trainer must never wrap its signed iteration counter."""
+    from msplat import TrainingConfig, Dataset, GaussianTrainer
+
+    ds = Dataset(GARDEN, downscale_factor=4.0)
+    cfg = TrainingConfig(iterations=1, num_downscales=0)
+    trainer = GaussianTrainer(ds, cfg)
+    trainer.step()
+
+    with tempfile.NamedTemporaryFile(suffix=".msplat", delete=False) as f:
+        ckpt_path = f.name
+
+    try:
+        trainer.save_checkpoint(ckpt_path)
+        with open(ckpt_path, "r+b") as checkpoint:
+            checkpoint.seek(8)  # magic + version precede the UInt32 step
+            checkpoint.write(struct.pack("<I", 2**31 - 2))
+
+        ds2 = Dataset(GARDEN, downscale_factor=4.0)
+        trainer2 = GaussianTrainer(ds2, cfg)
+        trainer2.load_checkpoint(ckpt_path)
+        assert trainer2.iteration == 2**31 - 2
+
+        assert trainer2.step().iteration == 2**31 - 1
+        with pytest.raises(OverflowError, match="cannot be incremented"):
+            trainer2.step()
     finally:
         os.unlink(ckpt_path)

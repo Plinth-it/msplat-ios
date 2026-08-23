@@ -14,8 +14,10 @@
 #include <filesystem>
 #include <chrono>
 #include <algorithm>
+#include <limits>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 
 namespace nb = nanobind;
 using namespace nb::literals;
@@ -153,6 +155,8 @@ public:
     }
 
     TrainingStats step() {
+        if (current_step == std::numeric_limits<int>::max())
+            throw std::overflow_error("Training iteration cannot be incremented further");
         current_step++;
         size_t cam_idx = next_camera();
         Camera &cam = dataset_ptr->train_camera(cam_idx);
@@ -377,7 +381,8 @@ NB_MODULE(_core, m) {
             "Per-step training statistics returned by GaussianTrainer.step().")
         .def_ro("iteration", &TrainingStats::iteration, "Current training iteration.")
         .def_ro("splat_count", &TrainingStats::splat_count, "Number of active Gaussians.")
-        .def_ro("ms_per_step", &TrainingStats::ms_per_step, "Wall-clock time for this step in milliseconds.")
+        .def_ro("ms_per_step", &TrainingStats::ms_per_step,
+            "CPU encoding and command-submission time in milliseconds; not completed GPU time.")
         .def("__repr__", [](const TrainingStats &s) {
             return "TrainingStats(iteration=" + std::to_string(s.iteration) +
                    ", splats=" + std::to_string(s.splat_count) +
