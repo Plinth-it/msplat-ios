@@ -123,12 +123,14 @@ public final class MsplatSession {
     }
 
     /// Creates a session from caller-owned canonical data. Every descriptor
-    /// buffer is copied synchronously by native ABI v5 before this returns.
+    /// buffer is copied synchronously by the checked native ABI v5 or v6 path
+    /// before this returns.
     ///
     /// Pass selected folder or resolved-bookmark roots in
-    /// `securityScopedResourceURLs` when frame URLs are derived children. The
-    /// session balances successful leases in ``close()`` after the trainer and
-    /// dataset have been destroyed. It does not attempt one lease per frame.
+    /// `securityScopedResourceURLs` when frame or mask URLs are derived
+    /// children. The session balances successful leases in ``close()`` after
+    /// the trainer and dataset have been destroyed. It does not attempt one
+    /// lease per asset.
     public init(
         dataset descriptor: DatasetDescriptor,
         securityScopedResourceURLs: [URL] = [],
@@ -459,7 +461,35 @@ public final class MsplatSession {
             config: config,
             maximumGaussianCount: maximumGaussianCount
         ) {
-            try withUnsafeNativeDatasetDescriptor(descriptor) { nativeDescriptor in
+            if descriptor.frames.contains(where: { $0.trainingMask != nil }) {
+                return try withUnsafeNativeDatasetDescriptorV6(descriptor) {
+                    nativeDescriptor, frameMasks, frameMaskCount in
+                    var dataset: MsplatDataset?
+                    var nativeError = MsplatErrorInfo()
+                    let status = msplat_dataset_create_from_descriptor_v6(
+                        nativeDescriptor,
+                        MemoryLayout<MsplatDatasetDescriptorV5>.size,
+                        frameMasks,
+                        frameMaskCount,
+                        MemoryLayout<MsplatFrameMaskV6>.stride,
+                        options.downscaleFactor,
+                        options.evalMode,
+                        options.testEvery,
+                        &dataset,
+                        &nativeError
+                    )
+                    try checkNativeStatus(status, error: &nativeError)
+                    guard let dataset else {
+                        throw MsplatError.internalFailure(
+                            "Native descriptor creation returned no dataset handle"
+                        )
+                    }
+                    return dataset
+                }
+            }
+
+            return try withUnsafeNativeDatasetDescriptor(descriptor) {
+                nativeDescriptor in
                 var dataset: MsplatDataset?
                 var nativeError = MsplatErrorInfo()
                 let status = msplat_dataset_create_from_descriptor_v5(

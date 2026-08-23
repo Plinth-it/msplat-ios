@@ -159,6 +159,8 @@ public struct TrainingPlan: Sendable, Equatable {
     /// Hard Gaussian population limit enforced when the plan is used with
     /// ``MsplatSession``.
     public let maximumGaussianCount: Int
+    /// Whether image-cache and decode estimates include per-frame UInt8 masks.
+    public let includesTrainingMasks: Bool
     /// Source dimensions after `inputDecodeScale` is applied.
     public let decodedInputDimensions: TrainingImageDimensions
     /// Effective pixel dimensions for every stage.
@@ -176,7 +178,8 @@ public struct TrainingPlan: Sendable, Equatable {
         iterationBudget: Int32,
         stages: [TrainingResolutionStage],
         targetSHDegree: Int32,
-        maximumGaussianCount: Int
+        maximumGaussianCount: Int,
+        includesTrainingMasks: Bool = false
     ) throws {
         guard inputDecodeScale.isFinite, (1...32).contains(inputDecodeScale) else {
             throw MsplatError.invalidArgument(
@@ -215,10 +218,12 @@ public struct TrainingPlan: Sendable, Equatable {
             decodedInputDimensions: decodedInputDimensions
         )
         let memoryEstimate = try Self.calculateMemoryEstimate(
+            inputDimensions: inputDimensions,
             decodedInputDimensions: decodedInputDimensions,
             resolvedStages: resolvedStages,
             targetSHDegree: targetSHDegree,
             maximumGaussianCount: maximumGaussianCount,
+            includesTrainingMasks: includesTrainingMasks,
             imageCacheBudgetBytes: TrainingMemoryEstimate.configuredNativeImageCacheBudgetBytes
         )
 
@@ -228,6 +233,7 @@ public struct TrainingPlan: Sendable, Equatable {
         self.stages = stages
         self.targetSHDegree = targetSHDegree
         self.maximumGaussianCount = maximumGaussianCount
+        self.includesTrainingMasks = includesTrainingMasks
         self.decodedInputDimensions = decodedInputDimensions
         self.resolvedStages = resolvedStages
         self.memoryEstimate = memoryEstimate
@@ -283,10 +289,12 @@ public struct TrainingPlan: Sendable, Equatable {
         imageCacheBudgetBytes: Int64
     ) throws -> TrainingMemoryEstimate {
         try Self.calculateMemoryEstimate(
+            inputDimensions: inputDimensions,
             decodedInputDimensions: decodedInputDimensions,
             resolvedStages: resolvedStages,
             targetSHDegree: targetSHDegree,
             maximumGaussianCount: maximumGaussianCount,
+            includesTrainingMasks: includesTrainingMasks,
             imageCacheBudgetBytes: imageCacheBudgetBytes
         )
     }
@@ -418,10 +426,12 @@ public struct TrainingPlan: Sendable, Equatable {
     }
 
     private static func calculateMemoryEstimate(
+        inputDimensions: TrainingImageDimensions,
         decodedInputDimensions: TrainingImageDimensions,
         resolvedStages: [ResolvedTrainingResolutionStage],
         targetSHDegree: Int32,
         maximumGaussianCount: Int,
+        includesTrainingMasks: Bool,
         imageCacheBudgetBytes: Int64
     ) throws -> TrainingMemoryEstimate {
         guard imageCacheBudgetBytes > 0 else {
@@ -489,6 +499,10 @@ public struct TrainingPlan: Sendable, Equatable {
             Int64(decodedInputDimensions.width),
             Int64(decodedInputDimensions.height),
         ], component: "decoded input pixels")
+        let sourcePixelCount = try checkedProduct([
+            Int64(inputDimensions.width),
+            Int64(inputDimensions.height),
+        ], component: "source input pixels")
 
         for stage in resolvedStages {
             let width = Int64(stage.dimensions.width)
@@ -593,17 +607,17 @@ public struct TrainingPlan: Sendable, Equatable {
             let imageCacheEntryBytes: Int64
             if stage.downscaleFactor == 1 {
                 imageCacheEntryBytes = try checkedProduct(
-                    [24, decodedPixelCount],
+                    [includesTrainingMasks ? 26 : 24, decodedPixelCount],
                     component: "full-resolution image cache entry"
                 )
             } else {
                 imageCacheEntryBytes = try checkedSum([
                     try checkedProduct(
-                        [12, decodedPixelCount],
+                        [includesTrainingMasks ? 13 : 12, decodedPixelCount],
                         component: "decoded image cache entry"
                     ),
                     try checkedProduct(
-                        [24, pixelCount],
+                        [includesTrainingMasks ? 26 : 24, pixelCount],
                         component: "stage image cache entry"
                     ),
                 ], component: "image cache entry")
@@ -625,14 +639,32 @@ public struct TrainingPlan: Sendable, Equatable {
             ))
         }
 
-        // ImageIO is asked for a thumbnail at the decoded-input dimensions, so
-        // app-owned RGBA, float RGB, resize, and undistortion buffers now scale
-        // with that target rather than with the encoded source raster. Codec-
-        // private allocations remain covered only by the general headroom.
-        let imageDecodeTransientBytes = try checkedProduct(
-            [36, decodedPixelCount],
+        // RGB uses a decoded-input thumbnail. Masks decode at source resolution
+        // before exact area reduction because ImageIO does not promise a
+        // coverage-preserving thumbnail filter. The mask implementation
+        // releases its CG objects before copying the compact source coverage,
+        // so its largest explicit/decode-backed phase is 12P + 8S.
+        let targetResolutionDecodeBytes = try checkedProduct(
+            [includesTrainingMasks ? 41 : 36, decodedPixelCount],
             component: "target-resolution image decode transient"
         )
+        let imageDecodeTransientBytes: Int64
+        if includesTrainingMasks {
+            let sourceMaskDecodeBytes = try checkedSum([
+                try checkedProduct(
+                    [12, decodedPixelCount],
+                    component: "decoded RGB retained during mask decode"
+                ),
+                try checkedProduct(
+                    [8, sourcePixelCount],
+                    component: "source-resolution mask decode"
+                ),
+            ], component: "source-resolution mask decode transient")
+            imageDecodeTransientBytes = max(
+                targetResolutionDecodeBytes, sourceMaskDecodeBytes)
+        } else {
+            imageDecodeTransientBytes = targetResolutionDecodeBytes
+        }
         let imageInsertionPeakBytes = try checkedSum([
             max(imageCacheBudgetBytes, largestImageCacheEntryBytes),
             max(largestImageCacheEntryBytes, imageDecodeTransientBytes),

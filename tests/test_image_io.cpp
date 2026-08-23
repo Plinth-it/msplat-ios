@@ -167,6 +167,23 @@ void checkPixel(const Image &image, int x, int y, RGB8 expected) {
     }
 }
 
+uint8_t coverageAt(const CoverageMask &mask, int x, int y) {
+    CHECK(x >= 0 && x < mask.width);
+    CHECK(y >= 0 && y < mask.height);
+    return mask.data[static_cast<size_t>(y) * mask.width + x];
+}
+
+void checkCoverageNear(const CoverageMask &mask, int x, int y,
+                       int expected, int tolerance = 2) {
+    const int actual = coverageAt(mask, x, y);
+    if (std::abs(actual - expected) > tolerance) {
+        fail("mask coverage", __LINE__,
+             "at " + std::to_string(x) + "," + std::to_string(y) +
+             " expected " + std::to_string(expected) + " got " +
+             std::to_string(actual));
+    }
+}
+
 void checkSameImage(const Image &lhs, const Image &rhs) {
     CHECK(lhs.width == rhs.width);
     CHECK(lhs.height == rhs.height);
@@ -364,6 +381,211 @@ void checkExactTargetSizeAndColor(const TempDirectory &temporary) {
         "changed while loading");
 }
 
+void checkCoverageMaskDecodeAndResize(const TempDirectory &temporary) {
+    const fs::path luminancePath = temporary.path / "luminance-mask.tiff";
+    const std::vector<RGB8> colors = {
+        {255, 0, 0}, {0, 255, 0},
+        {0, 0, 255}, {255, 255, 255},
+    };
+    writeTIFF(luminancePath, 2, 2, rgbaGrid(2, 2, colors), 1);
+    const ImageSourceInfo luminanceInfo =
+        inspectImageSource(luminancePath.string());
+    const CoverageMask luminance = imreadCoverageMask(
+        luminancePath.string(), luminanceInfo, 2, 2, false,
+        TrainingMaskChannel::Luminance);
+    CHECK(luminance.width == 2);
+    CHECK(luminance.height == 2);
+    checkCoverageNear(luminance, 0, 0, 54);
+    checkCoverageNear(luminance, 1, 0, 182);
+    checkCoverageNear(luminance, 0, 1, 18);
+    checkCoverageNear(luminance, 1, 1, 255);
+
+    const fs::path alphaPath = temporary.path / "alpha-mask.tiff";
+    std::vector<uint8_t> alphaRGBA(2 * 2 * 4, 0);
+    const std::array<uint8_t, 4> alphaValues = {0, 64, 128, 255};
+    for (size_t index = 0; index < alphaValues.size(); ++index)
+        alphaRGBA[index * 4 + 3] = alphaValues[index];
+    writeTIFF(alphaPath, 2, 2, alphaRGBA, 1);
+    const ImageSourceInfo alphaInfo = inspectImageSource(alphaPath.string());
+    const CoverageMask alpha = imreadCoverageMask(
+        alphaPath.string(), alphaInfo, 2, 2, false,
+        TrainingMaskChannel::Alpha);
+    for (int index = 0; index < 4; ++index) {
+        checkCoverageNear(alpha, index % 2, index / 2,
+                          alphaValues[static_cast<size_t>(index)], 0);
+    }
+
+    const fs::path premultipliedPath =
+        temporary.path / "premultiplied-luminance-mask.tiff";
+    writeTIFF(premultipliedPath, 1, 1, {128, 0, 0, 128}, 1);
+    const ImageSourceInfo premultipliedInfo =
+        inspectImageSource(premultipliedPath.string());
+    const CoverageMask premultiplied = imreadCoverageMask(
+        premultipliedPath.string(), premultipliedInfo, 1, 1, false,
+        TrainingMaskChannel::Luminance);
+    checkCoverageNear(premultiplied, 0, 0, 27);
+
+    CoverageMask soft;
+    soft.width = 2;
+    soft.height = 2;
+    soft.data = {0, 64, 128, 255};
+    const CoverageMask averaged = resizeCoverageArea(soft, 1, 1);
+    CHECK(averaged.width == 1);
+    CHECK(averaged.height == 1);
+    CHECK(averaged.data == std::vector<uint8_t>({112}));
+
+    const fs::path areaPath = temporary.path / "area-alpha-mask.tiff";
+    const std::array<uint8_t, 16> areaValues = {
+        255, 0,   0,   255,
+        0,   0,   255, 255,
+        128, 128, 64,  64,
+        128, 128, 64,  64,
+    };
+    std::vector<uint8_t> areaRGBA(4 * 4 * 4, 0);
+    for (size_t index = 0; index < areaValues.size(); ++index) {
+        areaRGBA[index * 4 + 3] = areaValues[index];
+    }
+    writeTIFF(areaPath, 4, 4, areaRGBA, 1);
+    const ImageSourceInfo areaInfo = inspectImageSource(areaPath.string());
+    const CoverageMask decodedArea = imreadCoverageMask(
+        areaPath.string(), areaInfo, 2, 2, false,
+        TrainingMaskChannel::Alpha);
+    CHECK(decodedArea.width == 2);
+    CHECK(decodedArea.height == 2);
+    CHECK(decodedArea.data == std::vector<uint8_t>({64, 191, 128, 64}));
+
+    const fs::path noAlphaPath = temporary.path / "no-alpha.ppm";
+    {
+        std::ofstream stream(noAlphaPath, std::ios::binary | std::ios::trunc);
+        const std::array<uint8_t, 6> pixels = {255, 255, 255, 0, 0, 0};
+        stream << "P6\n2 1\n255\n";
+        stream.write(reinterpret_cast<const char *>(pixels.data()),
+                     static_cast<std::streamsize>(pixels.size()));
+        CHECK(static_cast<bool>(stream));
+    }
+    const ImageSourceInfo noAlphaInfo = inspectImageSource(noAlphaPath.string());
+    checkThrows<msplat::InvalidDatasetError>(
+        [&] {
+            (void)imreadCoverageMask(
+                noAlphaPath.string(), noAlphaInfo, 2, 1, false,
+                TrainingMaskChannel::Alpha);
+        },
+        "no alpha channel");
+}
+
+void checkCoverageMaskOrientation(const TempDirectory &temporary) {
+    const fs::path path = temporary.path / "oriented-alpha-mask.tiff";
+    std::vector<uint8_t> rgba(3 * 2 * 4, 0);
+    const std::array<uint8_t, 6> values = {16, 32, 48, 64, 80, 96};
+    for (size_t index = 0; index < values.size(); ++index)
+        rgba[index * 4 + 3] = values[index];
+    writeTIFF(path, 3, 2, rgba, 6);
+
+    const ImageSourceInfo info = inspectImageSource(path.string());
+    const CoverageMask oriented = imreadCoverageMask(
+        path.string(), info, 2, 3, true, TrainingMaskChannel::Alpha);
+    CHECK(oriented.width == 2);
+    CHECK(oriented.height == 3);
+    checkCoverageNear(oriented, 0, 0, values[3], 0);
+    checkCoverageNear(oriented, 1, 0, values[0], 0);
+    checkCoverageNear(oriented, 0, 1, values[4], 0);
+    checkCoverageNear(oriented, 1, 1, values[1], 0);
+    checkCoverageNear(oriented, 0, 2, values[5], 0);
+    checkCoverageNear(oriented, 1, 2, values[2], 0);
+}
+
+void checkJointUndistortion() {
+    Image image;
+    image.width = 13;
+    image.height = 9;
+    image.data.resize(13 * 9 * 3);
+    CoverageMask mask;
+    mask.width = 13;
+    mask.height = 9;
+    mask.data.resize(13 * 9);
+    for (int y = 0; y < 9; ++y) {
+        for (int x = 0; x < 13; ++x) {
+            const size_t pixel = static_cast<size_t>(y) * 13 + x;
+            const uint8_t coverage = static_cast<uint8_t>(
+                16 + ((x * 17 + y * 29) % 224));
+            mask.data[pixel] = coverage;
+            for (int channel = 0; channel < 3; ++channel) {
+                image.data[pixel * 3 + channel] = coverage / 255.0f;
+            }
+        }
+    }
+
+    const auto result = undistortImageAndCoverageMask(
+        image, mask, 10.0f, 10.0f, 6.0f, 4.0f,
+        0.08f, -0.01f, 0.002f, -0.003f, 0.0f);
+    CHECK(result.image.width == result.width);
+    CHECK(result.image.height == result.height);
+    CHECK(result.coverageMask.width == result.width);
+    CHECK(result.coverageMask.height == result.height);
+    for (size_t pixel = 0; pixel < result.coverageMask.data.size(); ++pixel) {
+        const int imageByte = static_cast<int>(std::lround(
+            result.image.data[pixel * 3] * 255.0f));
+        CHECK(std::abs(imageByte - result.coverageMask.data[pixel]) <= 1);
+    }
+}
+
+void checkMaskedCameraLoading(const TempDirectory &temporary) {
+    const fs::path imagePath = temporary.path / "masked-camera-rgb.tiff";
+    writeTIFF(imagePath, 13, 9,
+              solidRGBA(13, 9, {24, 144, 208}), 1);
+
+    const fs::path maskPath = temporary.path / "masked-camera-mask.tiff";
+    std::vector<uint8_t> maskRGBA(13 * 9 * 4, 0);
+    for (size_t index = 0; index < maskRGBA.size() / 4; ++index)
+        maskRGBA[index * 4 + 3] = 128;
+    writeTIFF(maskPath, 13, 9, maskRGBA, 1);
+
+    Camera camera;
+    camera.filePath = imagePath.string();
+    camera.trainingMask = TrainingMaskDescriptor{
+        maskPath.string(), TrainingMaskChannel::Alpha};
+    camera.width = 13;
+    camera.height = 9;
+    camera.fx = 13.0f;
+    camera.fy = 9.0f;
+    camera.loadImage(2.5f);
+    CHECK(camera.image.width == 5);
+    CHECK(camera.image.height == 3);
+    CHECK(camera.coverageMask.width == 5);
+    CHECK(camera.coverageMask.height == 3);
+    for (uint8_t value : camera.coverageMask.data) CHECK(value == 128);
+
+    const CoverageMask &coarse = camera.getCoverageMask(2);
+    CHECK(coarse.width == 2);
+    CHECK(coarse.height == 1);
+    for (uint8_t value : coarse.data) CHECK(value == 128);
+
+    const fs::path mismatchedPath = temporary.path / "wrong-size-mask.tiff";
+    writeTIFF(mismatchedPath, 12, 9,
+              solidRGBA(12, 9, {255, 255, 255}), 1);
+    Camera mismatched;
+    mismatched.filePath = imagePath.string();
+    mismatched.trainingMask = TrainingMaskDescriptor{
+        mismatchedPath.string(), TrainingMaskChannel::Luminance};
+    mismatched.width = 13;
+    mismatched.height = 9;
+    checkThrows<msplat::InvalidDatasetError>(
+        [&] { mismatched.loadImage(1.0f); },
+        "do not match");
+
+    const fs::path zeroPath = temporary.path / "zero-mask.tiff";
+    writeTIFF(zeroPath, 13, 9, solidRGBA(13, 9, {0, 0, 0}), 1);
+    Camera zero;
+    zero.filePath = imagePath.string();
+    zero.trainingMask = TrainingMaskDescriptor{
+        zeroPath.string(), TrainingMaskChannel::Luminance};
+    zero.width = 13;
+    zero.height = 9;
+    checkThrows<msplat::InvalidDatasetError>(
+        [&] { zero.loadImage(1.0f); },
+        "zero coverage");
+}
+
 void checkFractionalCameraScale(const TempDirectory &temporary) {
     constexpr RGB8 color{24, 144, 208};
     const fs::path path = temporary.path / "camera-orientation-6.tiff";
@@ -487,14 +709,22 @@ void checkBadInputs(const TempDirectory &temporary) {
 void checkImageCacheAccountingCategories() {
     Camera camera;
     camera.image.data.resize(2 * 3 * 3);
+    camera.coverageMask.data.resize(2 * 3);
     Image pyramid;
     pyramid.data.resize(1 * 2 * 3);
     camera.imagePyramids.emplace(2, std::move(pyramid));
+    CoverageMask maskPyramid;
+    maskPyramid.data.resize(1 * 2);
+    camera.coverageMaskPyramids.emplace(2, std::move(maskPyramid));
     camera.mtensorImageCache.emplace(
         2, MTensor({1, 2, 3}, DType::Float32));
+    camera.mtensorCoverageMaskCache.emplace(
+        2, MTensor({1, 2}, DType::UInt8));
 
-    const size_t expectedCpuBytes = (2 * 3 * 3 + 1 * 2 * 3) * sizeof(float);
-    const size_t expectedGpuBytes = 1 * 2 * 3 * sizeof(float);
+    const size_t expectedCpuBytes =
+        (2 * 3 * 3 + 1 * 2 * 3) * sizeof(float) + 2 * 3 + 1 * 2;
+    const size_t expectedGpuBytes =
+        1 * 2 * 3 * sizeof(float) + 1 * 2;
     CHECK(camera.cachedCpuImageBytes() == expectedCpuBytes);
     CHECK(camera.cachedGpuImageBytes() == expectedGpuBytes);
     CHECK(camera.cachedImageBytes() == expectedCpuBytes + expectedGpuBytes);
@@ -504,6 +734,95 @@ void checkImageCacheAccountingCategories() {
     CHECK(emptyCache.cachedGpuBytes() == 0);
     CHECK(emptyCache.hitCount() == 0);
     CHECK(emptyCache.missCount() == 0);
+}
+
+void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
+    Camera resident;
+    resident.filePath = "unused-on-resident-hit";
+    resident.trainingMask = TrainingMaskDescriptor{
+        "unused-mask-on-resident-hit", TrainingMaskChannel::Luminance};
+    resident.image.width = 3;
+    resident.image.height = 2;
+    resident.image.data.resize(3 * 2 * 3, 0.25f);
+    resident.coverageMask.width = 3;
+    resident.coverageMask.height = 2;
+    resident.coverageMask.data = {1, 2, 3, 4, 5, 6};
+    resident.loadedImageDownscaleFactor = 1.0f;
+    resident.mtensorImageCache.emplace(
+        1, MTensor({2, 3, 3}, DType::Float32));
+    resident.mtensorCoverageMaskCache.emplace(
+        1, MTensor({2, 3}, DType::UInt8));
+
+    std::vector<Camera> residentCameras;
+    residentCameras.push_back(std::move(resident));
+    CameraImageCache residentCache(1.0f, 1024);
+    const CameraTrainingTarget target =
+        residentCache.gpuTrainingTarget(residentCameras, 0, 1);
+    CHECK(target.image != nullptr);
+    CHECK(target.coverageMask != nullptr);
+    CHECK(target.coverageMask->dtype() == DType::UInt8);
+    CHECK(target.coverageMask->shape() == std::vector<int64_t>({2, 3}));
+    CHECK(target.coverageUnits == 21);
+    CHECK(residentCameras[0].coverageUnitsByDownscale.at(1) == 21);
+    CHECK(residentCache.hitCount() == 1);
+    CHECK(residentCache.missCount() == 0);
+    CHECK(residentCache.cachedBytes() ==
+          residentCameras[0].cachedImageBytes());
+
+    const fs::path imagePath = temporary.path / "cache-rgb.tiff";
+    const fs::path maskPath = temporary.path / "cache-mask.tiff";
+    writeTIFF(imagePath, 4, 4, solidRGBA(4, 4, {64, 96, 128}), 1);
+    writeTIFF(maskPath, 4, 4, solidRGBA(4, 4, {255, 255, 255}), 1);
+
+    std::vector<Camera> cameras(2);
+    for (Camera &camera : cameras) {
+        camera.filePath = imagePath.string();
+        camera.trainingMask = TrainingMaskDescriptor{
+            maskPath.string(), TrainingMaskChannel::Luminance};
+        camera.width = 4;
+        camera.height = 4;
+    }
+
+    constexpr size_t oneCameraBytes =
+        4 * 4 * 3 * sizeof(float) + 4 * 4;
+    CameraImageCache evictionCache(1.0f, oneCameraBytes);
+    (void)evictionCache.ensureLoaded(cameras, 0);
+    CHECK(!cameras[0].image.empty());
+    CHECK(!cameras[0].coverageMask.empty());
+    (void)evictionCache.ensureLoaded(cameras, 1);
+    CHECK(cameras[0].image.empty());
+    CHECK(cameras[0].coverageMask.empty());
+    CHECK(!cameras[1].image.empty());
+    CHECK(!cameras[1].coverageMask.empty());
+    CHECK(evictionCache.cachedCpuBytes() == oneCameraBytes);
+    CHECK(evictionCache.cachedGpuBytes() == 0);
+
+    Camera zeroAtCoarse;
+    zeroAtCoarse.filePath = "unused-zero-at-coarse";
+    zeroAtCoarse.trainingMask = TrainingMaskDescriptor{
+        "unused-zero-mask", TrainingMaskChannel::Luminance};
+    zeroAtCoarse.image.width = 4;
+    zeroAtCoarse.image.height = 4;
+    zeroAtCoarse.image.data.resize(4 * 4 * 3, 0.5f);
+    zeroAtCoarse.coverageMask.width = 4;
+    zeroAtCoarse.coverageMask.height = 4;
+    zeroAtCoarse.coverageMask.data.resize(4 * 4, 0);
+    zeroAtCoarse.coverageMask.data[0] = 1;
+    zeroAtCoarse.loadedImageDownscaleFactor = 1.0f;
+    std::vector<Camera> zeroCameras;
+    zeroCameras.push_back(std::move(zeroAtCoarse));
+    CameraImageCache zeroCache(1.0f, 1'024);
+    checkThrows<msplat::InvalidDatasetError>(
+        [&] { (void)zeroCache.gpuTrainingTarget(zeroCameras, 0, 2); },
+        "zero coverage");
+    CHECK(zeroCameras[0].image.empty());
+    CHECK(zeroCameras[0].coverageMask.empty());
+    CHECK(zeroCameras[0].imagePyramids.empty());
+    CHECK(zeroCameras[0].coverageMaskPyramids.empty());
+    CHECK(zeroCameras[0].mtensorImageCache.empty());
+    CHECK(zeroCameras[0].mtensorCoverageMaskCache.empty());
+    CHECK(zeroCameras[0].cachedImageBytes() == 0);
+    CHECK(zeroCache.cachedBytes() == 0);
 }
 
 } // namespace
@@ -523,6 +842,18 @@ int main() {
         checkStage("exact target size and color", [&] {
             checkExactTargetSizeAndColor(temporary);
         });
+        checkStage("coverage mask decode and resize", [&] {
+            checkCoverageMaskDecodeAndResize(temporary);
+        });
+        checkStage("coverage mask orientation", [&] {
+            checkCoverageMaskOrientation(temporary);
+        });
+        checkStage("joint mask undistortion", [&] {
+            checkJointUndistortion();
+        });
+        checkStage("masked Camera loading", [&] {
+            checkMaskedCameraLoading(temporary);
+        });
         checkStage("fractional Camera scale", [&] {
             checkFractionalCameraScale(temporary);
         });
@@ -531,6 +862,9 @@ int main() {
         });
         checkStage("image cache accounting categories", [&] {
             checkImageCacheAccountingCategories();
+        });
+        checkStage("masked cache hit and eviction", [&] {
+            checkMaskedCacheHitAndEviction(temporary);
         });
         return 0;
     } catch (const std::exception &error) {

@@ -42,6 +42,36 @@ require_contains("${metal_source}" "uint out = (py*W+px)*9 + c*3;"
     "compact derivative producer stride")
 require_contains("${metal_source}" "uint hp = (gy * W + gx) * 9 + c * 3;"
     "compact derivative consumer stride")
+require_contains("${host_source}"
+    "const MTensor& loss_coverage_buffer = coverage_mask ? *coverage_mask : gt;"
+    "allocation-free unmasked coverage buffer")
+require_contains("${host_source}"
+    "const uint32_t coverage_stride = coverage_mask ? img_width : 0u;"
+    "zero-stride unmasked coverage contract")
+require_contains("${host_source}"
+    "ENC_BUF(enc, loss_coverage_buffer, 8);"
+    "fused forward coverage binding")
+require_contains("${host_source}"
+    "ENC_SCALAR(enc, coverage_stride, 9);"
+    "fused forward coverage stride binding")
+require_contains("${host_source}"
+    "ENC_BUF(enc, loss_coverage_buffer, 6);"
+    "backward coverage binding")
+require_contains("${host_source}"
+    "ENC_SCALAR(enc, coverage_stride, 7);"
+    "backward coverage stride binding")
+require_contains("${metal_source}"
+    "ssim_weight * (coverage_sum - ssim_sum) / 3.0f"
+    "coverage-weighted SSIM center loss")
+require_contains("${metal_source}"
+    "tg_f1[dy][dx] = coverage *"
+    "coverage-weighted SSIM center derivative")
+require_contains("${metal_source}"
+    "float v_l1 = coverage *"
+    "coverage-weighted direct L1 derivative")
+require_contains("${host_source}"
+    "static_cast<double>(rawLoss) * 255.0"
+    "coverage-unit telemetry normalization")
 require_contains("${planner_source}" "[116, pixelCount]"
     "116-byte per-pixel planner coefficient")
 
@@ -62,3 +92,8 @@ require_absent("${host_source}" "g_tcache.v_rendered"
     "separate rendered-gradient allocation")
 require_absent("${host_source}" "ENC_BUF(enc, rendered_gradient, 6)"
     "redundant aliased output binding")
+require_absent("${host_source}" "lossPixelCount"
+    "pixel-count-only loss telemetry denominator")
+require_absent("${metal_source}"
+    "float pixel_loss = (px < W && py < H)\n        ? ssim_weight * (coverage_sum"
+    "partial-threadgroup loss gate")

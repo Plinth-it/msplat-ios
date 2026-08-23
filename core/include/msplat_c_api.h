@@ -16,8 +16,10 @@ extern "C" {
 // hard training-limit contract without changing MsplatConfig's v2 layout.
 // ABI v4 adds query-only completed-step and live-memory telemetry.
 // ABI v5 adds a checked, caller-owned canonical dataset descriptor boundary.
+// ABI v6 adds optional per-frame training masks without changing the v5 frame
+// or descriptor layouts.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 5u
+#define MSPLAT_ABI_VERSION 6u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -223,6 +225,9 @@ typedef struct {
 #define MSPLAT_RASTER_ORIENTATION_ENCODED_PIXELS 0u
 #define MSPLAT_RASTER_ORIENTATION_EXIF_NORMALIZED 1u
 
+#define MSPLAT_MASK_COVERAGE_LUMINANCE 0u
+#define MSPLAT_MASK_COVERAGE_ALPHA 1u
+
 typedef struct {
     int32_t width;
     int32_t height;
@@ -284,6 +289,17 @@ typedef struct {
     uint64_t reserved[2];
 } MsplatDatasetDescriptorV5;
 
+/// Per-frame training-mask sidecar introduced in ABI v6. There must be one
+/// element for every v5 frame. A NULL/zero-length path means that frame is
+/// unmasked and requires every other field to be zero. Non-empty mask paths
+/// are copied synchronously and use one of the MSPLAT_MASK_COVERAGE_* modes.
+typedef struct {
+    MsplatStringViewV5 maskPath;
+    uint32_t coverageChannel;
+    uint32_t reserved;
+    uint64_t reserved2[2];
+} MsplatFrameMaskV6;
+
 // Checked dataset API (ABI v2).
 MsplatStatus msplat_dataset_create_v2(const char* path, float downscaleFactor,
                                       bool evalMode, int testEvery,
@@ -305,6 +321,23 @@ MsplatStatus msplat_dataset_camera_pose_v2(MsplatDataset ds, int cameraIndex,
 MsplatStatus msplat_dataset_create_from_descriptor_v5(
     const MsplatDatasetDescriptorV5* descriptor,
     size_t descriptorSize,
+    float downscaleFactor,
+    bool evalMode,
+    int32_t testEvery,
+    MsplatDataset* outDataset,
+    MsplatErrorInfo* error);
+
+/// Checked canonical-descriptor API with optional per-frame masks (ABI v6).
+/// The v5 descriptor and complete mask sidecar are copied synchronously. No
+/// caller-owned pointer is retained. `descriptorSize` and
+/// `frameMaskElementSize` must exactly match their corresponding C structs;
+/// `frameMaskCount` must equal descriptor->frameCount.
+MsplatStatus msplat_dataset_create_from_descriptor_v6(
+    const MsplatDatasetDescriptorV5* descriptor,
+    size_t descriptorSize,
+    const MsplatFrameMaskV6* frameMasks,
+    size_t frameMaskCount,
+    size_t frameMaskElementSize,
     float downscaleFactor,
     bool evalMode,
     int32_t testEvery,

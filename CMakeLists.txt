@@ -186,6 +186,15 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             ${CMAKE_SOURCE_DIR}/core/include)
         add_test(NAME msplat_intersection_layout
             COMMAND msplat_intersection_layout_tests)
+        add_executable(msplat_masked_metrics_tests
+            tests/test_masked_metrics.cpp
+            core/src/ssim.cpp)
+        target_include_directories(msplat_masked_metrics_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/include)
+        target_link_libraries(msplat_masked_metrics_tests PRIVATE
+            ${FOUNDATION_LIBRARY})
+        add_test(NAME msplat_masked_metrics
+            COMMAND msplat_masked_metrics_tests)
         add_test(NAME msplat_exact_intersection_contract
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}

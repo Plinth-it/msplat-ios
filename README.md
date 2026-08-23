@@ -187,12 +187,20 @@ process-global Metal state. The legacy `GaussianDataset` and `GaussianTrainer`
 types remain available for source compatibility.
 
 Plinth can also construct a Swift `DatasetDescriptor` from calibrated frame
-URLs, sparse points, and optional observations, then pass it to
+URLs, optional per-frame soft training masks, sparse points, and optional
+observations, then pass it to
 `MsplatSession(dataset:securityScopedResourceURLs:options:config:)`. The native
-ABI copies every descriptor buffer synchronously. Callers should provide the
-selected folder or bookmark roots whose security scopes must stay active for
-lazy image decoding; the session releases those scopes after its native
-trainer and dataset are destroyed.
+ABI v5/v6 path copies every descriptor and mask-sidecar buffer synchronously.
+Luminance masks use premultiplied Rec. 709 coverage; alpha masks require an
+alpha channel. Both remain soft UInt8 coverage through resize and
+undistortion, must match the image in its selected encoded or EXIF-normalized
+raster frame, and normalize training loss over covered RGB units. Callers
+should provide the selected folder or bookmark roots whose security scopes
+cover every lazily decoded image and mask URL; the session releases those
+scopes after its native trainer and dataset are destroyed. Set
+`TrainingPlan.includesTrainingMasks` through its initializer when planning a
+masked dataset so the estimate includes full-source mask decoding and paired
+CPU/GPU mask caches.
 
 `step()` returns a submission receipt: its `cpuSubmitMs` measures active CPU
 encoding and submission time with required synchronous GPU waits excluded.

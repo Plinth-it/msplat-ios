@@ -19,6 +19,12 @@
   errors remain distinct from semantic dataset failures. Swift exposes the
   same immutable descriptor through the actor-isolated `MsplatSession` while
   retaining explicitly supplied security-scoped roots for lazy image access.
+- Added ABI v6 optional per-frame training masks as a synchronously copied
+  sidecar to the stable v5 descriptor. Luminance or alpha masks retain UInt8
+  soft coverage through resize and undistortion, weight L1 and SSIM loss, and
+  normalize completed loss telemetry by covered RGB units. Unmasked callers
+  continue through ABI v5 without mask allocation or storage and with unchanged
+  loss normalization.
 - Replaced fixed 2,048-entry per-tile bins with a two-pass exact intersection
   pipeline: projection counts each tile, the host builds checked offsets and
   grows compact arenas, and exact-range bitonic/radix sorting preserves every

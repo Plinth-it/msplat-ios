@@ -56,6 +56,18 @@ struct Dataset::Impl {
     MTensor& gpuImageForTestCamera(size_t testIndex, int downscaleFactor) {
         return images.gpuImage(data.cameras, testIndices[testIndex], downscaleFactor);
     }
+
+    CameraTrainingTarget trainingTargetForTrainCamera(
+        size_t trainIndex, int downscaleFactor) {
+        return images.gpuTrainingTarget(
+            data.cameras, trainIndices[trainIndex], downscaleFactor);
+    }
+
+    CameraTrainingTarget trainingTargetForTestCamera(
+        size_t testIndex, int downscaleFactor) {
+        return images.gpuTrainingTarget(
+            data.cameras, testIndices[testIndex], downscaleFactor);
+    }
 };
 
 namespace {
@@ -223,11 +235,14 @@ Stats Trainer::step() {
         Camera& cam = impl->ds->trainCamera(camIdx);
 
         int ds = impl->model->getDownscaleFactor(nextStep);
-        MTensor& gt = impl->ds->gpuImageForTrainCamera(camIdx, ds);
+        CameraTrainingTarget target =
+            impl->ds->trainingTargetForTrainCamera(camIdx, ds);
+        if (!target.image)
+            throw std::runtime_error("Training target has no RGB image");
 
         msplat_training_step_mark_cpu_start(logicalStep);
         impl->model->fullIteration(
-            cam, nextStep, gt, impl->config.ssimWeight);
+            cam, nextStep, target, impl->config.ssimWeight);
         impl->model->schedulersStep(nextStep);
         impl->model->afterTrain(nextStep);
 
@@ -235,8 +250,10 @@ Stats Trainer::step() {
         descriptor.iteration = nextStep;
         descriptor.splatCount = impl->model->means.size(0);
         descriptor.modelCapacity = impl->model->buf_capacity;
-        descriptor.effectiveWidth = static_cast<int32_t>(gt.size(1));
-        descriptor.effectiveHeight = static_cast<int32_t>(gt.size(0));
+        descriptor.effectiveWidth =
+            static_cast<int32_t>(target.image->size(1));
+        descriptor.effectiveHeight =
+            static_cast<int32_t>(target.image->size(0));
         descriptor.activeShDegree = std::min(
             nextStep / impl->config.shDegreeInterval,
             impl->config.shDegree);
@@ -283,11 +300,24 @@ EvalMetrics Trainer::evaluate() {
         msplat_gpu_sync();
         MTensor rgbCpu = rgb.cpu();
         int dsf = impl->model->getDownscaleFactor(impl->config.iterations);
-        MTensor gtCpu = impl->ds->gpuImageForTestCamera(i, dsf).cpu();
+        CameraTrainingTarget target =
+            impl->ds->trainingTargetForTestCamera(i, dsf);
+        if (!target.image)
+            throw std::runtime_error("Evaluation target has no RGB image");
+        MTensor gtCpu = target.image->cpu();
+        MTensor maskCpu;
+        const MTensor* coverageMask = nullptr;
+        if (target.coverageMask) {
+            maskCpu = target.coverageMask->cpu();
+            coverageMask = &maskCpu;
+        }
 
-        sumPsnr += psnr(rgbCpu, gtCpu);
-        sumSsim += ssim_eval(rgbCpu, gtCpu);
-        sumL1 += l1_loss(rgbCpu, gtCpu);
+        sumPsnr += psnr(
+            rgbCpu, gtCpu, coverageMask, target.coverageUnits);
+        sumSsim += ssim_eval(
+            rgbCpu, gtCpu, coverageMask, target.coverageUnits);
+        sumL1 += l1_loss(
+            rgbCpu, gtCpu, coverageMask, target.coverageUnits);
     }
 
     EvalMetrics m;
@@ -718,11 +748,10 @@ bool isRFC3629UTF8(const char* data, size_t length) noexcept {
     return true;
 }
 
-std::string copyStringView(const MsplatStringViewV5& view,
-                           const char* name) {
+void validateStringView(const MsplatStringViewV5& view, const char* name) {
     requireCountedPointer(view.data, view.length,
                           MSPLAT_DATASET_V5_MAX_STRING_BYTES, name);
-    if (view.length == 0) return {};
+    if (view.length == 0) return;
     if (std::memchr(view.data, '\0', view.length) != nullptr) {
         throw std::invalid_argument(
             std::string(name) + " must not contain embedded NUL bytes");
@@ -731,6 +760,12 @@ std::string copyStringView(const MsplatStringViewV5& view,
         throw std::invalid_argument(
             std::string(name) + " must contain valid RFC 3629 UTF-8");
     }
+}
+
+std::string copyStringView(const MsplatStringViewV5& view,
+                           const char* name) {
+    validateStringView(view, name);
+    if (view.length == 0) return {};
     return std::string(view.data, view.length);
 }
 
@@ -842,6 +877,60 @@ std::vector<T> copyCountedArray(const T* pointer, size_t count,
     return result;
 }
 
+void validateFrameMaskArray(const MsplatFrameMaskV6* frameMasks,
+                            size_t frameMaskCount,
+                            size_t frameMaskElementSize,
+                            size_t descriptorFrameCount) {
+    require(frameMaskElementSize == sizeof(MsplatFrameMaskV6),
+            "Frame-mask element size does not match this msplat ABI");
+    require(frameMaskCount == descriptorFrameCount,
+            "Frame-mask count must match the dataset frame count");
+    requireCountedPointer(frameMasks, frameMaskCount,
+                          MSPLAT_DATASET_V5_MAX_FRAMES, "frameMasks");
+    for (size_t index = 0; index < frameMaskCount; ++index) {
+        const MsplatFrameMaskV6& input = frameMasks[index];
+        require(input.reserved == 0 && input.reserved2[0] == 0 &&
+                    input.reserved2[1] == 0,
+                "Frame-mask reserved fields must be zero");
+
+        validateStringView(input.maskPath, "frame mask path");
+        if (input.maskPath.length == 0) {
+            require(input.coverageChannel == MSPLAT_MASK_COVERAGE_LUMINANCE,
+                    "An unmasked frame-mask slot must otherwise be zero");
+            continue;
+        }
+
+        require(input.coverageChannel == MSPLAT_MASK_COVERAGE_LUMINANCE ||
+                    input.coverageChannel == MSPLAT_MASK_COVERAGE_ALPHA,
+                "Frame-mask coverage channel is not recognized");
+    }
+}
+
+std::vector<std::optional<TrainingMaskDescriptor>> copyFrameMasks(
+    const MsplatFrameMaskV6* frameMasks, size_t frameMaskCount) {
+    std::vector<std::optional<TrainingMaskDescriptor>> result(frameMaskCount);
+    for (size_t index = 0; index < frameMaskCount; ++index) {
+        const MsplatFrameMaskV6& input = frameMasks[index];
+        if (input.maskPath.length == 0) continue;
+
+        TrainingMaskDescriptor mask;
+        mask.path = std::string(input.maskPath.data, input.maskPath.length);
+        switch (input.coverageChannel) {
+            case MSPLAT_MASK_COVERAGE_LUMINANCE:
+                mask.channel = TrainingMaskChannel::Luminance;
+                break;
+            case MSPLAT_MASK_COVERAGE_ALPHA:
+                mask.channel = TrainingMaskChannel::Alpha;
+                break;
+            default:
+                throw std::invalid_argument(
+                    "Frame-mask coverage channel is not recognized");
+        }
+        result[index] = std::move(mask);
+    }
+    return result;
+}
+
 void validateConfig(const MsplatConfig& c) {
     require(c.iterations > 0 && c.iterations <= 1000000,
             "iterations must be in 1...1000000");
@@ -945,6 +1034,44 @@ MsplatStatus msplat_dataset_create_from_descriptor_v5(
             downscaleFactor, evalMode, static_cast<int>(testEvery));
 
         ::DatasetDescriptor copied = copyDatasetDescriptor(*descriptor);
+        auto handle = std::make_unique<CApiDatasetHandle>();
+        handle->dataset = createCheckedDataset([&] {
+            return std::make_shared<msplat::Dataset>(
+                std::move(copied), downscaleFactor, evalMode,
+                static_cast<int>(testEvery));
+        });
+        *outDataset = static_cast<MsplatDataset>(handle.release());
+    });
+}
+
+MsplatStatus msplat_dataset_create_from_descriptor_v6(
+    const MsplatDatasetDescriptorV5* descriptor,
+    size_t descriptorSize,
+    const MsplatFrameMaskV6* frameMasks,
+    size_t frameMaskCount,
+    size_t frameMaskElementSize,
+    float downscaleFactor,
+    bool evalMode,
+    int32_t testEvery,
+    MsplatDataset* outDataset,
+    MsplatErrorInfo* error) {
+    if (outDataset) *outDataset = nullptr;
+    return guarded(error, MSPLAT_STATUS_INVALID_DATASET, [&] {
+        require(outDataset != nullptr, "outDataset must not be null");
+        require(descriptor != nullptr, "Dataset descriptor must not be null");
+        require(descriptorSize == sizeof(MsplatDatasetDescriptorV5),
+                "Dataset descriptor size does not match this msplat ABI");
+        validateDatasetCreationOptions(
+            downscaleFactor, evalMode, static_cast<int>(testEvery));
+        validateFrameMaskArray(
+            frameMasks, frameMaskCount, frameMaskElementSize,
+            descriptor->frameCount);
+        auto copiedMasks = copyFrameMasks(frameMasks, frameMaskCount);
+
+        ::DatasetDescriptor copied = copyDatasetDescriptor(*descriptor);
+        for (size_t index = 0; index < copiedMasks.size(); ++index) {
+            copied.frames[index].trainingMask = std::move(copiedMasks[index]);
+        }
         auto handle = std::make_unique<CApiDatasetHandle>();
         handle->dataset = createCheckedDataset([&] {
             return std::make_shared<msplat::Dataset>(

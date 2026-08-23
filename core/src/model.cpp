@@ -101,24 +101,6 @@ int numShBases(int degree){
     }
 }
 
-// Metrics on CPU MTensor data
-float psnr(const MTensor& rendered, const MTensor& gt) {
-    int64_t n = rendered.numel();
-    const float *r = rendered.data<float>(), *g = gt.data<float>();
-    double mse = 0;
-    for (int64_t i = 0; i < n; i++) { double d = r[i] - g[i]; mse += d * d; }
-    mse /= n;
-    return 10.0f * std::log10(1.0 / mse);
-}
-
-float l1_loss(const MTensor& rendered, const MTensor& gt) {
-    int64_t n = rendered.numel();
-    const float *r = rendered.data<float>(), *g = gt.data<float>();
-    double sum = 0;
-    for (int64_t i = 0; i < n; i++) sum += std::abs(r[i] - g[i]);
-    return (float)(sum / n);
-}
-
 // Model constructor
 Model::Model(const InputData &inputData, int numCameras,
     int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
@@ -1130,7 +1112,22 @@ MTensor Model::render(Camera& cam, int step){
         opacities, backgroundColor);
 }
 
-void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
+void Model::fullIteration(Camera& cam, int step, MTensor& gt,
+                          float ssimWeight) {
+    uint64_t coverageUnits = 0;
+    if (gt.ndim() >= 2 && gt.size(0) > 0 && gt.size(1) > 0) {
+        const uint64_t pixels = static_cast<uint64_t>(gt.size(0)) *
+            static_cast<uint64_t>(gt.size(1));
+        if (pixels <= std::numeric_limits<uint64_t>::max() / 255u)
+            coverageUnits = pixels * 255u;
+    }
+    CameraTrainingTarget target{&gt, nullptr, coverageUnits};
+    fullIteration(cam, step, target, ssimWeight);
+}
+
+void Model::fullIteration(Camera& cam, int step,
+                          const CameraTrainingTarget& target,
+                          float ssimWeight){
     const bool collectDensificationStats =
         collectsDensificationStats(step, stopSplitAt);
     if (!collectDensificationStats) {
@@ -1140,6 +1137,40 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     auto s = prepareCam(cam, step);
     lastHeight = s.height; lastWidth = s.width;
     int numPoints = means.size(0);
+
+    if (!target.image || !target.image->defined() || !target.image->isGpu() ||
+        target.image->dtype() != DType::Float32 ||
+        target.image->ndim() != 3 || target.image->size(0) != s.height ||
+        target.image->size(1) != s.width || target.image->size(2) != 3) {
+        throw std::invalid_argument(
+            "Training image must be a GPU float32 tensor matching the camera");
+    }
+    const uint64_t pixelCount = static_cast<uint64_t>(s.height) *
+        static_cast<uint64_t>(s.width);
+    if (pixelCount == 0 ||
+        pixelCount > std::numeric_limits<uint64_t>::max() / 255u) {
+        throw std::invalid_argument("Training image dimensions are invalid");
+    }
+    const uint64_t fullCoverageUnits = pixelCount * 255u;
+    if (target.coverageUnits == 0 ||
+        target.coverageUnits > fullCoverageUnits) {
+        throw std::invalid_argument("Training coverage denominator is invalid");
+    }
+    if (target.coverageMask) {
+        if (!target.coverageMask->defined() ||
+            !target.coverageMask->isGpu() ||
+            target.coverageMask->dtype() != DType::UInt8 ||
+            target.coverageMask->ndim() != 2 ||
+            target.coverageMask->size(0) != s.height ||
+            target.coverageMask->size(1) != s.width) {
+            throw std::invalid_argument(
+                "Training coverage mask must be a GPU uint8 tensor matching the camera");
+        }
+    } else if (target.coverageUnits != fullCoverageUnits) {
+        throw std::invalid_argument(
+            "Unmasked training coverage denominator is inconsistent");
+    }
+    MTensor& gt = *target.image;
 
     if (collectDensificationStats && !hasDensificationScratch()) {
         allocateDensificationScratch();
@@ -1175,7 +1206,8 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     }
 
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
-    float lossInvN = 1.0f / (float)(s.height * s.width * 3);
+    const float lossInvN = static_cast<float>(
+        255.0 / (static_cast<double>(target.coverageUnits) * 3.0));
 
     MTensor r;
     adam_step_count = nextAdamStep;
@@ -1185,7 +1217,8 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
             quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
             s.height, s.width, s.tileBounds, 0.01f,
             s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-            opacities, backgroundColor, gt, ssimWeight,
+            opacities, backgroundColor, gt, target.coverageMask,
+            target.coverageUnits, ssimWeight,
             lossInvN,
             N_ADAM_GROUPS,
             adam_p, adam_ea, adam_eas,

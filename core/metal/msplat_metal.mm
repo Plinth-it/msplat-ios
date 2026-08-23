@@ -289,10 +289,11 @@ struct MsplatLogicalTrainingStep {
         }
     }
 
-    void markReadbackEncoded(uint64_t capacity, uint64_t pixelCount) {
+    void markReadbackEncoded(uint64_t capacity,
+                             uint64_t lossCoverageUnits) {
         std::lock_guard<std::mutex> lock(mutex);
         packedIntersectionCapacity = capacity;
-        lossPixelCount = pixelCount;
+        this->lossCoverageUnits = lossCoverageUnits;
         readbackEncoded = true;
     }
 
@@ -360,10 +361,10 @@ private:
 
                 float rawLoss = 0.0f;
                 std::memcpy(&rawLoss, &words[1], sizeof(rawLoss));
-                if (lossPixelCount > 0 && std::isfinite(rawLoss)) {
+                if (lossCoverageUnits > 0 && std::isfinite(rawLoss)) {
                     completed.loss =
-                        static_cast<double>(rawLoss) /
-                        static_cast<double>(lossPixelCount);
+                        static_cast<double>(rawLoss) * 255.0 /
+                        static_cast<double>(lossCoverageUnits);
                     lossValid = std::isfinite(completed.loss);
                 }
 
@@ -401,7 +402,7 @@ private:
     size_t pendingCommandBuffers = 0;
     uint32_t commandBufferCount = 0;
     uint64_t packedIntersectionCapacity = 0;
-    uint64_t lossPixelCount = 0;
+    uint64_t lossCoverageUnits = 0;
     double cpuSubmitMs = 0.0;
     double synchronousGpuWaitMs = 0.0;
     double gpuExecutionMs = 0.0;
@@ -1821,7 +1822,8 @@ MTensor msplat_train_step(
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
-    MTensor &gt, float ssim_weight,
+    MTensor &gt, const MTensor* coverage_mask,
+    uint64_t loss_coverage_units, float ssim_weight,
     float loss_inv_n,
     int num_adam_groups,
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
@@ -1843,6 +1845,33 @@ MTensor msplat_train_step(
         g_profile_stages_checked = true;
     }
     uint32_t channels = 3;
+    const uint64_t pixelCount = static_cast<uint64_t>(img_height) *
+        static_cast<uint64_t>(img_width);
+    if (pixelCount == 0 ||
+        pixelCount > std::numeric_limits<uint64_t>::max() / 255u) {
+        throw std::invalid_argument("Training image dimensions are invalid");
+    }
+    const uint64_t fullCoverageUnits = pixelCount * 255u;
+    if (loss_coverage_units == 0 ||
+        loss_coverage_units > fullCoverageUnits ||
+        !std::isfinite(loss_inv_n) || loss_inv_n <= 0.0f) {
+        throw std::invalid_argument("Training loss normalization is invalid");
+    }
+    if (coverage_mask) {
+        if (!coverage_mask->defined() || !coverage_mask->isGpu() ||
+            coverage_mask->dtype() != DType::UInt8 ||
+            coverage_mask->ndim() != 2 ||
+            coverage_mask->size(0) != static_cast<int64_t>(img_height) ||
+            coverage_mask->size(1) != static_cast<int64_t>(img_width)) {
+            throw std::invalid_argument(
+                "Training coverage mask must be a GPU uint8 image");
+        }
+    } else if (loss_coverage_units != fullCoverageUnits) {
+        throw std::invalid_argument(
+            "Unmasked training coverage denominator is inconsistent");
+    }
+    const MTensor& loss_coverage_buffer = coverage_mask ? *coverage_mask : gt;
+    const uint32_t coverage_stride = coverage_mask ? img_width : 0u;
 
     // --- Cached buffer pool ---
     g_tcache.ensure_shared_forward(
@@ -2109,6 +2138,8 @@ MTensor msplat_train_step(
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, ssim_deriv_h_buf, 6); ENC_BUF(enc, loss_sum, 7);
+        ENC_BUF(enc, loss_coverage_buffer, 8);
+        ENC_SCALAR(enc, coverage_stride, 9);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 3: V bwd
@@ -2117,6 +2148,8 @@ MTensor msplat_train_step(
         ENC_BUF(enc, ssim_deriv_h_buf, 2);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
+        ENC_BUF(enc, loss_coverage_buffer, 6);
+        ENC_SCALAR(enc, coverage_stride, 7);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
     };
 
@@ -2290,8 +2323,7 @@ MTensor msplat_train_step(
         [blit endEncoding];
         logicalStep->markReadbackEncoded(
             static_cast<uint64_t>(capacity_u32),
-            static_cast<uint64_t>(img_height) *
-                static_cast<uint64_t>(img_width));
+            loss_coverage_units);
         return true;
     };
 

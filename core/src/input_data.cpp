@@ -57,12 +57,57 @@ bool dimensionsShareAspect(int lhsWidth, int lhsHeight,
     return std::abs(lhs - rhs) / denominator <= relativeTolerance;
 }
 
+uint64_t fullCoverageUnits(int width, int height, const std::string &path) {
+    if (width <= 0 || height <= 0) {
+        throw msplat::InvalidDatasetError(
+            "Training target has invalid dimensions for " + path);
+    }
+    const uint64_t pixelCount =
+        static_cast<uint64_t>(width) * static_cast<uint64_t>(height);
+    if (pixelCount > std::numeric_limits<uint64_t>::max() / 255u) {
+        throw msplat::InvalidDatasetError(
+            "Training target coverage exceeds the supported range for " + path);
+    }
+    return pixelCount * 255u;
+}
+
+uint64_t maskCoverageUnits(
+    const CoverageMask &mask, const std::string &path) {
+    const uint64_t expectedSize =
+        static_cast<uint64_t>(mask.width) *
+        static_cast<uint64_t>(mask.height);
+    if (mask.width <= 0 || mask.height <= 0 ||
+        expectedSize != mask.data.size()) {
+        throw msplat::InvalidDatasetError(
+            "Training mask storage does not match its dimensions for " + path);
+    }
+
+    uint64_t units = 0;
+    for (uint8_t value : mask.data) {
+        if (units > std::numeric_limits<uint64_t>::max() - value) {
+            throw msplat::InvalidDatasetError(
+                "Training mask coverage exceeds the supported range for " +
+                path);
+        }
+        units += value;
+    }
+    if (units == 0) {
+        throw msplat::InvalidDatasetError(
+            "Training mask has zero coverage at the generated resolution: " +
+            path);
+    }
+    return units;
+}
+
 } // namespace
 
 // ── Image loading ───────────────────────────────────────────────────────────
 
 void Camera::loadImage(float downscaleFactor) {
-    if (!image.empty() && loadedImageDownscaleFactor == downscaleFactor) return;
+    if (!image.empty() && loadedImageDownscaleFactor == downscaleFactor &&
+        (!trainingMask || !coverageMask.empty())) {
+        return;
+    }
     releaseImageMemory();
 
     if (!std::isfinite(downscaleFactor) || downscaleFactor < 1.0f) {
@@ -92,6 +137,25 @@ void Camera::loadImage(float downscaleFactor) {
         ? sourceInfo.orientedWidth : sourceInfo.rawWidth;
     const int sourceHeight = normalizeExif
         ? sourceInfo.orientedHeight : sourceInfo.rawHeight;
+
+    ImageSourceInfo maskSourceInfo;
+    if (trainingMask) {
+        maskSourceInfo = inspectImageSource(trainingMask->path);
+        const int maskWidth = normalizeExif
+            ? maskSourceInfo.orientedWidth : maskSourceInfo.rawWidth;
+        const int maskHeight = normalizeExif
+            ? maskSourceInfo.orientedHeight : maskSourceInfo.rawHeight;
+        if (maskWidth != sourceWidth || maskHeight != sourceHeight) {
+            throw msplat::InvalidDatasetError(
+                "Training mask dimensions " + std::to_string(maskWidth) +
+                "x" + std::to_string(maskHeight) +
+                " do not match the selected " +
+                (normalizeExif ? "EXIF-oriented" : "encoded") +
+                " image dimensions " + std::to_string(sourceWidth) + "x" +
+                std::to_string(sourceHeight) + " for " + filePath +
+                ": " + trainingMask->path);
+        }
+    }
 
     // Each descriptor explicitly names the pixel frame its calibration uses.
     // Existing adapters preserve encoded pixels; a native adapter may request
@@ -132,6 +196,13 @@ void Camera::loadImage(float downscaleFactor) {
         sourceHeight, downscaleFactor, "height", filePath);
     Image raw = imreadRGB(filePath, sourceInfo, targetWidth, targetHeight,
                           normalizeExif);
+    CoverageMask rawMask;
+    if (trainingMask) {
+        rawMask = imreadCoverageMask(
+            trainingMask->path, maskSourceInfo, targetWidth, targetHeight,
+            normalizeExif, trainingMask->channel);
+        (void)maskCoverageUnits(rawMask, trainingMask->path);
+    }
 
     // Scale from the calibration's declared pixel frame directly to the exact
     // target canvas. COLMAP uses image-edge coordinates (the upper-left pixel
@@ -152,15 +223,32 @@ void Camera::loadImage(float downscaleFactor) {
 
     // Undistort if needed
     if (hasDistortion()) {
-        auto result = undistortImage(raw, fx, fy, cx, cy, k1, k2, p1, p2, k3);
-        raw = std::move(result.image);
-        fx = result.fx; fy = result.fy;
-        cx = result.cx; cy = result.cy;
-        width = result.width; height = result.height;
+        if (trainingMask) {
+            auto result = undistortImageAndCoverageMask(
+                raw, rawMask, fx, fy, cx, cy, k1, k2, p1, p2, k3);
+            raw = std::move(result.image);
+            rawMask = std::move(result.coverageMask);
+            fx = result.fx; fy = result.fy;
+            cx = result.cx; cy = result.cy;
+            width = result.width; height = result.height;
+            (void)maskCoverageUnits(rawMask, trainingMask->path);
+        } else {
+            auto result = undistortImage(
+                raw, fx, fy, cx, cy, k1, k2, p1, p2, k3);
+            raw = std::move(result.image);
+            fx = result.fx; fy = result.fy;
+            cx = result.cx; cy = result.cy;
+            width = result.width; height = result.height;
+        }
         k1 = k2 = k3 = p1 = p2 = 0;
     }
 
     image = std::move(raw);
+    coverageMask = std::move(rawMask);
+    if (trainingMask) {
+        coverageUnitsByDownscale.emplace(
+            1, maskCoverageUnits(coverageMask, trainingMask->path));
+    }
     loadedImageDownscaleFactor = downscaleFactor;
 }
 
@@ -178,33 +266,159 @@ const Image& Camera::getImage(int downscaleFactor) {
     return inserted.first->second;
 }
 
-MTensor& Camera::getGPUImage(int downscaleFactor) {
-    auto it = mtensorImageCache.find(downscaleFactor);
-    if (it != mtensorImageCache.end()) return it->second;
+const CoverageMask& Camera::getCoverageMask(int downscaleFactor) {
+    if (!trainingMask) {
+        throw std::logic_error(
+            "Coverage was requested for a camera without a training mask");
+    }
+    if (coverageMask.empty()) loadImage(1.0f);
+    if (downscaleFactor <= 1) return coverageMask;
+
+    auto it = coverageMaskPyramids.find(downscaleFactor);
+    if (it != coverageMaskPyramids.end()) return it->second;
+
+    const int newWidth = coverageMask.width / downscaleFactor;
+    const int newHeight = coverageMask.height / downscaleFactor;
+    CoverageMask scaled = resizeCoverageArea(
+        coverageMask, newWidth, newHeight);
+    const uint64_t units = maskCoverageUnits(scaled, trainingMask->path);
+    auto inserted = coverageMaskPyramids.emplace(
+        downscaleFactor, std::move(scaled));
+    coverageUnitsByDownscale.emplace(downscaleFactor, units);
+    return inserted.first->second;
+}
+
+uint64_t Camera::getCoverageUnits(int downscaleFactor) {
+    if (!trainingMask) {
+        throw std::logic_error(
+            "Coverage was requested for a camera without a training mask");
+    }
+    const int cacheKey = std::max(downscaleFactor, 1);
+    const auto cached = coverageUnitsByDownscale.find(cacheKey);
+    if (cached != coverageUnitsByDownscale.end()) return cached->second;
+
+    const CoverageMask &mask = getCoverageMask(cacheKey);
+    const uint64_t units = maskCoverageUnits(mask, trainingMask->path);
+    coverageUnitsByDownscale.emplace(cacheKey, units);
+    return units;
+}
+
+CameraTrainingTarget Camera::getGPUTrainingTarget(int downscaleFactor) {
+    const auto imageIt = mtensorImageCache.find(downscaleFactor);
+    const auto maskIt = mtensorCoverageMaskCache.find(downscaleFactor);
+    const bool imageIsResident = imageIt != mtensorImageCache.end();
+    const bool maskIsResident = !trainingMask ||
+        maskIt != mtensorCoverageMaskCache.end();
+    if (imageIsResident && maskIsResident) {
+        const uint64_t units = trainingMask
+            ? getCoverageUnits(downscaleFactor)
+            : fullCoverageUnits(
+                  static_cast<int>(imageIt->second.size(1)),
+                  static_cast<int>(imageIt->second.size(0)), filePath);
+        return {
+            &imageIt->second,
+            trainingMask ? &maskIt->second : nullptr,
+            units,
+        };
+    }
 
     // The training resolution only moves from coarse to fine. Keeping GPU and
     // CPU pyramid copies for earlier stages makes an uninterrupted run retain
     // substantially more memory than a checkpoint resume at the same step.
     for (auto& item : mtensorImageCache) item.second.reset();
     mtensorImageCache.clear();
+    for (auto& item : mtensorCoverageMaskCache) item.second.reset();
+    mtensorCoverageMaskCache.clear();
     imagePyramids.clear();
+    coverageMaskPyramids.clear();
+
+    const CoverageMask *mask = nullptr;
+    uint64_t units = 0;
+    if (trainingMask) {
+        // Validate coverage before materializing the matching RGB pyramid so a
+        // zero-coverage stage cannot leave half of a CPU cache pair resident.
+        mask = &getCoverageMask(downscaleFactor);
+        units = getCoverageUnits(downscaleFactor);
+    }
 
     const Image& img = getImage(downscaleFactor);
     if (img.empty())
         throw msplat::DatasetIOError("Failed to decode image: " + filePath);
-    MTensor mt = gpu_empty({img.height, img.width, 3}, DType::Float32);
-    memcpy(mt.data_ptr(), img.ptr(), img.width * img.height * 3 * sizeof(float));
-    mtensorImageCache[downscaleFactor] = mt;
-    return mtensorImageCache[downscaleFactor];
+    if (mask) {
+        if (mask->width != img.width || mask->height != img.height) {
+            throw msplat::InvalidDatasetError(
+                "Generated training mask dimensions do not match the image: " +
+                trainingMask->path);
+        }
+    } else {
+        units = fullCoverageUnits(img.width, img.height, filePath);
+    }
+
+    // Allocate and populate the complete pair before publishing either cache
+    // entry. A mask validation/allocation failure must not strand an RGB tensor
+    // outside CameraImageCache accounting.
+    MTensor imageStorage = gpu_empty(
+        {img.height, img.width, 3}, DType::Float32);
+    memcpy(imageStorage.data_ptr(), img.ptr(),
+           img.width * img.height * 3 * sizeof(float));
+    std::optional<MTensor> maskStorage;
+    if (mask) {
+        maskStorage.emplace(gpu_empty(
+            {mask->height, mask->width}, DType::UInt8));
+        memcpy(maskStorage->data_ptr(), mask->ptr(), mask->data.size());
+    }
+
+    try {
+        auto imageInserted = mtensorImageCache.emplace(
+            downscaleFactor, std::move(imageStorage));
+        if (!imageInserted.second) {
+            throw std::logic_error("Training image cache insertion failed");
+        }
+
+        MTensor *maskTensor = nullptr;
+        if (maskStorage) {
+            auto maskInserted = mtensorCoverageMaskCache.emplace(
+                downscaleFactor, std::move(*maskStorage));
+            if (!maskInserted.second) {
+                throw std::logic_error(
+                    "Training mask cache insertion failed");
+            }
+            maskTensor = &maskInserted.first->second;
+        }
+        return {&imageInserted.first->second, maskTensor, units};
+    } catch (...) {
+        if (auto it = mtensorImageCache.find(downscaleFactor);
+            it != mtensorImageCache.end()) {
+            it->second.reset();
+            mtensorImageCache.erase(it);
+        }
+        if (auto it = mtensorCoverageMaskCache.find(downscaleFactor);
+            it != mtensorCoverageMaskCache.end()) {
+            it->second.reset();
+            mtensorCoverageMaskCache.erase(it);
+        }
+        throw;
+    }
+}
+
+MTensor& Camera::getGPUImage(int downscaleFactor) {
+    return *getGPUTrainingTarget(downscaleFactor).image;
 }
 
 void Camera::releaseImageMemory() {
     image = Image();
+    coverageMask = CoverageMask();
     imagePyramids.clear();
+    coverageMaskPyramids.clear();
     for (auto& item : mtensorImageCache) {
         item.second.reset();
     }
     mtensorImageCache.clear();
+    for (auto& item : mtensorCoverageMaskCache) {
+        item.second.reset();
+    }
+    mtensorCoverageMaskCache.clear();
+    coverageUnitsByDownscale.clear();
     loadedImageDownscaleFactor = 0.0f;
 }
 
@@ -213,12 +427,19 @@ size_t Camera::cachedCpuImageBytes() const {
     for (const auto& item : imagePyramids) {
         bytes += item.second.data.size() * sizeof(float);
     }
+    bytes += coverageMask.data.size();
+    for (const auto& item : coverageMaskPyramids) {
+        bytes += item.second.data.size();
+    }
     return bytes;
 }
 
 size_t Camera::cachedGpuImageBytes() const {
     size_t bytes = 0;
     for (const auto& item : mtensorImageCache) {
+        bytes += item.second.nbytes();
+    }
+    for (const auto& item : mtensorCoverageMaskCache) {
         bytes += item.second.nbytes();
     }
     return bytes;
@@ -244,21 +465,41 @@ size_t CameraImageCache::defaultBudgetBytes() {
 
 MTensor& CameraImageCache::gpuImage(std::vector<Camera> &cameras, size_t index,
                                     int downscaleFactor) {
+    return *gpuTrainingTarget(cameras, index, downscaleFactor).image;
+}
+
+CameraTrainingTarget CameraImageCache::gpuTrainingTarget(
+    std::vector<Camera> &cameras, size_t index, int downscaleFactor) {
     Camera &cam = cameras[index];
-    if (cam.mtensorImageCache.find(downscaleFactor) != cam.mtensorImageCache.end()) {
+    const bool imageIsResident =
+        cam.mtensorImageCache.find(downscaleFactor) !=
+        cam.mtensorImageCache.end();
+    const bool maskIsResident = !cam.trainingMask ||
+        cam.mtensorCoverageMaskCache.find(downscaleFactor) !=
+            cam.mtensorCoverageMaskCache.end();
+    if (imageIsResident && maskIsResident) {
         ++_hitCount;
     } else {
         ++_missCount;
     }
-    cam.loadImage(_downscaleFactor);
-    MTensor &image = cam.getGPUImage(downscaleFactor);
+    try {
+        cam.loadImage(_downscaleFactor);
+        CameraTrainingTarget target =
+            cam.getGPUTrainingTarget(downscaleFactor);
 
-    Entry &entry = _entries[index];
-    entry.lastUse = ++_clock;
-    entry.cpuBytes = cam.cachedCpuImageBytes();
-    entry.gpuBytes = cam.cachedGpuImageBytes();
-    evict(cameras, index);
-    return image;
+        Entry &entry = _entries[index];
+        entry.lastUse = ++_clock;
+        entry.cpuBytes = cam.cachedCpuImageBytes();
+        entry.gpuBytes = cam.cachedGpuImageBytes();
+        evict(cameras, index);
+        return target;
+    } catch (...) {
+        // A failed lazy decode, validation, or paired upload must not leave
+        // resident bytes that the LRU has never accounted for.
+        cam.releaseImageMemory();
+        _entries.erase(index);
+        throw;
+    }
 }
 
 Camera& CameraImageCache::ensureLoaded(std::vector<Camera> &cameras, size_t index) {
@@ -479,6 +720,7 @@ InputData inputDataFromDescriptor(DatasetDescriptor descriptor) {
                   camera.camToWorld);
         camera.filePath = std::move(frame.imagePath);
         camera.rasterOrientation = frame.rasterOrientation;
+        camera.trainingMask = std::move(frame.trainingMask);
         data.cameras.push_back(std::move(camera));
         data.metadata.frameIds.push_back(std::move(frame.id));
         data.metadata.calibrationIds.push_back(std::move(frame.calibrationId));

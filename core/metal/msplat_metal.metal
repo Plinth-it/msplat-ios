@@ -3254,6 +3254,8 @@ kernel void ssim_v_fwd_kernel(
     constant float& ssim_weight,
     device float* intermediates,    // (H, W, 15)
     device atomic_float* loss_sum,
+    constant uchar* coverage_mask,  // (H, W), ignored when stride is zero
+    constant uint& coverage_stride,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3332,7 +3334,12 @@ kernel void ssim_v_fwd_kernel(
     // Pixel loss
     float pixel_loss = 0.0f;
     if (px < W && py < H) {
-        pixel_loss = ssim_weight * (1.0f - ssim_sum / 3.0f) + (1.0f - ssim_weight) * l1_sum / 3.0f;
+        const float coverage = coverage_stride == 0
+            ? 1.0f
+            : float(coverage_mask[py * coverage_stride + px]) / 255.0f;
+        pixel_loss = coverage * (
+            ssim_weight * (1.0f - ssim_sum / 3.0f) +
+            (1.0f - ssim_weight) * l1_sum / 3.0f);
     }
 
     // Threadgroup reduction → atomic add to loss_sum
@@ -3358,6 +3365,8 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constant float& ssim_weight, constant float& inv_n,
     device float* deriv_h_buf, // (H, W, 9): 3 values × 3 channels
     device atomic_float* loss_sum,
+    constant uchar* coverage_mask, // (H, W), ignored when stride is zero
+    constant uint& coverage_stride,
     uint2 gid [[thread_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]],
     uint2 tg_size [[threads_per_threadgroup]]
@@ -3368,7 +3377,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     const int base_gy = (int)(tgid.y * SSIM_TG) - SSIM_HALF_WIN;
     constexpr uint TILE_DIM = SSIM_TG + 2 * SSIM_HALF_WIN;
     constexpr uint TILE_PIXELS = TILE_DIM * TILE_DIM;
-    float ssim_sum = 0.0f, l1_sum = 0.0f;
+    float ssim_sum = 0.0f, l1_sum = 0.0f, coverage_sum = 0.0f;
 
     for (uint c = 0; c < 3; c++) {
         threadgroup float tg_hp[TILE_DIM][TILE_DIM][5];
@@ -3398,6 +3407,14 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                 sq_y += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][3];
                 cross_xy += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][4];
             }
+            int gpx = base_gx + (int)dx;
+            int gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
+            const bool valid_center =
+                gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H;
+            const float coverage = !valid_center ? 0.0f :
+                (coverage_stride == 0 ? 1.0f :
+                 float(coverage_mask[
+                    uint(gpy) * coverage_stride + uint(gpx)]) / 255.0f);
             float sigma_x_sq = sq_x - mu_x*mu_x, sigma_y_sq = sq_y - mu_y*mu_y;
             float sigma_xy = cross_xy - mu_x*mu_y;
             float A = 2.0f*mu_x*mu_y + SSIM_C1, B = 2.0f*sigma_xy + SSIM_C2;
@@ -3405,14 +3422,16 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             float iCD = 1.0f / (Cd * D);
             float dmu = 2.0f*B*(mu_x*Cd - A*mu_y) / (Cd*Cd*D);
             float dsyq = -A*B*iCD/D, dsxy = 2.0f*A*iCD;
-            tg_f1[dy][dx] = dmu - 2.0f*mu_y*dsyq - mu_x*dsxy;
-            tg_f2[dy][dx] = 2.0f*dsyq;
-            tg_f3[dy][dx] = dsxy;
+            tg_f1[dy][dx] = coverage *
+                (dmu - 2.0f*mu_y*dsyq - mu_x*dsxy);
+            tg_f2[dy][dx] = coverage * 2.0f*dsyq;
+            tg_f3[dy][dx] = coverage * dsxy;
             if (dx >= SSIM_HALF_WIN && dx < SSIM_HALF_WIN + SSIM_TG) {
-                int gpx = base_gx + (int)dx, gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
-                if (gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H) {
-                    ssim_sum += (A * B) / (Cd * D);
-                    l1_sum += fabs(gt[(gpy*W+gpx)*3+c] - rendered[(gpy*W+gpx)*3+c]);
+                if (valid_center) {
+                    ssim_sum += coverage * (A * B) / (Cd * D);
+                    l1_sum += coverage *
+                        fabs(gt[(gpy*W+gpx)*3+c] - rendered[(gpy*W+gpx)*3+c]);
+                    coverage_sum += coverage;
                 }
             }
         }
@@ -3430,7 +3449,12 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    float pixel_loss = (px < W && py < H) ? ssim_weight*(1.0f-ssim_sum/3.0f) + (1.0f-ssim_weight)*l1_sum/3.0f : 0.0f;
+    // DERIV_PIXELS exceeds the thread count, so one thread can own valid
+    // centers even when its gid lies outside a partial edge threadgroup.
+    // Invalid centers already contribute zero coverage above.
+    float pixel_loss =
+        ssim_weight * (coverage_sum - ssim_sum) / 3.0f +
+        (1.0f - ssim_weight) * l1_sum / 3.0f;
     threadgroup float tg_sum[256];
     tg_sum[tr] = pixel_loss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3449,6 +3473,8 @@ kernel void ssim_h_bwd_kernel(
     constant float* intermediates,  // (H, W, 15) from forward
     constant uint2& img_size,       // (W, H)
     device float* ssim_h_buf,       // (H, W, 15) — reused from forward
+    constant uchar* coverage_mask,  // (H, W), ignored when stride is zero
+    constant uint& coverage_stride,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3492,10 +3518,15 @@ kernel void ssim_h_bwd_kernel(
                 float dmu  = 2.0f * B * (mu_x * Cd - A * mu_y) / (Cd * Cd * D);
                 float dsyq = -A * B * iCD / D;
                 float dsxy = 2.0f * A * iCD;
+                const float coverage = coverage_stride == 0
+                    ? 1.0f
+                    : float(coverage_mask[
+                        uint(gy) * coverage_stride + uint(gx)]) / 255.0f;
 
-                f1 = dmu - 2.0f * mu_y * dsyq - mu_x * dsxy;
-                f2 = 2.0f * dsyq;
-                f3 = dsxy;
+                f1 = coverage *
+                    (dmu - 2.0f * mu_y * dsyq - mu_x * dsxy);
+                f2 = coverage * 2.0f * dsyq;
+                f3 = coverage * dsxy;
             }
             tg_f1[c][sy][sx] = f1;
             tg_f2[c][sy][sx] = f2;
@@ -3529,7 +3560,9 @@ kernel void ssim_v_bwd_kernel(
     constant float* deriv_h_buf,    // (H, W, 9): 3 values × 3 channels
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
-    constant float& inv_n,          // 1.0 / (H * W * 3)
+    constant float& inv_n,          // 255 / (sum(coverage bytes) * 3)
+    constant uchar* coverage_mask,  // (H, W), ignored when stride is zero
+    constant uint& coverage_stride,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3584,7 +3617,12 @@ kernel void ssim_v_bwd_kernel(
             float gt_val = gt[(py * W + px) * 3 + c];
 
             float v_ssim = conv_f1 + rend_val * conv_f2 + gt_val * conv_f3;
-            float v_l1 = (gt_val > rend_val) ? -1.0f : ((gt_val < rend_val) ? 1.0f : 0.0f);
+            const float coverage = coverage_stride == 0
+                ? 1.0f
+                : float(coverage_mask[py * coverage_stride + px]) / 255.0f;
+            float v_l1 = coverage * (
+                (gt_val > rend_val) ? -1.0f :
+                ((gt_val < rend_val) ? 1.0f : 0.0f));
 
             rendered_gradient[pixel_channel] = inv_n * (
                 -ssim_weight * v_ssim + (1.0f - ssim_weight) * v_l1

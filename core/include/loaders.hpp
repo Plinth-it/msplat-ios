@@ -34,7 +34,13 @@ ImageSourceInfo inspectImageSource(const std::string &path);
 Image imreadRGB(const std::string &path, const ImageSourceInfo &sourceInfo,
                 int targetWidth, int targetHeight,
                 bool applyExifOrientation);
+CoverageMask imreadCoverageMask(
+    const std::string &path, const ImageSourceInfo &sourceInfo,
+    int targetWidth, int targetHeight, bool applyExifOrientation,
+    TrainingMaskChannel channel);
 Image resizeArea(const Image &src, int dstW, int dstH);  // box-filter downscale
+CoverageMask resizeCoverageArea(
+    const CoverageMask &src, int dstW, int dstH);  // box-filter, UInt8 round
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG
 
 // Undistortion (Brown-Conrady model, alpha=0 crop)
@@ -44,6 +50,17 @@ struct UndistortResult {
     int width, height;      // cropped dimensions
 };
 UndistortResult undistortImage(const Image &src,
+    float fx, float fy, float cx, float cy,
+    float k1, float k2, float p1, float p2, float k3);
+
+struct UndistortTrainingTargetResult {
+    Image image;
+    CoverageMask coverageMask;
+    float fx, fy, cx, cy;
+    int width, height;
+};
+UndistortTrainingTargetResult undistortImageAndCoverageMask(
+    const Image &image, const CoverageMask &coverageMask,
     float fx, float fy, float cx, float cy,
     float k1, float k2, float p1, float p2, float k3);
 

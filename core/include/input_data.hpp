@@ -20,6 +20,21 @@ struct Image {
     const float* ptr() const { return data.data(); }
 };
 
+struct CoverageMask {
+    std::vector<uint8_t> data;  // width * height bytes, soft coverage [0,255]
+    int width = 0, height = 0;
+
+    bool empty() const { return data.empty(); }
+    uint8_t* ptr() { return data.data(); }
+    const uint8_t* ptr() const { return data.data(); }
+};
+
+struct CameraTrainingTarget {
+    MTensor *image = nullptr;
+    MTensor *coverageMask = nullptr;  // null means uniform full coverage
+    uint64_t coverageUnits = 0;       // sum(mask), or width * height * 255
+};
+
 struct Camera {
     int width = 0, height = 0;
     float fx = 0, fy = 0, cx = 0, cy = 0;
@@ -27,10 +42,15 @@ struct Camera {
     float camToWorld[16] = {};  // 4x4 row-major, camera-to-world (OpenGL: Y-up, Z-back)
     std::string filePath;
     RasterOrientation rasterOrientation = RasterOrientation::EncodedPixels;
+    std::optional<TrainingMaskDescriptor> trainingMask;
 
     Image image;
+    CoverageMask coverageMask;
     std::unordered_map<int, Image> imagePyramids;
+    std::unordered_map<int, CoverageMask> coverageMaskPyramids;
     std::unordered_map<int, MTensor> mtensorImageCache;
+    std::unordered_map<int, MTensor> mtensorCoverageMaskCache;
+    std::unordered_map<int, uint64_t> coverageUnitsByDownscale;
     float loadedImageDownscaleFactor = 0.0f;
     MTensor cachedViewMat, cachedProjViewMat;
     float cachedCamPos[3] = {};
@@ -53,7 +73,10 @@ struct Camera {
 
     void loadImage(float downscaleFactor);
     const Image& getImage(int downscaleFactor);
+    const CoverageMask& getCoverageMask(int downscaleFactor);
+    uint64_t getCoverageUnits(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
+    CameraTrainingTarget getGPUTrainingTarget(int downscaleFactor);
     void releaseImageMemory();
     size_t cachedCpuImageBytes() const;
     size_t cachedGpuImageBytes() const;
@@ -99,6 +122,11 @@ public:
     /// `downscaleFactor`, evicting other cameras to stay under budget. The
     /// camera being asked for is never the eviction victim.
     MTensor& gpuImage(std::vector<Camera> &cameras, size_t index, int downscaleFactor);
+
+    /// Returns the RGB tensor together with optional soft coverage. A cache hit
+    /// requires every tensor needed by the target to already be resident.
+    CameraTrainingTarget gpuTrainingTarget(
+        std::vector<Camera> &cameras, size_t index, int downscaleFactor);
 
     /// Decodes cameras[index] if it is not resident, and accounts for it, but
     /// uploads nothing. Render paths need this: the correction from the

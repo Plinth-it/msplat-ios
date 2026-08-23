@@ -17,6 +17,7 @@
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
+static_assert(MSPLAT_ABI_VERSION == 6u);
 static_assert(sizeof(MsplatSubmittedTrainingStep) == 32);
 static_assert(alignof(MsplatSubmittedTrainingStep) == 4);
 static_assert(sizeof(MsplatCompletedTrainingStep) == 64);
@@ -94,6 +95,13 @@ static_assert(offsetof(MsplatDatasetDescriptorV5, observationCount) == 88);
 static_assert(offsetof(MsplatDatasetDescriptorV5, provenanceAdapter) == 96);
 static_assert(offsetof(MsplatDatasetDescriptorV5, provenanceSource) == 112);
 static_assert(offsetof(MsplatDatasetDescriptorV5, reserved) == 128);
+static_assert(std::is_standard_layout<MsplatFrameMaskV6>::value);
+static_assert(sizeof(MsplatFrameMaskV6) == 40);
+static_assert(alignof(MsplatFrameMaskV6) == 8);
+static_assert(offsetof(MsplatFrameMaskV6, maskPath) == 0);
+static_assert(offsetof(MsplatFrameMaskV6, coverageChannel) == 16);
+static_assert(offsetof(MsplatFrameMaskV6, reserved) == 20);
+static_assert(offsetof(MsplatFrameMaskV6, reserved2) == 24);
 static_assert(MSPLAT_DATASET_V5_MAX_STRING_BYTES == 1048576u);
 static_assert(MSPLAT_DATASET_V5_MAX_FRAMES == 1000000u);
 static_assert(MSPLAT_DATASET_V5_MAX_POINTS == 100000000u);
@@ -174,12 +182,42 @@ struct DescriptorFixture {
     DescriptorFixture& operator=(const DescriptorFixture&) = delete;
 };
 
+struct FrameMaskFixture {
+    DescriptorFixture dataset;
+    char maskPaths[2][11] = {"mask-0.png", "mask-1.png"};
+    MsplatFrameMaskV6 masks[2] = {};
+
+    FrameMaskFixture() {
+        masks[0].maskPath = {
+            maskPaths[0], std::strlen(maskPaths[0])};
+        masks[0].coverageChannel = MSPLAT_MASK_COVERAGE_LUMINANCE;
+        masks[1].maskPath = {
+            maskPaths[1], std::strlen(maskPaths[1])};
+        masks[1].coverageChannel = MSPLAT_MASK_COVERAGE_ALPHA;
+    }
+
+    FrameMaskFixture(const FrameMaskFixture&) = delete;
+    FrameMaskFixture& operator=(const FrameMaskFixture&) = delete;
+};
+
 MsplatStatus createDescriptor(const MsplatDatasetDescriptorV5* descriptor,
                               size_t descriptorSize,
                               MsplatDataset* outDataset,
                               MsplatErrorInfo* error) {
     return msplat_dataset_create_from_descriptor_v5(
         descriptor, descriptorSize, 1.0f, false, 8, outDataset, error);
+}
+
+MsplatStatus createDescriptorV6(const MsplatDatasetDescriptorV5* descriptor,
+                                size_t descriptorSize,
+                                const MsplatFrameMaskV6* frameMasks,
+                                size_t frameMaskCount,
+                                size_t frameMaskElementSize,
+                                MsplatDataset* outDataset,
+                                MsplatErrorInfo* error) {
+    return msplat_dataset_create_from_descriptor_v6(
+        descriptor, descriptorSize, frameMasks, frameMaskCount,
+        frameMaskElementSize, 1.0f, false, 8, outDataset, error);
 }
 
 template <typename Mutation>
@@ -196,6 +234,33 @@ bool rejectsDescriptorAs(MsplatStatus expected, Mutation mutation) {
 }
 
 bool createsAndDestroysDescriptor(DescriptorFixture &fixture);
+
+bool createsAndDestroysDescriptorV6(FrameMaskFixture &fixture) {
+    MsplatDataset dataset = nullptr;
+    MsplatErrorInfo error{};
+    if (createDescriptorV6(
+            &fixture.dataset.descriptor, sizeof(fixture.dataset.descriptor),
+            fixture.masks, 2, sizeof(MsplatFrameMaskV6),
+            &dataset, &error) != MSPLAT_STATUS_OK ||
+        dataset == nullptr || error.status != MSPLAT_STATUS_OK) {
+        return false;
+    }
+    return msplat_dataset_destroy_v2(dataset, &error) == MSPLAT_STATUS_OK;
+}
+
+template <typename Mutation>
+bool rejectsFrameMasksAs(MsplatStatus expected, Mutation mutation) {
+    FrameMaskFixture fixture;
+    mutation(fixture);
+
+    MsplatDataset dataset = reinterpret_cast<MsplatDataset>(uintptr_t{1});
+    MsplatErrorInfo error{};
+    const MsplatStatus status = createDescriptorV6(
+        &fixture.dataset.descriptor, sizeof(fixture.dataset.descriptor),
+        fixture.masks, 2, sizeof(MsplatFrameMaskV6), &dataset, &error);
+    return status == expected && dataset == nullptr && error.status == status &&
+           error.message[0] != '\0';
+}
 
 template <size_t N>
 bool rejectsFrameIdUTF8(const uint8_t (&bytes)[N]) {
@@ -315,6 +380,116 @@ int main() {
     CHECK(copiedPose[3] == -1.0f);
     CHECK(msplat_dataset_destroy_v2(copiedDataset, &error) ==
           MSPLAT_STATUS_OK);
+
+    // ABI v6 keeps the v5 descriptor layout stable and carries one optional
+    // mask slot per frame in a checked, synchronously copied sidecar.
+    FrameMaskFixture maskedFixture;
+    CHECK(createsAndDestroysDescriptorV6(maskedFixture));
+    FrameMaskFixture unmaskedFixture;
+    unmaskedFixture.masks[0] = {};
+    unmaskedFixture.masks[1] = {};
+    CHECK(createsAndDestroysDescriptorV6(unmaskedFixture));
+
+    MsplatDataset v6Dataset = reinterpret_cast<MsplatDataset>(uintptr_t{1});
+    CHECK(createDescriptorV6(
+              &maskedFixture.dataset.descriptor,
+              sizeof(maskedFixture.dataset.descriptor) - 1,
+              maskedFixture.masks, 2, sizeof(MsplatFrameMaskV6),
+              &v6Dataset, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(v6Dataset == nullptr);
+    v6Dataset = reinterpret_cast<MsplatDataset>(uintptr_t{1});
+    CHECK(createDescriptorV6(
+              &maskedFixture.dataset.descriptor,
+              sizeof(maskedFixture.dataset.descriptor) + 1,
+              maskedFixture.masks, 2, sizeof(MsplatFrameMaskV6),
+              &v6Dataset, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(v6Dataset == nullptr);
+    v6Dataset = reinterpret_cast<MsplatDataset>(uintptr_t{1});
+    CHECK(createDescriptorV6(
+              &maskedFixture.dataset.descriptor,
+              sizeof(maskedFixture.dataset.descriptor),
+              maskedFixture.masks, 2, sizeof(MsplatFrameMaskV6) - 1,
+              &v6Dataset, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(v6Dataset == nullptr);
+    v6Dataset = reinterpret_cast<MsplatDataset>(uintptr_t{1});
+    CHECK(createDescriptorV6(
+              &maskedFixture.dataset.descriptor,
+              sizeof(maskedFixture.dataset.descriptor),
+              maskedFixture.masks, 2, sizeof(MsplatFrameMaskV6) + 1,
+              &v6Dataset, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(v6Dataset == nullptr);
+    v6Dataset = reinterpret_cast<MsplatDataset>(uintptr_t{1});
+    CHECK(createDescriptorV6(
+              &maskedFixture.dataset.descriptor,
+              sizeof(maskedFixture.dataset.descriptor),
+              maskedFixture.masks, 1, sizeof(MsplatFrameMaskV6),
+              &v6Dataset, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(v6Dataset == nullptr);
+    v6Dataset = reinterpret_cast<MsplatDataset>(uintptr_t{1});
+    CHECK(createDescriptorV6(
+              &maskedFixture.dataset.descriptor,
+              sizeof(maskedFixture.dataset.descriptor),
+              nullptr, 2, sizeof(MsplatFrameMaskV6),
+              &v6Dataset, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(v6Dataset == nullptr);
+
+    CHECK(rejectsFrameMasksAs(
+        MSPLAT_STATUS_INVALID_ARGUMENT,
+        [](auto &value) { value.masks[0].reserved = 1; }));
+    CHECK(rejectsFrameMasksAs(
+        MSPLAT_STATUS_INVALID_ARGUMENT,
+        [](auto &value) { value.masks[0].reserved2[0] = 1; }));
+    CHECK(rejectsFrameMasksAs(
+        MSPLAT_STATUS_INVALID_ARGUMENT,
+        [](auto &value) { value.masks[0].reserved2[1] = 1; }));
+    CHECK(rejectsFrameMasksAs(
+        MSPLAT_STATUS_INVALID_ARGUMENT,
+        [](auto &value) { value.masks[0].coverageChannel = 2; }));
+    CHECK(rejectsFrameMasksAs(
+        MSPLAT_STATUS_INVALID_ARGUMENT,
+        [](auto &value) { value.masks[0].maskPath.data = nullptr; }));
+    CHECK(rejectsFrameMasksAs(
+        MSPLAT_STATUS_INVALID_ARGUMENT,
+        [](auto &value) { value.maskPaths[0][1] = '\0'; }));
+    CHECK(rejectsFrameMasksAs(
+        MSPLAT_STATUS_INVALID_ARGUMENT,
+        [](auto &value) {
+            value.masks[0].maskPath.length =
+                static_cast<size_t>(MSPLAT_DATASET_V5_MAX_STRING_BYTES) + 1;
+        }));
+    CHECK(rejectsFrameMasksAs(
+        MSPLAT_STATUS_INVALID_ARGUMENT,
+        [](auto &value) {
+            value.masks[0].maskPath = {nullptr, 0};
+            value.masks[0].coverageChannel = MSPLAT_MASK_COVERAGE_ALPHA;
+        }));
+    CHECK(rejectsFrameMasksAs(
+        MSPLAT_STATUS_INVALID_ARGUMENT,
+        [](auto &value) {
+            value.masks[0].maskPath.length = 0;
+        }));
+    const uint8_t invalidMaskUTF8[] = {0xed, 0xa0, 0x80};
+    CHECK(rejectsFrameMasksAs(
+        MSPLAT_STATUS_INVALID_ARGUMENT,
+        [&](auto &value) {
+            value.masks[0].maskPath = {
+                reinterpret_cast<const char*>(invalidMaskUTF8),
+                sizeof(invalidMaskUTF8)};
+        }));
+
+    // Sidecar validation precedes descriptor allocation/copy so structural
+    // mask errors retain INVALID_ARGUMENT precedence for large descriptors.
+    FrameMaskFixture validationOrder;
+    validationOrder.dataset.descriptor.reserved[0] = 1;
+    validationOrder.masks[0].reserved = 1;
+    v6Dataset = reinterpret_cast<MsplatDataset>(uintptr_t{1});
+    CHECK(createDescriptorV6(
+              &validationOrder.dataset.descriptor,
+              sizeof(validationOrder.dataset.descriptor),
+              validationOrder.masks, 2, sizeof(MsplatFrameMaskV6),
+              &v6Dataset, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(v6Dataset == nullptr);
+    CHECK(std::strstr(error.message, "Frame-mask") != nullptr);
 
     // Optional metadata and correspondence arrays accept either a complete
     // pointer/count pair or the canonical absent representation.

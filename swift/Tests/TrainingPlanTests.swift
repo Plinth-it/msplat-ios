@@ -30,6 +30,7 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(config.shDegreeInterval, 666)
         XCTAssertEqual(config.downscaleFactor, 1)
         XCTAssertEqual(plan.maximumGaussianCount, 750_000)
+        XCTAssertFalse(plan.includesTrainingMasks)
         XCTAssertEqual(
             plan.decodedInputDimensions,
             try TrainingImageDimensions(width: 960, height: 720)
@@ -94,6 +95,71 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(customEstimate.codeDerivedBytes, 1_672_217_416)
         XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 334_443_484)
         XCTAssertEqual(customEstimate.estimatedPeakMemory, 2_006_660_900)
+    }
+
+    func testMaskAwareMemoryEstimateIncludesUInt8CacheAndDecodeStorage() throws {
+        let plan = try TrainingPlan(
+            inputDimensions: TrainingImageDimensions(width: 1_920, height: 1_440),
+            inputDecodeScale: 2,
+            iterationBudget: 2_000,
+            stages: [
+                TrainingResolutionStage(
+                    iterations: 1...1_000,
+                    downscaleFactor: 2
+                ),
+                TrainingResolutionStage(
+                    iterations: 1_001...2_000,
+                    downscaleFactor: 1
+                ),
+            ],
+            targetSHDegree: 2,
+            maximumGaussianCount: 750_000,
+            includesTrainingMasks: true
+        )
+
+        XCTAssertTrue(plan.includesTrainingMasks)
+        let estimate = try plan.memoryEstimate(
+            imageCacheBudgetBytes:
+                TrainingMemoryEstimate.defaultIOSImageCacheBudgetBytes
+        )
+        XCTAssertEqual(estimate.largestImageCacheEntryBytes, 17_971_200)
+        XCTAssertEqual(estimate.imageDecodeTransientBytes, 30_412_800)
+        XCTAssertEqual(estimate.imageInsertionPeakBytes, 567_283_712)
+        XCTAssertEqual(estimate.codeDerivedBytes, 2_147_509_064)
+        XCTAssertEqual(estimate.recommendedHeadroomBytes, 429_501_813)
+        XCTAssertEqual(estimate.estimatedPeakMemory, 2_577_010_877)
+
+        let customEstimate = try plan.memoryEstimate(
+            imageCacheBudgetBytes: 64 * 1_024 * 1_024
+        )
+        XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 97_521_664)
+        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_677_747_016)
+        XCTAssertEqual(customEstimate.estimatedPeakMemory, 2_013_296_420)
+    }
+
+    func testMaskAwareCoarseOnlyCacheEstimateIncludesBothResolutions() throws {
+        let plan = try TrainingPlan(
+            inputDimensions: TrainingImageDimensions(width: 1_920, height: 1_440),
+            inputDecodeScale: 2,
+            iterationBudget: 1_000,
+            stages: [
+                TrainingResolutionStage(
+                    iterations: 1...1_000,
+                    downscaleFactor: 2
+                ),
+            ],
+            targetSHDegree: 2,
+            maximumGaussianCount: 750_000,
+            includesTrainingMasks: true
+        )
+
+        XCTAssertEqual(
+            try plan.memoryEstimate(
+                imageCacheBudgetBytes:
+                    TrainingMemoryEstimate.defaultIOSImageCacheBudgetBytes
+            ).largestImageCacheEntryBytes,
+            13_478_400
+        )
     }
 
     func testSingleCoarseStageDoesNotTransitionWithinBudget() throws {

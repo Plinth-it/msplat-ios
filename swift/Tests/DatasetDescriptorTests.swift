@@ -10,6 +10,14 @@ final class DatasetDescriptorTests: XCTestCase {
         XCTAssertEqual(descriptor, descriptor)
         XCTAssertEqual(DatasetRasterOrientation.encodedPixels.rawValue, 0)
         XCTAssertEqual(DatasetRasterOrientation.exifNormalized.rawValue, 1)
+        let mask = try DatasetTrainingMask(
+            url: URL(fileURLWithPath: "/tmp/mask.png"),
+            coverageChannel: .alpha
+        )
+        requireSendable(mask)
+        XCTAssertEqual(mask, mask)
+        XCTAssertEqual(DatasetMaskCoverageChannel.luminance.rawValue, 0)
+        XCTAssertEqual(DatasetMaskCoverageChannel.alpha.rawValue, 1)
     }
 
     func testValueValidationRejectsMalformedInputs() throws {
@@ -30,6 +38,10 @@ final class DatasetDescriptorTests: XCTestCase {
             rasterOrientation: .encodedPixels,
             calibration: calibration,
             cameraToWorld: pose
+        ))
+        XCTAssertThrowsError(try DatasetTrainingMask(
+            url: remoteURL,
+            coverageChannel: .luminance
         ))
         XCTAssertThrowsError(try DatasetSparsePointSet(
             xyz: [0, 1], rgb: [0, 0]
@@ -146,7 +158,8 @@ final class DatasetDescriptorTests: XCTestCase {
     func testNativeMarshallingPreservesValuesAndDefaultProvenance() throws {
         let descriptor = try makeDescriptor(provenance: nil)
 
-        try withUnsafeNativeDatasetDescriptor(descriptor) { pointer in
+        try withUnsafeNativeDatasetDescriptorV6(descriptor) {
+            pointer, masks, maskCount in
             let native = pointer.pointee
             XCTAssertEqual(native.frameCount, 2)
             XCTAssertEqual(native.pointXYZCount, 6)
@@ -182,6 +195,43 @@ final class DatasetDescriptorTests: XCTestCase {
             XCTAssertEqual(observations[1].pointIndex, -1)
             XCTAssertEqual(observations[2].frameIndex, 1)
             XCTAssertEqual(observations[2].pointIndex, 1)
+            XCTAssertEqual(maskCount, 2)
+            XCTAssertNil(masks[0].maskPath.data)
+            XCTAssertEqual(masks[0].maskPath.length, 0)
+            XCTAssertEqual(masks[0].coverageChannel, 0)
+            XCTAssertNil(masks[1].maskPath.data)
+        }
+    }
+
+    func testNativeMarshallingPreservesMaskSidecars() throws {
+        let mask = try DatasetTrainingMask(
+            url: URL(fileURLWithPath: "/tmp/soft-mask.png"),
+            coverageChannel: .alpha
+        )
+        let frame = try DatasetFrame(
+            id: "frame",
+            calibrationID: "camera",
+            imageURL: URL(fileURLWithPath: "/tmp/image.png"),
+            rasterOrientation: .exifNormalized,
+            calibration: makeCalibration(),
+            cameraToWorld: identityPose(),
+            trainingMask: mask
+        )
+        let descriptor = try DatasetDescriptor(
+            frames: [frame], points: makePoints()
+        )
+
+        try withUnsafeNativeDatasetDescriptorV6(descriptor) {
+            _, masks, maskCount in
+            XCTAssertEqual(maskCount, 1)
+            XCTAssertEqual(decode(masks[0].maskPath), "/tmp/soft-mask.png")
+            XCTAssertEqual(
+                masks[0].coverageChannel,
+                DatasetMaskCoverageChannel.alpha.rawValue
+            )
+            XCTAssertEqual(masks[0].reserved, 0)
+            XCTAssertEqual(masks[0].reserved2.0, 0)
+            XCTAssertEqual(masks[0].reserved2.1, 0)
         }
     }
 
@@ -196,6 +246,28 @@ final class DatasetDescriptorTests: XCTestCase {
                 )
             }
         }
+    }
+
+    func testV5MarshallingRejectsTrainingMasks() throws {
+        let mask = try DatasetTrainingMask(
+            url: URL(fileURLWithPath: "/tmp/mask.png")
+        )
+        let frame = try DatasetFrame(
+            id: "frame",
+            calibrationID: "camera",
+            imageURL: URL(fileURLWithPath: "/tmp/image.png"),
+            rasterOrientation: .encodedPixels,
+            calibration: makeCalibration(),
+            cameraToWorld: identityPose(),
+            trainingMask: mask
+        )
+        let descriptor = try DatasetDescriptor(
+            frames: [frame], points: makePoints()
+        )
+
+        XCTAssertThrowsError(
+            try withUnsafeNativeDatasetDescriptor(descriptor) { _ in () }
+        )
     }
 
     func testNativeMarshallingUsesNilForAbsentPointMetadata() throws {
@@ -222,12 +294,15 @@ final class DatasetDescriptorTests: XCTestCase {
         }
     }
 
-    func testSwiftImportedV5LayoutsMatchTheCABI() {
+    func testSwiftImportedDescriptorLayoutsMatchTheCABI() {
         XCTAssertEqual(MemoryLayout<MsplatStringViewV5>.size, 16)
         XCTAssertEqual(MemoryLayout<MsplatCameraCalibrationV5>.size, 44)
         XCTAssertEqual(MemoryLayout<MsplatDatasetFrameV5>.size, 168)
         XCTAssertEqual(MemoryLayout<MsplatSparseObservationV5>.size, 24)
         XCTAssertEqual(MemoryLayout<MsplatDatasetDescriptorV5>.size, 144)
+        XCTAssertEqual(MemoryLayout<MsplatFrameMaskV6>.size, 40)
+        XCTAssertEqual(MemoryLayout<MsplatFrameMaskV6>.stride, 40)
+        XCTAssertEqual(MemoryLayout<MsplatFrameMaskV6>.alignment, 8)
 
         XCTAssertEqual(MemoryLayout<DatasetObservation>.size, 24)
         XCTAssertEqual(MemoryLayout<DatasetObservation>.stride, 24)

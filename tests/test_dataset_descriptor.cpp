@@ -42,6 +42,8 @@ DatasetDescriptor validDescriptor() {
     first.id = "frame-0";
     first.calibrationId = "camera-0";
     first.imagePath = "images/0.jpg";
+    first.trainingMask = TrainingMaskDescriptor{
+        "masks/0.png", TrainingMaskChannel::Alpha};
     first.calibration = {640, 480, 500.0f, 501.0f, 320.0f, 240.0f,
                          0.01f, -0.02f, 0.001f, 0.002f, -0.003f};
 
@@ -380,6 +382,11 @@ int main() {
     CHECK(materialized.metadata.provenance.source == "synthetic");
     CHECK(materialized.cameras[1].rasterOrientation ==
           RasterOrientation::ExifNormalized);
+    CHECK(materialized.cameras[0].trainingMask.has_value());
+    CHECK(materialized.cameras[0].trainingMask->path == "masks/0.png");
+    CHECK(materialized.cameras[0].trainingMask->channel ==
+          TrainingMaskChannel::Alpha);
+    CHECK(!materialized.cameras[1].trainingMask.has_value());
     CHECK(std::abs(materialized.scale - (2.0f / 3.0f)) < 1e-6f);
     CHECK(std::abs(materialized.translation[0] - 0.5f) < 1e-6f);
     CHECK(std::abs(materialized.translation[1] - 1.0f) < 1e-6f);
@@ -414,6 +421,13 @@ int main() {
     CHECK(rejects(valid, [](auto &value) { value.frames[0].imagePath.clear(); }));
     CHECK(rejects(valid, [](auto &value) {
         value.frames[0].rasterOrientation = static_cast<RasterOrientation>(2);
+    }));
+    CHECK(rejects(valid, [](auto &value) {
+        value.frames[0].trainingMask->path.clear();
+    }));
+    CHECK(rejects(valid, [](auto &value) {
+        value.frames[0].trainingMask->channel =
+            static_cast<TrainingMaskChannel>(2);
     }));
     CHECK(rejects(valid, [](auto &value) {
         value.provenance.adapter.clear();

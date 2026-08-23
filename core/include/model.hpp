@@ -6,8 +6,6 @@
 #include "input_data.hpp"
 
 int numShBases(int degree);
-float psnr(const MTensor& rendered, const MTensor& gt);
-float l1_loss(const MTensor& rendered, const MTensor& gt);
 /// Validate checkpoint structure and tensor metadata without allocating Metal
 /// buffers or changing model state. Throws std::runtime_error when invalid.
 void validateCheckpointFile(const std::string &filename);
@@ -43,7 +41,10 @@ struct Model{
     float cam_pos[3];
   };
   CamSetup prepareCam(Camera& cam, int step);
-  void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight);
+  // Compatibility path for callers that do not load training masks.
+  void fullIteration(Camera& cam, int step, MTensor& gt, float ssimWeight);
+  void fullIteration(Camera& cam, int step,
+                     const CameraTrainingTarget& target, float ssimWeight);
   MTensor render(Camera& cam, int step);
 
   MTensor means;

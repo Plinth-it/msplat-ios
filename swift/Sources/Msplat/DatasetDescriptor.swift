@@ -18,6 +18,37 @@ public enum DatasetRasterOrientation: UInt32, Sendable, Equatable {
     case exifNormalized = 1
 }
 
+/// Selects the soft-coverage channel extracted from a training-mask image.
+public enum DatasetMaskCoverageChannel: UInt32, Sendable, Equatable {
+    /// Rec. 709 luminance of the mask's premultiplied RGB values.
+    case luminance = 0
+    /// The mask image's alpha channel. Images without alpha are rejected.
+    case alpha = 1
+}
+
+/// Optional soft per-pixel training coverage for one dataset frame.
+public struct DatasetTrainingMask: Sendable, Equatable {
+    public let url: URL
+    public let coverageChannel: DatasetMaskCoverageChannel
+
+    public init(
+        url: URL,
+        coverageChannel: DatasetMaskCoverageChannel = .luminance
+    ) throws {
+        guard url.isFileURL else {
+            throw MsplatError.invalidArgument(
+                "Dataset training-mask URLs must be file URLs"
+            )
+        }
+        try validateDatasetString(
+            url.path,
+            name: "Dataset training-mask paths"
+        )
+        self.url = url
+        self.coverageChannel = coverageChannel
+    }
+}
+
 /// Immutable pinhole calibration and optional lens-distortion coefficients.
 public struct DatasetCalibration: Sendable, Equatable {
     public let width: Int
@@ -86,6 +117,8 @@ public struct DatasetFrame: Sendable, Equatable {
     public let calibration: DatasetCalibration
     /// Row-major OpenGL camera-to-world transform (Y-up, Z-back).
     public let cameraToWorld: CameraPose
+    /// Soft coverage in the same oriented source-pixel frame as the image.
+    public let trainingMask: DatasetTrainingMask?
 
     public init(
         id: String,
@@ -93,7 +126,8 @@ public struct DatasetFrame: Sendable, Equatable {
         imageURL: URL,
         rasterOrientation: DatasetRasterOrientation,
         calibration: DatasetCalibration,
-        cameraToWorld: CameraPose
+        cameraToWorld: CameraPose,
+        trainingMask: DatasetTrainingMask? = nil
     ) throws {
         try validateDatasetString(id, name: "Dataset frame IDs")
         try validateDatasetString(
@@ -116,6 +150,7 @@ public struct DatasetFrame: Sendable, Equatable {
         self.rasterOrientation = rasterOrientation
         self.calibration = calibration
         self.cameraToWorld = cameraToWorld
+        self.trainingMask = trainingMask
     }
 }
 
@@ -329,7 +364,7 @@ func validateDatasetDescriptorCounts(
         frameCount
     ) else {
         throw MsplatError.invalidArgument(
-            "Dataset frame count exceeds the native ABI v5 limit"
+            "Dataset frame count exceeds the native descriptor limit"
         )
     }
     try validateDatasetPointCount(pointCount)
@@ -337,7 +372,7 @@ func validateDatasetDescriptorCounts(
         observationCount
     ) else {
         throw MsplatError.invalidArgument(
-            "Dataset observation count exceeds the native ABI v5 limit"
+            "Dataset observation count exceeds the native descriptor limit"
         )
     }
 }
@@ -351,7 +386,7 @@ func addDatasetStringByteCount(
             byteCount
           ) else {
         throw MsplatError.invalidArgument(
-            "Dataset string length exceeds the native ABI v5 limit"
+            "Dataset string length exceeds the native descriptor limit"
         )
     }
     let (newTotal, overflow) = total.addingReportingOverflow(byteCount)
@@ -368,7 +403,7 @@ private func validateDatasetPointCount(_ pointCount: Int) throws {
         pointCount
     ) else {
         throw MsplatError.invalidArgument(
-            "Dataset point count exceeds the native ABI v5 limit"
+            "Dataset point count exceeds the native descriptor limit"
         )
     }
 }
@@ -381,7 +416,7 @@ private func validateDatasetString(_ value: String, name: String) throws {
     }
     guard value.utf8.count <= DatasetDescriptorNativeLimits.maximumStringBytes else {
         throw MsplatError.invalidArgument(
-            "\(name) must not exceed the native ABI v5 UTF-8 byte limit"
+            "\(name) must not exceed the native descriptor UTF-8 byte limit"
         )
     }
 }
@@ -398,6 +433,12 @@ private func datasetStringTableByteCount(
             to: &total
         )
         try addDatasetStringByteCount(frame.imageURL.path.utf8.count, to: &total)
+        if let trainingMask = frame.trainingMask {
+            try addDatasetStringByteCount(
+                trainingMask.url.path.utf8.count,
+                to: &total
+            )
+        }
     }
     try addDatasetStringByteCount(provenance.adapter.utf8.count, to: &total)
     try addDatasetStringByteCount(provenance.source.utf8.count, to: &total)
@@ -426,10 +467,16 @@ private struct NativeStringTable {
 }
 
 /// Pins every caller-owned buffer for exactly one synchronous C invocation.
-/// ABI v5 deep-copies all views before returning; no pointer escapes this body.
-func withUnsafeNativeDatasetDescriptor<Result>(
+/// Native descriptor entry points deep-copy all views before returning; no
+/// pointer escapes this body.
+private func withUnsafeNativeDatasetDescriptorStorage<Result>(
     _ descriptor: DatasetDescriptor,
-    _ body: (UnsafePointer<MsplatDatasetDescriptorV5>) throws -> Result
+    includeFrameMasks: Bool,
+    _ body: (
+        UnsafePointer<MsplatDatasetDescriptorV5>,
+        UnsafePointer<MsplatFrameMaskV6>?,
+        Int
+    ) throws -> Result
 ) throws -> Result {
     let provenance = try descriptor.provenance ?? DatasetProvenance(
         adapter: "swift",
@@ -443,12 +490,21 @@ func withUnsafeNativeDatasetDescriptor<Result>(
     strings.bytes.reserveCapacity(stringByteCount)
     var frameStrings: [NativeFrameStrings] = []
     frameStrings.reserveCapacity(descriptor.frames.count)
+    var maskPaths: [NativeStringSlice?] = []
+    if includeFrameMasks {
+        maskPaths.reserveCapacity(descriptor.frames.count)
+    }
     for frame in descriptor.frames {
         frameStrings.append(NativeFrameStrings(
             id: strings.append(frame.id),
             calibrationID: strings.append(frame.calibrationID),
             imagePath: strings.append(frame.imageURL.path)
         ))
+        if includeFrameMasks {
+            maskPaths.append(
+                frame.trainingMask.map { strings.append($0.url.path) }
+            )
+        }
     }
     let provenanceAdapter = strings.append(provenance.adapter)
     let provenanceSource = strings.append(provenance.source)
@@ -471,6 +527,10 @@ func withUnsafeNativeDatasetDescriptor<Result>(
 
         var nativeFrames: [MsplatDatasetFrameV5] = []
         nativeFrames.reserveCapacity(descriptor.frames.count)
+        var nativeMasks: [MsplatFrameMaskV6] = []
+        if includeFrameMasks {
+            nativeMasks.reserveCapacity(descriptor.frames.count)
+        }
         for (index, frame) in descriptor.frames.enumerated() {
             var native = MsplatDatasetFrameV5()
             native.id = stringView(frameStrings[index].id)
@@ -510,48 +570,121 @@ func withUnsafeNativeDatasetDescriptor<Result>(
                 }
             }
             nativeFrames.append(native)
+
+            if includeFrameMasks {
+                var nativeMask = MsplatFrameMaskV6()
+                if let mask = frame.trainingMask,
+                   let maskPath = maskPaths[index] {
+                    nativeMask.maskPath = stringView(maskPath)
+                    nativeMask.coverageChannel = mask.coverageChannel.rawValue
+                }
+                nativeMasks.append(nativeMask)
+            }
         }
 
         return try nativeFrames.withUnsafeBufferPointer { frames in
-            try descriptor.points.xyz.withUnsafeBufferPointer { pointXYZ in
-                try descriptor.points.rgb.withUnsafeBufferPointer { pointRGB in
-                    try withOptionalBufferPointer(
-                        descriptor.points.sourceIDs
-                    ) { pointSourceIDs, pointSourceIDCount in
+            func invokeBody(
+                maskBase: UnsafePointer<MsplatFrameMaskV6>?,
+                maskCount: Int
+            ) throws -> Result {
+                try descriptor.points.xyz.withUnsafeBufferPointer {
+                    pointXYZ in
+                    try descriptor.points.rgb.withUnsafeBufferPointer {
+                        pointRGB in
                         try withOptionalBufferPointer(
-                            descriptor.points.reprojectionErrors
-                        ) { reprojectionErrors, reprojectionErrorCount in
-                            try withUnsafeNativeObservations(
-                                descriptor.observations
-                            ) { observations, observationCount in
-                                var native = MsplatDatasetDescriptorV5()
-                                native.frames = frames.baseAddress
-                                native.frameCount = frames.count
-                                native.pointXYZ = pointXYZ.baseAddress
-                                native.pointXYZCount = pointXYZ.count
-                                native.pointRGB = pointRGB.baseAddress
-                                native.pointRGBCount = pointRGB.count
-                                native.pointSourceIds = pointSourceIDs
-                                native.pointSourceIdCount = pointSourceIDCount
-                                native.pointReprojectionErrors = reprojectionErrors
-                                native.pointReprojectionErrorCount =
-                                    reprojectionErrorCount
-                                native.observations = observations
-                                native.observationCount = observationCount
-                                native.provenanceAdapter = stringView(
-                                    provenanceAdapter
-                                )
-                                native.provenanceSource = stringView(
-                                    provenanceSource
-                                )
-                                native.reserved = (0, 0)
-                                return try withUnsafePointer(to: &native, body)
+                            descriptor.points.sourceIDs
+                        ) { pointSourceIDs, pointSourceIDCount in
+                            try withOptionalBufferPointer(
+                                descriptor.points.reprojectionErrors
+                            ) { reprojectionErrors, reprojectionErrorCount in
+                                try withUnsafeNativeObservations(
+                                    descriptor.observations
+                                ) { observations, observationCount in
+                                    var native = MsplatDatasetDescriptorV5()
+                                    native.frames = frames.baseAddress
+                                    native.frameCount = frames.count
+                                    native.pointXYZ = pointXYZ.baseAddress
+                                    native.pointXYZCount = pointXYZ.count
+                                    native.pointRGB = pointRGB.baseAddress
+                                    native.pointRGBCount = pointRGB.count
+                                    native.pointSourceIds = pointSourceIDs
+                                    native.pointSourceIdCount = pointSourceIDCount
+                                    native.pointReprojectionErrors =
+                                        reprojectionErrors
+                                    native.pointReprojectionErrorCount =
+                                        reprojectionErrorCount
+                                    native.observations = observations
+                                    native.observationCount = observationCount
+                                    native.provenanceAdapter = stringView(
+                                        provenanceAdapter
+                                    )
+                                    native.provenanceSource = stringView(
+                                        provenanceSource
+                                    )
+                                    native.reserved = (0, 0)
+                                    return try withUnsafePointer(to: &native) {
+                                        try body($0, maskBase, maskCount)
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
+
+            guard includeFrameMasks else {
+                return try invokeBody(maskBase: nil, maskCount: 0)
+            }
+            return try nativeMasks.withUnsafeBufferPointer { masks in
+                guard let maskBase = masks.baseAddress else {
+                    throw MsplatError.internalFailure(
+                        "Could not create native frame-mask storage"
+                    )
+                }
+                return try invokeBody(
+                    maskBase: maskBase,
+                    maskCount: masks.count
+                )
+            }
         }
+    }
+}
+
+func withUnsafeNativeDatasetDescriptor<Result>(
+    _ descriptor: DatasetDescriptor,
+    _ body: (UnsafePointer<MsplatDatasetDescriptorV5>) throws -> Result
+) throws -> Result {
+    guard descriptor.frames.allSatisfy({ $0.trainingMask == nil }) else {
+        throw MsplatError.invalidArgument(
+            "ABI v5 cannot represent dataset training masks"
+        )
+    }
+    return try withUnsafeNativeDatasetDescriptorStorage(
+        descriptor,
+        includeFrameMasks: false
+    ) { native, _, _ in
+        try body(native)
+    }
+}
+
+func withUnsafeNativeDatasetDescriptorV6<Result>(
+    _ descriptor: DatasetDescriptor,
+    _ body: (
+        UnsafePointer<MsplatDatasetDescriptorV5>,
+        UnsafePointer<MsplatFrameMaskV6>,
+        Int
+    ) throws -> Result
+) throws -> Result {
+    try withUnsafeNativeDatasetDescriptorStorage(
+        descriptor,
+        includeFrameMasks: true
+    ) { native, masks, maskCount in
+        guard let masks else {
+            throw MsplatError.internalFailure(
+                "Could not create native frame-mask storage"
+            )
+        }
+        return try body(native, masks, maskCount)
     }
 }
 

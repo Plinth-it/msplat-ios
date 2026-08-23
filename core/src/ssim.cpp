@@ -2,7 +2,140 @@
 // Ported from https://github.com/Po-Hsun-Su/pytorch-ssim (MIT)
 
 #include "ssim.hpp"
+#include <cstdint>
 #include <cstring>
+#include <limits>
+#include <stdexcept>
+
+namespace {
+
+struct MetricInput {
+    int height;
+    int width;
+    int channels;
+    int64_t pixels;
+    const uint8_t* coverage;
+    uint64_t coverageUnits;
+};
+
+MetricInput validateMetricInput(const MTensor& rendered, const MTensor& gt,
+                                const MTensor* coverageMask,
+                                uint64_t suppliedCoverageUnits) {
+    if (!rendered.defined() || !gt.defined())
+        throw std::invalid_argument("Metric images must be defined");
+    if (rendered.dtype() != DType::Float32 || gt.dtype() != DType::Float32)
+        throw std::invalid_argument("Metric images must use float32");
+    if (rendered.shape() != gt.shape() || rendered.ndim() != 3 ||
+        rendered.size(2) != 3) {
+        throw std::invalid_argument(
+            "Metric images must have matching (height, width, 3) shapes");
+    }
+
+    const int64_t height64 = rendered.size(0);
+    const int64_t width64 = rendered.size(1);
+    if (height64 <= 0 || width64 <= 0 ||
+        height64 > std::numeric_limits<int>::max() ||
+        width64 > std::numeric_limits<int>::max() ||
+        height64 > std::numeric_limits<int>::max() / width64) {
+        throw std::invalid_argument("Metric image dimensions are invalid");
+    }
+    const int64_t pixels = height64 * width64;
+    if (static_cast<uint64_t>(pixels) >
+        std::numeric_limits<uint64_t>::max() / 255u) {
+        throw std::invalid_argument("Metric coverage denominator overflows");
+    }
+
+    MetricInput input{
+        static_cast<int>(height64), static_cast<int>(width64), 3, pixels,
+        nullptr, static_cast<uint64_t>(pixels) * 255u};
+    if (!coverageMask) {
+        if (suppliedCoverageUnits != 0 &&
+            suppliedCoverageUnits != input.coverageUnits) {
+            throw std::invalid_argument(
+                "Unmasked metric coverage denominator is inconsistent");
+        }
+        return input;
+    }
+
+    if (!coverageMask->defined() || coverageMask->dtype() != DType::UInt8 ||
+        coverageMask->ndim() != 2 || coverageMask->size(0) != height64 ||
+        coverageMask->size(1) != width64) {
+        throw std::invalid_argument(
+            "Metric coverage mask must be uint8 with shape (height, width)");
+    }
+
+    input.coverage = coverageMask->data<uint8_t>();
+    uint64_t calculatedCoverageUnits = 0;
+    for (int64_t index = 0; index < pixels; ++index)
+        calculatedCoverageUnits += input.coverage[index];
+    if (calculatedCoverageUnits == 0)
+        throw std::invalid_argument("Metric coverage mask has zero coverage");
+    if (suppliedCoverageUnits != 0 &&
+        suppliedCoverageUnits != calculatedCoverageUnits) {
+        throw std::invalid_argument(
+            "Metric coverage denominator does not match the mask");
+    }
+    input.coverageUnits = calculatedCoverageUnits;
+    return input;
+}
+
+} // namespace
+
+float psnr(const MTensor& rendered, const MTensor& gt,
+           const MTensor* coverageMask, uint64_t coverageUnits) {
+    const MetricInput input = validateMetricInput(
+        rendered, gt, coverageMask, coverageUnits);
+    const float* renderedData = rendered.data<float>();
+    const float* gtData = gt.data<float>();
+
+    double mse = 0.0;
+    if (!input.coverage) {
+        const int64_t elements = rendered.numel();
+        for (int64_t index = 0; index < elements; ++index) {
+            const double difference = renderedData[index] - gtData[index];
+            mse += difference * difference;
+        }
+        mse /= static_cast<double>(elements);
+    } else {
+        for (int64_t pixel = 0; pixel < input.pixels; ++pixel) {
+            const double coverage = input.coverage[pixel];
+            for (int channel = 0; channel < input.channels; ++channel) {
+                const int64_t index = pixel * input.channels + channel;
+                const double difference = renderedData[index] - gtData[index];
+                mse += coverage * difference * difference;
+            }
+        }
+        mse /= static_cast<double>(input.coverageUnits) * input.channels;
+    }
+    return 10.0f * std::log10(1.0 / mse);
+}
+
+float l1_loss(const MTensor& rendered, const MTensor& gt,
+              const MTensor* coverageMask, uint64_t coverageUnits) {
+    const MetricInput input = validateMetricInput(
+        rendered, gt, coverageMask, coverageUnits);
+    const float* renderedData = rendered.data<float>();
+    const float* gtData = gt.data<float>();
+
+    double sum = 0.0;
+    if (!input.coverage) {
+        const int64_t elements = rendered.numel();
+        for (int64_t index = 0; index < elements; ++index)
+            sum += std::abs(renderedData[index] - gtData[index]);
+        return static_cast<float>(sum / static_cast<double>(elements));
+    }
+
+    for (int64_t pixel = 0; pixel < input.pixels; ++pixel) {
+        const double coverage = input.coverage[pixel];
+        for (int channel = 0; channel < input.channels; ++channel) {
+            const int64_t index = pixel * input.channels + channel;
+            sum += coverage *
+                std::abs(renderedData[index] - gtData[index]);
+        }
+    }
+    return static_cast<float>(
+        sum / (static_cast<double>(input.coverageUnits) * input.channels));
+}
 
 std::vector<float> createSSIMWindow(int windowSize, float sigma) {
     // 1D Gaussian
@@ -60,10 +193,19 @@ static void gaussianBlur(const float* in, float* out, float* tmp,
 
 float ssim_eval(const MTensor& rendered, const MTensor& gt,
                 int windowSize, float sigma) {
-    int H = rendered.size(0);
-    int W = rendered.size(1);
-    int C = rendered.size(2);
-    int HW = H * W;
+    return ssim_eval(
+        rendered, gt, nullptr, 0, windowSize, sigma);
+}
+
+float ssim_eval(const MTensor& rendered, const MTensor& gt,
+                const MTensor* coverageMask, uint64_t coverageUnits,
+                int windowSize, float sigma) {
+    const MetricInput input = validateMetricInput(
+        rendered, gt, coverageMask, coverageUnits);
+    const int H = input.height;
+    const int W = input.width;
+    const int C = input.channels;
+    const int HW = static_cast<int>(input.pixels);
 
     // 1D Gaussian kernel
     std::vector<float> kernel(windowSize);
@@ -114,10 +256,16 @@ float ssim_eval(const MTensor& rendered, const MTensor& gt,
 
             float num = (2.0f * m12 + C1) * (2.0f * sig12 + C2);
             float den = (m1sq + m2sq + C1) * (sig1sq + sig2sq + C2);
-            ssim_sum += num / den;
+            const double value = num / den;
+            ssim_sum += input.coverage
+                ? static_cast<double>(input.coverage[i]) * value
+                : value;
             count++;
         }
     }
 
-    return (float)(ssim_sum / count);
+    const double denominator = input.coverage
+        ? static_cast<double>(input.coverageUnits) * C
+        : count;
+    return static_cast<float>(ssim_sum / denominator);
 }

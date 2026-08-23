@@ -112,6 +112,21 @@ void validateDatasetDescriptor(const DatasetDescriptor &descriptor) {
                 reject("frame '" + frame.id + "' has an unknown raster orientation");
         }
 
+        if (frame.trainingMask) {
+            if (frame.trainingMask->path.empty()) {
+                reject("frame '" + frame.id +
+                       "' training mask path must not be empty");
+            }
+            switch (frame.trainingMask->channel) {
+                case TrainingMaskChannel::Luminance:
+                case TrainingMaskChannel::Alpha:
+                    break;
+                default:
+                    reject("frame '" + frame.id +
+                           "' has an unknown training mask channel");
+            }
+        }
+
         validateCalibration(frame.calibration, frame.id);
         validatePose(frame.cameraToWorld, frame.id);
     }

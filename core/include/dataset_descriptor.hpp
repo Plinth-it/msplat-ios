@@ -4,12 +4,23 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 
 enum class RasterOrientation : uint8_t {
     EncodedPixels = 0,
     ExifNormalized = 1,
+};
+
+enum class TrainingMaskChannel : uint8_t {
+    Luminance = 0,
+    Alpha = 1,
+};
+
+struct TrainingMaskDescriptor {
+    std::string path;
+    TrainingMaskChannel channel = TrainingMaskChannel::Luminance;
 };
 
 struct CameraCalibration {
@@ -33,6 +44,10 @@ struct DatasetFrameDescriptor {
     // Names the pixel frame used by calibration and cameraToWorld. The pose is
     // a rigid, row-major OpenGL camera-to-world transform (Y-up, Z-back).
     RasterOrientation rasterOrientation = RasterOrientation::EncodedPixels;
+    // Optional soft training coverage in the same source pixel frame as the
+    // image. Coverage remains 8-bit throughout loading; 0 excludes a pixel
+    // and 255 gives it full weight.
+    std::optional<TrainingMaskDescriptor> trainingMask;
     CameraCalibration calibration;
     std::array<float, 16> cameraToWorld = {
         1.0f, 0.0f, 0.0f, 0.0f,

@@ -160,24 +160,27 @@ bool sameSourceInfo(const ImageSourceInfo &lhs, const ImageSourceInfo &rhs) {
            lhs.exifOrientation == rhs.exifOrientation;
 }
 
-} // namespace
-
-ImageSourceInfo inspectImageSource(const std::string &path) {
-    auto source = openImageSource(path);
-    return sourceInfo(source.get(), path);
+bool hasAlphaChannel(CGImageAlphaInfo alphaInfo) {
+    switch (alphaInfo) {
+        case kCGImageAlphaPremultipliedLast:
+        case kCGImageAlphaPremultipliedFirst:
+        case kCGImageAlphaLast:
+        case kCGImageAlphaFirst:
+        case kCGImageAlphaOnly:
+            return true;
+        case kCGImageAlphaNone:
+        case kCGImageAlphaNoneSkipLast:
+        case kCGImageAlphaNoneSkipFirst:
+            return false;
+    }
+    return false;
 }
 
-Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceInfo,
-                int targetWidth, int targetHeight,
-                bool applyExifOrientation) {
-    const size_t rgbaElements = checkedElementCount(
-        targetWidth, targetHeight, 4, sizeof(uint8_t), "Decoded image");
-    const size_t rgbElements = checkedElementCount(
-        targetWidth, targetHeight, 3, sizeof(float), "Decoded image");
-    const size_t rowBytes = static_cast<size_t>(targetWidth) * 4;
-
-    auto source = openImageSource(path);
-    const ImageSourceInfo currentSourceInfo = sourceInfo(source.get(), path);
+CFHandle<CGImageRef> createThumbnail(
+    CGImageSourceRef source, const std::string &path,
+    const ImageSourceInfo &expectedSourceInfo,
+    int targetWidth, int targetHeight, bool applyExifOrientation) {
+    const ImageSourceInfo currentSourceInfo = sourceInfo(source, path);
     if (!sameSourceInfo(currentSourceInfo, expectedSourceInfo)) {
         throw msplat::DatasetChangedError(
             "Image dimensions or orientation changed while loading: " + path);
@@ -213,12 +216,34 @@ Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceIn
     }
 
     CFHandle<CGImageRef> thumbnail(CGImageSourceCreateThumbnailAtIndex(
-        source.get(), 0, options.get()));
+        source, 0, options.get()));
     if (!thumbnail || CGImageGetWidth(thumbnail.get()) == 0 ||
         CGImageGetHeight(thumbnail.get()) == 0) {
         throw msplat::DatasetIOError(
             "Failed to decode image thumbnail: " + path);
     }
+    return thumbnail;
+}
+
+} // namespace
+
+ImageSourceInfo inspectImageSource(const std::string &path) {
+    auto source = openImageSource(path);
+    return sourceInfo(source.get(), path);
+}
+
+Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceInfo,
+                int targetWidth, int targetHeight,
+                bool applyExifOrientation) {
+    const size_t rgbaElements = checkedElementCount(
+        targetWidth, targetHeight, 4, sizeof(uint8_t), "Decoded image");
+    const size_t rgbElements = checkedElementCount(
+        targetWidth, targetHeight, 3, sizeof(float), "Decoded image");
+    auto source = openImageSource(path);
+    auto thumbnail = createThumbnail(
+        source.get(), path, expectedSourceInfo, targetWidth, targetHeight,
+        applyExifOrientation);
+    const size_t rowBytes = static_cast<size_t>(targetWidth) * 4;
 
     // ImageIO performs the codec-aware downsample and, when requested by a
     // calibration-aware caller, the EXIF transform. Rendering the thumbnail
@@ -262,6 +287,111 @@ Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceIn
         image.data[i * 3 + 2] = rgba[i * 4 + 2] / 255.0f;
     }
     return image;
+}
+
+CoverageMask imreadCoverageMask(
+    const std::string &path, const ImageSourceInfo &expectedSourceInfo,
+    int targetWidth, int targetHeight, bool applyExifOrientation,
+    TrainingMaskChannel channel) {
+    if (channel != TrainingMaskChannel::Luminance &&
+        channel != TrainingMaskChannel::Alpha) {
+        throw std::invalid_argument("Unknown training mask channel");
+    }
+
+    const int sourceWidth = applyExifOrientation
+        ? expectedSourceInfo.orientedWidth : expectedSourceInfo.rawWidth;
+    const int sourceHeight = applyExifOrientation
+        ? expectedSourceInfo.orientedHeight : expectedSourceInfo.rawHeight;
+    const size_t rgbaElements = checkedElementCount(
+        sourceWidth, sourceHeight, 4, sizeof(uint8_t),
+        "Decoded training mask");
+    const size_t sourceMaskElements = checkedElementCount(
+        sourceWidth, sourceHeight, 1, sizeof(uint8_t),
+        "Decoded training mask");
+    (void)checkedElementCount(
+        targetWidth, targetHeight, 1, sizeof(uint8_t),
+        "Decoded training mask target");
+
+    std::vector<uint8_t> rgba(rgbaElements);
+    {
+        auto source = openImageSource(path);
+        auto thumbnail = createThumbnail(
+            source.get(), path, expectedSourceInfo, sourceWidth, sourceHeight,
+            applyExifOrientation);
+        if (CGImageGetWidth(thumbnail.get()) !=
+                static_cast<size_t>(sourceWidth) ||
+            CGImageGetHeight(thumbnail.get()) !=
+                static_cast<size_t>(sourceHeight)) {
+            throw msplat::DatasetIOError(
+                "Training mask full-resolution decode changed dimensions: " +
+                path);
+        }
+        if (channel == TrainingMaskChannel::Alpha &&
+            !hasAlphaChannel(CGImageGetAlphaInfo(thumbnail.get()))) {
+            throw msplat::InvalidDatasetError(
+                "Training mask requests alpha coverage but the image has no "
+                "alpha channel: " + path);
+        }
+
+        CFHandle<CGColorSpaceRef> colorSpace(
+            CGColorSpaceCreateWithName(kCGColorSpaceSRGB));
+        if (!colorSpace) {
+            throw msplat::DatasetIOError(
+                "Failed to create training mask color space: " + path);
+        }
+
+        // A premultiplied destination makes luminance coverage naturally
+        // include source alpha instead of treating transparent RGB as visible.
+        const CGBitmapInfo bitmapInfo = static_cast<CGBitmapInfo>(
+            kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+        const size_t rowBytes = static_cast<size_t>(sourceWidth) * 4;
+        CFHandle<CGContextRef> context(CGBitmapContextCreate(
+            rgba.data(), static_cast<size_t>(sourceWidth),
+            static_cast<size_t>(sourceHeight), 8, rowBytes, colorSpace.get(),
+            bitmapInfo));
+        if (!context) {
+            throw msplat::DatasetIOError(
+                "Failed to allocate training mask decode context: " + path);
+        }
+
+        CGContextSetBlendMode(context.get(), kCGBlendModeCopy);
+        CGContextSetInterpolationQuality(context.get(), kCGInterpolationNone);
+        CGContextDrawImage(
+            context.get(),
+            CGRectMake(0, 0, static_cast<CGFloat>(sourceWidth),
+                       static_cast<CGFloat>(sourceHeight)),
+            thumbnail.get());
+
+        // Compact coverage into the start of the RGBA buffer. This is safe
+        // in-place because each destination byte precedes every unread source
+        // pixel, and it avoids a fifth source-sized allocation while the
+        // decoded CGImage is resident.
+        for (size_t i = 0; i < sourceMaskElements; ++i) {
+            if (channel == TrainingMaskChannel::Alpha) {
+                rgba[i] = rgba[i * 4 + 3];
+                continue;
+            }
+            const float luminance =
+                0.2126f * rgba[i * 4 + 0] +
+                0.7152f * rgba[i * 4 + 1] +
+                0.0722f * rgba[i * 4 + 2];
+            rgba[i] = static_cast<uint8_t>(
+                std::clamp(std::lround(luminance), 0L, 255L));
+        }
+    }
+
+    CoverageMask mask;
+    mask.width = sourceWidth;
+    mask.height = sourceHeight;
+    mask.data.assign(rgba.begin(), rgba.begin() + sourceMaskElements);
+    if (sourceWidth == targetWidth && sourceHeight == targetHeight) {
+        return mask;
+    }
+
+    // Coverage is derived before any resampling, then reduced exactly once by
+    // the explicit box filter. ImageIO does not document its thumbnail filter,
+    // so target-sized thumbnail decode would silently alter sparse coverage.
+    return resizeCoverageArea(mask, targetWidth, targetHeight);
 }
 
 // ── Image writing (CoreGraphics PNG) ─────────────────────────────────────────
@@ -392,6 +522,62 @@ Image resizeArea(const Image &src, int dstW, int dstH) {
 
 // ── Undistortion (Brown-Conrady model) ───────────────────────────────────────
 
+CoverageMask resizeCoverageArea(const CoverageMask &src, int dstW, int dstH) {
+    const size_t sourceElements = checkedElementCount(
+        src.width, src.height, 1, sizeof(uint8_t), "Source training mask");
+    if (src.data.size() != sourceElements) {
+        throw std::invalid_argument(
+            "Source training mask storage does not match its dimensions");
+    }
+    const size_t destinationElements = checkedElementCount(
+        dstW, dstH, 1, sizeof(uint8_t), "Resized training mask");
+
+    CoverageMask dst;
+    dst.width = dstW;
+    dst.height = dstH;
+    dst.data.resize(destinationElements);
+
+    const double scaleX = static_cast<double>(src.width) / dstW;
+    const double scaleY = static_cast<double>(src.height) / dstH;
+    for (int dy = 0; dy < dstH; ++dy) {
+        const double srcY0 = dy * scaleY;
+        const double srcY1 = (dy + 1) * scaleY;
+        for (int dx = 0; dx < dstW; ++dx) {
+            const double srcX0 = dx * scaleX;
+            const double srcX1 = (dx + 1) * scaleX;
+            double sum = 0.0;
+            double totalArea = 0.0;
+
+            const int iy0 = static_cast<int>(srcY0);
+            const int iy1 = std::min(
+                static_cast<int>(std::ceil(srcY1)), src.height);
+            const int ix0 = static_cast<int>(srcX0);
+            const int ix1 = std::min(
+                static_cast<int>(std::ceil(srcX1)), src.width);
+            for (int iy = iy0; iy < iy1; ++iy) {
+                const double wy =
+                    std::min(static_cast<double>(iy + 1), srcY1) -
+                    std::max(static_cast<double>(iy), srcY0);
+                for (int ix = ix0; ix < ix1; ++ix) {
+                    const double wx =
+                        std::min(static_cast<double>(ix + 1), srcX1) -
+                        std::max(static_cast<double>(ix), srcX0);
+                    const double area = wx * wy;
+                    const size_t sourceIndex =
+                        static_cast<size_t>(iy) * src.width + ix;
+                    sum += src.data[sourceIndex] * area;
+                    totalArea += area;
+                }
+            }
+
+            const long rounded = std::lround(sum / totalArea);
+            dst.data[static_cast<size_t>(dy) * dstW + dx] =
+                static_cast<uint8_t>(std::clamp(rounded, 0L, 255L));
+        }
+    }
+    return dst;
+}
+
 // Apply forward distortion: normalized undistorted → normalized distorted
 static void distortPoint(float x, float y,
     float k1, float k2, float p1, float p2, float k3,
@@ -450,6 +636,35 @@ static void bilinearSample(const Image &img, float x, float y, float out[3]) {
         float bottom = p01[c] * (1.0f - fx) + p11[c] * fx;
         out[c] = top * (1.0f - fy) + bottom * fy;
     }
+}
+
+static uint8_t bilinearSampleCoverage(
+    const CoverageMask &mask, float x, float y) {
+    int x0 = static_cast<int>(std::floor(x));
+    int y0 = static_cast<int>(std::floor(y));
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+
+    x0 = std::clamp(x0, 0, mask.width - 1);
+    x1 = std::clamp(x1, 0, mask.width - 1);
+    y0 = std::clamp(y0, 0, mask.height - 1);
+    y1 = std::clamp(y1, 0, mask.height - 1);
+
+    const float fractionX = x - std::floor(x);
+    const float fractionY = y - std::floor(y);
+    const auto sample = [&](int sampleX, int sampleY) {
+        return static_cast<float>(mask.data[
+            static_cast<size_t>(sampleY) * mask.width + sampleX]);
+    };
+    const float top =
+        sample(x0, y0) * (1.0f - fractionX) +
+        sample(x1, y0) * fractionX;
+    const float bottom =
+        sample(x0, y1) * (1.0f - fractionX) +
+        sample(x1, y1) * fractionX;
+    return static_cast<uint8_t>(std::clamp(
+        std::lround(top * (1.0f - fractionY) + bottom * fractionY),
+        0L, 255L));
 }
 
 UndistortResult undistortImage(const Image &src,
@@ -571,5 +786,63 @@ UndistortResult undistortImage(const Image &src,
     result.cy = cy - roiY;
     result.width = roiW;
     result.height = roiH;
+    return result;
+}
+
+UndistortTrainingTargetResult undistortImageAndCoverageMask(
+    const Image &image, const CoverageMask &coverageMask,
+    float fx, float fy, float cx, float cy,
+    float k1, float k2, float p1, float p2, float k3) {
+    const size_t maskElements = checkedElementCount(
+        coverageMask.width, coverageMask.height, 1, sizeof(uint8_t),
+        "Training mask to undistort");
+    if (coverageMask.data.size() != maskElements) {
+        throw std::invalid_argument(
+            "Training mask storage does not match its dimensions");
+    }
+    if (coverageMask.width != image.width ||
+        coverageMask.height != image.height) {
+        throw std::invalid_argument(
+            "Training mask dimensions do not match the image");
+    }
+
+    UndistortResult imageResult = undistortImage(
+        image, fx, fy, cx, cy, k1, k2, p1, p2, k3);
+    const int roiX = static_cast<int>(std::lround(cx - imageResult.cx));
+    const int roiY = static_cast<int>(std::lround(cy - imageResult.cy));
+
+    CoverageMask croppedMask;
+    croppedMask.width = imageResult.width;
+    croppedMask.height = imageResult.height;
+    croppedMask.data.resize(checkedElementCount(
+        croppedMask.width, croppedMask.height, 1, sizeof(uint8_t),
+        "Undistorted training mask"));
+    for (int y = 0; y < croppedMask.height; ++y) {
+        for (int x = 0; x < croppedMask.width; ++x) {
+            const float undistortedX = static_cast<float>(x + roiX);
+            const float undistortedY = static_cast<float>(y + roiY);
+            const float normalizedX = (undistortedX - cx) / fx;
+            const float normalizedY = (undistortedY - cy) / fy;
+            float distortedX = 0.0f;
+            float distortedY = 0.0f;
+            distortPoint(normalizedX, normalizedY,
+                         k1, k2, p1, p2, k3,
+                         distortedX, distortedY);
+            const float sourceX = distortedX * fx + cx;
+            const float sourceY = distortedY * fy + cy;
+            croppedMask.data[static_cast<size_t>(y) * croppedMask.width + x] =
+                bilinearSampleCoverage(coverageMask, sourceX, sourceY);
+        }
+    }
+
+    UndistortTrainingTargetResult result;
+    result.image = std::move(imageResult.image);
+    result.coverageMask = std::move(croppedMask);
+    result.fx = imageResult.fx;
+    result.fy = imageResult.fy;
+    result.cx = imageResult.cx;
+    result.cy = imageResult.cy;
+    result.width = imageResult.width;
+    result.height = imageResult.height;
     return result;
 }
