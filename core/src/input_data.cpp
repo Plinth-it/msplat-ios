@@ -108,6 +108,37 @@ bool isMirroredExifOrientation(int orientation) {
 
 // ── Image loading ───────────────────────────────────────────────────────────
 
+void Camera::setCameraToWorld(const float pose[16]) {
+    if (!pose)
+        throw std::invalid_argument("Camera pose must not be null");
+    for (int index = 0; index < 16; ++index) {
+        if (!std::isfinite(pose[index])) {
+            throw std::invalid_argument(
+                "Camera pose must contain only finite values");
+        }
+    }
+    std::copy_n(pose, 16, camToWorld);
+    invalidateProjectionCache();
+}
+
+bool Camera::projectionCacheMatchesPose() const noexcept {
+    return cachedPoseValid &&
+        std::equal(std::begin(camToWorld), std::end(camToWorld),
+                   cachedCameraToWorld.begin());
+}
+
+void Camera::recordProjectionCachePose() noexcept {
+    std::copy(std::begin(camToWorld), std::end(camToWorld),
+              cachedCameraToWorld.begin());
+    cachedPoseValid = true;
+}
+
+void Camera::invalidateProjectionCache() {
+    cachedViewMat.reset();
+    cachedProjViewMat.reset();
+    cachedPoseValid = false;
+}
+
 void Camera::loadImage(float downscaleFactor) {
     if (!image.empty() && loadedImageDownscaleFactor == downscaleFactor &&
         (!trainingMask || !coverageMask.empty())) {
@@ -617,6 +648,7 @@ void autoScaleAndCenter(InputData &data) {
         cam.camToWorld[3]  *= data.scale;
         cam.camToWorld[7]  *= data.scale;
         cam.camToWorld[11] *= data.scale;
+        cam.invalidateProjectionCache();
     }
 
     // Apply to point cloud
@@ -729,8 +761,13 @@ InputData inputDataFromDescriptor(DatasetDescriptor descriptor) {
         camera.k3 = frame.calibration.k3;
         camera.p1 = frame.calibration.p1;
         camera.p2 = frame.calibration.p2;
-        std::copy(frame.cameraToWorld.begin(), frame.cameraToWorld.end(),
-                  camera.camToWorld);
+        camera.declared = {
+            true,
+            camera.fx, camera.fy, camera.cx, camera.cy,
+            camera.k1, camera.k2, camera.k3, camera.p1, camera.p2,
+            camera.width, camera.height,
+        };
+        camera.setCameraToWorld(frame.cameraToWorld.data());
         camera.filePath = std::move(frame.imagePath);
         camera.rasterOrientation = frame.rasterOrientation;
         camera.trainingMask = std::move(frame.trainingMask);

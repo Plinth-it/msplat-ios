@@ -978,6 +978,48 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
     CHECK(zeroCache.cachedBytes() == 0);
 }
 
+void checkCameraPoseCacheContract() {
+    Camera camera;
+    const std::array<float, 16> identity = {
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 1.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 1.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
+
+    camera.setCameraToWorld(identity.data());
+    CHECK(!camera.projectionCacheMatchesPose());
+    camera.recordProjectionCachePose();
+    CHECK(camera.projectionCacheMatchesPose());
+
+    camera.cachedViewMat = MTensor({4, 4}, DType::Float32);
+    camera.cachedProjViewMat = MTensor({4, 4}, DType::Float32);
+    CHECK(camera.cachedViewMat.defined());
+    CHECK(camera.cachedProjViewMat.defined());
+    std::array<float, 16> translated = identity;
+    translated[3] = 0.125f;
+    camera.setCameraToWorld(translated.data());
+    CHECK(!camera.cachedViewMat.defined());
+    CHECK(!camera.cachedProjViewMat.defined());
+    CHECK(!camera.projectionCacheMatchesPose());
+    camera.recordProjectionCachePose();
+
+    // Even a legacy direct write must force prepareCam to rebuild its derived
+    // matrices instead of reusing a view from the previous pose.
+    camera.camToWorld[3] = 0.25f;
+    CHECK(!camera.projectionCacheMatchesPose());
+    camera.recordProjectionCachePose();
+    CHECK(camera.projectionCacheMatchesPose());
+
+    camera.invalidateProjectionCache();
+    CHECK(!camera.projectionCacheMatchesPose());
+
+    std::array<float, 16> invalid = identity;
+    invalid[6] = std::numeric_limits<float>::quiet_NaN();
+    checkThrows<std::invalid_argument>(
+        [&] { camera.setCameraToWorld(invalid.data()); }, "finite");
+}
+
 } // namespace
 
 int main() {
@@ -1033,6 +1075,9 @@ int main() {
         });
         checkStage("masked cache hit and eviction", [&] {
             checkMaskedCacheHitAndEviction(temporary);
+        });
+        checkStage("camera pose cache contract", [&] {
+            checkCameraPoseCacheContract();
         });
         return 0;
     } catch (const std::exception &error) {

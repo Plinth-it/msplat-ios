@@ -233,12 +233,16 @@ public:
 
     // Render a single camera view → numpy (H, W, 3) float32
     nb::object render(int cam_idx, bool use_test) {
-        auto &cams = use_test ? dataset_ptr->test_cams : dataset_ptr->train_cams;
-        if (cam_idx < 0 || cam_idx >= (int)cams.size()) {
+        const size_t cameraCount = use_test
+            ? dataset_ptr->test_cams.size()
+            : dataset_ptr->train_cams.size();
+        if (cam_idx < 0 || static_cast<size_t>(cam_idx) >= cameraCount) {
             throw std::runtime_error("Camera index out of range");
         }
 
-        Camera &cam = cams[cam_idx];
+        Camera &cam = use_test
+            ? dataset_ptr->test_camera(static_cast<size_t>(cam_idx))
+            : dataset_ptr->train_camera(static_cast<size_t>(cam_idx));
         MTensor rgb = model->render(cam, current_step);
         msplat_gpu_sync();
         MTensor rgb_cpu = rgb.cpu();
@@ -263,9 +267,7 @@ public:
             throw std::runtime_error("ref_cam_idx out of range");
 
         Camera cam = dataset_ptr->train_camera(ref_cam_idx);
-        memcpy(cam.camToWorld, cam_to_world.data(), 16 * sizeof(float));
-        cam.cachedViewMat = MTensor();
-        cam.cachedProjViewMat = MTensor();
+        cam.setCameraToWorld(cam_to_world.data());
 
         MTensor rgb = model->render(cam, current_step);
         msplat_gpu_sync();

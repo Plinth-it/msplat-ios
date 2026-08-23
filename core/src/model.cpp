@@ -1067,7 +1067,9 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
     float fovX = 2.0f * std::atan(s.width / (2.0f * s.fx));
     float fovY = 2.0f * std::atan(s.height / (2.0f * s.fy));
 
-    if (!cam.cachedViewMat.defined() || cam.cachedFovX != fovX || cam.cachedFovY != fovY) {
+    if (!cam.cachedViewMat.defined() || !cam.cachedProjViewMat.defined() ||
+        cam.cachedFovX != fovX ||
+        cam.cachedFovY != fovY || !cam.projectionCacheMatchesPose()) {
         const float *d = cam.camToWorld;
         float R[3][3], Rinv[3][3], T[3], Tinv[3];
         for (int i = 0; i < 3; i++) {
@@ -1087,6 +1089,7 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
         memcpy(cam.cachedProjViewMat.data_ptr(), pvm, sizeof(pvm));
         cam.cachedCamPos[0] = T[0]; cam.cachedCamPos[1] = T[1]; cam.cachedCamPos[2] = T[2];
         cam.cachedFovX = fovX; cam.cachedFovY = fovY;
+        cam.recordProjectionCachePose();
     }
 
     s.degreesToUse = (std::min<int>)(step / shDegreeInterval, shDegree);

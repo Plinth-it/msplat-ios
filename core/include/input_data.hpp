@@ -36,6 +36,8 @@ struct CameraTrainingTarget {
 };
 
 struct Camera {
+    // Effective training-raster calibration. Image loading may scale,
+    // rectify, and crop these values; `declared` remains the source geometry.
     int width = 0, height = 0;
     float fx = 0, fy = 0, cx = 0, cy = 0;
     float k1 = 0, k2 = 0, k3 = 0, p1 = 0, p2 = 0;
@@ -55,9 +57,11 @@ struct Camera {
     MTensor cachedViewMat, cachedProjViewMat;
     float cachedCamPos[3] = {};
     float cachedFovX = 0, cachedFovY = 0;
+    std::array<float, 16> cachedCameraToWorld = {};
+    bool cachedPoseValid = false;
 
-    /// The intrinsics and distortion as the dataset declared them, captured
-    /// before loadImage first rewrites them. loadImage re-derives the effective
+    /// The immutable intrinsics and distortion as the dataset declared them.
+    /// loadImage re-derives the effective
     /// values from these on every call, so a camera whose image was evicted and
     /// reloaded lands on the same numbers rather than compounding the
     /// correction — and keeps its distortion coefficients, which the undistort
@@ -77,6 +81,13 @@ struct Camera {
     uint64_t getCoverageUnits(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
     CameraTrainingTarget getGPUTrainingTarget(int downscaleFactor);
+    /// Changes the pose and invalidates every derived render matrix.
+    void setCameraToWorld(const float pose[16]);
+    /// Direct pose writes remain detectable so legacy/internal callers cannot
+    /// accidentally reuse a view matrix derived from an earlier pose.
+    bool projectionCacheMatchesPose() const noexcept;
+    void recordProjectionCachePose() noexcept;
+    void invalidateProjectionCache();
     void releaseImageMemory();
     size_t cachedCpuImageBytes() const;
     size_t cachedGpuImageBytes() const;

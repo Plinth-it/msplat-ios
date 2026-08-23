@@ -357,10 +357,7 @@ PixelBuffer Trainer::renderFromPose(const float camToWorld[16], int refCameraInd
         return {};
 
     Camera cam = impl->ds->images.ensureLoaded(impl->ds->data.cameras, indices[refCameraIndex]);
-    memcpy(cam.camToWorld, camToWorld, 16 * sizeof(float));
-    // Invalidate cached matrices so prepareCam recomputes from the new pose
-    cam.cachedViewMat = MTensor();
-    cam.cachedProjViewMat = MTensor();
+    cam.setCameraToWorld(camToWorld);
 
     MTensor rgb = impl->model->render(cam, impl->currentStep);
     msplat_gpu_sync();
@@ -406,9 +403,7 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
     if (outCapacity < required)
         throw std::invalid_argument("RGBA output buffer is too small");
 
-    memcpy(cam.camToWorld, camToWorld, 16 * sizeof(float));
-    cam.cachedViewMat = MTensor();
-    cam.cachedProjViewMat = MTensor();
+    cam.setCameraToWorld(camToWorld);
 
     MTensor rgb = impl->model->render(cam, impl->currentStep);
     msplat_gpu_sync();

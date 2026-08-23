@@ -68,6 +68,11 @@
   now uses corrected data only when both its corrected camera and image exist,
   otherwise falling back to its complete raw pair; incomplete pairs and
   missing required intrinsics are rejected explicitly.
+- Camera render caches now fingerprint the complete camera-to-world pose and
+  rebuild derived view/projection state after either explicit or legacy direct
+  pose mutation. Runtime cameras also retain their immutable source
+  calibration eagerly, keeping sparse observations separate from effective
+  decoded-image geometry ahead of camera refinement.
 - COLMAP image observations and sparse-point tracks are now retained as one
   canonical correspondence table. Text and binary imports reject inconsistent
   tracks, duplicate source IDs, truncated records, and unsafe source counts.

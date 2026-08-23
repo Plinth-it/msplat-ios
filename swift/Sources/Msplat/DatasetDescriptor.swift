@@ -222,6 +222,10 @@ public struct DatasetSparsePointSet: Sendable, Equatable {
 
 /// One source image feature, optionally linked to a sparse point.
 ///
+/// `x` and `y` are image-edge coordinates in the frame's declared source
+/// raster; the upper-left pixel center is `(0.5, 0.5)`. Native decode scaling,
+/// rectification, and cropping do not mutate them.
+///
 /// Its frozen stored representation matches `MsplatSparseObservationV5` so a
 /// descriptor can lend its observation storage directly to one synchronous C
 /// call without allocating a second observation array.

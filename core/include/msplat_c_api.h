@@ -263,6 +263,9 @@ typedef struct {
     /// Index into the point arrays, or -1 for an untriangulated feature.
     int32_t pointIndex;
     uint32_t reserved;
+    /// Image-edge coordinates in the owning frame's declared source raster;
+    /// the upper-left pixel center is (0.5, 0.5). Native decode scaling,
+    /// rectification, and cropping do not mutate these values.
     float x;
     float y;
 } MsplatSparseObservationV5;

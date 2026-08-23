@@ -539,6 +539,18 @@ int main() {
     CHECK(materialized.cameras[0].trainingMask->channel ==
           TrainingMaskChannel::Alpha);
     CHECK(!materialized.cameras[1].trainingMask.has_value());
+    CHECK(materialized.cameras[0].declared.captured);
+    CHECK(materialized.cameras[0].declared.width == 640);
+    CHECK(materialized.cameras[0].declared.height == 480);
+    CHECK(materialized.cameras[0].declared.fx == 500.0f);
+    CHECK(materialized.cameras[0].declared.fy == 501.0f);
+    CHECK(materialized.cameras[0].declared.cx == 320.0f);
+    CHECK(materialized.cameras[0].declared.cy == 240.0f);
+    CHECK(materialized.cameras[0].declared.k1 == 0.01f);
+    CHECK(materialized.cameras[0].declared.k2 == -0.02f);
+    CHECK(materialized.cameras[0].declared.k3 == 0.001f);
+    CHECK(materialized.cameras[0].declared.p1 == 0.002f);
+    CHECK(materialized.cameras[0].declared.p2 == -0.003f);
     CHECK(std::abs(materialized.scale - (2.0f / 3.0f)) < 1e-6f);
     CHECK(std::abs(materialized.translation[0] - 0.5f) < 1e-6f);
     CHECK(std::abs(materialized.translation[1] - 1.0f) < 1e-6f);
