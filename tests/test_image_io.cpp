@@ -441,6 +441,28 @@ void checkBadInputs(const TempDirectory &temporary) {
         {});
 }
 
+void checkImageCacheAccountingCategories() {
+    Camera camera;
+    camera.image.data.resize(2 * 3 * 3);
+    Image pyramid;
+    pyramid.data.resize(1 * 2 * 3);
+    camera.imagePyramids.emplace(2, std::move(pyramid));
+    camera.mtensorImageCache.emplace(
+        2, MTensor({1, 2, 3}, DType::Float32));
+
+    const size_t expectedCpuBytes = (2 * 3 * 3 + 1 * 2 * 3) * sizeof(float);
+    const size_t expectedGpuBytes = 1 * 2 * 3 * sizeof(float);
+    CHECK(camera.cachedCpuImageBytes() == expectedCpuBytes);
+    CHECK(camera.cachedGpuImageBytes() == expectedGpuBytes);
+    CHECK(camera.cachedImageBytes() == expectedCpuBytes + expectedGpuBytes);
+
+    CameraImageCache emptyCache(1.0f, 1024);
+    CHECK(emptyCache.cachedCpuBytes() == 0);
+    CHECK(emptyCache.cachedGpuBytes() == 0);
+    CHECK(emptyCache.hitCount() == 0);
+    CHECK(emptyCache.missCount() == 0);
+}
+
 } // namespace
 
 int main() {
@@ -463,6 +485,9 @@ int main() {
         });
         checkStage("bad inputs", [&] {
             checkBadInputs(temporary);
+        });
+        checkStage("image cache accounting categories", [&] {
+            checkImageCacheAccountingCategories();
         });
         return 0;
     } catch (const std::exception &error) {

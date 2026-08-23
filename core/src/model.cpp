@@ -364,7 +364,9 @@ size_t Model::estimatedGpuBytes() const {
         &densify_split_flag, &densify_dup_flag, &densify_split_prefix, &densify_dup_prefix,
         &densify_keep_flag, &densify_keep_prefix, &densify_block_totals,
         &densify_compact_scratch, &densify_random_samples,
-        &radii, &xysGradNorm, &visCounts, &max2DSize, &backgroundColor
+        // `radii` is a non-owning alias of the shared render cache's radii_out
+        // buffer, so counting it here would report the same allocation twice.
+        &xysGradNorm, &visCounts, &max2DSize, &backgroundColor
     };
     for (const MTensor* tensor : tensors) {
         if (tensor->defined()) bytes += tensor->nbytes();
@@ -1174,7 +1176,7 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     float lossInvN = 1.0f / (float)(s.height * s.width * 3);
 
-    auto [r, loss] = msplat_train_step(
+    MTensor r = msplat_train_step(
         numPoints, means, scales, 1.0f,
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,

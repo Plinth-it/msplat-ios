@@ -38,9 +38,23 @@ final class TrainingSession: ObservableObject {
     }
 
     @Published private(set) var phase: Phase = .idle
-    @Published private(set) var iteration = 0
+    @Published private(set) var submittedIteration = 0
+    @Published private(set) var completedIteration = 0
     @Published private(set) var splatCount = 0
-    @Published private(set) var msPerStep: Float = 0
+    @Published private(set) var modelCapacity = 0
+    @Published private(set) var cpuSubmitMs: Float = 0
+    @Published private(set) var gpuExecutionMs: Float?
+    @Published private(set) var endToEndMs: Float?
+    @Published private(set) var loss: Float?
+    @Published private(set) var effectiveWidth = 0
+    @Published private(set) var effectiveHeight = 0
+    @Published private(set) var activeSHDegree = 0
+    @Published private(set) var retainedPackedIntersections: UInt64?
+    @Published private(set) var packedIntersectionCapacity: UInt64?
+    @Published private(set) var overflowKinds: RasterizerOverflowKinds = []
+    @Published private(set) var overflowedCompletedSteps: UInt64 = 0
+    @Published private(set) var memorySnapshot: TrainingMemorySnapshot?
+    @Published private(set) var thermalState = "Nominal"
     @Published private(set) var preview: UIImage?
     @Published private(set) var trainingCameras = 0
     @Published private(set) var footprintMB = 0
@@ -61,9 +75,23 @@ final class TrainingSession: ObservableObject {
     func start(folder: DatasetFolder) {
         guard phase == .idle || phase == .cancelled || phase == .finished || isFailed else { return }
         phase = .planning
-        iteration = 0
+        submittedIteration = 0
+        completedIteration = 0
         splatCount = 0
-        msPerStep = 0
+        modelCapacity = 0
+        cpuSubmitMs = 0
+        gpuExecutionMs = nil
+        endToEndMs = nil
+        loss = nil
+        effectiveWidth = 0
+        effectiveHeight = 0
+        activeSHDegree = 0
+        retainedPackedIntersections = nil
+        packedIntersectionCapacity = nil
+        overflowKinds = []
+        overflowedCompletedSteps = 0
+        memorySnapshot = nil
+        thermalState = "Nominal"
         preview = nil
         trainingCameras = 0
         footprintMB = 0
@@ -159,12 +187,35 @@ final class TrainingSession: ObservableObject {
                         pose: previewPose,
                         referenceCamera: 0
                     )
-                    iteration = stats.iteration
-                    splatCount = stats.splatCount
-                    msPerStep = stats.cpuSubmitMs
+                    // Rendering synchronizes all previously submitted training
+                    // work, so this poll can truthfully advance completed
+                    // progress and attach timings to the matching iteration.
+                    let telemetry = try await activeSession.trainingMetrics()
+                    let memory = try await activeSession.memoryMetrics()
+                    submittedIteration = telemetry.submitted?.iteration ?? stats.iteration
+                    cpuSubmitMs = telemetry.submitted?.cpuSubmitMs ?? stats.cpuSubmitMs
+                    if let completed = telemetry.completed {
+                        completedIteration = completed.iteration
+                        splatCount = completed.splatCount
+                        modelCapacity = completed.modelCapacity
+                        gpuExecutionMs = completed.gpuExecutionMs
+                        endToEndMs = completed.endToEndMs
+                        loss = completed.loss
+                        effectiveWidth = completed.effectiveWidth
+                        effectiveHeight = completed.effectiveHeight
+                        activeSHDegree = completed.activeSHDegree
+                        retainedPackedIntersections =
+                            completed.retainedPackedIntersectionCount
+                        packedIntersectionCapacity =
+                            completed.packedIntersectionCapacity
+                        overflowKinds = completed.overflowKinds
+                    }
+                    overflowedCompletedSteps = telemetry.overflowedCompletedSteps
+                    memorySnapshot = memory
                     preview = Self.image(from: frame)
-                    footprintMB = Self.footprintMB()
-                    availableMB = Self.availableMB()
+                    footprintMB = memory.processPhysicalFootprintBytes.map(Self.megabytes) ?? 0
+                    availableMB = memory.processAvailableBytes.map(Self.megabytes) ?? 0
+                    thermalState = Self.thermalStateDescription()
                 }
             }
 
@@ -263,6 +314,10 @@ final class TrainingSession: ObservableObject {
         Int((bytes + 1_048_575) / 1_048_576)
     }
 
+    private nonisolated static func megabytes(_ bytes: UInt64) -> Int {
+        Int((bytes + 1_048_575) / 1_048_576)
+    }
+
     private nonisolated static func image(from frame: RGBAFrame) -> UIImage? {
         guard frame.width > 0, frame.height > 0,
               let provider = CGDataProvider(data: frame.data as CFData),
@@ -277,21 +332,18 @@ final class TrainingSession: ObservableObject {
         return UIImage(cgImage: cg)
     }
 
-    /// What jetsam actually counts against the app.
-    private nonisolated static func footprintMB() -> Int {
-        var info = task_vm_info_data_t()
-        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
-        let result = withUnsafeMutablePointer(to: &info) {
-            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
-                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
-            }
-        }
-        guard result == KERN_SUCCESS else { return 0 }
-        return Int(info.phys_footprint) >> 20
-    }
-
     /// How much more the app may use before it is killed.
     private nonisolated static func availableMB() -> Int {
         Int(os_proc_available_memory()) >> 20
+    }
+
+    private nonisolated static func thermalStateDescription() -> String {
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: "Nominal"
+        case .fair: "Fair"
+        case .serious: "Serious"
+        case .critical: "Critical"
+        @unknown default: "Unknown"
+        }
     }
 }

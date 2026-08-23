@@ -12,6 +12,7 @@
 #import <cmath>
 #import <condition_variable>
 #import <cstdlib>
+#import <cstring>
 #import <dlfcn.h>
 #import <unordered_map>
 #import <functional>
@@ -53,6 +54,351 @@ static int g_stage_report_count = 0;
 // every operation that touches either so cleanup, rendering, and training cannot
 // mutate their shared lifecycle concurrently.
 static std::mutex g_engine_mutex;
+
+namespace {
+
+using TelemetryClock = std::chrono::steady_clock;
+static constexpr size_t kTrainingReadbackWordCount = 4;
+static constexpr size_t kTrainingReadbackBytes =
+    kTrainingReadbackWordCount * sizeof(uint32_t);
+static constexpr NSUInteger kTrainingReadbackLossOffset = sizeof(uint32_t);
+static constexpr NSUInteger kTrainingReadbackIntersectionOffset =
+    2 * sizeof(uint32_t);
+
+double elapsedMilliseconds(TelemetryClock::time_point start,
+                           TelemetryClock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+} // namespace
+
+struct MsplatTrainingTelemetryState {
+    MTensor acquireReadback(id<MTLDevice> device) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (!readbackPool.empty()) {
+            MTensor result = std::move(readbackPool.back());
+            readbackPool.pop_back();
+            return result;
+        }
+
+        MTensor result = mtensor_empty(
+            device, {static_cast<int64_t>(kTrainingReadbackWordCount)},
+            DType::Int32);
+        ++allocatedReadbackCount;
+        return result;
+    }
+
+    void releaseReadback(MTensor&& readback) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            readbackPool.push_back(std::move(readback));
+        } catch (...) {
+            // Telemetry must never make a Metal completion callback throw.
+        }
+    }
+
+    uint64_t currentGeneration() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return generation;
+    }
+
+    void reset() {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++generation;
+        snapshot = {};
+        snapshot.generation = generation;
+    }
+
+    MsplatTrainingTelemetrySnapshot readSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return snapshot;
+    }
+
+    size_t readbackBytes() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return allocatedReadbackCount * kTrainingReadbackBytes;
+    }
+
+    void publishSubmitted(uint64_t stepGeneration,
+                          const MsplatTrainingStepDescriptor& descriptor,
+                          double cpuSubmitMs) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stepGeneration != generation) return;
+            const bool hasSubmitted =
+                (snapshot.flags & MSPLAT_TRAINING_TELEMETRY_HAS_SUBMITTED) != 0;
+            if (hasSubmitted &&
+                descriptor.iteration < snapshot.submittedStep.iteration) {
+                return;
+            }
+            snapshot.flags |= MSPLAT_TRAINING_TELEMETRY_HAS_SUBMITTED;
+            snapshot.submittedStep = descriptor;
+            snapshot.submittedCpuSubmitMs = cpuSubmitMs;
+        } catch (...) {
+            // Completion telemetry is best-effort and must not terminate a host.
+        }
+    }
+
+    void publishCompleted(uint64_t stepGeneration,
+                          const MsplatCompletedTrainingStepMetrics& completed,
+                          bool gpuTimingValid, bool lossValid,
+                          bool intersectionCountValid) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stepGeneration != generation) return;
+
+            if (completed.overflowReasons != MSPLAT_TRAINING_OVERFLOW_NONE) {
+                ++snapshot.overflowedStepCount;
+                if (completed.overflowReasons &
+                    MSPLAT_TRAINING_OVERFLOW_TILE_CAP) {
+                    ++snapshot.tileCapOverflowedStepCount;
+                }
+                if (completed.overflowReasons &
+                    MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY) {
+                    ++snapshot.packedCapacityOverflowedStepCount;
+                }
+                snapshot.lastOverflowIteration = std::max(
+                    snapshot.lastOverflowIteration, completed.step.iteration);
+            }
+
+            const bool hasCompleted =
+                (snapshot.flags & MSPLAT_TRAINING_TELEMETRY_HAS_COMPLETED) != 0;
+            if (hasCompleted &&
+                completed.step.iteration < snapshot.completedStep.step.iteration) {
+                return;
+            }
+
+            snapshot.flags |= MSPLAT_TRAINING_TELEMETRY_HAS_COMPLETED;
+            snapshot.flags &= ~(
+                MSPLAT_TRAINING_TELEMETRY_GPU_TIMING_VALID |
+                MSPLAT_TRAINING_TELEMETRY_LOSS_VALID |
+                MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID);
+            if (gpuTimingValid)
+                snapshot.flags |= MSPLAT_TRAINING_TELEMETRY_GPU_TIMING_VALID;
+            if (lossValid)
+                snapshot.flags |= MSPLAT_TRAINING_TELEMETRY_LOSS_VALID;
+            if (intersectionCountValid) {
+                snapshot.flags |=
+                    MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID;
+            }
+            snapshot.completedStep = completed;
+        } catch (...) {
+            // Completion telemetry is best-effort and must not terminate a host.
+        }
+    }
+
+    void publishFailure(uint64_t stepGeneration, int64_t iteration) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stepGeneration != generation) return;
+            snapshot.flags |= MSPLAT_TRAINING_TELEMETRY_HAS_FAILED;
+            ++snapshot.failedStepCount;
+            snapshot.lastFailedIteration =
+                std::max(snapshot.lastFailedIteration, iteration);
+        } catch (...) {
+            // Completion telemetry is best-effort and must not terminate a host.
+        }
+    }
+
+private:
+    mutable std::mutex mutex;
+    uint64_t generation = 1;
+    MsplatTrainingTelemetrySnapshot snapshot = [] {
+        MsplatTrainingTelemetrySnapshot initial;
+        initial.generation = 1;
+        return initial;
+    }();
+    std::vector<MTensor> readbackPool;
+    size_t allocatedReadbackCount = 0;
+};
+
+struct MsplatLogicalTrainingStep {
+    MsplatLogicalTrainingStep(MsplatTrainingTelemetryHandle telemetryState,
+                              uint64_t stepGeneration, int64_t stepIteration,
+                              TelemetryClock::time_point stepWallStart,
+                              MTensor stepReadback)
+        : telemetry(std::move(telemetryState)),
+          generation(stepGeneration), iteration(stepIteration),
+          wallStart(stepWallStart),
+          readback(std::move(stepReadback)) {}
+
+    MTensor& readbackBuffer() { return readback; }
+
+    void markCpuStart() {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (sealed || aborted)
+            throw std::logic_error("Training telemetry step is no longer active");
+        cpuStart = TelemetryClock::now();
+        cpuStarted = true;
+    }
+
+    void validateForSubmit(
+        const MsplatTrainingStepDescriptor& submittedDescriptor) const {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (sealed || aborted)
+            throw std::logic_error("Training telemetry step is no longer active");
+        if (!cpuStarted)
+            throw std::logic_error("Training telemetry CPU timer was not started");
+        if (submittedDescriptor.iteration != iteration)
+            throw std::invalid_argument(
+                "Training telemetry iteration does not match the active step");
+        if (submittedDescriptor.splatCount < 0 ||
+            submittedDescriptor.modelCapacity < submittedDescriptor.splatCount ||
+            submittedDescriptor.effectiveWidth <= 0 ||
+            submittedDescriptor.effectiveHeight <= 0 ||
+            submittedDescriptor.activeShDegree < 0) {
+            throw std::invalid_argument("Training telemetry descriptor is invalid");
+        }
+    }
+
+    void beginCommandBuffer() {
+        std::lock_guard<std::mutex> lock(mutex);
+        ++pendingCommandBuffers;
+        ++commandBufferCount;
+    }
+
+    void cancelCommandBuffer() noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (pendingCommandBuffers > 0) --pendingCommandBuffers;
+            finishIfReadyLocked();
+        } catch (...) {
+            // Never throw through Objective-C exception recovery paths.
+        }
+    }
+
+    void finishCommandBuffer(bool succeeded, double gpuStartSeconds,
+                             double gpuEndSeconds) noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (!succeeded) {
+                commandBufferFailed = true;
+            } else if (!std::isfinite(gpuStartSeconds) ||
+                       !std::isfinite(gpuEndSeconds) ||
+                       gpuEndSeconds <= gpuStartSeconds) {
+                gpuTimingValid = false;
+            } else {
+                gpuExecutionMs +=
+                    (gpuEndSeconds - gpuStartSeconds) * 1000.0;
+            }
+            if (pendingCommandBuffers > 0) --pendingCommandBuffers;
+            finishIfReadyLocked();
+        } catch (...) {
+            // A C++ exception must never escape a Metal completion handler.
+        }
+    }
+
+    void markReadbackEncoded(uint64_t capacity, uint64_t pixelCount) {
+        std::lock_guard<std::mutex> lock(mutex);
+        packedIntersectionCapacity = capacity;
+        lossPixelCount = pixelCount;
+        readbackEncoded = true;
+    }
+
+    double seal(const MsplatTrainingStepDescriptor& submittedDescriptor,
+                TelemetryClock::time_point cpuEnd) {
+        std::lock_guard<std::mutex> lock(mutex);
+        descriptor = submittedDescriptor;
+        cpuSubmitMs = elapsedMilliseconds(cpuStart, cpuEnd);
+        sealed = true;
+        telemetry->publishSubmitted(
+            generation, descriptor, cpuSubmitMs);
+        finishIfReadyLocked();
+        return cpuSubmitMs;
+    }
+
+    void abort() noexcept {
+        try {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (sealed) return;
+            aborted = true;
+            finishIfReadyLocked();
+        } catch (...) {
+            // Abort is used from catch paths and must remain noexcept.
+        }
+    }
+
+private:
+    void finishIfReadyLocked() noexcept {
+        if (published || pendingCommandBuffers != 0 || (!sealed && !aborted))
+            return;
+        published = true;
+
+        if (commandBufferFailed) {
+            telemetry->publishFailure(generation, iteration);
+        } else if (sealed && !aborted) {
+            MsplatCompletedTrainingStepMetrics completed;
+            completed.step = descriptor;
+            completed.cpuSubmitMs = cpuSubmitMs;
+            completed.gpuExecutionMs = gpuExecutionMs;
+            completed.endToEndMs =
+                elapsedMilliseconds(wallStart, TelemetryClock::now());
+            completed.commandBufferCount = commandBufferCount;
+            completed.packedIntersectionCapacity =
+                packedIntersectionCapacity;
+
+            bool lossValid = false;
+            bool intersectionCountValid = false;
+            if (readbackEncoded && readback.defined()) {
+                const auto* words = readback.data<uint32_t>();
+                completed.overflowReasons = words[0] & (
+                    MSPLAT_TRAINING_OVERFLOW_TILE_CAP |
+                    MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY);
+
+                float rawLoss = 0.0f;
+                std::memcpy(&rawLoss, &words[1], sizeof(rawLoss));
+                if (lossPixelCount > 0 && std::isfinite(rawLoss)) {
+                    completed.loss =
+                        static_cast<double>(rawLoss) /
+                        static_cast<double>(lossPixelCount);
+                    lossValid = std::isfinite(completed.loss);
+                }
+
+                int32_t postTileCapIntersections = 0;
+                std::memcpy(&postTileCapIntersections, &words[2],
+                            sizeof(postTileCapIntersections));
+                if (postTileCapIntersections >= 0) {
+                    completed.retainedPackedIntersections = std::min<uint64_t>(
+                        static_cast<uint64_t>(postTileCapIntersections),
+                        packedIntersectionCapacity);
+                    intersectionCountValid = true;
+                }
+            }
+
+            const bool completedGpuTimingValid =
+                commandBufferCount > 0 && gpuTimingValid;
+            if (!completedGpuTimingValid)
+                completed.gpuExecutionMs = 0.0;
+            telemetry->publishCompleted(
+                generation, completed, completedGpuTimingValid, lossValid,
+                intersectionCountValid);
+        }
+
+        telemetry->releaseReadback(std::move(readback));
+    }
+
+    MsplatTrainingTelemetryHandle telemetry;
+    uint64_t generation = 0;
+    int64_t iteration = 0;
+    TelemetryClock::time_point wallStart;
+    TelemetryClock::time_point cpuStart;
+    MTensor readback;
+    mutable std::mutex mutex;
+    MsplatTrainingStepDescriptor descriptor;
+    size_t pendingCommandBuffers = 0;
+    uint32_t commandBufferCount = 0;
+    uint64_t packedIntersectionCapacity = 0;
+    uint64_t lossPixelCount = 0;
+    double cpuSubmitMs = 0.0;
+    double gpuExecutionMs = 0.0;
+    bool cpuStarted = false;
+    bool gpuTimingValid = true;
+    bool readbackEncoded = false;
+    bool commandBufferFailed = false;
+    bool sealed = false;
+    bool aborted = false;
+    bool published = false;
+};
 
 struct ScopedObjCRelease {
     id object = nil;
@@ -134,6 +480,12 @@ struct MetalContext {
     // command buffers during long training runs.
     std::shared_ptr<CommandCompletionState> commandCompletionState =
         std::make_shared<CommandCompletionState>();
+    // The active logical step is installed by Trainer::step. A root command
+    // buffer is associated only when training first asks to encode into it;
+    // this avoids charging an empty ordering fence from a prior
+    // commitAndContinue to the next step.
+    MsplatLogicalTrainingStepHandle activeTrainingStep;
+    MsplatLogicalTrainingStepHandle currentCBTrainingStep;
 
     id<MTLCommandBuffer> getCommandBuffer() {
         if (!_currentCB) {
@@ -142,6 +494,14 @@ struct MetalContext {
                 throw std::runtime_error("msplat: failed to create a Metal command buffer");
             }
             [_currentCB retain];
+        }
+        if (activeTrainingStep) {
+            if (currentCBTrainingStep &&
+                currentCBTrainingStep != activeTrainingStep) {
+                throw std::logic_error(
+                    "A Metal command buffer spans two logical training steps");
+            }
+            currentCBTrainingStep = activeTrainingStep;
         }
         return _currentCB;
     }
@@ -153,10 +513,17 @@ struct MetalContext {
                     "msplat: MPS command buffer has no root command buffer");
             }
             auto completionState = commandCompletionState;
+            auto logicalStep = currentCBTrainingStep;
             const bool collectTiming = g_gpu_timing_enabled;
             completionState->beginSubmission();
+            if (logicalStep) logicalStep->beginCommandBuffer();
             @try {
                 [submitted addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                    if (logicalStep) {
+                        logicalStep->finishCommandBuffer(
+                            cb.status == MTLCommandBufferStatusCompleted,
+                            cb.GPUStartTime, cb.GPUEndTime);
+                    }
                     completionState->finishSubmission(cb);
                     if (!collectTiming) return;
                     double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
@@ -166,10 +533,12 @@ struct MetalContext {
                     }
                 }];
                 [_currentCB commitAndContinue];
+                currentCBTrainingStep.reset();
             } @catch (NSException *exception) {
                 const char* reason = exception.reason.UTF8String;
                 std::string message = "msplat: Metal commitAndContinue failed";
                 if (reason) message += std::string(": ") + reason;
+                if (logicalStep) logicalStep->cancelCommandBuffer();
                 completionState->cancelSubmission();
                 throw std::runtime_error(message);
             }
@@ -180,10 +549,12 @@ struct MetalContext {
             [_currentCB release];
             _currentCB = nil;
         }
+        currentCBTrainingStep.reset();
     }
     void syncCB() {
         char failure[1024] = {};
         MPSCommandBuffer* commandBuffer = _currentCB;
+        auto logicalStep = currentCBTrainingStep;
         id<MTLCommandBuffer> finalCommandBuffer = nil;
         bool finalWasCommitted = false;
         if (commandBuffer) {
@@ -194,6 +565,8 @@ struct MetalContext {
             }
             [finalCommandBuffer retain];
             _currentCB = nil;
+            currentCBTrainingStep.reset();
+            if (logicalStep) logicalStep->beginCommandBuffer();
 
             @try {
                 [commandBuffer commit];
@@ -203,6 +576,7 @@ struct MetalContext {
                 snprintf(failure, sizeof(failure),
                          "msplat: Metal command buffer commit failed%s%s",
                          reason ? ": " : "", reason ? reason : "");
+                if (logicalStep) logicalStep->cancelCommandBuffer();
             }
         }
 
@@ -221,6 +595,11 @@ struct MetalContext {
                              "msplat: Metal command buffer did not complete (status %ld)",
                              static_cast<long>(status));
                 }
+            }
+            if (logicalStep) {
+                logicalStep->finishCommandBuffer(
+                    status == MTLCommandBufferStatusCompleted,
+                    submitted.GPUStartTime, submitted.GPUEndTime);
             }
             [submitted release];
         };
@@ -334,6 +713,11 @@ struct MetalContext {
             syncCB();
         } catch (const std::exception& error) {
             fprintf(stderr, "msplat: Metal teardown sync failed: %s\n", error.what());
+        }
+        if (activeTrainingStep) {
+            auto abandoned = std::move(activeTrainingStep);
+            currentCBTrainingStep.reset();
+            abandoned->abort();
         }
 
         id resources[] = {
@@ -621,13 +1005,109 @@ MTensor gpu_empty(std::vector<int64_t> shape, DType dtype) {
     return mtensor_empty(get_global_context()->device, std::move(shape), dtype);
 }
 
-void msplat_commit() {
+MsplatTrainingTelemetryHandle msplat_training_telemetry_create() {
+    return std::make_shared<MsplatTrainingTelemetryState>();
+}
+
+void msplat_training_telemetry_reset(
+    const MsplatTrainingTelemetryHandle& telemetry) {
+    if (!telemetry)
+        throw std::invalid_argument("Training telemetry state must not be null");
+    telemetry->reset();
+}
+
+MsplatTrainingTelemetrySnapshot msplat_training_telemetry_snapshot(
+    const MsplatTrainingTelemetryHandle& telemetry) {
+    if (!telemetry)
+        throw std::invalid_argument("Training telemetry state must not be null");
+    return telemetry->readSnapshot();
+}
+
+size_t msplat_training_telemetry_readback_bytes(
+    const MsplatTrainingTelemetryHandle& telemetry) {
+    if (!telemetry) return 0;
+    return telemetry->readbackBytes();
+}
+
+MsplatLogicalTrainingStepHandle msplat_training_step_begin(
+    const MsplatTrainingTelemetryHandle& telemetry, int64_t iteration) {
+    if (!telemetry)
+        throw std::invalid_argument("Training telemetry state must not be null");
+    if (iteration <= 0)
+        throw std::invalid_argument("Training telemetry iteration must be positive");
+
+    const auto wallStart = TelemetryClock::now();
     std::lock_guard<std::mutex> lock(g_engine_mutex);
+    MetalContext* context = get_global_context();
+    if (context->activeTrainingStep)
+        throw std::logic_error("A logical training step is already active");
+
+    MTensor readback = telemetry->acquireReadback(context->device);
+    auto step = std::make_shared<MsplatLogicalTrainingStep>(
+        telemetry, telemetry->currentGeneration(), iteration, wallStart,
+        std::move(readback));
+    context->activeTrainingStep = step;
+    return step;
+}
+
+void msplat_training_step_mark_cpu_start(
+    const MsplatLogicalTrainingStepHandle& step) {
+    if (!step)
+        throw std::invalid_argument("Logical training step must not be null");
+    step->markCpuStart();
+}
+
+double msplat_training_step_submit(
+    const MsplatLogicalTrainingStepHandle& step,
+    const MsplatTrainingStepDescriptor& descriptor) {
+    if (!step)
+        throw std::invalid_argument("Logical training step must not be null");
+
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    MetalContext* context = get_global_context();
+    if (context->activeTrainingStep != step)
+        throw std::logic_error("Logical training step is not active");
+    step->validateForSubmit(descriptor);
+
     if (!g_gpu_timing_checked) {
         g_gpu_timing_enabled = std::getenv("PROFILE_GPU") != nullptr;
         g_gpu_timing_checked = true;
     }
-    get_global_context()->commitCB();
+    context->commitCB();
+    const auto cpuEnd = TelemetryClock::now();
+    context->activeTrainingStep.reset();
+    return step->seal(descriptor, cpuEnd);
+}
+
+void msplat_training_step_abort(
+    const MsplatLogicalTrainingStepHandle& step) noexcept {
+    if (!step) return;
+    try {
+        std::lock_guard<std::mutex> lock(g_engine_mutex);
+        MetalContext* context = get_global_context();
+        if (context->activeTrainingStep == step) {
+            if (context->currentCBTrainingStep == step)
+                context->discardCB();
+            context->activeTrainingStep.reset();
+        }
+    } catch (...) {
+        // Abort is called while propagating another error.
+    }
+    step->abort();
+}
+
+void msplat_commit() {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    MetalContext* context = get_global_context();
+    if (context->activeTrainingStep) {
+        throw std::logic_error(
+            "Use msplat_training_step_submit for an active logical step");
+    }
+    if (!g_gpu_timing_checked) {
+        g_gpu_timing_enabled = std::getenv("PROFILE_GPU") != nullptr;
+        g_gpu_timing_checked = true;
+    }
+    context->commitCB();
 }
 
 void msplat_gpu_sync() {
@@ -971,12 +1451,17 @@ static int64_t intersection_capacity(MetalContext* ctx, int num_points, int num_
 void cleanup_msplat_metal() {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     if (MetalContext* ctx = g_context_instance.load(std::memory_order_acquire)) {
+        auto activeStep = ctx->activeTrainingStep;
         try {
             ctx->syncCB();
         } catch (...) {
+            ctx->activeTrainingStep.reset();
+            if (activeStep) activeStep->abort();
             g_tcache = FusedTensorCache{};
             throw;
         }
+        ctx->activeTrainingStep.reset();
+        if (activeStep) activeStep->abort();
     }
     g_tcache = FusedTensorCache{};
 }
@@ -1273,7 +1758,7 @@ MTensor msplat_render(
     return g_tcache.out_img;
 }
 
-std::tuple<MTensor, float> msplat_train_step(
+MTensor msplat_train_step(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
     MTensor &quats, MTensor &viewmat, MTensor &projmat,
     float fx, float fy, float cx, float cy,
@@ -1294,25 +1779,33 @@ std::tuple<MTensor, float> msplat_train_step(
 ) {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     MetalContext* ctx = get_global_context();
+    auto logicalStep = ctx->activeTrainingStep;
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
 
-    // --- Overflow check: detect per-tile overflow (> 2048 gaussians in a tile) ---
-    // Only warn once to avoid noisy output (per-tile overflow is common at >1M gaussians)
-    static bool overflow_warned = false;
-    static int iter_count_oc = 0;
-    iter_count_oc++;
-    bool num_points_changed = (num_points != g_tcache.fwd_num_points && g_tcache.fwd_num_points > 0);
-    if (!overflow_warned && g_tcache.overflow_flag.defined() && g_tcache.fwd_num_points > 0
-        && (num_points_changed || (iter_count_oc % 100) == 1)) {
-        ctx->syncCB();
-        int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
-        if (flag_val > 0) {
-            fprintf(stderr, "WARNING: rasterizer overflow — a tile held >2048 gaussians, "
-                    "or the packed intersection buffers ran short. Some gaussians "
-                    "were dropped from this frame.\n");
-            overflow_warned = true;
+    // Legacy direct callers still receive the historical warning. Tracked
+    // training uses a distinct per-step readback, so it can report every
+    // completed overflow without forcing this periodic synchronization.
+    if (!logicalStep) {
+        static bool overflow_warned = false;
+        static int iter_count_oc = 0;
+        iter_count_oc++;
+        bool num_points_changed =
+            (num_points != g_tcache.fwd_num_points &&
+             g_tcache.fwd_num_points > 0);
+        if (!overflow_warned && g_tcache.overflow_flag.defined() &&
+            g_tcache.fwd_num_points > 0 &&
+            (num_points_changed || (iter_count_oc % 100) == 1)) {
+            ctx->syncCB();
+            int32_t flag_val = *g_tcache.overflow_flag.data<int32_t>();
+            if (flag_val > 0) {
+                fprintf(stderr,
+                        "WARNING: rasterizer overflow — a tile held >2048 "
+                        "gaussians, or the packed intersection buffers ran "
+                        "short. Some gaussians were dropped from this frame.\n");
+                overflow_warned = true;
+            }
         }
     }
     int64_t capacity = intersection_capacity(ctx, num_points, num_tiles);
@@ -1334,6 +1827,9 @@ std::tuple<MTensor, float> msplat_train_step(
     MTensor &gaussian_ids = g_tcache.gaussian_ids;
     MTensor &tile_bins = g_tcache.tile_bins;
     MTensor &loss_sum = g_tcache.loss_sum;
+    MTensor &overflow_flag = logicalStep
+        ? logicalStep->readbackBuffer()
+        : g_tcache.overflow_flag;
     MTensor &packed_xy_opac = g_tcache.packed_xy_opac;
     MTensor &packed_conic = g_tcache.packed_conic;
     MTensor &packed_rgb = g_tcache.packed_rgb;
@@ -1436,7 +1932,7 @@ std::tuple<MTensor, float> msplat_train_step(
             [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:5];
             ENC_BUF(enc, g_tcache.tile_scatter_counters, 6);
             ENC_BUF(enc, g_tcache.prealloc_bins, 7);
-            ENC_BUF(enc, g_tcache.overflow_flag, 8);
+            ENC_BUF(enc, overflow_flag, 8);
             [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -1461,7 +1957,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, tile_bins, 12);
             uint32_t capacity_u32 = (uint32_t)g_tcache.capacity;
             ENC_SCALAR(enc, capacity_u32, 13);
-            ENC_BUF(enc, g_tcache.overflow_flag, 14);
+            ENC_BUF(enc, overflow_flag, 14);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
@@ -1673,7 +2169,8 @@ std::tuple<MTensor, float> msplat_train_step(
         if (!blit) return false;
         // tile_bins written by sort kernel, tile_counts no longer used
         [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
-        [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
+        [blit fillBuffer:overflow_flag.buffer()
+                   range:NSMakeRange(0, overflow_flag.nbytes()) value:0];
         [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
         [blit fillBuffer:v_xy.buffer() range:NSMakeRange(0, v_xy.nbytes()) value:0];
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
@@ -1684,6 +2181,29 @@ std::tuple<MTensor, float> msplat_train_step(
         [blit fillBuffer:v_scale.buffer() range:NSMakeRange(0, v_scale.nbytes()) value:0];
         [blit fillBuffer:v_quat.buffer() range:NSMakeRange(0, v_quat.nbytes()) value:0];
         [blit endEncoding];
+        return true;
+    };
+
+    auto encode_step_readback = [&](id<MTLCommandBuffer> cb) -> bool {
+        if (!logicalStep) return true;
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        if (!blit) return false;
+        [blit copyFromBuffer:loss_sum.buffer()
+                sourceOffset:0
+                    toBuffer:logicalStep->readbackBuffer().buffer()
+           destinationOffset:kTrainingReadbackLossOffset
+                        size:sizeof(float)];
+        [blit copyFromBuffer:g_tcache.tile_offsets.buffer()
+                sourceOffset:static_cast<NSUInteger>(num_tiles - 1) *
+                             sizeof(int32_t)
+                    toBuffer:logicalStep->readbackBuffer().buffer()
+           destinationOffset:kTrainingReadbackIntersectionOffset
+                        size:sizeof(int32_t)];
+        [blit endEncoding];
+        logicalStep->markReadbackEncoded(
+            static_cast<uint64_t>(capacity_u32),
+            static_cast<uint64_t>(img_height) *
+                static_cast<uint64_t>(img_width));
         return true;
     };
 
@@ -1798,6 +2318,12 @@ std::tuple<MTensor, float> msplat_train_step(
             }
             encode_grad_stats(enc);
             [enc endEncoding];
+
+            if (!encode_step_readback(command_buffer)) {
+                encodingFailure =
+                    "msplat: failed to create a training telemetry blit encoder";
+                return;
+            }
         });
 
         if (encodingFailure) {
@@ -1879,6 +2405,11 @@ std::tuple<MTensor, float> msplat_train_step(
             encode_grad_stats(enc);
 
             [enc endEncoding];
+            if (!encode_step_readback(command_buffer)) {
+                encodingFailure =
+                    "msplat: failed to create a training telemetry blit encoder";
+                return;
+            }
         });
         if (encodingFailure) {
             ctx->discardCB();
@@ -1886,8 +2417,9 @@ std::tuple<MTensor, float> msplat_train_step(
         }
     }
 
-    float loss_val = *loss_sum.data<float>() / (float)(img_height * img_width);
-    return std::make_tuple(radii_out, loss_val);
+    // Loss is copied into the step's unique readback and published only after
+    // GPU completion; the synchronous return remains the densification radii.
+    return radii_out;
 }
 
 // ============================================================================

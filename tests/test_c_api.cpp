@@ -1,9 +1,26 @@
 #include "msplat_c_api.h"
 
+#include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <type_traits>
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
+
+static_assert(sizeof(MsplatSubmittedTrainingStep) == 32);
+static_assert(alignof(MsplatSubmittedTrainingStep) == 4);
+static_assert(sizeof(MsplatCompletedTrainingStep) == 64);
+static_assert(alignof(MsplatCompletedTrainingStep) == 8);
+static_assert(sizeof(MsplatTrainingMetrics) == 136);
+static_assert(alignof(MsplatTrainingMetrics) == 8);
+static_assert(offsetof(MsplatTrainingMetrics, submitted) == 8);
+static_assert(offsetof(MsplatTrainingMetrics, completed) == 40);
+static_assert(offsetof(MsplatTrainingMetrics, overflowedCompletedSteps) == 104);
+static_assert(offsetof(MsplatTrainingMetrics, lastFailedIteration) == 132);
+static_assert(sizeof(MsplatTrainingMemoryMetrics) == 96);
+static_assert(alignof(MsplatTrainingMemoryMetrics) == 8);
+static_assert(offsetof(MsplatTrainingMemoryMetrics, trainerModelBufferBytes) == 8);
+static_assert(offsetof(MsplatTrainingMemoryMetrics, trainingGpuImageCacheMisses) == 88);
 
 int main() {
     CHECK(msplat_abi_version() == MSPLAT_ABI_VERSION);
@@ -28,6 +45,56 @@ int main() {
     CHECK(stats.iteration == 0);
     CHECK(stats.splatCount == 0);
     CHECK(stats.msPerStep == 0.0f);
+
+    MsplatTrainingMetrics trainingMetrics;
+    std::memset(&trainingMetrics, 0x5a, sizeof(trainingMetrics));
+    status = msplat_trainer_metrics_v4(
+        nullptr, &trainingMetrics, sizeof(trainingMetrics), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    MsplatTrainingMetrics zeroTrainingMetrics{};
+    CHECK(std::memcmp(&trainingMetrics, &zeroTrainingMetrics,
+                      sizeof(trainingMetrics)) == 0);
+
+    std::memset(&trainingMetrics, 0x5a, sizeof(trainingMetrics));
+    MsplatTrainingMetrics unchangedTrainingMetrics = trainingMetrics;
+    status = msplat_trainer_metrics_v4(
+        nullptr, &trainingMetrics, sizeof(trainingMetrics) - 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&trainingMetrics, &unchangedTrainingMetrics,
+                      sizeof(trainingMetrics)) == 0);
+    status = msplat_trainer_metrics_v4(
+        nullptr, &trainingMetrics, sizeof(trainingMetrics) + 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&trainingMetrics, &unchangedTrainingMetrics,
+                      sizeof(trainingMetrics)) == 0);
+    status = msplat_trainer_metrics_v4(
+        nullptr, nullptr, sizeof(trainingMetrics), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+
+    MsplatTrainingMemoryMetrics memoryMetrics;
+    std::memset(&memoryMetrics, 0x5a, sizeof(memoryMetrics));
+    status = msplat_trainer_memory_metrics_v4(
+        nullptr, &memoryMetrics, sizeof(memoryMetrics), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    MsplatTrainingMemoryMetrics zeroMemoryMetrics{};
+    CHECK(std::memcmp(&memoryMetrics, &zeroMemoryMetrics,
+                      sizeof(memoryMetrics)) == 0);
+
+    std::memset(&memoryMetrics, 0x5a, sizeof(memoryMetrics));
+    MsplatTrainingMemoryMetrics unchangedMemoryMetrics = memoryMetrics;
+    status = msplat_trainer_memory_metrics_v4(
+        nullptr, &memoryMetrics, sizeof(memoryMetrics) - 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&memoryMetrics, &unchangedMemoryMetrics,
+                      sizeof(memoryMetrics)) == 0);
+    status = msplat_trainer_memory_metrics_v4(
+        nullptr, &memoryMetrics, sizeof(memoryMetrics) + 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&memoryMetrics, &unchangedMemoryMetrics,
+                      sizeof(memoryMetrics)) == 0);
+    status = msplat_trainer_memory_metrics_v4(
+        nullptr, nullptr, sizeof(memoryMetrics), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
 
     status = msplat_set_metallib_path_v2("", &error);
     CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);

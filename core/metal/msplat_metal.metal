@@ -2,6 +2,11 @@
 
 using namespace metal;
 
+// Must match MsplatTrainingOverflowReason in bindings.h. A bitmask preserves
+// both causes when a frame exceeds the tile-local and packed-buffer limits.
+#define MSPLAT_OVERFLOW_TILE_CAP         (1u << 0)
+#define MSPLAT_OVERFLOW_PACKED_CAPACITY  (1u << 1)
+
 #define BLOCK_X 16
 #define BLOCK_Y 16
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
@@ -806,7 +811,7 @@ kernel void map_gaussian_to_intersects_kernel(
     device int64_t* isect_ids,
     device int32_t* gaussian_ids,
     constant float* aabb, // float2: per-axis pixel extents
-    device atomic_uint* overflow_flag, // set to 1 if any intersection exceeds capacity
+    device atomic_uint* overflow_flag, // MSPLAT_OVERFLOW_PACKED_CAPACITY bit
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -828,7 +833,9 @@ kernel void map_gaussian_to_intersects_kernel(
     for (int i = tile_min.y; i < tile_max.y; ++i) {
         for (int j = tile_min.x; j < tile_max.x; ++j) {
             if ((uint)cur_idx >= capacity) {
-                atomic_store_explicit(overflow_flag, 1u, memory_order_relaxed);
+                atomic_fetch_or_explicit(
+                    overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                    memory_order_relaxed);
                 return;
             }
             int64_t tile_id = i * tile_bounds.x + j;
@@ -2050,7 +2057,9 @@ kernel void scatter_to_prealloc_bins_kernel(
             if (pos >= MAX_TILE_ELEMS) {
                 // Clamp counter so prefix_sum sees at most MAX_TILE_ELEMS
                 atomic_store_explicit(&scatter_counters[tile_id], MAX_TILE_ELEMS, memory_order_relaxed);
-                atomic_store_explicit(overflow_flag, 1u, memory_order_relaxed);
+                atomic_fetch_or_explicit(
+                    overflow_flag, MSPLAT_OVERFLOW_TILE_CAP,
+                    memory_order_relaxed);
                 continue;
             }
             prealloc_bins[(uint64_t)tile_id * MAX_TILE_ELEMS + pos] = ((uint64_t)depth_bits << 32) | (uint64_t)idx;
@@ -2098,7 +2107,9 @@ kernel void bitonic_sort_per_tile_kernel(
     int cap = (int)capacity;
     int writable = clamp(cap - start, 0, count);
     if (writable < count && tid == 0) {
-        atomic_store_explicit(overflow_flag, 1u, memory_order_relaxed);
+        atomic_fetch_or_explicit(
+            overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+            memory_order_relaxed);
     }
 
     // Write tile_bins for rasterizer

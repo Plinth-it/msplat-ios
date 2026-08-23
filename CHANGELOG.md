@@ -8,6 +8,11 @@
   `MsplatTrainingLimits` structure. Its `maxGaussians` field provides an
   optional hard population and backing-buffer ceiling while ABI v2 creation
   retains the unlimited behavior.
+- Added ABI v4 query-only telemetry for submitted versus completed training,
+  per-logical-step GPU and end-to-end timing, completion-safe loss, typed
+  rasterizer overflow incidence, categorized buffer ownership, image-cache
+  hit/miss counts, `phys_footprint`, and iOS available memory. Legacy step
+  statistics remain submission-only and ABI-compatible.
 - Enforced the Gaussian ceiling during initialization, densification, PLY
   import, and checkpoint restore. Capacity-constrained densification keeps the
   highest normalized-gradient candidates, and `--max-gaussians` exposes the
@@ -49,6 +54,10 @@
   temporary-file replacement, with native regression tests for invalid inputs.
 - Made the iOS preview's single-resolution policy and CPU submission timing
   explicit, pinned CMake downloads by hash, and added an iOS simulator build to CI.
+- The iOS example now advances progress from completed GPU iterations and
+  displays CPU submission, GPU execution, end-to-end latency, loss, effective
+  resolution/SH degree, tracked memory categories, cache hit rate, thermal
+  state, and completed-step overflow warnings.
 
 ## v1.1.3 — Fused kernels + pre-allocated tile bins
 

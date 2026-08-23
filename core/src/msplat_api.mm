@@ -9,7 +9,6 @@
 #include "ssim.hpp"
 #include "memory_report.hpp"
 
-#include <chrono>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -134,6 +133,7 @@ struct Trainer::Impl {
     Config config;
     Dataset::Impl* ds = nullptr;
     int currentStep = 0;
+    MsplatTrainingTelemetryHandle telemetry = msplat_training_telemetry_create();
 
     // Camera iteration
     std::vector<size_t> camIndices;
@@ -189,31 +189,46 @@ Stats Trainer::step() {
     if (impl->currentStep == std::numeric_limits<int>::max())
         throw std::overflow_error("Training iteration cannot be incremented further");
     impl->currentStep++;
-    size_t camIdx = impl->nextCamera();
-    Camera& cam = impl->ds->trainCamera(camIdx);
+    auto logicalStep = msplat_training_step_begin(
+        impl->telemetry, impl->currentStep);
+    double cpuSubmitMs = 0.0;
+    try {
+        size_t camIdx = impl->nextCamera();
+        Camera& cam = impl->ds->trainCamera(camIdx);
 
-    int ds = impl->model->getDownscaleFactor(impl->currentStep);
-    MTensor& gt = impl->ds->gpuImageForTrainCamera(camIdx, ds);
+        int ds = impl->model->getDownscaleFactor(impl->currentStep);
+        MTensor& gt = impl->ds->gpuImageForTrainCamera(camIdx, ds);
 
-    auto t0 = std::chrono::high_resolution_clock::now();
+        msplat_training_step_mark_cpu_start(logicalStep);
+        impl->model->fullIteration(
+            cam, impl->currentStep, gt, impl->config.ssimWeight);
+        impl->model->schedulersStep(impl->currentStep);
+        impl->model->afterTrain(impl->currentStep);
 
-    impl->model->fullIteration(cam, impl->currentStep, gt, impl->config.ssimWeight);
-    impl->model->schedulersStep(impl->currentStep);
-    impl->model->afterTrain(impl->currentStep);
-    msplat_commit();
+        MsplatTrainingStepDescriptor descriptor;
+        descriptor.iteration = impl->currentStep;
+        descriptor.splatCount = impl->model->means.size(0);
+        descriptor.modelCapacity = impl->model->buf_capacity;
+        descriptor.effectiveWidth = static_cast<int32_t>(gt.size(1));
+        descriptor.effectiveHeight = static_cast<int32_t>(gt.size(0));
+        descriptor.activeShDegree = std::min(
+            impl->currentStep / impl->config.shDegreeInterval,
+            impl->config.shDegree);
+        cpuSubmitMs = msplat_training_step_submit(logicalStep, descriptor);
+    } catch (...) {
+        msplat_training_step_abort(logicalStep);
+        throw;
+    }
 
     reportMemory(impl->currentStep, (int)impl->model->means.size(0),
                  impl->model->estimatedGpuBytes(),
                  impl->ds->images.cachedBytes(),
                  impl->ds->images.budgetBytes());
 
-    auto t1 = std::chrono::high_resolution_clock::now();
-    float ms = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count() / 1000.0f;
-
     Stats s;
     s.iteration = impl->currentStep;
     s.splatCount = (int)impl->model->means.size(0);
-    s.msPerStep = ms;
+    s.msPerStep = static_cast<float>(cpuSubmitMs);
     return s;
 }
 
@@ -377,6 +392,7 @@ void Trainer::saveCheckpoint(const std::string& path) {
 int Trainer::loadCheckpoint(const std::string& path) {
     std::lock_guard lock(g_trainerTransactionMutex);
     impl->currentStep = impl->model->loadCheckpoint(path);
+    msplat_training_telemetry_reset(impl->telemetry);
     // Re-shuffle cameras for resumed training
     impl->shuffleCameras();
     return impl->currentStep;
@@ -390,6 +406,81 @@ int Trainer::splatCount() const {
 int Trainer::iteration() const {
     std::lock_guard lock(g_trainerTransactionMutex);
     return impl->currentStep;
+}
+
+TrainingMetrics Trainer::metrics() const {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    const MsplatTrainingTelemetrySnapshot snapshot =
+        msplat_training_telemetry_snapshot(impl->telemetry);
+    TrainingMetrics metrics;
+    metrics.hasSubmittedStep =
+        snapshot.flags & MSPLAT_TRAINING_TELEMETRY_HAS_SUBMITTED;
+    metrics.hasCompletedStep =
+        snapshot.flags & MSPLAT_TRAINING_TELEMETRY_HAS_COMPLETED;
+    metrics.gpuTimeValid =
+        snapshot.flags & MSPLAT_TRAINING_TELEMETRY_GPU_TIMING_VALID;
+    metrics.lossValid = snapshot.flags & MSPLAT_TRAINING_TELEMETRY_LOSS_VALID;
+    metrics.intersectionsValid =
+        snapshot.flags & MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID;
+    metrics.hasFailedStep = snapshot.flags & MSPLAT_TRAINING_TELEMETRY_HAS_FAILED;
+
+    auto copyDescriptor = [](const MsplatTrainingStepDescriptor& source,
+                             SubmittedTrainingStep& destination) {
+        destination.iteration = static_cast<int>(source.iteration);
+        destination.splatCount = static_cast<int>(source.splatCount);
+        destination.modelCapacity = static_cast<int>(source.modelCapacity);
+        destination.effectiveWidth = source.effectiveWidth;
+        destination.effectiveHeight = source.effectiveHeight;
+        destination.activeSHDegree = source.activeShDegree;
+    };
+    copyDescriptor(snapshot.submittedStep, metrics.submitted);
+    metrics.submitted.cpuSubmitMs =
+        static_cast<float>(snapshot.submittedCpuSubmitMs);
+    copyDescriptor(snapshot.completedStep.step, metrics.completed);
+    metrics.completed.cpuSubmitMs =
+        static_cast<float>(snapshot.completedStep.cpuSubmitMs);
+    metrics.completed.gpuExecutionMs =
+        static_cast<float>(snapshot.completedStep.gpuExecutionMs);
+    metrics.completed.endToEndMs =
+        static_cast<float>(snapshot.completedStep.endToEndMs);
+    metrics.completed.loss = static_cast<float>(snapshot.completedStep.loss);
+    metrics.completed.overflowKinds = snapshot.completedStep.overflowReasons;
+    metrics.completed.retainedPackedIntersectionCount =
+        snapshot.completedStep.retainedPackedIntersections;
+    metrics.completed.packedIntersectionCapacity =
+        snapshot.completedStep.packedIntersectionCapacity;
+    metrics.overflowedCompletedSteps = snapshot.overflowedStepCount;
+    metrics.tileCapOverflowedSteps = snapshot.tileCapOverflowedStepCount;
+    metrics.packedCapacityOverflowedSteps =
+        snapshot.packedCapacityOverflowedStepCount;
+    metrics.lastOverflowIteration =
+        static_cast<int>(snapshot.lastOverflowIteration);
+    metrics.lastFailedIteration =
+        static_cast<int>(snapshot.lastFailedIteration);
+    return metrics;
+}
+
+TrainingMemoryMetrics Trainer::memoryMetrics() const {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    TrainingMemoryMetrics metrics;
+    metrics.trainerModelBufferBytes = impl->model->estimatedGpuBytes();
+    metrics.engineSharedTransientBufferBytes =
+        msplat_shared_cached_tensor_bytes();
+    metrics.engineTrainingTransientBufferBytes =
+        msplat_training_cached_tensor_bytes();
+    metrics.trainerTelemetryReadbackBytes =
+        msplat_training_telemetry_readback_bytes(impl->telemetry);
+    metrics.trainerImageCacheCpuBytes = impl->ds->images.cachedCpuBytes();
+    metrics.trainerImageCacheGpuBytes = impl->ds->images.cachedGpuBytes();
+    metrics.trainerImageCacheBudgetBytes = impl->ds->images.budgetBytes();
+    metrics.trainingGpuImageCacheHits = impl->ds->images.hitCount();
+    metrics.trainingGpuImageCacheMisses = impl->ds->images.missCount();
+    const ProcessMemorySnapshot processMemory = currentProcessMemory();
+    metrics.processPhysFootprintBytes = processMemory.physicalFootprintBytes;
+    metrics.processAvailableBytes = processMemory.availableBytes;
+    metrics.hasProcessPhysFootprint = processMemory.hasPhysicalFootprint;
+    metrics.hasProcessAvailableBytes = processMemory.hasAvailableBytes;
+    return metrics;
 }
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
@@ -854,6 +945,109 @@ MsplatStatus msplat_trainer_iteration_v2(MsplatTrainer t, int* outIteration,
         require(t != nullptr, "Trainer handle must not be null");
         require(outIteration != nullptr, "outIteration must not be null");
         *outIteration = trainerHandle(t).trainer->iteration();
+    });
+}
+
+MsplatStatus msplat_trainer_metrics_v4(
+    MsplatTrainer t, MsplatTrainingMetrics* outMetrics, size_t outputSize,
+    MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        // Validate the caller's layout before writing a byte. This keeps an
+        // older, smaller client buffer from being zeroed past its boundary.
+        require(outputSize == sizeof(MsplatTrainingMetrics),
+                "Training metrics size does not match this msplat ABI");
+        require(outMetrics != nullptr, "outMetrics must not be null");
+        *outMetrics = {};
+        require(t != nullptr, "Trainer handle must not be null");
+
+        const msplat::TrainingMetrics metrics =
+            trainerHandle(t).trainer->metrics();
+        if (metrics.hasSubmittedStep)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_HAS_SUBMITTED_STEP;
+        if (metrics.hasCompletedStep)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_HAS_COMPLETED_STEP;
+        if (metrics.gpuTimeValid)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_GPU_TIME_VALID;
+        if (metrics.lossValid)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_LOSS_VALID;
+        if (metrics.intersectionsValid)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_INTERSECTIONS_VALID;
+        if (metrics.hasFailedStep)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_HAS_FAILED_STEP;
+
+        auto copySubmitted = [](const msplat::SubmittedTrainingStep& source,
+                                MsplatSubmittedTrainingStep& destination) {
+            destination.iteration = source.iteration;
+            destination.splatCount = source.splatCount;
+            destination.modelCapacity = source.modelCapacity;
+            destination.effectiveWidth = source.effectiveWidth;
+            destination.effectiveHeight = source.effectiveHeight;
+            destination.activeSHDegree = source.activeSHDegree;
+            destination.cpuSubmitMs = source.cpuSubmitMs;
+        };
+        copySubmitted(metrics.submitted, outMetrics->submitted);
+
+        const msplat::CompletedTrainingStep& completed = metrics.completed;
+        outMetrics->completed.iteration = completed.iteration;
+        outMetrics->completed.splatCount = completed.splatCount;
+        outMetrics->completed.modelCapacity = completed.modelCapacity;
+        outMetrics->completed.effectiveWidth = completed.effectiveWidth;
+        outMetrics->completed.effectiveHeight = completed.effectiveHeight;
+        outMetrics->completed.activeSHDegree = completed.activeSHDegree;
+        outMetrics->completed.cpuSubmitMs = completed.cpuSubmitMs;
+        outMetrics->completed.gpuExecutionMs = completed.gpuExecutionMs;
+        outMetrics->completed.endToEndMs = completed.endToEndMs;
+        outMetrics->completed.loss = completed.loss;
+        outMetrics->completed.overflowKinds = completed.overflowKinds;
+        outMetrics->completed.retainedPackedIntersectionCount =
+            completed.retainedPackedIntersectionCount;
+        outMetrics->completed.packedIntersectionCapacity =
+            completed.packedIntersectionCapacity;
+        outMetrics->overflowedCompletedSteps = metrics.overflowedCompletedSteps;
+        outMetrics->tileCapOverflowedSteps = metrics.tileCapOverflowedSteps;
+        outMetrics->packedCapacityOverflowedSteps =
+            metrics.packedCapacityOverflowedSteps;
+        outMetrics->lastOverflowIteration = metrics.lastOverflowIteration;
+        outMetrics->lastFailedIteration = metrics.lastFailedIteration;
+    });
+}
+
+MsplatStatus msplat_trainer_memory_metrics_v4(
+    MsplatTrainer t, MsplatTrainingMemoryMetrics* outMetrics,
+    size_t outputSize, MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(outputSize == sizeof(MsplatTrainingMemoryMetrics),
+                "Training memory metrics size does not match this msplat ABI");
+        require(outMetrics != nullptr, "outMetrics must not be null");
+        *outMetrics = {};
+        require(t != nullptr, "Trainer handle must not be null");
+
+        const msplat::TrainingMemoryMetrics metrics =
+            trainerHandle(t).trainer->memoryMetrics();
+        if (metrics.hasProcessPhysFootprint)
+            outMetrics->flags |= MSPLAT_MEMORY_METRICS_PHYS_FOOTPRINT_VALID;
+        if (metrics.hasProcessAvailableBytes)
+            outMetrics->flags |= MSPLAT_MEMORY_METRICS_AVAILABLE_VALID;
+        outMetrics->trainerModelBufferBytes = metrics.trainerModelBufferBytes;
+        outMetrics->engineSharedTransientBufferBytes =
+            metrics.engineSharedTransientBufferBytes;
+        outMetrics->engineTrainingTransientBufferBytes =
+            metrics.engineTrainingTransientBufferBytes;
+        outMetrics->trainerTelemetryReadbackBytes =
+            metrics.trainerTelemetryReadbackBytes;
+        outMetrics->trainerImageCacheCpuBytes =
+            metrics.trainerImageCacheCpuBytes;
+        outMetrics->trainerImageCacheGpuBytes =
+            metrics.trainerImageCacheGpuBytes;
+        outMetrics->trainerImageCacheBudgetBytes =
+            metrics.trainerImageCacheBudgetBytes;
+        outMetrics->processPhysFootprintBytes =
+            metrics.processPhysFootprintBytes;
+        outMetrics->processAvailableBytes = metrics.processAvailableBytes;
+        outMetrics->trainingGpuImageCacheHits =
+            metrics.trainingGpuImageCacheHits;
+        outMetrics->trainingGpuImageCacheMisses =
+            metrics.trainingGpuImageCacheMisses;
     });
 }
 

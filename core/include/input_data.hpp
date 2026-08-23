@@ -53,6 +53,8 @@ struct Camera {
     const Image& getImage(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
     void releaseImageMemory();
+    size_t cachedCpuImageBytes() const;
+    size_t cachedGpuImageBytes() const;
     size_t cachedImageBytes() const;
     bool hasDistortion() const { return k1 != 0 || k2 != 0 || k3 != 0 || p1 != 0 || p2 != 0; }
 };
@@ -93,19 +95,28 @@ public:
     Camera& ensureLoaded(std::vector<Camera> &cameras, size_t index);
 
     size_t cachedBytes() const;
+    size_t cachedCpuBytes() const;
+    size_t cachedGpuBytes() const;
     size_t budgetBytes() const { return _budgetBytes; }
+    uint64_t hitCount() const { return _hitCount; }
+    uint64_t missCount() const { return _missCount; }
 
 private:
     void evict(std::vector<Camera> &cameras, size_t protectedIndex);
 
     struct Entry {
         uint64_t lastUse = 0;
-        size_t bytes = 0;
+        size_t cpuBytes = 0;
+        size_t gpuBytes = 0;
+
+        size_t bytes() const { return cpuBytes + gpuBytes; }
     };
     std::unordered_map<size_t, Entry> _entries;
     float _downscaleFactor = 1.0f;
     size_t _budgetBytes = 0;
     uint64_t _clock = 0;
+    uint64_t _hitCount = 0;
+    uint64_t _missCount = 0;
 };
 
 struct InputData {

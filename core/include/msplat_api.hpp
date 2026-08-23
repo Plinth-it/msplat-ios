@@ -45,6 +45,57 @@ struct Stats {
     float msPerStep = 0.0f; // CPU encode + submission; not completed GPU time.
 };
 
+struct SubmittedTrainingStep {
+    int iteration = 0;
+    int splatCount = 0;
+    int modelCapacity = 0;
+    int effectiveWidth = 0;
+    int effectiveHeight = 0;
+    int activeSHDegree = 0;
+    float cpuSubmitMs = 0.0f;
+};
+
+struct CompletedTrainingStep : SubmittedTrainingStep {
+    float gpuExecutionMs = 0.0f;
+    float endToEndMs = 0.0f;
+    float loss = 0.0f;
+    uint32_t overflowKinds = 0;
+    uint64_t retainedPackedIntersectionCount = 0;
+    uint64_t packedIntersectionCapacity = 0;
+};
+
+struct TrainingMetrics {
+    bool hasSubmittedStep = false;
+    bool hasCompletedStep = false;
+    bool gpuTimeValid = false;
+    bool lossValid = false;
+    bool intersectionsValid = false;
+    bool hasFailedStep = false;
+    SubmittedTrainingStep submitted;
+    CompletedTrainingStep completed;
+    uint64_t overflowedCompletedSteps = 0;
+    uint64_t tileCapOverflowedSteps = 0;
+    uint64_t packedCapacityOverflowedSteps = 0;
+    int lastOverflowIteration = 0;
+    int lastFailedIteration = 0;
+};
+
+struct TrainingMemoryMetrics {
+    size_t trainerModelBufferBytes = 0;
+    size_t engineSharedTransientBufferBytes = 0;
+    size_t engineTrainingTransientBufferBytes = 0;
+    size_t trainerTelemetryReadbackBytes = 0;
+    size_t trainerImageCacheCpuBytes = 0;
+    size_t trainerImageCacheGpuBytes = 0;
+    size_t trainerImageCacheBudgetBytes = 0;
+    size_t processPhysFootprintBytes = 0;
+    size_t processAvailableBytes = 0;
+    uint64_t trainingGpuImageCacheHits = 0;
+    uint64_t trainingGpuImageCacheMisses = 0;
+    bool hasProcessPhysFootprint = false;
+    bool hasProcessAvailableBytes = false;
+};
+
 struct EvalMetrics {
     float psnr = 0.0f;
     float ssim = 0.0f;
@@ -163,6 +214,10 @@ public:
 
     int splatCount() const;
     int iteration() const;
+    /// Latest submitted and successfully completed logical-step snapshots.
+    TrainingMetrics metrics() const;
+    /// Live buffer ownership, cache, and process-memory measurements.
+    TrainingMemoryMetrics memoryMetrics() const;
 
 private:
     struct Impl;

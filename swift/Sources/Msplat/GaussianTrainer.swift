@@ -36,6 +36,39 @@ public class GaussianTrainer {
         withNativeEngineLock { msplat_trainer_train(handle) }
     }
 
+    /// Poll submission and completed-GPU progress between calls to `step()`.
+    /// The legacy blocking `train()` call holds the engine lock until it returns.
+    public func trainingMetrics() throws -> TrainingTelemetry {
+        try withNativeEngineLock {
+            var metrics = MsplatTrainingMetrics()
+            var nativeError = MsplatErrorInfo()
+            let status = msplat_trainer_metrics_v4(
+                handle,
+                &metrics,
+                MemoryLayout<MsplatTrainingMetrics>.size,
+                &nativeError
+            )
+            try checkNativeStatus(status, error: &nativeError)
+            return TrainingTelemetry(from: metrics)
+        }
+    }
+
+    /// Return live categorized native-buffer and process-memory measurements.
+    public func memoryMetrics() throws -> TrainingMemorySnapshot {
+        try withNativeEngineLock {
+            var metrics = MsplatTrainingMemoryMetrics()
+            var nativeError = MsplatErrorInfo()
+            let status = msplat_trainer_memory_metrics_v4(
+                handle,
+                &metrics,
+                MemoryLayout<MsplatTrainingMemoryMetrics>.size,
+                &nativeError
+            )
+            try checkNativeStatus(status, error: &nativeError)
+            return TrainingMemorySnapshot(from: metrics)
+        }
+    }
+
     /// Evaluate on held-out test views.
     public func evaluate() -> EvalMetrics {
         withNativeEngineLock {

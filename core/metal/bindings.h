@@ -1,6 +1,8 @@
 #ifndef MSPLAT_BINDINGS_H
 #define MSPLAT_BINDINGS_H
 
+#include <cstdint>
+#include <memory>
 #include <tuple>
 #include "metal_tensor.hpp"
 
@@ -27,6 +29,91 @@ void msplat_commit();
 
 // Synchronize (commit + wait for completion)
 void msplat_gpu_sync();
+
+// Completion-only training telemetry. A trainer owns one shared state. Each
+// submitted logical step owns a distinct readback buffer until every command
+// buffer associated with that step has completed, so pipelined steps cannot
+// overwrite each other's loss or overflow result.
+enum MsplatTrainingOverflowReason : uint32_t {
+    MSPLAT_TRAINING_OVERFLOW_NONE = 0,
+    MSPLAT_TRAINING_OVERFLOW_TILE_CAP = 1u << 0,
+    MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY = 1u << 1,
+};
+
+enum MsplatTrainingTelemetryFlag : uint32_t {
+    MSPLAT_TRAINING_TELEMETRY_HAS_SUBMITTED = 1u << 0,
+    MSPLAT_TRAINING_TELEMETRY_HAS_COMPLETED = 1u << 1,
+    MSPLAT_TRAINING_TELEMETRY_GPU_TIMING_VALID = 1u << 2,
+    MSPLAT_TRAINING_TELEMETRY_LOSS_VALID = 1u << 3,
+    MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID = 1u << 4,
+    MSPLAT_TRAINING_TELEMETRY_HAS_FAILED = 1u << 5,
+};
+
+struct MsplatTrainingStepDescriptor {
+    int64_t iteration = 0;
+    int64_t splatCount = 0;
+    int64_t modelCapacity = 0;
+    int32_t effectiveWidth = 0;
+    int32_t effectiveHeight = 0;
+    int32_t activeShDegree = 0;
+    int32_t reserved = 0;
+};
+
+struct MsplatCompletedTrainingStepMetrics {
+    MsplatTrainingStepDescriptor step;
+    double cpuSubmitMs = 0.0;
+    double gpuExecutionMs = 0.0;
+    double endToEndMs = 0.0;
+    double loss = 0.0;
+    uint64_t retainedPackedIntersections = 0;
+    uint64_t packedIntersectionCapacity = 0;
+    uint32_t overflowReasons = MSPLAT_TRAINING_OVERFLOW_NONE;
+    uint32_t commandBufferCount = 0;
+};
+
+struct MsplatTrainingTelemetrySnapshot {
+    uint32_t flags = 0;
+    uint32_t reserved = 0;
+    uint64_t generation = 0;
+    MsplatTrainingStepDescriptor submittedStep;
+    double submittedCpuSubmitMs = 0.0;
+    MsplatCompletedTrainingStepMetrics completedStep;
+    uint64_t overflowedStepCount = 0;
+    uint64_t tileCapOverflowedStepCount = 0;
+    uint64_t packedCapacityOverflowedStepCount = 0;
+    int64_t lastOverflowIteration = 0;
+    uint64_t failedStepCount = 0;
+    int64_t lastFailedIteration = 0;
+};
+
+struct MsplatTrainingTelemetryState;
+struct MsplatLogicalTrainingStep;
+using MsplatTrainingTelemetryHandle =
+    std::shared_ptr<MsplatTrainingTelemetryState>;
+using MsplatLogicalTrainingStepHandle =
+    std::shared_ptr<MsplatLogicalTrainingStep>;
+
+MsplatTrainingTelemetryHandle msplat_training_telemetry_create();
+void msplat_training_telemetry_reset(
+    const MsplatTrainingTelemetryHandle& telemetry);
+MsplatTrainingTelemetrySnapshot msplat_training_telemetry_snapshot(
+    const MsplatTrainingTelemetryHandle& telemetry);
+size_t msplat_training_telemetry_readback_bytes(
+    const MsplatTrainingTelemetryHandle& telemetry);
+
+// Begin at Trainer::step entry so endToEndMs includes image preparation. Mark
+// CPU start immediately before native GPU encoding. Submit commits the final
+// command buffer non-blockingly, seals the descriptor, and returns cpuSubmitMs.
+// The caller must abort the token if any work between begin and submit throws.
+MsplatLogicalTrainingStepHandle msplat_training_step_begin(
+    const MsplatTrainingTelemetryHandle& telemetry, int64_t iteration);
+void msplat_training_step_mark_cpu_start(
+    const MsplatLogicalTrainingStepHandle& step);
+double msplat_training_step_submit(
+    const MsplatLogicalTrainingStepHandle& step,
+    const MsplatTrainingStepDescriptor& descriptor);
+void msplat_training_step_abort(
+    const MsplatLogicalTrainingStepHandle& step) noexcept;
 
 // Bytes held by the cached per-iteration intermediates (the "temp" line in
 // MSPLAT_MEM_LOG_EVERY). These dwarf the model at full resolution.
@@ -58,8 +145,8 @@ MTensor msplat_render(
 );
 
 // Fused forward + backward + Adam, with optional densification grad stats.
-// Returns: (radii [N], loss_value float)
-std::tuple<MTensor, float> msplat_train_step(
+// True loss is available from the completed logical-step telemetry snapshot.
+MTensor msplat_train_step(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
     MTensor &quats, MTensor &viewmat, MTensor &projmat,
     float fx, float fy, float cx, float cy,

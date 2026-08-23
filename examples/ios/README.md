@@ -56,10 +56,21 @@ observe. COLMAP camera calibration uses encoded raster coordinates, so valid
 EXIF orientation metadata is checked but intentionally not applied; an oriented
 image provider must transform its calibration and pose together with its pixels.
 
-During training the app reports the step, Gaussian count, CPU
-encode/submission time, `phys_footprint`, and the memory iOS currently reports
-available. It also samples a rendered preview rather than rendering every
-iteration.
+During training the app distinguishes submitted from completed iterations and
+advances its progress bar only from GPU completion. At each sampled preview it
+polls the matching logical-step GPU execution and end-to-end time, loss,
+effective resolution and SH degree, Gaussian count/capacity, rasterizer
+overflow incidence, categorized native/image-cache memory, `phys_footprint`,
+iOS available memory, cache hit rate, and thermal state. The preview render is
+sampled rather than performed every iteration; because it synchronizes prior
+work, the following telemetry poll is an authoritative completion snapshot.
+
+The model/transient/image figures are logical owned buffers. They do not include
+Metal driver state, codec-private surfaces, framework allocations, or allocator
+overhead; `phys_footprint` is the process-wide device measurement. The
+simulator does not provide meaningful jetsam headroom, and physical-device
+profiling remains the validation gate for timing, memory pressure, and thermal
+behavior.
 
 The exported PLY goes to the app's Documents folder and is offered through the
 share sheet.

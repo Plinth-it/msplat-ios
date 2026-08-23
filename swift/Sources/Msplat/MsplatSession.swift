@@ -137,6 +137,38 @@ public final class MsplatSession {
         }
     }
 
+    /// Polls submission and GPU-completion progress without submitting work.
+    public func trainingMetrics() throws -> TrainingTelemetry {
+        try withTrainer { trainer in
+            var metrics = MsplatTrainingMetrics()
+            var nativeError = MsplatErrorInfo()
+            let status = msplat_trainer_metrics_v4(
+                trainer,
+                &metrics,
+                MemoryLayout<MsplatTrainingMetrics>.size,
+                &nativeError
+            )
+            try checkNativeStatus(status, error: &nativeError)
+            return TrainingTelemetry(from: metrics)
+        }
+    }
+
+    /// Returns live categorized native-buffer and process-memory measurements.
+    public func memoryMetrics() throws -> TrainingMemorySnapshot {
+        try withTrainer { trainer in
+            var metrics = MsplatTrainingMemoryMetrics()
+            var nativeError = MsplatErrorInfo()
+            let status = msplat_trainer_memory_metrics_v4(
+                trainer,
+                &metrics,
+                MemoryLayout<MsplatTrainingMemoryMetrics>.size,
+                &nativeError
+            )
+            try checkNativeStatus(status, error: &nativeError)
+            return TrainingMemorySnapshot(from: metrics)
+        }
+    }
+
     public func evaluate() throws -> EvalMetrics {
         try withTrainer { trainer in
             var metrics = MsplatEvalMetrics()

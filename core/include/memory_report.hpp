@@ -5,6 +5,17 @@
 
 namespace msplat {
 
+struct ProcessMemorySnapshot {
+    size_t physicalFootprintBytes = 0;
+    size_t availableBytes = 0;
+    bool hasPhysicalFootprint = false;
+    bool hasAvailableBytes = false;
+};
+
+/// Returns the process measurements used by the runtime telemetry. Available
+/// memory is an iOS jetsam-headroom value and is unavailable on macOS.
+ProcessMemorySnapshot currentProcessMemory();
+
 /// Emits one MSPLAT_MEM line to stderr when MSPLAT_MEM_LOG_EVERY says this step
 /// is due, and does nothing when that variable is unset.
 ///

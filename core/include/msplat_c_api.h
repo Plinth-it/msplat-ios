@@ -14,8 +14,9 @@ extern "C" {
 
 // ABI v2 added checked, error-returning entry points. ABI v3 adds an optional
 // hard training-limit contract without changing MsplatConfig's v2 layout.
+// ABI v4 adds query-only completed-step and live-memory telemetry.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 3u
+#define MSPLAT_ABI_VERSION 4u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 typedef enum {
@@ -103,6 +104,86 @@ typedef struct {
     int splatCount;
     float msPerStep; // CPU encode + command submission time; not completed GPU time.
 } MsplatStats;
+
+// Flags for MsplatTrainingMetrics.flags.
+#define MSPLAT_TRAINING_METRICS_HAS_SUBMITTED_STEP (1u << 0)
+#define MSPLAT_TRAINING_METRICS_HAS_COMPLETED_STEP (1u << 1)
+#define MSPLAT_TRAINING_METRICS_GPU_TIME_VALID     (1u << 2)
+#define MSPLAT_TRAINING_METRICS_LOSS_VALID         (1u << 3)
+#define MSPLAT_TRAINING_METRICS_INTERSECTIONS_VALID (1u << 4)
+#define MSPLAT_TRAINING_METRICS_HAS_FAILED_STEP    (1u << 5)
+
+// Bit values for MsplatCompletedTrainingStep.overflowKinds.
+#define MSPLAT_RASTER_OVERFLOW_TILE_CAP        (1u << 0)
+#define MSPLAT_RASTER_OVERFLOW_PACKED_CAPACITY (1u << 1)
+
+/// Identity and CPU submission cost of one submitted training step.
+typedef struct {
+    int32_t iteration;
+    int32_t splatCount;
+    int32_t modelCapacity;
+    int32_t effectiveWidth;
+    int32_t effectiveHeight;
+    int32_t activeSHDegree;
+    float cpuSubmitMs;
+    uint32_t reserved;
+} MsplatSubmittedTrainingStep;
+
+/// Measurements published only after every command buffer belonging to this
+/// logical training step has completed successfully.
+typedef struct {
+    int32_t iteration;
+    int32_t splatCount;
+    int32_t modelCapacity;
+    int32_t effectiveWidth;
+    int32_t effectiveHeight;
+    int32_t activeSHDegree;
+    float cpuSubmitMs;
+    float gpuExecutionMs;
+    float endToEndMs;
+    float loss;
+    uint32_t overflowKinds;
+    uint32_t reserved;
+    uint64_t retainedPackedIntersectionCount;
+    uint64_t packedIntersectionCapacity;
+} MsplatCompletedTrainingStep;
+
+/// Query-only snapshot. Submitted and completed descriptors are intentionally
+/// separate because GPU completion may lag CPU submission by several steps.
+typedef struct {
+    uint32_t flags;
+    uint32_t reserved;
+    MsplatSubmittedTrainingStep submitted;
+    MsplatCompletedTrainingStep completed;
+    uint64_t overflowedCompletedSteps;
+    uint64_t tileCapOverflowedSteps;
+    uint64_t packedCapacityOverflowedSteps;
+    int32_t lastOverflowIteration;
+    int32_t lastFailedIteration;
+} MsplatTrainingMetrics;
+
+// Flags for MsplatTrainingMemoryMetrics.flags.
+#define MSPLAT_MEMORY_METRICS_PHYS_FOOTPRINT_VALID (1u << 0)
+#define MSPLAT_MEMORY_METRICS_AVAILABLE_VALID      (1u << 1)
+
+/// Live memory/accounting snapshot. Buffer categories are logical owned bytes;
+/// process footprint additionally includes driver, framework, and allocator
+/// overhead. Available bytes is an iOS jetsam-headroom measurement.
+typedef struct {
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t trainerModelBufferBytes;
+    uint64_t engineSharedTransientBufferBytes;
+    uint64_t engineTrainingTransientBufferBytes;
+    uint64_t trainerTelemetryReadbackBytes;
+    uint64_t trainerImageCacheCpuBytes;
+    uint64_t trainerImageCacheGpuBytes;
+    uint64_t trainerImageCacheBudgetBytes;
+    uint64_t processPhysFootprintBytes;
+    uint64_t processAvailableBytes;
+    uint64_t trainingGpuImageCacheHits;
+    uint64_t trainingGpuImageCacheMisses;
+} MsplatTrainingMemoryMetrics;
 
 typedef struct {
     float psnr;
@@ -211,6 +292,15 @@ MsplatStatus msplat_trainer_splat_count_v2(MsplatTrainer t, int* outCount,
                                            MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_iteration_v2(MsplatTrainer t, int* outIteration,
                                          MsplatErrorInfo* error);
+// ABI v4 query APIs. outputSize must exactly match the corresponding struct.
+// A size mismatch leaves the output untouched. With a correct size, failures
+// zero the output before returning an error status.
+MsplatStatus msplat_trainer_metrics_v4(
+    MsplatTrainer t, MsplatTrainingMetrics* outMetrics, size_t outputSize,
+    MsplatErrorInfo* error);
+MsplatStatus msplat_trainer_memory_metrics_v4(
+    MsplatTrainer t, MsplatTrainingMemoryMetrics* outMetrics,
+    size_t outputSize, MsplatErrorInfo* error);
 void msplat_pixel_buffer_free(MsplatPixelBuffer* buffer);
 
 MsplatTrainer msplat_trainer_create(MsplatDataset ds, MsplatConfig config);

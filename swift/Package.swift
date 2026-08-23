@@ -39,7 +39,7 @@ let package = Package(
         // Tests
         .testTarget(
             name: "MsplatTests",
-            dependencies: ["Msplat"],
+            dependencies: ["Msplat", "MsplatCore"],
             path: "Tests"
         ),
     ]

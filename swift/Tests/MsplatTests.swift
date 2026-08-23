@@ -1,5 +1,6 @@
 import XCTest
-import Msplat
+@testable import Msplat
+import MsplatCore
 
 final class MsplatTests: XCTestCase {
 
@@ -63,6 +64,100 @@ final class MsplatTests: XCTestCase {
         var nonFinite = [Float](repeating: 0, count: 16)
         nonFinite[3] = .nan
         XCTAssertThrowsError(try CameraPose(elements: nonFinite))
+    }
+
+    func testTrainingTelemetryConversionKeepsSubmissionAndCompletionSeparate() {
+        var native = MsplatTrainingMetrics()
+        native.flags = UInt32(MSPLAT_TRAINING_METRICS_HAS_SUBMITTED_STEP)
+            | UInt32(MSPLAT_TRAINING_METRICS_HAS_COMPLETED_STEP)
+            | UInt32(MSPLAT_TRAINING_METRICS_GPU_TIME_VALID)
+            | UInt32(MSPLAT_TRAINING_METRICS_LOSS_VALID)
+            | UInt32(MSPLAT_TRAINING_METRICS_INTERSECTIONS_VALID)
+        native.submitted.iteration = 12
+        native.submitted.splatCount = 120
+        native.submitted.modelCapacity = 150
+        native.submitted.effectiveWidth = 1_920
+        native.submitted.effectiveHeight = 1_080
+        native.submitted.activeSHDegree = 2
+        native.submitted.cpuSubmitMs = 1.25
+        native.completed.iteration = 10
+        native.completed.splatCount = 100
+        native.completed.modelCapacity = 125
+        native.completed.effectiveWidth = 960
+        native.completed.effectiveHeight = 540
+        native.completed.activeSHDegree = 1
+        native.completed.cpuSubmitMs = 1.5
+        native.completed.gpuExecutionMs = 8.5
+        native.completed.endToEndMs = 11.0
+        native.completed.loss = 0.125
+        native.completed.overflowKinds = UInt32(MSPLAT_RASTER_OVERFLOW_TILE_CAP)
+            | UInt32(MSPLAT_RASTER_OVERFLOW_PACKED_CAPACITY)
+        native.completed.retainedPackedIntersectionCount = 4_000_000_001
+        native.completed.packedIntersectionCapacity = 5_000_000_001
+        native.overflowedCompletedSteps = 3
+        native.tileCapOverflowedSteps = 2
+        native.packedCapacityOverflowedSteps = 1
+        native.lastOverflowIteration = 10
+
+        let telemetry = TrainingTelemetry(from: native)
+        XCTAssertEqual(telemetry.submitted?.iteration, 12)
+        XCTAssertEqual(telemetry.submitted?.effectiveWidth, 1_920)
+        XCTAssertEqual(telemetry.completed?.iteration, 10)
+        XCTAssertEqual(telemetry.completed?.effectiveWidth, 960)
+        XCTAssertEqual(telemetry.completed?.gpuExecutionMs, 8.5)
+        XCTAssertEqual(telemetry.completed?.loss, 0.125)
+        XCTAssertEqual(
+            telemetry.completed?.overflowKinds,
+            [.tileCapacity, .packedCapacity]
+        )
+        XCTAssertEqual(
+            telemetry.completed?.retainedPackedIntersectionCount,
+            4_000_000_001
+        )
+        XCTAssertEqual(telemetry.overflowedCompletedSteps, 3)
+        XCTAssertEqual(telemetry.lastOverflowIteration, 10)
+    }
+
+    func testTrainingTelemetryValidityFlagsControlOptionals() {
+        var native = MsplatTrainingMetrics()
+        native.completed.iteration = 7
+        native.completed.gpuExecutionMs = 99
+        native.completed.loss = 99
+
+        var telemetry = TrainingTelemetry(from: native)
+        XCTAssertNil(telemetry.submitted)
+        XCTAssertNil(telemetry.completed)
+
+        native.flags = UInt32(MSPLAT_TRAINING_METRICS_HAS_COMPLETED_STEP)
+        telemetry = TrainingTelemetry(from: native)
+        XCTAssertEqual(telemetry.completed?.iteration, 7)
+        XCTAssertNil(telemetry.completed?.gpuExecutionMs)
+        XCTAssertNil(telemetry.completed?.loss)
+    }
+
+    func testTrainingMemoryConversionPreservesCountsAndValidity() {
+        var native = MsplatTrainingMemoryMetrics()
+        native.flags = UInt32(MSPLAT_MEMORY_METRICS_PHYS_FOOTPRINT_VALID)
+        native.trainerModelBufferBytes = 1
+        native.engineSharedTransientBufferBytes = 2
+        native.engineTrainingTransientBufferBytes = 3
+        native.trainerTelemetryReadbackBytes = 4
+        native.trainerImageCacheGpuBytes = 5
+        native.trainerImageCacheCpuBytes = 6
+        native.processPhysFootprintBytes = 5_000_000_001
+        native.processAvailableBytes = 6_000_000_001
+        native.trainingGpuImageCacheHits = 3
+        native.trainingGpuImageCacheMisses = 1
+
+        let snapshot = TrainingMemorySnapshot(from: native)
+        XCTAssertEqual(snapshot.trackedNativeBufferBytes, 15)
+        XCTAssertEqual(snapshot.processPhysicalFootprintBytes, 5_000_000_001)
+        XCTAssertNil(snapshot.processAvailableBytes)
+        XCTAssertEqual(snapshot.trainingGpuImageCacheHitRate, 0.75)
+
+        native.trainingGpuImageCacheHits = 0
+        native.trainingGpuImageCacheMisses = 0
+        XCTAssertNil(TrainingMemorySnapshot(from: native).trainingGpuImageCacheHitRate)
     }
 
     func testLoadDataset() throws {

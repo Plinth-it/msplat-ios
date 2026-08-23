@@ -9,7 +9,9 @@ This fork reduces model and transient growth, adds a byte-budgeted image cache,
 enforces an optional hard Gaussian population limit, fixes correctness bugs,
 and provides an iOS build plus a COLMAP-to-PLY example app. Its Swift
 `TrainingPlan` also validates resolution stages and derives a conservative
-peak-memory estimate before a session is created.
+peak-memory estimate before a session is created. ABI v4 telemetry keeps CPU
+submission progress separate from completed GPU work and exposes categorized
+runtime memory and rasterizer overflow state.
 
 ## Memory
 
@@ -87,6 +89,8 @@ calibration. ImageIO converts decoded thumbnails into an explicit sRGB canvas.
 - ABI v3 checked trainer creation with a size-validated
   `MsplatTrainingLimits` structure; ABI v2 creation remains available and
   unlimited
+- ABI v4 query-only training and memory snapshots. Existing step APIs and
+  `MsplatStats` retain their submission-only behavior and layout.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
@@ -148,6 +152,11 @@ func train() throws {
         let stats = try session.step()
         print("step=\(stats.iteration) splats=\(stats.splatCount)")
     }
+    let telemetry = try session.trainingMetrics()
+    if let completed = telemetry.completed,
+       let gpuMs = completed.gpuExecutionMs {
+        print("GPU completed step \(completed.iteration): \(gpuMs) ms")
+    }
     try session.exportPLY(to: URL(fileURLWithPath: "output.ply"))
 }
 ```
@@ -155,6 +164,18 @@ func train() throws {
 `MsplatSession` is the checked, throwing API and serializes the engine's
 process-global Metal state. The legacy `GaussianDataset` and `GaussianTrainer`
 types remain available for source compatibility.
+
+`step()` returns a submission receipt: its `cpuSubmitMs` ends when Metal accepts
+the work and is not GPU duration. `trainingMetrics()` is a non-draining poll
+whose submitted and completed descriptors may name different iterations. A
+completed descriptor is published only after every command buffer in that
+logical step succeeds; `gpuExecutionMs` sums their Metal GPU intervals, while
+`endToEndMs` is completion-observed wall latency, including queueing,
+completion-handler scheduling, and any required synchronous readbacks.
+`memoryMetrics()` separates model, render-transient, training-transient,
+telemetry-readback, and image-cache bytes from process `phys_footprint` and iOS
+available memory. The buffer categories are logical allocations, not a claim
+about physical residency.
 
 CLI:
 

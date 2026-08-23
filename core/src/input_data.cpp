@@ -192,15 +192,24 @@ void Camera::releaseImageMemory() {
     loadedImageDownscaleFactor = 0.0f;
 }
 
-size_t Camera::cachedImageBytes() const {
+size_t Camera::cachedCpuImageBytes() const {
     size_t bytes = image.data.size() * sizeof(float);
     for (const auto& item : imagePyramids) {
         bytes += item.second.data.size() * sizeof(float);
     }
+    return bytes;
+}
+
+size_t Camera::cachedGpuImageBytes() const {
+    size_t bytes = 0;
     for (const auto& item : mtensorImageCache) {
         bytes += item.second.nbytes();
     }
     return bytes;
+}
+
+size_t Camera::cachedImageBytes() const {
+    return cachedCpuImageBytes() + cachedGpuImageBytes();
 }
 
 // ── Image cache ─────────────────────────────────────────────────────────────
@@ -220,12 +229,18 @@ size_t CameraImageCache::defaultBudgetBytes() {
 MTensor& CameraImageCache::gpuImage(std::vector<Camera> &cameras, size_t index,
                                     int downscaleFactor) {
     Camera &cam = cameras[index];
+    if (cam.mtensorImageCache.find(downscaleFactor) != cam.mtensorImageCache.end()) {
+        ++_hitCount;
+    } else {
+        ++_missCount;
+    }
     cam.loadImage(_downscaleFactor);
     MTensor &image = cam.getGPUImage(downscaleFactor);
 
     Entry &entry = _entries[index];
     entry.lastUse = ++_clock;
-    entry.bytes = cam.cachedImageBytes();
+    entry.cpuBytes = cam.cachedCpuImageBytes();
+    entry.gpuBytes = cam.cachedGpuImageBytes();
     evict(cameras, index);
     return image;
 }
@@ -236,7 +251,8 @@ Camera& CameraImageCache::ensureLoaded(std::vector<Camera> &cameras, size_t inde
 
     Entry &entry = _entries[index];
     entry.lastUse = ++_clock;
-    entry.bytes = cam.cachedImageBytes();
+    entry.cpuBytes = cam.cachedCpuImageBytes();
+    entry.gpuBytes = cam.cachedGpuImageBytes();
     evict(cameras, index);
     return cam;
 }
@@ -259,7 +275,19 @@ void CameraImageCache::evict(std::vector<Camera> &cameras, size_t protectedIndex
 
 size_t CameraImageCache::cachedBytes() const {
     size_t bytes = 0;
-    for (const auto &item : _entries) bytes += item.second.bytes;
+    for (const auto &item : _entries) bytes += item.second.bytes();
+    return bytes;
+}
+
+size_t CameraImageCache::cachedCpuBytes() const {
+    size_t bytes = 0;
+    for (const auto &item : _entries) bytes += item.second.cpuBytes;
+    return bytes;
+}
+
+size_t CameraImageCache::cachedGpuBytes() const {
+    size_t bytes = 0;
+    for (const auto &item : _entries) bytes += item.second.gpuBytes;
     return bytes;
 }
 

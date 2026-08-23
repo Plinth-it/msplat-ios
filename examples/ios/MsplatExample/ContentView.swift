@@ -107,20 +107,103 @@ struct ContentView: View {
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                         .listRowInsets(EdgeInsets())
                 }
-                ProgressView(value: Double(session.iteration),
+                ProgressView(value: Double(session.completedIteration),
                              total: Double(max(session.iterations, 1)))
-                LabeledContent("Step", value: "\(session.iteration) / \(session.iterations)")
-                LabeledContent("Gaussians", value: session.splatCount.formatted())
-                LabeledContent("CPU submit", value: String(format: "%.1f ms", session.msPerStep))
+                LabeledContent(
+                    "Submitted",
+                    value: "\(session.submittedIteration) / \(session.iterations)"
+                )
+                LabeledContent(
+                    "Completed",
+                    value: "\(session.completedIteration) / \(session.iterations)"
+                )
+                LabeledContent(
+                    "Gaussians",
+                    value: session.modelCapacity > 0
+                        ? "\(session.splatCount.formatted()) / \(session.modelCapacity.formatted())"
+                        : session.splatCount.formatted()
+                )
+                LabeledContent("CPU submit", value: duration(session.cpuSubmitMs))
+                LabeledContent("GPU execute", value: duration(session.gpuExecutionMs))
+                LabeledContent("End to end", value: duration(session.endToEndMs))
+                LabeledContent("Loss", value: session.loss.map {
+                    String(format: "%.5f", $0)
+                } ?? "—")
+                LabeledContent(
+                    "Training frame",
+                    value: session.effectiveWidth > 0
+                        ? "\(session.effectiveWidth) × \(session.effectiveHeight), SH\(session.activeSHDegree)"
+                        : "—"
+                )
+                LabeledContent(
+                    "Packed intersections",
+                    value: packedIntersectionDescription
+                )
                 LabeledContent("Cameras", value: "\(session.trainingCameras)")
-                // os_proc_available_memory reports 0 in the simulator, which
-                // has no jetsam limit — showing "0 MB left" there would read
-                // as being out of memory rather than as not applicable.
-                LabeledContent("Memory", value: session.availableMB > 0
+                LabeledContent("Process memory", value: session.footprintMB > 0
+                    ? (session.availableMB > 0
                     ? "\(session.footprintMB) MB used, \(session.availableMB) MB free"
                     : "\(session.footprintMB) MB used")
+                    : "—")
+                if let memory = session.memorySnapshot {
+                    LabeledContent(
+                        "Tracked GPU buffers",
+                        value: bytes(memory.trackedNativeBufferBytes)
+                    )
+                    LabeledContent(
+                        "Model / transients",
+                        value: "\(bytes(memory.trainerModelBufferBytes)) / " +
+                            "\(bytes(memory.engineSharedTransientBufferBytes + memory.engineTrainingTransientBufferBytes))"
+                    )
+                    LabeledContent(
+                        "Image cache CPU / GPU",
+                        value: "\(bytes(memory.trainerImageCacheCpuBytes)) / " +
+                            "\(bytes(memory.trainerImageCacheGpuBytes))"
+                    )
+                    LabeledContent(
+                        "GPU image-cache hits",
+                        value: memory.trainingGpuImageCacheHitRate.map {
+                            String(format: "%.0f%%", $0 * 100)
+                        } ?? "—"
+                    )
+                }
+                LabeledContent("Thermal", value: session.thermalState)
+                if session.overflowedCompletedSteps > 0 {
+                    Text(
+                        "Rasterizer overflow on \(session.overflowedCompletedSteps) completed " +
+                        "step(s); latest source: \(overflowDescription)."
+                    )
+                    .foregroundStyle(.red)
+                }
             }
         }
+    }
+
+    private func duration(_ milliseconds: Float?) -> String {
+        milliseconds.map { String(format: "%.1f ms", $0) } ?? "—"
+    }
+
+    private func duration(_ milliseconds: Float) -> String {
+        String(format: "%.1f ms", milliseconds)
+    }
+
+    private func bytes(_ count: UInt64) -> String {
+        ByteCountFormatter.string(fromByteCount: Int64(clamping: count), countStyle: .memory)
+    }
+
+    private var overflowDescription: String {
+        var sources: [String] = []
+        if session.overflowKinds.contains(.tileCapacity) { sources.append("tile cap") }
+        if session.overflowKinds.contains(.packedCapacity) { sources.append("packed arena") }
+        return sources.isEmpty ? "earlier step" : sources.joined(separator: " + ")
+    }
+
+    private var packedIntersectionDescription: String {
+        guard let retained = session.retainedPackedIntersections,
+              let capacity = session.packedIntersectionCapacity else {
+            return "—"
+        }
+        return "\(retained.formatted()) / \(capacity.formatted()) retained"
     }
 
     private var isBusy: Bool {
