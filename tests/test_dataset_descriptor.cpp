@@ -418,6 +418,7 @@ bool checkPolycamLayout1MissingTransformRejected() {
     {
         std::ofstream camera(cameraDirectory / "missing.json");
         camera << R"({"width":4,"height":3,"fx":2,"fy":2.5,
+"cx":2,"cy":1.5,
 "t_00":1,"t_01":0,"t_02":0,"t_03":0,
 "t_10":0,"t_11":1,"t_12":0,"t_13":0,
 "t_20":0,"t_21":0,"t_22":1})";
