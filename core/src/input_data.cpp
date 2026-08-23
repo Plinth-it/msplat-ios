@@ -1,4 +1,5 @@
 #include "input_data.hpp"
+#include "dataset_errors.hpp"
 #include "loaders.hpp"
 #include "msplat.hpp"
 #include <nlohmann/json.hpp>
@@ -25,7 +26,7 @@ int targetDimension(int sourceDimension, float downscaleFactor,
     if (!std::isfinite(scaled) || scaled < 1.0f ||
         static_cast<double>(scaled) >
             static_cast<double>(std::numeric_limits<int>::max())) {
-        throw std::invalid_argument(
+        throw msplat::InvalidDatasetError(
             "Image downscale produces an invalid " + std::string(axis) +
             " for " + path);
     }
@@ -79,7 +80,7 @@ void Camera::loadImage(float downscaleFactor) {
     width = declared.width; height = declared.height;
 
     if (width < 0 || height < 0 || (width == 0) != (height == 0)) {
-        throw std::invalid_argument(
+        throw msplat::InvalidDatasetError(
             "Camera dimensions must both be positive or both be omitted for " +
             filePath);
     }
@@ -116,7 +117,7 @@ void Camera::loadImage(float downscaleFactor) {
                      "raster, but this camera requests EXIF-normalized pixels; "
                      "provide calibration and pose in the normalized frame.";
         }
-        throw std::invalid_argument(
+        throw msplat::InvalidDatasetError(
             "Camera dimensions " + std::to_string(width) + "x" +
             std::to_string(height) + " do not match " +
             (normalizeExif ? "EXIF-oriented" : "encoded") +
@@ -189,7 +190,8 @@ MTensor& Camera::getGPUImage(int downscaleFactor) {
     imagePyramids.clear();
 
     const Image& img = getImage(downscaleFactor);
-    if (img.empty()) throw std::runtime_error("Failed to load image: " + filePath);
+    if (img.empty())
+        throw msplat::DatasetIOError("Failed to decode image: " + filePath);
     MTensor mt = gpu_empty({img.height, img.width, 3}, DType::Float32);
     memcpy(mt.data_ptr(), img.ptr(), img.width * img.height * 3 * sizeof(float));
     mtensorImageCache[downscaleFactor] = mt;

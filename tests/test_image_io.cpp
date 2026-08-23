@@ -1,4 +1,5 @@
 #include "loaders.hpp"
+#include "dataset_errors.hpp"
 
 #include <CoreGraphics/CoreGraphics.h>
 #include <ImageIO/ImageIO.h>
@@ -409,7 +410,7 @@ void checkFractionalCameraScale(const TempDirectory &temporary) {
     orientedCalibration.filePath = path.string();
     orientedCalibration.width = 9;
     orientedCalibration.height = 13;
-    checkThrows<std::invalid_argument>(
+    checkThrows<msplat::InvalidDatasetError>(
         [&] { orientedCalibration.loadImage(1.0f); },
         "preserves encoded pixel coordinates");
 

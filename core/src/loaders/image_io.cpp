@@ -1,4 +1,5 @@
 #include "loaders.hpp"
+#include "dataset_errors.hpp"
 #include <cmath>
 #include <cstring>
 #include <algorithm>
@@ -83,7 +84,8 @@ CFHandle<CFURLRef> makeFileURL(const std::string &path) {
         reinterpret_cast<const UInt8 *>(path.data()),
         static_cast<CFIndex>(path.size()),
         false));
-    if (!url) throw std::runtime_error("Failed to create image URL: " + path);
+    if (!url)
+        throw msplat::DatasetIOError("Failed to create image URL: " + path);
     return url;
 }
 
@@ -91,7 +93,7 @@ CFHandle<CGImageSourceRef> openImageSource(const std::string &path) {
     auto url = makeFileURL(path);
     CFHandle<CGImageSourceRef> source(CGImageSourceCreateWithURL(url.get(), nullptr));
     if (!source || CGImageSourceGetCount(source.get()) == 0) {
-        throw std::runtime_error("Failed to open image source: " + path);
+        throw msplat::DatasetIOError("Failed to open image source: " + path);
     }
     return source;
 }
@@ -100,16 +102,16 @@ int readPositiveInt(CFDictionaryRef properties, CFStringRef key,
                     const char *label, const std::string &path) {
     const void *value = CFDictionaryGetValue(properties, key);
     if (!value || CFGetTypeID(value) != CFNumberGetTypeID()) {
-        throw std::runtime_error("Image " + std::string(label) +
-                                 " is missing: " + path);
+        throw msplat::InvalidDatasetError(
+            "Image " + std::string(label) + " is missing: " + path);
     }
 
     int64_t number = 0;
     if (!CFNumberGetValue(static_cast<CFNumberRef>(value),
                           kCFNumberSInt64Type, &number) ||
         number <= 0 || number > std::numeric_limits<int>::max()) {
-        throw std::runtime_error("Image " + std::string(label) +
-                                 " is invalid: " + path);
+        throw msplat::InvalidDatasetError(
+            "Image " + std::string(label) + " is invalid: " + path);
     }
     return static_cast<int>(number);
 }
@@ -118,7 +120,8 @@ ImageSourceInfo sourceInfo(CGImageSourceRef source, const std::string &path) {
     CFHandle<CFDictionaryRef> properties(
         CGImageSourceCopyPropertiesAtIndex(source, 0, nullptr));
     if (!properties) {
-        throw std::runtime_error("Failed to read image metadata: " + path);
+        throw msplat::DatasetIOError(
+            "Failed to decode image metadata: " + path);
     }
 
     ImageSourceInfo info;
@@ -130,13 +133,15 @@ ImageSourceInfo sourceInfo(CGImageSourceRef source, const std::string &path) {
     if (const void *value = CFDictionaryGetValue(
             properties.get(), kCGImagePropertyOrientation)) {
         if (CFGetTypeID(value) != CFNumberGetTypeID()) {
-            throw std::runtime_error("Image EXIF orientation is invalid: " + path);
+            throw msplat::InvalidDatasetError(
+                "Image EXIF orientation is invalid: " + path);
         }
         int32_t orientation = 0;
         if (!CFNumberGetValue(static_cast<CFNumberRef>(value),
                               kCFNumberSInt32Type, &orientation) ||
             orientation < 1 || orientation > 8) {
-            throw std::runtime_error("Image EXIF orientation must be in 1...8: " + path);
+            throw msplat::InvalidDatasetError(
+                "Image EXIF orientation must be in 1...8: " + path);
         }
         info.exifOrientation = orientation;
     }
@@ -174,7 +179,7 @@ Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceIn
     auto source = openImageSource(path);
     const ImageSourceInfo currentSourceInfo = sourceInfo(source.get(), path);
     if (!sameSourceInfo(currentSourceInfo, expectedSourceInfo)) {
-        throw std::runtime_error(
+        throw msplat::DatasetChangedError(
             "Image dimensions or orientation changed while loading: " + path);
     }
 
@@ -182,7 +187,8 @@ Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceIn
     CFHandle<CFNumberRef> maximumPixelSizeNumber(CFNumberCreate(
         nullptr, kCFNumberSInt64Type, &maximumPixelSize));
     if (!maximumPixelSizeNumber) {
-        throw std::runtime_error("Failed to configure image thumbnail: " + path);
+        throw msplat::DatasetIOError(
+            "Failed to configure image thumbnail: " + path);
     }
 
     const void *keys[] = {
@@ -202,14 +208,16 @@ Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceIn
         &kCFTypeDictionaryKeyCallBacks,
         &kCFTypeDictionaryValueCallBacks));
     if (!options) {
-        throw std::runtime_error("Failed to configure image thumbnail: " + path);
+        throw msplat::DatasetIOError(
+            "Failed to configure image thumbnail: " + path);
     }
 
     CFHandle<CGImageRef> thumbnail(CGImageSourceCreateThumbnailAtIndex(
         source.get(), 0, options.get()));
     if (!thumbnail || CGImageGetWidth(thumbnail.get()) == 0 ||
         CGImageGetHeight(thumbnail.get()) == 0) {
-        throw std::runtime_error("Failed to decode image thumbnail: " + path);
+        throw msplat::DatasetIOError(
+            "Failed to decode image thumbnail: " + path);
     }
 
     // ImageIO performs the codec-aware downsample and, when requested by a
@@ -220,7 +228,8 @@ Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceIn
     CFHandle<CGColorSpaceRef> colorSpace(
         CGColorSpaceCreateWithName(kCGColorSpaceSRGB));
     if (!colorSpace) {
-        throw std::runtime_error("Failed to create sRGB color space");
+        throw msplat::DatasetIOError(
+            "Failed to create image decode color space: " + path);
     }
 
     const CGBitmapInfo bitmapInfo = static_cast<CGBitmapInfo>(
@@ -230,7 +239,8 @@ Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceIn
         static_cast<size_t>(targetHeight), 8, rowBytes, colorSpace.get(),
         bitmapInfo));
     if (!context) {
-        throw std::runtime_error("Failed to allocate image decode context: " + path);
+        throw msplat::DatasetIOError(
+            "Failed to allocate image decode context: " + path);
     }
 
     CGContextSetBlendMode(context.get(), kCGBlendModeCopy);

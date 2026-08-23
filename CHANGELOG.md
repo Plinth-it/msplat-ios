@@ -13,6 +13,12 @@
   rasterizer overflow incidence, categorized buffer ownership, image-cache
   hit/miss counts, `phys_footprint`, and iOS available memory. Legacy step
   statistics remain submission-only and ABI-compatible.
+- Added ABI v5 checked creation from a canonical caller-owned dataset
+  descriptor. The boundary deep-copies frame calibration and poses, image
+  paths, sparse points, observations, and provenance; structural contract
+  errors remain distinct from semantic dataset failures. Swift exposes the
+  same immutable descriptor through the actor-isolated `MsplatSession` while
+  retaining explicitly supplied security-scoped roots for lazy image access.
 - Replaced fixed 2,048-entry per-tile bins with a two-pass exact intersection
   pipeline: projection counts each tile, the host builds checked offsets and
   grows compact arenas, and exact-range bitonic/radix sorting preserves every

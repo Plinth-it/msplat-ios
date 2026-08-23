@@ -10,6 +10,8 @@
 #include <memory>
 #include <string>
 
+struct DatasetDescriptor;
+
 namespace msplat {
 
 // ── Config ──────────────────────────────────────────────────────────────────
@@ -135,6 +137,8 @@ struct PixelBuffer {
 class Dataset {
 public:
     Dataset(const std::string& path, float downscaleFactor,
+            bool evalMode, int testEvery);
+    Dataset(::DatasetDescriptor descriptor, float downscaleFactor,
             bool evalMode, int testEvery);
     ~Dataset();
 

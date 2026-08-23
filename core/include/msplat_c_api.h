@@ -15,9 +15,17 @@ extern "C" {
 // ABI v2 added checked, error-returning entry points. ABI v3 adds an optional
 // hard training-limit contract without changing MsplatConfig's v2 layout.
 // ABI v4 adds query-only completed-step and live-memory telemetry.
+// ABI v5 adds a checked, caller-owned canonical dataset descriptor boundary.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 4u
+#define MSPLAT_ABI_VERSION 5u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
+
+// Checked descriptor input limits. Wrappers should reject larger values before
+// constructing pointer/count views so they match the native allocation guard.
+#define MSPLAT_DATASET_V5_MAX_STRING_BYTES 1048576u
+#define MSPLAT_DATASET_V5_MAX_FRAMES 1000000u
+#define MSPLAT_DATASET_V5_MAX_POINTS 100000000u
+#define MSPLAT_DATASET_V5_MAX_OBSERVATIONS 100000000u
 
 typedef enum {
     MSPLAT_STATUS_OK = 0,
@@ -205,6 +213,77 @@ typedef struct {
 
 typedef void* MsplatDataset;
 
+/// A length-delimited UTF-8 string. `data` must be NULL exactly when `length`
+/// is zero. Embedded NUL bytes are not accepted.
+typedef struct {
+    const char* data;
+    size_t length;
+} MsplatStringViewV5;
+
+#define MSPLAT_RASTER_ORIENTATION_ENCODED_PIXELS 0u
+#define MSPLAT_RASTER_ORIENTATION_EXIF_NORMALIZED 1u
+
+typedef struct {
+    int32_t width;
+    int32_t height;
+    float fx;
+    float fy;
+    float cx;
+    float cy;
+    float k1;
+    float k2;
+    float k3;
+    float p1;
+    float p2;
+} MsplatCameraCalibrationV5;
+
+typedef struct {
+    MsplatStringViewV5 id;
+    MsplatStringViewV5 calibrationId;
+    MsplatStringViewV5 imagePath;
+    uint32_t rasterOrientation;
+    uint32_t reserved;
+    MsplatCameraCalibrationV5 calibration;
+    /// Rigid row-major OpenGL camera-to-world transform (Y-up, Z-back).
+    float cameraToWorld[16];
+} MsplatDatasetFrameV5;
+
+typedef struct {
+    uint32_t frameIndex;
+    uint32_t frameObservationIndex;
+    /// Index into the point arrays, or -1 for an untriangulated feature.
+    int32_t pointIndex;
+    uint32_t reserved;
+    float x;
+    float y;
+} MsplatSparseObservationV5;
+
+/// Canonical, caller-owned dataset input introduced in ABI v5. Array counts
+/// are element counts: XYZ and RGB contain three elements per point, while
+/// source IDs and reprojection errors contain one. Optional arrays use a NULL
+/// pointer and zero count. All reserved fields must be zero.
+typedef struct {
+    const MsplatDatasetFrameV5* frames;
+    size_t frameCount;
+
+    const float* pointXYZ;
+    size_t pointXYZCount;
+    const uint8_t* pointRGB;
+    size_t pointRGBCount;
+
+    const uint64_t* pointSourceIds;
+    size_t pointSourceIdCount;
+    const float* pointReprojectionErrors;
+    size_t pointReprojectionErrorCount;
+
+    const MsplatSparseObservationV5* observations;
+    size_t observationCount;
+
+    MsplatStringViewV5 provenanceAdapter;
+    MsplatStringViewV5 provenanceSource;
+    uint64_t reserved[2];
+} MsplatDatasetDescriptorV5;
+
 // Checked dataset API (ABI v2).
 MsplatStatus msplat_dataset_create_v2(const char* path, float downscaleFactor,
                                       bool evalMode, int testEvery,
@@ -218,6 +297,19 @@ MsplatStatus msplat_dataset_num_test_v2(MsplatDataset ds, int* outCount,
 MsplatStatus msplat_dataset_camera_pose_v2(MsplatDataset ds, int cameraIndex,
                                            float camToWorld[16],
                                            MsplatErrorInfo* error);
+
+/// Checked canonical-descriptor API (ABI v5). The complete descriptor,
+/// including every string and array, is copied synchronously. No caller-owned
+/// pointer is retained after this function returns. `descriptorSize` must be
+/// exactly sizeof(MsplatDatasetDescriptorV5).
+MsplatStatus msplat_dataset_create_from_descriptor_v5(
+    const MsplatDatasetDescriptorV5* descriptor,
+    size_t descriptorSize,
+    float downscaleFactor,
+    bool evalMode,
+    int32_t testEvery,
+    MsplatDataset* outDataset,
+    MsplatErrorInfo* error);
 
 MsplatDataset msplat_dataset_create(const char* path, float downscaleFactor,
                                      bool evalMode, int testEvery);

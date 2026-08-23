@@ -11,7 +11,8 @@ and provides an iOS build plus a COLMAP-to-PLY example app. Its Swift
 `TrainingPlan` also validates resolution stages and derives a conservative
 peak-memory estimate before a session is created. ABI v4 telemetry keeps CPU
 submission progress separate from completed GPU work and exposes categorized
-runtime memory and rasterizer overflow state.
+runtime memory and rasterizer overflow state. ABI v5 lets Plinth pass a
+canonical, caller-owned dataset directly through a checked deep-copy boundary.
 
 ## Memory
 
@@ -104,6 +105,9 @@ adapters can opt into tested EXIF-normalized materialization.
   unlimited
 - ABI v4 query-only training and memory snapshots. Existing step APIs and
   `MsplatStats` retain their submission-only behavior and layout.
+- ABI v5 checked canonical-dataset creation with synchronous ownership of
+  frame calibration, image paths, sparse points, observations, and provenance;
+  the existing folder-based ABI v2 entry point remains available.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
@@ -181,6 +185,14 @@ func train() throws {
 `MsplatSession` is the checked, throwing API and serializes the engine's
 process-global Metal state. The legacy `GaussianDataset` and `GaussianTrainer`
 types remain available for source compatibility.
+
+Plinth can also construct a Swift `DatasetDescriptor` from calibrated frame
+URLs, sparse points, and optional observations, then pass it to
+`MsplatSession(dataset:securityScopedResourceURLs:options:config:)`. The native
+ABI copies every descriptor buffer synchronously. Callers should provide the
+selected folder or bookmark roots whose security scopes must stay active for
+lazy image decoding; the session releases those scopes after its native
+trainer and dataset are destroyed.
 
 `step()` returns a submission receipt: its `cpuSubmitMs` measures active CPU
 encoding and submission time with required synchronous GPU waits excluded.

@@ -91,21 +91,17 @@ public final class MsplatSession {
         config: TrainingConfig = TrainingConfig(),
         maximumGaussianCount: Int? = nil
     ) throws {
-        try config.validate()
-        if let maximumGaussianCount {
-            guard (1...Int(Int32.max)).contains(maximumGaussianCount) else {
-                throw MsplatError.invalidArgument(
-                    "maximumGaussianCount must be in 1...2147483647"
-                )
-            }
-        }
+        try Self.validateCreation(
+            config: config,
+            maximumGaussianCount: maximumGaussianCount
+        )
         guard datasetURL.isFileURL, !datasetURL.path.isEmpty else {
             throw MsplatError.invalidArgument(
                 "The dataset URL must be a file URL with a non-empty path"
             )
         }
         try reserveNativeSession()
-        var lease = SecurityScopedURLLease(url: datasetURL)
+        var securityScopes = SecurityScopedURLLeases(urls: [datasetURL])
 
         do {
             let handles = try Self.createHandles(
@@ -117,10 +113,59 @@ public final class MsplatSession {
             resources = SessionResources(
                 dataset: handles.dataset,
                 trainer: handles.trainer,
-                securityScope: lease
+                securityScopes: securityScopes
             )
         } catch {
-            lease.close()
+            securityScopes.close()
+            releaseNativeSession()
+            throw error
+        }
+    }
+
+    /// Creates a session from caller-owned canonical data. Every descriptor
+    /// buffer is copied synchronously by native ABI v5 before this returns.
+    ///
+    /// Pass selected folder or resolved-bookmark roots in
+    /// `securityScopedResourceURLs` when frame URLs are derived children. The
+    /// session balances successful leases in ``close()`` after the trainer and
+    /// dataset have been destroyed. It does not attempt one lease per frame.
+    public init(
+        dataset descriptor: DatasetDescriptor,
+        securityScopedResourceURLs: [URL] = [],
+        options: DatasetOptions = DatasetOptions(),
+        config: TrainingConfig = TrainingConfig(),
+        maximumGaussianCount: Int? = nil
+    ) throws {
+        try Self.validateCreation(
+            config: config,
+            maximumGaussianCount: maximumGaussianCount
+        )
+        for url in securityScopedResourceURLs {
+            guard url.isFileURL, !url.path.isEmpty else {
+                throw MsplatError.invalidArgument(
+                    "Security-scoped resources must be non-empty file URLs"
+                )
+            }
+        }
+
+        try reserveNativeSession()
+        var securityScopes = SecurityScopedURLLeases(
+            urls: securityScopedResourceURLs
+        )
+        do {
+            let handles = try Self.createHandles(
+                descriptor: descriptor,
+                options: options,
+                config: config,
+                maximumGaussianCount: maximumGaussianCount
+            )
+            resources = SessionResources(
+                dataset: handles.dataset,
+                trainer: handles.trainer,
+                securityScopes: securityScopes
+            )
+        } catch {
+            securityScopes.close()
             releaseNativeSession()
             throw error
         }
@@ -380,10 +425,13 @@ public final class MsplatSession {
         config: TrainingConfig,
         maximumGaussianCount: Int?
     ) throws -> (dataset: MsplatDataset, trainer: MsplatTrainer) {
-        try withConfiguredNativeEngine(metallibResourceName) {
+        try createHandles(
+            config: config,
+            maximumGaussianCount: maximumGaussianCount
+        ) {
             var dataset: MsplatDataset?
             var nativeError = MsplatErrorInfo()
-            let datasetStatus = msplat_dataset_create_v2(
+            let status = msplat_dataset_create_v2(
                 path,
                 options.downscaleFactor,
                 options.evalMode,
@@ -391,10 +439,56 @@ public final class MsplatSession {
                 &dataset,
                 &nativeError
             )
-            try checkNativeStatus(datasetStatus, error: &nativeError)
+            try checkNativeStatus(status, error: &nativeError)
             guard let dataset else {
-                throw MsplatError.internalFailure("Native dataset creation returned no handle")
+                throw MsplatError.internalFailure(
+                    "Native dataset creation returned no handle"
+                )
             }
+            return dataset
+        }
+    }
+
+    private static func createHandles(
+        descriptor: DatasetDescriptor,
+        options: DatasetOptions,
+        config: TrainingConfig,
+        maximumGaussianCount: Int?
+    ) throws -> (dataset: MsplatDataset, trainer: MsplatTrainer) {
+        try createHandles(
+            config: config,
+            maximumGaussianCount: maximumGaussianCount
+        ) {
+            try withUnsafeNativeDatasetDescriptor(descriptor) { nativeDescriptor in
+                var dataset: MsplatDataset?
+                var nativeError = MsplatErrorInfo()
+                let status = msplat_dataset_create_from_descriptor_v5(
+                    nativeDescriptor,
+                    MemoryLayout<MsplatDatasetDescriptorV5>.size,
+                    options.downscaleFactor,
+                    options.evalMode,
+                    options.testEvery,
+                    &dataset,
+                    &nativeError
+                )
+                try checkNativeStatus(status, error: &nativeError)
+                guard let dataset else {
+                    throw MsplatError.internalFailure(
+                        "Native descriptor creation returned no dataset handle"
+                    )
+                }
+                return dataset
+            }
+        }
+    }
+
+    private static func createHandles(
+        config: TrainingConfig,
+        maximumGaussianCount: Int?,
+        createDataset: () throws -> MsplatDataset
+    ) throws -> (dataset: MsplatDataset, trainer: MsplatTrainer) {
+        try withConfiguredNativeEngine(metallibResourceName) {
+            let dataset = try createDataset()
 
             do {
                 var config = config.toC()
@@ -408,6 +502,7 @@ public final class MsplatSession {
                     limits.maxGaussians = nativeLimit
                 }
                 var trainer: MsplatTrainer?
+                var nativeError = MsplatErrorInfo()
                 let trainerStatus = msplat_trainer_create_v3(
                     dataset,
                     &config,
@@ -428,6 +523,20 @@ public final class MsplatSession {
                 var destroyError = MsplatErrorInfo()
                 _ = msplat_dataset_destroy_v2(dataset, &destroyError)
                 throw error
+            }
+        }
+    }
+
+    private static func validateCreation(
+        config: TrainingConfig,
+        maximumGaussianCount: Int?
+    ) throws {
+        try config.validate()
+        if let maximumGaussianCount {
+            guard (1...Int(Int32.max)).contains(maximumGaussianCount) else {
+                throw MsplatError.invalidArgument(
+                    "maximumGaussianCount must be in 1...2147483647"
+                )
             }
         }
     }
@@ -473,14 +582,14 @@ private final class SessionResources: @unchecked Sendable {
     private struct State: @unchecked Sendable {
         var dataset: DatasetHandle?
         var trainer: TrainerHandle?
-        var securityScope: SecurityScopedURLLease?
+        var securityScopes: SecurityScopedURLLeases?
         var ownsSessionReservation = true
     }
 
     private struct DetachedResources: @unchecked Sendable {
         let dataset: DatasetHandle?
         let trainer: TrainerHandle?
-        let securityScope: SecurityScopedURLLease?
+        let securityScopes: SecurityScopedURLLeases?
         let ownsSessionReservation: Bool
     }
 
@@ -489,12 +598,12 @@ private final class SessionResources: @unchecked Sendable {
     init(
         dataset: MsplatDataset,
         trainer: MsplatTrainer,
-        securityScope: SecurityScopedURLLease
+        securityScopes: SecurityScopedURLLeases
     ) {
         state = Mutex(State(
             dataset: DatasetHandle(rawValue: dataset),
             trainer: TrainerHandle(rawValue: trainer),
-            securityScope: securityScope
+            securityScopes: securityScopes
         ))
     }
 
@@ -532,12 +641,12 @@ private final class SessionResources: @unchecked Sendable {
             let resources = DetachedResources(
                 dataset: state.dataset,
                 trainer: state.trainer,
-                securityScope: state.securityScope,
+                securityScopes: state.securityScopes,
                 ownsSessionReservation: state.ownsSessionReservation
             )
             state.dataset = nil
             state.trainer = nil
-            state.securityScope = nil
+            state.securityScopes = nil
             state.ownsSessionReservation = false
             return resources
         }
@@ -566,8 +675,8 @@ private final class SessionResources: @unchecked Sendable {
             }
         }
 
-        var securityScope = detached.securityScope
-        securityScope?.close()
+        var securityScopes = detached.securityScopes
+        securityScopes?.close()
         if detached.ownsSessionReservation { releaseNativeSession() }
 
         if let firstError { throw firstError }
@@ -591,6 +700,29 @@ private struct SecurityScopedURLLease: Sendable {
         guard isActive else { return }
         isActive = false
         url.stopAccessingSecurityScopedResource()
+    }
+}
+
+private struct SecurityScopedURLLeases: Sendable {
+    private var leases: [SecurityScopedURLLease]
+
+    init(urls: [URL]) {
+        var seen = Set<URL>()
+        var leases: [SecurityScopedURLLease] = []
+        leases.reserveCapacity(urls.count)
+        for url in urls {
+            let key = url.standardizedFileURL
+            guard seen.insert(key).inserted else { continue }
+            leases.append(SecurityScopedURLLease(url: url))
+        }
+        self.leases = leases
+    }
+
+    mutating func close() {
+        for index in leases.indices {
+            leases[index].close()
+        }
+        leases.removeAll(keepingCapacity: false)
     }
 }
 

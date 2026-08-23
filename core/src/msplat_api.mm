@@ -3,6 +3,7 @@
 
 #include "msplat_api.hpp"
 
+#include "dataset_errors.hpp"
 #include "model.hpp"
 #include "input_data.hpp"
 #include "msplat.hpp"
@@ -21,6 +22,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <unordered_map>
+#include <utility>
 
 #include <TargetConditionals.h>
 
@@ -56,27 +58,47 @@ struct Dataset::Impl {
     }
 };
 
+namespace {
+
+void initializeDataset(Dataset::Impl& impl, InputData data,
+                       float downscaleFactor, bool evalMode, int testEvery,
+                       const std::string& sourceDescription) {
+    impl.data = std::move(data);
+    if (impl.data.cameras.empty())
+        throw std::runtime_error("Dataset has no cameras: " + sourceDescription);
+    if (impl.data.points.count <= 0)
+        throw std::runtime_error("Dataset has no sparse points: " + sourceDescription);
+    impl.images = CameraImageCache(
+        downscaleFactor, CameraImageCache::defaultBudgetBytes());
+
+    // No image is decoded here. The first step that needs a camera loads it.
+    if (evalMode) {
+        auto [train, test] = impl.data.splitTrainTestIndices(testEvery);
+        impl.trainIndices = std::move(train);
+        impl.testIndices = std::move(test);
+    } else {
+        auto [train, valIdx] = impl.data.trainIndices(false);
+        impl.trainIndices = std::move(train);
+        (void)valIdx;
+    }
+}
+
+} // namespace
+
 Dataset::Dataset(const std::string& path, float downscaleFactor,
                  bool evalMode, int testEvery)
     : impl(std::make_unique<Impl>())
 {
-    impl->data = inputDataFromX(path);
-    if (impl->data.cameras.empty())
-        throw std::runtime_error("Dataset has no cameras: " + path);
-    if (impl->data.points.count <= 0)
-        throw std::runtime_error("Dataset has no sparse points: " + path);
-    impl->images = CameraImageCache(downscaleFactor, CameraImageCache::defaultBudgetBytes());
+    initializeDataset(*impl, inputDataFromX(path), downscaleFactor,
+                      evalMode, testEvery, path);
+}
 
-    // No image is decoded here. The first step that needs a camera loads it.
-    if (evalMode) {
-        auto [train, test] = impl->data.splitTrainTestIndices(testEvery);
-        impl->trainIndices = train;
-        impl->testIndices = test;
-    } else {
-        auto [train, valIdx] = impl->data.trainIndices(false);
-        impl->trainIndices = train;
-        (void)valIdx;
-    }
+Dataset::Dataset(::DatasetDescriptor descriptor, float downscaleFactor,
+                 bool evalMode, int testEvery)
+    : impl(std::make_unique<Impl>())
+{
+    initializeDataset(*impl, inputDataFromDescriptor(std::move(descriptor)),
+                      downscaleFactor, evalMode, testEvery, "descriptor");
 }
 
 Dataset::~Dataset() = default;
@@ -566,6 +588,15 @@ MsplatStatus guarded(MsplatErrorInfo* outError, MsplatStatus fallback,
             clearError(outError);
             operation();
             return MSPLAT_STATUS_OK;
+        } catch (const msplat::DatasetIOError& exception) {
+            storeError(MSPLAT_STATUS_IO_ERROR, exception.what(), outError);
+            return MSPLAT_STATUS_IO_ERROR;
+        } catch (const msplat::InvalidDatasetError& exception) {
+            storeError(MSPLAT_STATUS_INVALID_DATASET, exception.what(), outError);
+            return MSPLAT_STATUS_INVALID_DATASET;
+        } catch (const msplat::DatasetChangedError& exception) {
+            storeError(MSPLAT_STATUS_INVALID_DATASET, exception.what(), outError);
+            return MSPLAT_STATUS_INVALID_DATASET;
         } catch (const std::invalid_argument& exception) {
             storeError(MSPLAT_STATUS_INVALID_ARGUMENT, exception.what(), outError);
             return MSPLAT_STATUS_INVALID_ARGUMENT;
@@ -600,6 +631,215 @@ void requirePose(const float* pose) {
     require(pose != nullptr, "Camera pose must not be null");
     for (int i = 0; i < 16; ++i)
         require(std::isfinite(pose[i]), "Camera pose must contain only finite values");
+}
+
+void validateDatasetCreationOptions(float downscaleFactor, bool evalMode,
+                                    int testEvery) {
+    require(std::isfinite(downscaleFactor) && downscaleFactor >= 1.0f &&
+                downscaleFactor <= 32.0f,
+            "downscaleFactor must be finite and in 1...32");
+    require(testEvery > 0, "testEvery must be greater than zero");
+    if (evalMode)
+        require(testEvery >= 2, "testEvery must be at least 2 in eval mode");
+}
+
+template <typename Factory>
+std::shared_ptr<msplat::Dataset> createCheckedDataset(Factory&& factory) {
+    try {
+        return factory();
+    } catch (const std::invalid_argument& exception) {
+        throw msplat::InvalidDatasetError(exception.what());
+    }
+}
+
+constexpr size_t kMaxDescriptorPointComponents =
+    static_cast<size_t>(MSPLAT_DATASET_V5_MAX_POINTS) * 3;
+
+void requireCountedPointer(const void* pointer, size_t count,
+                           size_t maximumCount, const char* name) {
+    if ((pointer == nullptr) != (count == 0)) {
+        throw std::invalid_argument(
+            std::string(name) + " pointer and count are inconsistent");
+    }
+    if (count > maximumCount) {
+        throw std::invalid_argument(
+            std::string(name) + " count exceeds the supported range");
+    }
+}
+
+bool isRFC3629UTF8(const char* data, size_t length) noexcept {
+    const auto* bytes = reinterpret_cast<const uint8_t*>(data);
+    auto continuation = [](uint8_t byte) {
+        return byte >= 0x80 && byte <= 0xbf;
+    };
+
+    size_t index = 0;
+    while (index < length) {
+        const uint8_t lead = bytes[index];
+        if (lead <= 0x7f) {
+            ++index;
+            continue;
+        }
+        if (lead >= 0xc2 && lead <= 0xdf) {
+            if (index + 1 >= length || !continuation(bytes[index + 1]))
+                return false;
+            index += 2;
+            continue;
+        }
+        if (lead >= 0xe0 && lead <= 0xef) {
+            if (index + 2 >= length || !continuation(bytes[index + 2]))
+                return false;
+            const uint8_t second = bytes[index + 1];
+            if ((lead == 0xe0 && (second < 0xa0 || second > 0xbf)) ||
+                (lead == 0xed && (second < 0x80 || second > 0x9f)) ||
+                (lead != 0xe0 && lead != 0xed && !continuation(second))) {
+                return false;
+            }
+            index += 3;
+            continue;
+        }
+        if (lead >= 0xf0 && lead <= 0xf4) {
+            if (index + 3 >= length ||
+                !continuation(bytes[index + 2]) ||
+                !continuation(bytes[index + 3])) {
+                return false;
+            }
+            const uint8_t second = bytes[index + 1];
+            if ((lead == 0xf0 && (second < 0x90 || second > 0xbf)) ||
+                (lead == 0xf4 && (second < 0x80 || second > 0x8f)) ||
+                (lead != 0xf0 && lead != 0xf4 && !continuation(second))) {
+                return false;
+            }
+            index += 4;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+std::string copyStringView(const MsplatStringViewV5& view,
+                           const char* name) {
+    requireCountedPointer(view.data, view.length,
+                          MSPLAT_DATASET_V5_MAX_STRING_BYTES, name);
+    if (view.length == 0) return {};
+    if (std::memchr(view.data, '\0', view.length) != nullptr) {
+        throw std::invalid_argument(
+            std::string(name) + " must not contain embedded NUL bytes");
+    }
+    if (!isRFC3629UTF8(view.data, view.length)) {
+        throw std::invalid_argument(
+            std::string(name) + " must contain valid RFC 3629 UTF-8");
+    }
+    return std::string(view.data, view.length);
+}
+
+template <typename T>
+std::vector<T> copyCountedArray(const T* pointer, size_t count,
+                                size_t maximumCount, const char* name) {
+    requireCountedPointer(pointer, count, maximumCount, name);
+    if (count > std::numeric_limits<size_t>::max() / sizeof(T)) {
+        throw std::invalid_argument(
+            std::string(name) + " byte size exceeds the supported range");
+    }
+
+    std::vector<T> result(count);
+    if (count != 0)
+        std::memcpy(result.data(), pointer, count * sizeof(T));
+    return result;
+}
+
+::DatasetDescriptor copyDatasetDescriptor(
+    const MsplatDatasetDescriptorV5& source) {
+    requireCountedPointer(source.frames, source.frameCount,
+                          MSPLAT_DATASET_V5_MAX_FRAMES, "frames");
+    requireCountedPointer(source.pointXYZ, source.pointXYZCount,
+                          kMaxDescriptorPointComponents, "pointXYZ");
+    requireCountedPointer(source.pointRGB, source.pointRGBCount,
+                          kMaxDescriptorPointComponents, "pointRGB");
+    requireCountedPointer(source.pointSourceIds, source.pointSourceIdCount,
+                          MSPLAT_DATASET_V5_MAX_POINTS, "pointSourceIds");
+    requireCountedPointer(source.pointReprojectionErrors,
+                          source.pointReprojectionErrorCount,
+                          MSPLAT_DATASET_V5_MAX_POINTS,
+                          "pointReprojectionErrors");
+    requireCountedPointer(source.observations, source.observationCount,
+                          MSPLAT_DATASET_V5_MAX_OBSERVATIONS, "observations");
+    require(source.reserved[0] == 0 && source.reserved[1] == 0,
+            "Dataset descriptor reserved fields must be zero");
+
+    ::DatasetDescriptor result;
+    result.frames.reserve(source.frameCount);
+    for (size_t index = 0; index < source.frameCount; ++index) {
+        const MsplatDatasetFrameV5& input = source.frames[index];
+        require(input.reserved == 0, "Dataset frame reserved field must be zero");
+
+        DatasetFrameDescriptor frame;
+        frame.id = copyStringView(input.id, "frame id");
+        frame.calibrationId = copyStringView(
+            input.calibrationId, "frame calibrationId");
+        frame.imagePath = copyStringView(input.imagePath, "frame imagePath");
+
+        switch (input.rasterOrientation) {
+            case MSPLAT_RASTER_ORIENTATION_ENCODED_PIXELS:
+                frame.rasterOrientation = RasterOrientation::EncodedPixels;
+                break;
+            case MSPLAT_RASTER_ORIENTATION_EXIF_NORMALIZED:
+                frame.rasterOrientation = RasterOrientation::ExifNormalized;
+                break;
+            default:
+                throw std::invalid_argument(
+                    "Dataset frame rasterOrientation is not recognized");
+        }
+
+        frame.calibration.width = input.calibration.width;
+        frame.calibration.height = input.calibration.height;
+        frame.calibration.fx = input.calibration.fx;
+        frame.calibration.fy = input.calibration.fy;
+        frame.calibration.cx = input.calibration.cx;
+        frame.calibration.cy = input.calibration.cy;
+        frame.calibration.k1 = input.calibration.k1;
+        frame.calibration.k2 = input.calibration.k2;
+        frame.calibration.k3 = input.calibration.k3;
+        frame.calibration.p1 = input.calibration.p1;
+        frame.calibration.p2 = input.calibration.p2;
+        std::memcpy(frame.cameraToWorld.data(), input.cameraToWorld,
+                    sizeof(input.cameraToWorld));
+        result.frames.push_back(std::move(frame));
+    }
+
+    result.points.xyz = copyCountedArray(
+        source.pointXYZ, source.pointXYZCount,
+        kMaxDescriptorPointComponents, "pointXYZ");
+    result.points.rgb = copyCountedArray(
+        source.pointRGB, source.pointRGBCount,
+        kMaxDescriptorPointComponents, "pointRGB");
+    result.points.sourceIds = copyCountedArray(
+        source.pointSourceIds, source.pointSourceIdCount,
+        MSPLAT_DATASET_V5_MAX_POINTS, "pointSourceIds");
+    result.points.reprojectionErrors = copyCountedArray(
+        source.pointReprojectionErrors, source.pointReprojectionErrorCount,
+        MSPLAT_DATASET_V5_MAX_POINTS, "pointReprojectionErrors");
+
+    result.observations.reserve(source.observationCount);
+    for (size_t index = 0; index < source.observationCount; ++index) {
+        const MsplatSparseObservationV5& input = source.observations[index];
+        require(input.reserved == 0,
+                "Sparse observation reserved field must be zero");
+        SparseObservation observation;
+        observation.frameIndex = input.frameIndex;
+        observation.frameObservationIndex = input.frameObservationIndex;
+        observation.pointIndex = input.pointIndex;
+        observation.x = input.x;
+        observation.y = input.y;
+        result.observations.push_back(observation);
+    }
+
+    result.provenance.adapter = copyStringView(
+        source.provenanceAdapter, "provenance adapter");
+    result.provenance.source = copyStringView(
+        source.provenanceSource, "provenance source");
+    return result;
 }
 
 void validateConfig(const MsplatConfig& c) {
@@ -677,14 +917,40 @@ MsplatStatus msplat_dataset_create_v2(const char* path, float downscaleFactor,
     return guarded(error, MSPLAT_STATUS_INVALID_DATASET, [&] {
         require(outDataset != nullptr, "outDataset must not be null");
         requirePath(path);
-        require(std::isfinite(downscaleFactor) && downscaleFactor >= 1.0f &&
-                    downscaleFactor <= 32.0f,
-                "downscaleFactor must be finite and in 1...32");
-        require(testEvery > 0, "testEvery must be greater than zero");
-        if (evalMode) require(testEvery >= 2, "testEvery must be at least 2 in eval mode");
+        validateDatasetCreationOptions(downscaleFactor, evalMode, testEvery);
         auto handle = std::make_unique<CApiDatasetHandle>();
-        handle->dataset = std::make_shared<msplat::Dataset>(
-            std::string(path), downscaleFactor, evalMode, testEvery);
+        handle->dataset = createCheckedDataset([&] {
+            return std::make_shared<msplat::Dataset>(
+                std::string(path), downscaleFactor, evalMode, testEvery);
+        });
+        *outDataset = static_cast<MsplatDataset>(handle.release());
+    });
+}
+
+MsplatStatus msplat_dataset_create_from_descriptor_v5(
+    const MsplatDatasetDescriptorV5* descriptor,
+    size_t descriptorSize,
+    float downscaleFactor,
+    bool evalMode,
+    int32_t testEvery,
+    MsplatDataset* outDataset,
+    MsplatErrorInfo* error) {
+    if (outDataset) *outDataset = nullptr;
+    return guarded(error, MSPLAT_STATUS_INVALID_DATASET, [&] {
+        require(outDataset != nullptr, "outDataset must not be null");
+        require(descriptor != nullptr, "Dataset descriptor must not be null");
+        require(descriptorSize == sizeof(MsplatDatasetDescriptorV5),
+                "Dataset descriptor size does not match this msplat ABI");
+        validateDatasetCreationOptions(
+            downscaleFactor, evalMode, static_cast<int>(testEvery));
+
+        ::DatasetDescriptor copied = copyDatasetDescriptor(*descriptor);
+        auto handle = std::make_unique<CApiDatasetHandle>();
+        handle->dataset = createCheckedDataset([&] {
+            return std::make_shared<msplat::Dataset>(
+                std::move(copied), downscaleFactor, evalMode,
+                static_cast<int>(testEvery));
+        });
         *outDataset = static_cast<MsplatDataset>(handle.release());
     });
 }
