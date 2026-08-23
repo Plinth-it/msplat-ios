@@ -1066,9 +1066,9 @@ MsplatStatus msplat_dataset_create_from_descriptor_v6(
         validateFrameMaskArray(
             frameMasks, frameMaskCount, frameMaskElementSize,
             descriptor->frameCount);
-        auto copiedMasks = copyFrameMasks(frameMasks, frameMaskCount);
 
         ::DatasetDescriptor copied = copyDatasetDescriptor(*descriptor);
+        auto copiedMasks = copyFrameMasks(frameMasks, frameMaskCount);
         for (size_t index = 0; index < copiedMasks.size(); ++index) {
             copied.frames[index].trainingMask = std::move(copiedMasks[index]);
         }
