@@ -17,7 +17,7 @@
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
-static_assert(MSPLAT_ABI_VERSION == 6u);
+static_assert(MSPLAT_ABI_VERSION == 7u);
 static_assert(sizeof(MsplatSubmittedTrainingStep) == 32);
 static_assert(alignof(MsplatSubmittedTrainingStep) == 4);
 static_assert(sizeof(MsplatCompletedTrainingStep) == 64);
@@ -102,6 +102,60 @@ static_assert(offsetof(MsplatFrameMaskV6, maskPath) == 0);
 static_assert(offsetof(MsplatFrameMaskV6, coverageChannel) == 16);
 static_assert(offsetof(MsplatFrameMaskV6, reserved) == 20);
 static_assert(offsetof(MsplatFrameMaskV6, reserved2) == 24);
+static_assert(std::is_standard_layout<MsplatReprojectionErrorStatisticsV7>::value);
+static_assert(sizeof(MsplatReprojectionErrorStatisticsV7) == 32);
+static_assert(alignof(MsplatReprojectionErrorStatisticsV7) == 8);
+static_assert(offsetof(MsplatReprojectionErrorStatisticsV7, sampleCount) == 0);
+static_assert(offsetof(MsplatReprojectionErrorStatisticsV7, meanPixels) == 8);
+static_assert(offsetof(MsplatReprojectionErrorStatisticsV7,
+                       rootMeanSquarePixels) == 16);
+static_assert(offsetof(MsplatReprojectionErrorStatisticsV7, maximumPixels) == 24);
+static_assert(std::is_standard_layout<MsplatFrameCaptureDiagnosticsV7>::value);
+static_assert(sizeof(MsplatFrameCaptureDiagnosticsV7) == 112);
+static_assert(alignof(MsplatFrameCaptureDiagnosticsV7) == 8);
+static_assert(offsetof(MsplatFrameCaptureDiagnosticsV7, frameIndex) == 0);
+static_assert(offsetof(MsplatFrameCaptureDiagnosticsV7, reserved32) == 4);
+static_assert(offsetof(MsplatFrameCaptureDiagnosticsV7, observationCount) == 8);
+static_assert(offsetof(MsplatFrameCaptureDiagnosticsV7, linkedObservationCount) == 16);
+static_assert(offsetof(MsplatFrameCaptureDiagnosticsV7,
+                       observedOutsideFrameCount) == 24);
+static_assert(offsetof(MsplatFrameCaptureDiagnosticsV7,
+                       reprojectedObservationCount) == 32);
+static_assert(offsetof(MsplatFrameCaptureDiagnosticsV7,
+                       behindCameraObservationCount) == 40);
+static_assert(offsetof(MsplatFrameCaptureDiagnosticsV7,
+                       nonFiniteProjectionCount) == 48);
+static_assert(offsetof(MsplatFrameCaptureDiagnosticsV7,
+                       projectedOutsideFrameCount) == 56);
+static_assert(offsetof(MsplatFrameCaptureDiagnosticsV7, reprojectionError) == 64);
+static_assert(offsetof(MsplatFrameCaptureDiagnosticsV7, reserved) == 96);
+static_assert(std::is_standard_layout<MsplatDatasetCaptureDiagnosticsV7>::value);
+static_assert(sizeof(MsplatDatasetCaptureDiagnosticsV7) == 184);
+static_assert(alignof(MsplatDatasetCaptureDiagnosticsV7) == 8);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7, frameCount) == 0);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7, pointCount) == 8);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7, observationCount) == 16);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7,
+                       linkedObservationCount) == 24);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7,
+                       observedOutsideFrameCount) == 32);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7,
+                       reprojectedObservationCount) == 40);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7,
+                       behindCameraObservationCount) == 48);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7,
+                       nonFiniteProjectionCount) == 56);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7,
+                       projectedOutsideFrameCount) == 64);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7, observedPointCount) == 72);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7, multiViewPointCount) == 80);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7, maximumTrackLength) == 88);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7, reserved32) == 92);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7, meanTrackLength) == 96);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7, reprojectionError) == 104);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7,
+                       sourcePointReprojectionError) == 136);
+static_assert(offsetof(MsplatDatasetCaptureDiagnosticsV7, reserved) == 168);
 static_assert(MSPLAT_DATASET_V5_MAX_STRING_BYTES == 1048576u);
 static_assert(MSPLAT_DATASET_V5_MAX_FRAMES == 1000000u);
 static_assert(MSPLAT_DATASET_V5_MAX_POINTS == 100000000u);
@@ -490,6 +544,158 @@ int main() {
               &v6Dataset, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
     CHECK(v6Dataset == nullptr);
     CHECK(std::strstr(error.message, "Frame-mask") != nullptr);
+
+    // ABI v7 analyzes immutable descriptor metadata without creating a
+    // dataset handle, decoding assets, or initializing Metal.
+    DescriptorFixture diagnosticsFixture;
+    MsplatDatasetCaptureDiagnosticsV7 captureSummary{};
+    MsplatFrameCaptureDiagnosticsV7 captureFrames[2] = {};
+    CHECK(msplat_dataset_capture_diagnostics_v7(
+              &diagnosticsFixture.descriptor,
+              sizeof(diagnosticsFixture.descriptor),
+              &captureSummary, sizeof(captureSummary),
+              captureFrames, 2, sizeof(MsplatFrameCaptureDiagnosticsV7),
+              &error) == MSPLAT_STATUS_OK);
+    CHECK(error.status == MSPLAT_STATUS_OK);
+    CHECK(captureSummary.frameCount == 2);
+    CHECK(captureSummary.pointCount == 2);
+    CHECK(captureSummary.observationCount == 3);
+    CHECK(captureSummary.linkedObservationCount == 2);
+    CHECK(captureSummary.observedOutsideFrameCount == 0);
+    CHECK(captureSummary.reprojectedObservationCount == 0);
+    CHECK(captureSummary.behindCameraObservationCount == 2);
+    CHECK(captureSummary.nonFiniteProjectionCount == 0);
+    CHECK(captureSummary.projectedOutsideFrameCount == 0);
+    CHECK(captureSummary.observedPointCount == 2);
+    CHECK(captureSummary.multiViewPointCount == 0);
+    CHECK(captureSummary.maximumTrackLength == 1);
+    CHECK(captureSummary.meanTrackLength == 1.0);
+    CHECK(captureSummary.reprojectionError.sampleCount == 0);
+    CHECK(captureSummary.sourcePointReprojectionError.sampleCount == 2);
+    CHECK(captureSummary.sourcePointReprojectionError.meanPixels == 0.375);
+    CHECK(captureSummary.sourcePointReprojectionError.maximumPixels == 0.5);
+    CHECK(captureFrames[0].frameIndex == 0);
+    CHECK(captureFrames[0].observationCount == 2);
+    CHECK(captureFrames[0].linkedObservationCount == 1);
+    CHECK(captureFrames[0].observedOutsideFrameCount == 0);
+    CHECK(captureFrames[0].reprojectedObservationCount == 0);
+    CHECK(captureFrames[0].behindCameraObservationCount == 1);
+    CHECK(captureFrames[0].nonFiniteProjectionCount == 0);
+    CHECK(captureFrames[0].projectedOutsideFrameCount == 0);
+    CHECK(captureFrames[0].reprojectionError.sampleCount == 0);
+    CHECK(captureFrames[1].frameIndex == 1);
+    CHECK(captureFrames[1].observationCount == 1);
+    CHECK(captureFrames[1].linkedObservationCount == 1);
+    CHECK(captureFrames[1].behindCameraObservationCount == 1);
+
+    MsplatDatasetCaptureDiagnosticsV7 captureSentinelSummary;
+    MsplatFrameCaptureDiagnosticsV7 captureSentinelFrames[2];
+    std::memset(&captureSentinelSummary, 0x5a,
+                sizeof(captureSentinelSummary));
+    std::memset(captureSentinelFrames, 0x5a,
+                sizeof(captureSentinelFrames));
+    const auto resetCaptureOutputs = [&] {
+        captureSummary = captureSentinelSummary;
+        std::memcpy(captureFrames, captureSentinelFrames,
+                    sizeof(captureFrames));
+    };
+    const auto captureOutputsRemainSentinels = [&] {
+        return std::memcmp(&captureSummary, &captureSentinelSummary,
+                           sizeof(captureSummary)) == 0 &&
+               std::memcmp(captureFrames, captureSentinelFrames,
+                           sizeof(captureFrames)) == 0;
+    };
+
+    const size_t invalidDiagnosticsDescriptorSizes[] = {
+        sizeof(diagnosticsFixture.descriptor) - 1,
+        sizeof(diagnosticsFixture.descriptor) + 1,
+    };
+    for (const size_t invalidSize : invalidDiagnosticsDescriptorSizes) {
+        resetCaptureOutputs();
+        CHECK(msplat_dataset_capture_diagnostics_v7(
+                  &diagnosticsFixture.descriptor, invalidSize,
+                  &captureSummary, sizeof(captureSummary),
+                  captureFrames, 2, sizeof(MsplatFrameCaptureDiagnosticsV7),
+                  &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+        CHECK(captureOutputsRemainSentinels());
+    }
+
+    const size_t invalidDiagnosticsSummarySizes[] = {
+        sizeof(captureSummary) - 1,
+        sizeof(captureSummary) + 1,
+    };
+    for (const size_t invalidSize : invalidDiagnosticsSummarySizes) {
+        resetCaptureOutputs();
+        CHECK(msplat_dataset_capture_diagnostics_v7(
+                  &diagnosticsFixture.descriptor,
+                  sizeof(diagnosticsFixture.descriptor),
+                  &captureSummary, invalidSize,
+                  captureFrames, 2, sizeof(MsplatFrameCaptureDiagnosticsV7),
+                  &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+        CHECK(captureOutputsRemainSentinels());
+    }
+
+    const size_t invalidDiagnosticsFrameSizes[] = {
+        sizeof(MsplatFrameCaptureDiagnosticsV7) - 1,
+        sizeof(MsplatFrameCaptureDiagnosticsV7) + 1,
+    };
+    for (const size_t invalidSize : invalidDiagnosticsFrameSizes) {
+        resetCaptureOutputs();
+        CHECK(msplat_dataset_capture_diagnostics_v7(
+                  &diagnosticsFixture.descriptor,
+                  sizeof(diagnosticsFixture.descriptor),
+                  &captureSummary, sizeof(captureSummary),
+                  captureFrames, 2, invalidSize,
+                  &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+        CHECK(captureOutputsRemainSentinels());
+    }
+
+    resetCaptureOutputs();
+    CHECK(msplat_dataset_capture_diagnostics_v7(
+              &diagnosticsFixture.descriptor,
+              sizeof(diagnosticsFixture.descriptor),
+              nullptr, sizeof(captureSummary),
+              captureFrames, 2, sizeof(MsplatFrameCaptureDiagnosticsV7),
+              &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(captureFrames, captureSentinelFrames,
+                      sizeof(captureFrames)) == 0);
+
+    resetCaptureOutputs();
+    CHECK(msplat_dataset_capture_diagnostics_v7(
+              &diagnosticsFixture.descriptor,
+              sizeof(diagnosticsFixture.descriptor),
+              &captureSummary, sizeof(captureSummary),
+              nullptr, 2, sizeof(MsplatFrameCaptureDiagnosticsV7),
+              &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&captureSummary, &captureSentinelSummary,
+                      sizeof(captureSummary)) == 0);
+
+    resetCaptureOutputs();
+    CHECK(msplat_dataset_capture_diagnostics_v7(
+              &diagnosticsFixture.descriptor,
+              sizeof(diagnosticsFixture.descriptor),
+              &captureSummary, sizeof(captureSummary),
+              captureFrames, 1, sizeof(MsplatFrameCaptureDiagnosticsV7),
+              &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(captureOutputsRemainSentinels());
+
+    DescriptorFixture invalidDiagnosticsFixture;
+    invalidDiagnosticsFixture.frames[0].calibration.fx = 0.0f;
+    resetCaptureOutputs();
+    CHECK(msplat_dataset_capture_diagnostics_v7(
+              &invalidDiagnosticsFixture.descriptor,
+              sizeof(invalidDiagnosticsFixture.descriptor),
+              &captureSummary, sizeof(captureSummary),
+              captureFrames, 2, sizeof(MsplatFrameCaptureDiagnosticsV7),
+              &error) == MSPLAT_STATUS_INVALID_DATASET);
+    const MsplatDatasetCaptureDiagnosticsV7 zeroCaptureSummary{};
+    const MsplatFrameCaptureDiagnosticsV7 zeroCaptureFrames[2] = {};
+    CHECK(std::memcmp(&captureSummary, &zeroCaptureSummary,
+                      sizeof(captureSummary)) == 0);
+    CHECK(std::memcmp(captureFrames, zeroCaptureFrames,
+                      sizeof(captureFrames)) == 0);
+    CHECK(error.status == MSPLAT_STATUS_INVALID_DATASET);
+    CHECK(error.message[0] != '\0');
 
     // Optional metadata and correspondence arrays accept either a complete
     // pointer/count pair or the canonical absent representation.

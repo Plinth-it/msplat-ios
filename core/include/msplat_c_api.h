@@ -18,8 +18,9 @@ extern "C" {
 // ABI v5 adds a checked, caller-owned canonical dataset descriptor boundary.
 // ABI v6 adds optional per-frame training masks without changing the v5 frame
 // or descriptor layouts.
+// ABI v7 adds CPU-only capture diagnostics over canonical observations.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 6u
+#define MSPLAT_ABI_VERSION 7u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -300,6 +301,58 @@ typedef struct {
     uint64_t reserved2[2];
 } MsplatFrameMaskV6;
 
+/// One-pass residual statistics. A zero sample count represents unavailable
+/// statistics; all numeric fields are then zero.
+typedef struct {
+    uint64_t sampleCount;
+    double meanPixels;
+    double rootMeanSquarePixels;
+    double maximumPixels;
+} MsplatReprojectionErrorStatisticsV7;
+
+/// Capture diagnostics for one canonical frame. Observed coordinates and
+/// predicted coordinates use the descriptor's source-pixel frame directly;
+/// the upper-left pixel center is (0.5, 0.5). Outside-frame counts use the
+/// half-open bounds [0, width) and [0, height).
+typedef struct {
+    uint32_t frameIndex;
+    uint32_t reserved32;
+    uint64_t observationCount;
+    uint64_t linkedObservationCount;
+    uint64_t observedOutsideFrameCount;
+    uint64_t reprojectedObservationCount;
+    uint64_t behindCameraObservationCount;
+    uint64_t nonFiniteProjectionCount;
+    uint64_t projectedOutsideFrameCount;
+    MsplatReprojectionErrorStatisticsV7 reprojectionError;
+    uint64_t reserved[2];
+} MsplatFrameCaptureDiagnosticsV7;
+
+/// Threshold-free capture diagnostics over a canonical descriptor. Source
+/// point errors are summarized separately from residuals recomputed from the
+/// declared camera geometry and linked observations. Track lengths count the
+/// distinct observing frames for each point and exclude unobserved points from
+/// their mean.
+typedef struct {
+    uint64_t frameCount;
+    uint64_t pointCount;
+    uint64_t observationCount;
+    uint64_t linkedObservationCount;
+    uint64_t observedOutsideFrameCount;
+    uint64_t reprojectedObservationCount;
+    uint64_t behindCameraObservationCount;
+    uint64_t nonFiniteProjectionCount;
+    uint64_t projectedOutsideFrameCount;
+    uint64_t observedPointCount;
+    uint64_t multiViewPointCount;
+    uint32_t maximumTrackLength;
+    uint32_t reserved32;
+    double meanTrackLength;
+    MsplatReprojectionErrorStatisticsV7 reprojectionError;
+    MsplatReprojectionErrorStatisticsV7 sourcePointReprojectionError;
+    uint64_t reserved[2];
+} MsplatDatasetCaptureDiagnosticsV7;
+
 // Checked dataset API (ABI v2).
 MsplatStatus msplat_dataset_create_v2(const char* path, float downscaleFactor,
                                       bool evalMode, int testEvery,
@@ -342,6 +395,21 @@ MsplatStatus msplat_dataset_create_from_descriptor_v6(
     bool evalMode,
     int32_t testEvery,
     MsplatDataset* outDataset,
+    MsplatErrorInfo* error);
+
+/// CPU-only descriptor preflight introduced in ABI v7. The complete v5
+/// descriptor is borrowed only for this synchronous call. No image or mask is
+/// decoded and Metal is not initialized. Output structure sizes and the frame
+/// count/element size must match this ABI exactly. Valid output storage is
+/// cleared before descriptor copying so failures never expose partial results.
+MsplatStatus msplat_dataset_capture_diagnostics_v7(
+    const MsplatDatasetDescriptorV5* descriptor,
+    size_t descriptorSize,
+    MsplatDatasetCaptureDiagnosticsV7* outDiagnostics,
+    size_t diagnosticsSize,
+    MsplatFrameCaptureDiagnosticsV7* outFrames,
+    size_t frameCount,
+    size_t frameElementSize,
     MsplatErrorInfo* error);
 
 MsplatDataset msplat_dataset_create(const char* path, float downscaleFactor,

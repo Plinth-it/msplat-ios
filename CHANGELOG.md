@@ -25,6 +25,11 @@
   normalize completed loss telemetry by covered RGB units. Unmasked callers
   continue through ABI v5 without mask allocation or storage and with unchanged
   loss normalization.
+- Added ABI v7 CPU-only capture diagnostics over canonical camera geometry,
+  sparse points, and observation tracks. Swift descriptors can now preflight
+  per-frame and aggregate reprojection residuals, source-reported point errors,
+  track coverage, out-of-frame features, behind-camera points, and non-finite
+  projections without decoding assets or initializing Metal.
 - Replaced fixed 2,048-entry per-tile bins with a two-pass exact intersection
   pipeline: projection counts each tile, the host builds checked offsets and
   grows compact arenas, and exact-range bitonic/radix sorting preserves every

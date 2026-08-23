@@ -294,6 +294,188 @@ final class DatasetDescriptorTests: XCTestCase {
         }
     }
 
+    func testCaptureDiagnosticsPreserveFrameIdentityAndGeometryCounts() throws {
+        let calibration = try DatasetCalibration(
+            width: 100,
+            height: 100,
+            fx: 100,
+            fy: 100,
+            cx: 50,
+            cy: 50
+        )
+        let mask = try DatasetTrainingMask(
+            url: URL(fileURLWithPath: "/tmp/frame-a-mask.png")
+        )
+        let first = try DatasetFrame(
+            id: "frame-a",
+            calibrationID: "camera-a",
+            imageURL: URL(fileURLWithPath: "/tmp/frame-a.png"),
+            rasterOrientation: .encodedPixels,
+            calibration: calibration,
+            cameraToWorld: identityPose(),
+            trainingMask: mask
+        )
+        let second = try DatasetFrame(
+            id: "frame-b",
+            calibrationID: "camera-b",
+            imageURL: URL(fileURLWithPath: "/tmp/frame-b.png"),
+            rasterOrientation: .encodedPixels,
+            calibration: calibration,
+            cameraToWorld: identityPose()
+        )
+        let points = try DatasetSparsePointSet(
+            xyz: [
+                0, 0, -2,
+                0, 0, 1,
+                1, 0, -2,
+            ],
+            rgb: [
+                255, 0, 0,
+                0, 255, 0,
+                0, 0, 255,
+            ],
+            reprojectionErrors: [0, 3, 4]
+        )
+        let observations = [
+            try DatasetObservation(
+                frameIndex: 0,
+                frameObservationIndex: 0,
+                pointIndex: 0,
+                x: 53,
+                y: 54
+            ),
+            try DatasetObservation(
+                frameIndex: 0,
+                frameObservationIndex: 1,
+                pointIndex: nil,
+                x: 100,
+                y: 50
+            ),
+            try DatasetObservation(
+                frameIndex: 1,
+                frameObservationIndex: 0,
+                pointIndex: 0,
+                x: 50,
+                y: 50
+            ),
+            try DatasetObservation(
+                frameIndex: 1,
+                frameObservationIndex: 1,
+                pointIndex: 1,
+                x: 50,
+                y: 50
+            ),
+        ]
+        let descriptor = try DatasetDescriptor(
+            frames: [first, second],
+            points: points,
+            observations: observations
+        )
+
+        let diagnostics = try descriptor.captureDiagnostics()
+
+        requireSendable(diagnostics)
+        XCTAssertEqual(diagnostics, diagnostics)
+        XCTAssertEqual(diagnostics.frameCount, 2)
+        XCTAssertEqual(diagnostics.maskedFrameCount, 1)
+        XCTAssertEqual(diagnostics.unmaskedFrameCount, 1)
+        XCTAssertEqual(diagnostics.pointCount, 3)
+        XCTAssertEqual(diagnostics.observationCount, 4)
+        XCTAssertEqual(diagnostics.linkedObservationCount, 3)
+        XCTAssertEqual(diagnostics.unlinkedObservationCount, 1)
+        XCTAssertEqual(diagnostics.observedOutsideFrameCount, 1)
+        XCTAssertEqual(diagnostics.observedInsideFrameCount, 3)
+        XCTAssertEqual(diagnostics.reprojectedObservationCount, 2)
+        XCTAssertEqual(diagnostics.behindCameraObservationCount, 1)
+        XCTAssertEqual(diagnostics.nonFiniteProjectionCount, 0)
+        XCTAssertEqual(diagnostics.unprojectableObservationCount, 1)
+        XCTAssertEqual(diagnostics.projectedOutsideFrameCount, 0)
+        XCTAssertEqual(diagnostics.projectedInsideFrameCount, 2)
+        XCTAssertEqual(diagnostics.observedPointCount, 2)
+        XCTAssertEqual(diagnostics.multiViewPointCount, 1)
+        XCTAssertEqual(diagnostics.singleViewPointCount, 1)
+        XCTAssertEqual(diagnostics.unobservedPointCount, 1)
+        XCTAssertEqual(diagnostics.maximumTrackLength, 2)
+        XCTAssertEqual(diagnostics.meanTrackLength, 1.5, accuracy: 1e-12)
+
+        let reprojection = try XCTUnwrap(diagnostics.reprojectionError)
+        requireSendable(reprojection)
+        XCTAssertEqual(reprojection.sampleCount, 2)
+        XCTAssertEqual(reprojection.meanPixels, 2.5, accuracy: 1e-12)
+        XCTAssertEqual(
+            reprojection.rootMeanSquarePixels,
+            sqrt(12.5),
+            accuracy: 1e-12
+        )
+        XCTAssertEqual(reprojection.maximumPixels, 5, accuracy: 1e-12)
+
+        let source = try XCTUnwrap(
+            diagnostics.sourcePointReprojectionError
+        )
+        XCTAssertEqual(source.sampleCount, 3)
+        XCTAssertEqual(source.meanPixels, 7.0 / 3.0, accuracy: 1e-12)
+        XCTAssertEqual(
+            source.rootMeanSquarePixels,
+            5.0 / sqrt(3.0),
+            accuracy: 1e-12
+        )
+        XCTAssertEqual(source.maximumPixels, 4, accuracy: 1e-12)
+
+        XCTAssertEqual(diagnostics.frames.map(\.frameID), ["frame-a", "frame-b"])
+        XCTAssertEqual(
+            diagnostics.frames.map(\.calibrationID),
+            ["camera-a", "camera-b"]
+        )
+        let firstDiagnostics = diagnostics.frames[0]
+        XCTAssertEqual(firstDiagnostics.frameIndex, 0)
+        XCTAssertEqual(firstDiagnostics.width, 100)
+        XCTAssertEqual(firstDiagnostics.height, 100)
+        XCTAssertTrue(firstDiagnostics.hasTrainingMask)
+        XCTAssertEqual(firstDiagnostics.observationCount, 2)
+        XCTAssertEqual(firstDiagnostics.linkedObservationCount, 1)
+        XCTAssertEqual(firstDiagnostics.unlinkedObservationCount, 1)
+        XCTAssertEqual(firstDiagnostics.observedOutsideFrameCount, 1)
+        XCTAssertEqual(firstDiagnostics.observedInsideFrameCount, 1)
+        XCTAssertEqual(firstDiagnostics.reprojectedObservationCount, 1)
+        XCTAssertEqual(firstDiagnostics.projectedInsideFrameCount, 1)
+        XCTAssertEqual(
+            try XCTUnwrap(firstDiagnostics.reprojectionError).meanPixels,
+            5,
+            accuracy: 1e-12
+        )
+
+        let secondDiagnostics = diagnostics.frames[1]
+        XCTAssertFalse(secondDiagnostics.hasTrainingMask)
+        XCTAssertEqual(secondDiagnostics.observationCount, 2)
+        XCTAssertEqual(secondDiagnostics.linkedObservationCount, 2)
+        XCTAssertEqual(secondDiagnostics.unprojectableObservationCount, 1)
+        XCTAssertEqual(
+            try XCTUnwrap(secondDiagnostics.reprojectionError).meanPixels,
+            0,
+            accuracy: 1e-12
+        )
+    }
+
+    func testCaptureDiagnosticsUseNilForUnavailableStatistics() throws {
+        let points = try DatasetSparsePointSet(
+            xyz: [0, 0, -2],
+            rgb: [255, 255, 255]
+        )
+        let descriptor = try DatasetDescriptor(
+            frames: [makeFrame(id: "frame", filename: "missing.png")],
+            points: points
+        )
+
+        let diagnostics = try descriptor.captureDiagnostics()
+
+        XCTAssertNil(diagnostics.reprojectionError)
+        XCTAssertNil(diagnostics.sourcePointReprojectionError)
+        XCTAssertNil(diagnostics.frames[0].reprojectionError)
+        XCTAssertEqual(diagnostics.observationCount, 0)
+        XCTAssertEqual(diagnostics.observedPointCount, 0)
+        XCTAssertEqual(diagnostics.unobservedPointCount, 1)
+    }
+
     func testSwiftImportedDescriptorLayoutsMatchTheCABI() {
         XCTAssertEqual(MemoryLayout<MsplatStringViewV5>.size, 16)
         XCTAssertEqual(MemoryLayout<MsplatCameraCalibrationV5>.size, 44)
@@ -303,6 +485,15 @@ final class DatasetDescriptorTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<MsplatFrameMaskV6>.size, 40)
         XCTAssertEqual(MemoryLayout<MsplatFrameMaskV6>.stride, 40)
         XCTAssertEqual(MemoryLayout<MsplatFrameMaskV6>.alignment, 8)
+        XCTAssertEqual(
+            MemoryLayout<MsplatReprojectionErrorStatisticsV7>.size,
+            32
+        )
+        XCTAssertEqual(MemoryLayout<MsplatFrameCaptureDiagnosticsV7>.size, 112)
+        XCTAssertEqual(
+            MemoryLayout<MsplatDatasetCaptureDiagnosticsV7>.size,
+            184
+        )
 
         XCTAssertEqual(MemoryLayout<DatasetObservation>.size, 24)
         XCTAssertEqual(MemoryLayout<DatasetObservation>.stride, 24)

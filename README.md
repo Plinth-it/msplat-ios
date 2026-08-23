@@ -202,6 +202,25 @@ scopes after its native trainer and dataset are destroyed. Set
 masked dataset so the estimate includes full-source mask decoding and paired
 CPU/GPU mask caches.
 
+Before creating a session, a canonical descriptor can be checked against its
+sparse correspondences without reading any image or mask and without starting
+Metal:
+
+```swift
+let capture = try descriptor.captureDiagnostics()
+if let residual = capture.reprojectionError {
+    print("Reprojection RMS: \(residual.rootMeanSquarePixels) px")
+}
+```
+
+The report keeps recomputed observation residuals separate from optional
+source-reported point errors. Aggregate and per-frame counts also identify
+unlinked observations, points behind the declared cameras, non-finite
+projections, and observed or predicted coordinates outside the raster. Track
+lengths count distinct observing frames per observed point; msplat deliberately
+supplies no subjective pass/fail threshold, leaving capture policy to the
+integrating app.
+
 `step()` returns a submission receipt: its `cpuSubmitMs` measures active CPU
 encoding and submission time with required synchronous GPU waits excluded.
 `trainingMetrics()` is a non-draining poll whose submitted and completed

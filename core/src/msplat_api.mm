@@ -3,6 +3,7 @@
 
 #include "msplat_api.hpp"
 
+#include "dataset_diagnostics.hpp"
 #include "dataset_errors.hpp"
 #include "model.hpp"
 #include "input_data.hpp"
@@ -931,6 +932,66 @@ std::vector<std::optional<TrainingMaskDescriptor>> copyFrameMasks(
     return result;
 }
 
+void copyReprojectionStatistics(
+    const DatasetReprojectionStatistics& source,
+    MsplatReprojectionErrorStatisticsV7& destination) noexcept {
+    destination.sampleCount = source.sampleCount;
+    destination.meanPixels = source.meanPixels;
+    destination.rootMeanSquarePixels = source.rootMeanSquarePixels;
+    destination.maximumPixels = source.maximumPixels;
+}
+
+void copyCaptureDiagnostics(
+    const DatasetCaptureDiagnostics& source,
+    MsplatDatasetCaptureDiagnosticsV7& destination,
+    MsplatFrameCaptureDiagnosticsV7* frameDestinations) noexcept {
+    destination.frameCount = source.frameCount;
+    destination.pointCount = source.pointCount;
+    destination.observationCount = source.observationCount;
+    destination.linkedObservationCount = source.linkedObservationCount;
+    destination.observedOutsideFrameCount =
+        source.observedOutsideFrameCount;
+    destination.reprojectedObservationCount =
+        source.reprojectedObservationCount;
+    destination.behindCameraObservationCount =
+        source.behindCameraObservationCount;
+    destination.nonFiniteProjectionCount = source.nonFiniteProjectionCount;
+    destination.projectedOutsideFrameCount =
+        source.projectedOutsideFrameCount;
+    destination.observedPointCount = source.observedPointCount;
+    destination.multiViewPointCount = source.multiViewPointCount;
+    destination.maximumTrackLength = source.maximumTrackLength;
+    destination.meanTrackLength = source.meanTrackLength;
+    copyReprojectionStatistics(
+        source.reprojectionError, destination.reprojectionError);
+    copyReprojectionStatistics(
+        source.sourcePointReprojectionError,
+        destination.sourcePointReprojectionError);
+
+    for (size_t index = 0; index < source.frames.size(); ++index) {
+        const DatasetFrameCaptureDiagnostics& sourceFrame = source.frames[index];
+        MsplatFrameCaptureDiagnosticsV7& destinationFrame =
+            frameDestinations[index];
+        destinationFrame.frameIndex = sourceFrame.frameIndex;
+        destinationFrame.observationCount = sourceFrame.observationCount;
+        destinationFrame.linkedObservationCount =
+            sourceFrame.linkedObservationCount;
+        destinationFrame.observedOutsideFrameCount =
+            sourceFrame.observedOutsideFrameCount;
+        destinationFrame.reprojectedObservationCount =
+            sourceFrame.reprojectedObservationCount;
+        destinationFrame.behindCameraObservationCount =
+            sourceFrame.behindCameraObservationCount;
+        destinationFrame.nonFiniteProjectionCount =
+            sourceFrame.nonFiniteProjectionCount;
+        destinationFrame.projectedOutsideFrameCount =
+            sourceFrame.projectedOutsideFrameCount;
+        copyReprojectionStatistics(
+            sourceFrame.reprojectionError,
+            destinationFrame.reprojectionError);
+    }
+}
+
 void validateConfig(const MsplatConfig& c) {
     require(c.iterations > 0 && c.iterations <= 1000000,
             "iterations must be in 1...1000000");
@@ -1079,6 +1140,58 @@ MsplatStatus msplat_dataset_create_from_descriptor_v6(
                 static_cast<int>(testEvery));
         });
         *outDataset = static_cast<MsplatDataset>(handle.release());
+    });
+}
+
+MsplatStatus msplat_dataset_capture_diagnostics_v7(
+    const MsplatDatasetDescriptorV5* descriptor,
+    size_t descriptorSize,
+    MsplatDatasetCaptureDiagnosticsV7* outDiagnostics,
+    size_t diagnosticsSize,
+    MsplatFrameCaptureDiagnosticsV7* outFrames,
+    size_t frameCount,
+    size_t frameElementSize,
+    MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(descriptor != nullptr, "Dataset descriptor must not be null");
+        require(descriptorSize == sizeof(MsplatDatasetDescriptorV5),
+                "Dataset descriptor size does not match this msplat ABI");
+        require(outDiagnostics != nullptr,
+                "Capture diagnostics output must not be null");
+        require(diagnosticsSize == sizeof(MsplatDatasetCaptureDiagnosticsV7),
+                "Capture diagnostics size does not match this msplat ABI");
+        require(frameElementSize == sizeof(MsplatFrameCaptureDiagnosticsV7),
+                "Frame diagnostics element size does not match this msplat ABI");
+        require(descriptor->frameCount <= MSPLAT_DATASET_V5_MAX_FRAMES,
+                "Dataset frame count exceeds the supported range");
+        require(frameCount == descriptor->frameCount,
+                "Frame diagnostics count must match the dataset frame count");
+        requireCountedPointer(
+            outFrames, frameCount, MSPLAT_DATASET_V5_MAX_FRAMES,
+            "frame diagnostics");
+        require(frameCount <= std::numeric_limits<size_t>::max() /
+                    sizeof(MsplatFrameCaptureDiagnosticsV7),
+                "Frame diagnostics byte size exceeds the supported range");
+
+        std::memset(outDiagnostics, 0, sizeof(*outDiagnostics));
+        if (frameCount != 0) {
+            std::memset(
+                outFrames, 0,
+                frameCount * sizeof(MsplatFrameCaptureDiagnosticsV7));
+        }
+
+        ::DatasetDescriptor copied = copyDatasetDescriptor(*descriptor);
+        DatasetCaptureDiagnostics diagnostics;
+        try {
+            diagnostics = analyzeDatasetCapture(copied);
+        } catch (const std::invalid_argument& exception) {
+            throw msplat::InvalidDatasetError(exception.what());
+        }
+        if (diagnostics.frames.size() != frameCount) {
+            throw std::runtime_error(
+                "Capture diagnostics frame count is inconsistent");
+        }
+        copyCaptureDiagnostics(diagnostics, *outDiagnostics, outFrames);
     });
 }
 
