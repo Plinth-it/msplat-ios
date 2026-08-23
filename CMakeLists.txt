@@ -114,6 +114,7 @@ add_library(msplat_core STATIC
     core/src/msplat_api.mm
     core/src/model.cpp
     core/src/input_data.cpp
+    core/src/dataset_descriptor.cpp
     core/src/memory_report.cpp
     core/src/loaders/load_colmap.cpp
     core/src/loaders/load_nerfstudio.cpp
@@ -166,6 +167,12 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         add_executable(msplat_image_io_tests tests/test_image_io.cpp)
         target_link_libraries(msplat_image_io_tests PRIVATE msplat_core)
         add_test(NAME msplat_image_io COMMAND msplat_image_io_tests)
+
+        add_executable(msplat_dataset_descriptor_tests
+            tests/test_dataset_descriptor.cpp)
+        target_link_libraries(msplat_dataset_descriptor_tests PRIVATE msplat_core)
+        add_test(NAME msplat_dataset_descriptor
+            COMMAND msplat_dataset_descriptor_tests)
 
         add_executable(msplat_intersection_layout_tests
             tests/test_intersection_layout.cpp)

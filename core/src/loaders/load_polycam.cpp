@@ -3,6 +3,7 @@
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <utility>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -15,8 +16,10 @@ static std::string findImage(const fs::path &dir, const std::string &stem) {
     return (dir / (stem + ".png")).string();
 }
 
-InputData loaders::loadPolycam(const std::string &projectRoot) {
-    InputData data;
+DatasetDescriptor loaders::loadPolycam(const std::string &projectRoot) {
+    DatasetDescriptor data;
+    data.provenance.adapter = "polycam";
+    data.provenance.source = projectRoot;
     fs::path root(projectRoot);
     fs::path keyframesDir = root / "keyframes" / "corrected_cameras";
     fs::path imagesDir = root / "keyframes" / "corrected_images";
@@ -32,12 +35,16 @@ InputData loaders::loadPolycam(const std::string &projectRoot) {
             std::ifstream f(jp);
             json j = json::parse(f);
 
-            Camera cam;
-            cam.width = j.value("width", 0);
-            cam.height = j.value("height", 0);
-            cam.fx = j.value("fx", 0.0f);  cam.fy = j.value("fy", 0.0f);
-            cam.cx = j.value("cx", (float)cam.width / 2.0f);
-            cam.cy = j.value("cy", (float)cam.height / 2.0f);
+            DatasetFrameDescriptor frame;
+            frame.id = jp.stem().string();
+            frame.calibrationId = frame.id;
+            frame.calibration.width = j.value("width", 0);
+            frame.calibration.height = j.value("height", 0);
+            frame.calibration.fx = j.value("fx", 0.0f);
+            frame.calibration.fy = j.value("fy", 0.0f);
+            frame.calibration.cx = j.value("cx", (float)frame.calibration.width / 2.0f);
+            frame.calibration.cy = j.value("cy", (float)frame.calibration.height / 2.0f);
+            frame.rasterOrientation = RasterOrientation::EncodedPixels;
 
             float R[9], T[3];
             for (int r = 0; r < 3; r++)
@@ -48,13 +55,13 @@ InputData loaders::loadPolycam(const std::string &projectRoot) {
             T[2] = j.value("t_22", 0.0f);
 
             // c2w with OpenGL Y/Z flip
-            cam.camToWorld[0]  =  R[0]; cam.camToWorld[1]  =  R[1]; cam.camToWorld[2]  =  R[2]; cam.camToWorld[3]  =  T[0];
-            cam.camToWorld[4]  = -R[3]; cam.camToWorld[5]  = -R[4]; cam.camToWorld[6]  = -R[5]; cam.camToWorld[7]  = -T[1];
-            cam.camToWorld[8]  = -R[6]; cam.camToWorld[9]  = -R[7]; cam.camToWorld[10] = -R[8]; cam.camToWorld[11] = -T[2];
-            cam.camToWorld[12] = 0;     cam.camToWorld[13] = 0;     cam.camToWorld[14] = 0;     cam.camToWorld[15] = 1;
+            frame.cameraToWorld[0]  =  R[0]; frame.cameraToWorld[1]  =  R[1]; frame.cameraToWorld[2]  =  R[2]; frame.cameraToWorld[3]  =  T[0];
+            frame.cameraToWorld[4]  = -R[3]; frame.cameraToWorld[5]  = -R[4]; frame.cameraToWorld[6]  = -R[5]; frame.cameraToWorld[7]  = -T[1];
+            frame.cameraToWorld[8]  = -R[6]; frame.cameraToWorld[9]  = -R[7]; frame.cameraToWorld[10] = -R[8]; frame.cameraToWorld[11] = -T[2];
+            frame.cameraToWorld[12] = 0;     frame.cameraToWorld[13] = 0;     frame.cameraToWorld[14] = 0;     frame.cameraToWorld[15] = 1;
 
-            cam.filePath = findImage(imagesDir, jp.stem().string());
-            data.cameras.push_back(cam);
+            frame.imagePath = findImage(imagesDir, frame.id);
+            data.frames.push_back(std::move(frame));
         }
     } else {
         // Layout 2: single cameras.json (dispatcher already confirmed it exists)
@@ -62,25 +69,35 @@ InputData loaders::loadPolycam(const std::string &projectRoot) {
         json j = json::parse(f);
 
         auto &frames = j.contains("frames") ? j["frames"] : j;
-        for (auto &frame : frames) {
-            Camera cam;
-            cam.width = frame.value("width", 0);
-            cam.height = frame.value("height", 0);
-            cam.fx = frame.value("fx", 0.0f);  cam.fy = frame.value("fy", 0.0f);
-            cam.cx = frame.value("cx", (float)cam.width / 2.0f);
-            cam.cy = frame.value("cy", (float)cam.height / 2.0f);
+        for (auto &frameJson : frames) {
+            DatasetFrameDescriptor frame;
+            frame.calibration.width = frameJson.value("width", 0);
+            frame.calibration.height = frameJson.value("height", 0);
+            frame.calibration.fx = frameJson.value("fx", 0.0f);
+            frame.calibration.fy = frameJson.value("fy", 0.0f);
+            frame.calibration.cx = frameJson.value("cx", (float)frame.calibration.width / 2.0f);
+            frame.calibration.cy = frameJson.value("cy", (float)frame.calibration.height / 2.0f);
+            frame.rasterOrientation = RasterOrientation::EncodedPixels;
 
-            if (frame.contains("transform_matrix")) {
-                auto &tm = frame["transform_matrix"];
-                for (int r = 0; r < 4; r++)
-                    for (int c = 0; c < 4; c++)
-                        cam.camToWorld[r*4+c] = tm[r][c].get<float>();
+            if (!frameJson.contains("transform_matrix")) {
+                throw std::runtime_error(
+                    "Polycam frame " + std::to_string(data.frames.size()) +
+                    " is missing transform_matrix");
             }
+            auto &tm = frameJson["transform_matrix"];
+            for (int r = 0; r < 4; r++)
+                for (int c = 0; c < 4; c++)
+                    frame.cameraToWorld[r*4+c] = tm[r][c].get<float>();
 
-            cam.filePath = frame.value("file_path", "");
-            if (!cam.filePath.empty() && cam.filePath[0] != '/')
-                cam.filePath = (root / cam.filePath).string();
-            data.cameras.push_back(cam);
+            std::string sourcePath = frameJson.value("file_path", "");
+            frame.id = sourcePath.empty()
+                ? "frame-" + std::to_string(data.frames.size())
+                : sourcePath;
+            frame.calibrationId = frame.id;
+            frame.imagePath = sourcePath;
+            if (!frame.imagePath.empty() && frame.imagePath[0] != '/')
+                frame.imagePath = (root / frame.imagePath).string();
+            data.frames.push_back(std::move(frame));
         }
     }
 
@@ -90,6 +107,5 @@ InputData loaders::loadPolycam(const std::string &projectRoot) {
         if (fs::exists(path)) { data.points = readPly(path); break; }
     }
 
-    autoScaleAndCenter(data);
     return data;
 }

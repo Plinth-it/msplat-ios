@@ -306,6 +306,18 @@ void checkMetadataAndRawOrientation(const TempDirectory &temporary) {
         } else {
             checkSameImage(rawBaseline, decoded);
         }
+
+        if (orientation == 6) {
+            const Image oriented = imreadRGB(path.string(), info, 2, 3, true);
+            CHECK(oriented.width == 2);
+            CHECK(oriented.height == 3);
+            checkPixel(oriented, 0, 0, gridColors[3]);
+            checkPixel(oriented, 1, 0, gridColors[0]);
+            checkPixel(oriented, 0, 1, gridColors[4]);
+            checkPixel(oriented, 1, 1, gridColors[1]);
+            checkPixel(oriented, 0, 2, gridColors[5]);
+            checkPixel(oriented, 1, 2, gridColors[2]);
+        }
     }
 
     // Lock the byte/channel interpretation as well as cross-orientation
@@ -400,6 +412,36 @@ void checkFractionalCameraScale(const TempDirectory &temporary) {
     checkThrows<std::invalid_argument>(
         [&] { orientedCalibration.loadImage(1.0f); },
         "preserves encoded pixel coordinates");
+
+    Camera normalizedCamera;
+    normalizedCamera.filePath = path.string();
+    normalizedCamera.rasterOrientation = RasterOrientation::ExifNormalized;
+    normalizedCamera.width = 9;
+    normalizedCamera.height = 13;
+    normalizedCamera.fx = 90.0f;
+    normalizedCamera.fy = 130.0f;
+    normalizedCamera.cx = 4.0f;
+    normalizedCamera.cy = 6.0f;
+    normalizedCamera.loadImage(1.0f);
+    CHECK(normalizedCamera.width == 9);
+    CHECK(normalizedCamera.height == 13);
+    CHECK(normalizedCamera.image.width == 9);
+    CHECK(normalizedCamera.image.height == 13);
+
+    normalizedCamera.loadImage(2.5f);
+    CHECK(normalizedCamera.width == 3);
+    CHECK(normalizedCamera.height == 5);
+    CHECK(std::abs(normalizedCamera.fx - 30.0f) < 1e-5f);
+    CHECK(std::abs(normalizedCamera.fy - 50.0f) < 1e-5f);
+    CHECK(std::abs(normalizedCamera.cx - (4.0f / 3.0f)) < 1e-5f);
+    CHECK(std::abs(normalizedCamera.cy - (30.0f / 13.0f)) < 1e-5f);
+
+    normalizedCamera.releaseImageMemory();
+    normalizedCamera.loadImage(2.5f);
+    CHECK(normalizedCamera.width == 3);
+    CHECK(normalizedCamera.height == 5);
+    CHECK(std::abs(normalizedCamera.fx - 30.0f) < 1e-5f);
+    CHECK(std::abs(normalizedCamera.fy - 50.0f) < 1e-5f);
 
     for (float invalid : {
              0.0f,

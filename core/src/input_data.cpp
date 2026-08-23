@@ -85,16 +85,22 @@ void Camera::loadImage(float downscaleFactor) {
     }
 
     const ImageSourceInfo sourceInfo = inspectImageSource(filePath);
+    const bool normalizeExif =
+        rasterOrientation == RasterOrientation::ExifNormalized;
+    const int sourceWidth = normalizeExif
+        ? sourceInfo.orientedWidth : sourceInfo.rawWidth;
+    const int sourceHeight = normalizeExif
+        ? sourceInfo.orientedHeight : sourceInfo.rawHeight;
 
-    // COLMAP and the current dataset adapters calibrate against the encoded
-    // raster (COLMAP explicitly reads with reorientation disabled). Preserve
-    // that coordinate frame here. The decode API can normalize EXIF for a
-    // future adapter that also transforms K and the camera pose explicitly.
+    // Each descriptor explicitly names the pixel frame its calibration uses.
+    // Existing adapters preserve encoded pixels; a native adapter may request
+    // ImageIO's EXIF-normalized frame after transforming its calibration and
+    // camera pose to match.
     if (width > 0 &&
         !dimensionsShareAspect(width, height,
-                               sourceInfo.rawWidth, sourceInfo.rawHeight)) {
+                               sourceWidth, sourceHeight)) {
         std::string detail;
-        if (sourceInfo.exifOrientation >= 5 &&
+        if (!normalizeExif && sourceInfo.exifOrientation >= 5 &&
             dimensionsShareAspect(width, height,
                                   sourceInfo.orientedWidth,
                                   sourceInfo.orientedHeight)) {
@@ -102,28 +108,36 @@ void Camera::loadImage(float downscaleFactor) {
                      "raster, but this camera path preserves encoded pixel "
                      "coordinates; normalize both pixels and calibration before "
                      "training.";
+        } else if (normalizeExif && sourceInfo.exifOrientation >= 5 &&
+                   dimensionsShareAspect(width, height,
+                                         sourceInfo.rawWidth,
+                                         sourceInfo.rawHeight)) {
+            detail = " The declared dimensions instead match the encoded "
+                     "raster, but this camera requests EXIF-normalized pixels; "
+                     "provide calibration and pose in the normalized frame.";
         }
         throw std::invalid_argument(
             "Camera dimensions " + std::to_string(width) + "x" +
-            std::to_string(height) + " do not match encoded image dimensions " +
-            std::to_string(sourceInfo.rawWidth) + "x" +
-            std::to_string(sourceInfo.rawHeight) + " for " + filePath + "." +
+            std::to_string(height) + " do not match " +
+            (normalizeExif ? "EXIF-oriented" : "encoded") +
+            " image dimensions " + std::to_string(sourceWidth) + "x" +
+            std::to_string(sourceHeight) + " for " + filePath + "." +
             detail);
     }
 
     const int targetWidth = targetDimension(
-        sourceInfo.rawWidth, downscaleFactor, "width", filePath);
+        sourceWidth, downscaleFactor, "width", filePath);
     const int targetHeight = targetDimension(
-        sourceInfo.rawHeight, downscaleFactor, "height", filePath);
+        sourceHeight, downscaleFactor, "height", filePath);
     Image raw = imreadRGB(filePath, sourceInfo, targetWidth, targetHeight,
-                          false);
+                          normalizeExif);
 
     // Scale from the calibration's declared pixel frame directly to the exact
     // target canvas. COLMAP uses image-edge coordinates (the upper-left pixel
     // center is 0.5, 0.5), so focal lengths and principal points both scale
     // directly with their axis.
-    const int calibrationWidth = width > 0 ? width : sourceInfo.rawWidth;
-    const int calibrationHeight = height > 0 ? height : sourceInfo.rawHeight;
+    const int calibrationWidth = width > 0 ? width : sourceWidth;
+    const int calibrationHeight = height > 0 ? height : sourceHeight;
     const float sx = static_cast<float>(targetWidth) /
                      static_cast<float>(calibrationWidth);
     const float sy = static_cast<float>(targetHeight) /
@@ -297,34 +311,50 @@ void autoScaleAndCenter(InputData &data) {
     if (data.cameras.empty()) return;
 
     // Compute mean camera position
-    float mean[3] = {};
+    double mean[3] = {};
     for (auto &cam : data.cameras) {
-        mean[0] += cam.camToWorld[3];   // column 3 of row 0
-        mean[1] += cam.camToWorld[7];   // column 3 of row 1
-        mean[2] += cam.camToWorld[11];  // column 3 of row 2
+        mean[0] += static_cast<double>(cam.camToWorld[3]);
+        mean[1] += static_cast<double>(cam.camToWorld[7]);
+        mean[2] += static_cast<double>(cam.camToWorld[11]);
     }
-    int n = (int)data.cameras.size();
+    const double n = static_cast<double>(data.cameras.size());
     mean[0] /= n; mean[1] /= n; mean[2] /= n;
 
-    data.translation[0] = mean[0];
-    data.translation[1] = mean[1];
-    data.translation[2] = mean[2];
+    auto checkedFloat = [](double value, const char *label) {
+        if (!std::isfinite(value) ||
+            std::abs(value) > std::numeric_limits<float>::max()) {
+            throw std::invalid_argument(
+                std::string("Dataset ") + label + " exceeds float32 range");
+        }
+        return static_cast<float>(value);
+    };
+
+    data.translation[0] = checkedFloat(mean[0], "translation");
+    data.translation[1] = checkedFloat(mean[1], "translation");
+    data.translation[2] = checkedFloat(mean[2], "translation");
 
     // Center camera poses
     for (auto &cam : data.cameras) {
-        cam.camToWorld[3]  -= mean[0];
-        cam.camToWorld[7]  -= mean[1];
-        cam.camToWorld[11] -= mean[2];
+        cam.camToWorld[3] = checkedFloat(
+            static_cast<double>(cam.camToWorld[3]) - mean[0],
+            "centered camera position");
+        cam.camToWorld[7] = checkedFloat(
+            static_cast<double>(cam.camToWorld[7]) - mean[1],
+            "centered camera position");
+        cam.camToWorld[11] = checkedFloat(
+            static_cast<double>(cam.camToWorld[11]) - mean[2],
+            "centered camera position");
     }
 
     // Compute scale from max absolute camera position
-    float maxAbs = 0;
+    double maxAbs = 0.0;
     for (auto &cam : data.cameras) {
-        maxAbs = std::max(maxAbs, std::abs(cam.camToWorld[3]));
-        maxAbs = std::max(maxAbs, std::abs(cam.camToWorld[7]));
-        maxAbs = std::max(maxAbs, std::abs(cam.camToWorld[11]));
+        maxAbs = std::max(maxAbs, std::abs(static_cast<double>(cam.camToWorld[3])));
+        maxAbs = std::max(maxAbs, std::abs(static_cast<double>(cam.camToWorld[7])));
+        maxAbs = std::max(maxAbs, std::abs(static_cast<double>(cam.camToWorld[11])));
     }
-    data.scale = (maxAbs > 0) ? (1.0f / maxAbs) : 1.0f;
+    data.scale = checkedFloat(maxAbs > 0.0 ? 1.0 / maxAbs : 1.0,
+                              "normalization scale");
 
     // Apply scale to camera positions
     for (auto &cam : data.cameras) {
@@ -335,9 +365,15 @@ void autoScaleAndCenter(InputData &data) {
 
     // Apply to point cloud
     for (int64_t i = 0; i < data.points.count; i++) {
-        data.points.xyz[i*3+0] = (data.points.xyz[i*3+0] - mean[0]) * data.scale;
-        data.points.xyz[i*3+1] = (data.points.xyz[i*3+1] - mean[1]) * data.scale;
-        data.points.xyz[i*3+2] = (data.points.xyz[i*3+2] - mean[2]) * data.scale;
+        data.points.xyz[i*3+0] = checkedFloat(
+            (static_cast<double>(data.points.xyz[i*3+0]) - mean[0]) * data.scale,
+            "normalized point coordinate");
+        data.points.xyz[i*3+1] = checkedFloat(
+            (static_cast<double>(data.points.xyz[i*3+1]) - mean[1]) * data.scale,
+            "normalized point coordinate");
+        data.points.xyz[i*3+2] = checkedFloat(
+            (static_cast<double>(data.points.xyz[i*3+2]) - mean[2]) * data.scale,
+            "normalized point coordinate");
     }
 }
 
@@ -415,24 +451,77 @@ void InputData::saveCameras(const std::string &filename, bool keepCrs) const {
     f << arr.dump(2);
 }
 
-// ── Format dispatcher ───────────────────────────────────────────────────────
+// ── Canonical descriptor materialization and format dispatch ────────────────
 
-InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath) {
+InputData inputDataFromDescriptor(DatasetDescriptor descriptor) {
+    validateDatasetDescriptor(descriptor);
+
+    InputData data;
+    data.cameras.reserve(descriptor.frames.size());
+    data.metadata.frameIds.reserve(descriptor.frames.size());
+    data.metadata.calibrationIds.reserve(descriptor.frames.size());
+    for (auto &frame : descriptor.frames) {
+        Camera camera;
+        camera.width = frame.calibration.width;
+        camera.height = frame.calibration.height;
+        camera.fx = frame.calibration.fx;
+        camera.fy = frame.calibration.fy;
+        camera.cx = frame.calibration.cx;
+        camera.cy = frame.calibration.cy;
+        camera.k1 = frame.calibration.k1;
+        camera.k2 = frame.calibration.k2;
+        camera.k3 = frame.calibration.k3;
+        camera.p1 = frame.calibration.p1;
+        camera.p2 = frame.calibration.p2;
+        std::copy(frame.cameraToWorld.begin(), frame.cameraToWorld.end(),
+                  camera.camToWorld);
+        camera.filePath = std::move(frame.imagePath);
+        camera.rasterOrientation = frame.rasterOrientation;
+        data.cameras.push_back(std::move(camera));
+        data.metadata.frameIds.push_back(std::move(frame.id));
+        data.metadata.calibrationIds.push_back(std::move(frame.calibrationId));
+    }
+
+    data.points.count = static_cast<int64_t>(descriptor.points.count());
+    data.points.xyz = std::move(descriptor.points.xyz);
+    data.points.rgb = std::move(descriptor.points.rgb);
+    data.metadata.pointSourceIds = std::move(descriptor.points.sourceIds);
+    data.metadata.pointReprojectionErrors =
+        std::move(descriptor.points.reprojectionErrors);
+    data.metadata.observations = std::move(descriptor.observations);
+    data.metadata.provenance = std::move(descriptor.provenance);
+
+    autoScaleAndCenter(data);
+    return data;
+}
+
+DatasetDescriptor datasetDescriptorFromX(
+    const std::string &path, const std::string &colmapImagePath) {
     fs::path root(path);
+    auto validated = [](DatasetDescriptor descriptor) {
+        validateDatasetDescriptor(descriptor);
+        return descriptor;
+    };
 
     // Nerfstudio: transforms.json
     if (fs::exists(root / "transforms.json"))
-        return loaders::loadNerfstudio(path);
+        return validated(loaders::loadNerfstudio(path));
 
     // COLMAP: cameras.bin or cameras.txt (direct or in sparse/0/)
     for (const auto &name : {"cameras.bin", "cameras.txt"})
         if (fs::exists(root / name) || fs::exists(root / "sparse" / "0" / name))
-            return loaders::loadColmap(path, colmapImagePath);
+            return validated(loaders::loadColmap(path, colmapImagePath));
 
     // Polycam: keyframes/ directory or cameras.json
     if (fs::exists(root / "keyframes" / "corrected_cameras") || fs::exists(root / "cameras.json"))
-        return loaders::loadPolycam(path);
+        return validated(loaders::loadPolycam(path));
 
     throw std::runtime_error("Unrecognized dataset format in: " + path +
         "\nSupported: COLMAP (cameras.bin or cameras.txt), Nerfstudio (transforms.json), Polycam (keyframes/)");
+}
+
+InputData inputDataFromX(
+    const std::string &path, const std::string &colmapImagePath) {
+    return inputDataFromDescriptor(
+        datasetDescriptorFromX(path, colmapImagePath));
 }

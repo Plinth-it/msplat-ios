@@ -88,6 +88,9 @@ coordinates with EXIF reorientation disabled. Its adapter therefore validates
 EXIF orientation but deliberately preserves the raw pixel frame; applying a
 display transform without updating intrinsics and poses would corrupt the
 calibration. ImageIO converts decoded thumbnails into an explicit sRGB canvas.
+The canonical dataset descriptor records that pixel-frame choice explicitly;
+existing file adapters use encoded pixels, while calibration-aware native
+adapters can opt into tested EXIF-normalized materialization.
 
 ## Additions
 
@@ -105,6 +108,9 @@ calibration. ImageIO converts decoded thumbnails into an explicit sRGB canvas.
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
   explicit sRGB conversion, and raw-coordinate EXIF handling for COLMAP
+- A validated canonical descriptor shared by the COLMAP, Nerfstudio, and
+  Polycam adapters, preserving source frame/calibration identity, sparse-point
+  IDs and reprojection errors, and adapter provenance
 - XCFramework slices for `macos-arm64`, `ios-arm64` and
   `ios-arm64_x86_64-simulator`, each with its own metallib
 

@@ -1,20 +1,21 @@
 #ifndef LOADERS_H
 #define LOADERS_H
 
+#include "dataset_descriptor.hpp"
 #include "input_data.hpp"
 
 // Format-specific loaders
 namespace loaders {
-    InputData loadColmap(const std::string &projectRoot, const std::string &imageSourcePath = "");
-    InputData loadNerfstudio(const std::string &projectRoot);
-    InputData loadPolycam(const std::string &projectRoot);
+    DatasetDescriptor loadColmap(const std::string &projectRoot, const std::string &imageSourcePath = "");
+    DatasetDescriptor loadNerfstudio(const std::string &projectRoot);
+    DatasetDescriptor loadPolycam(const std::string &projectRoot);
 }
 
 // PLY point cloud reader
-Points readPly(const std::string &path);
+SparsePointSet readPly(const std::string &path);
 
 // COLMAP binary point cloud reader
-Points readColmapPoints(const std::string &path);
+SparsePointSet readColmapPoints(const std::string &path);
 
 // Image I/O
 struct ImageSourceInfo {

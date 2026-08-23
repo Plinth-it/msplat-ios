@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <algorithm>
 #include <sstream>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -29,6 +30,7 @@ struct ColmapCamera {
 };
 
 struct ColmapImage {
+    uint32_t id;
     uint32_t camId;
     double quat[4]; // w, x, y, z
     double t[3];    // world-to-camera translation
@@ -78,9 +80,8 @@ static std::vector<ColmapImage> readImagesBin(const std::string &path) {
     images.reserve(n);
 
     for (uint64_t i = 0; i < n; i++) {
-        ColmapImage img;
-        uint32_t imageId;
-        f.read(reinterpret_cast<char*>(&imageId), 4);
+        ColmapImage img = {};
+        f.read(reinterpret_cast<char*>(&img.id), 4);
         f.read(reinterpret_cast<char*>(img.quat), 32); // 4 doubles
         f.read(reinterpret_cast<char*>(img.t), 24);     // 3 doubles
         f.read(reinterpret_cast<char*>(&img.camId), 4);
@@ -159,9 +160,8 @@ static std::vector<ColmapImage> readImagesText(const std::string &path) {
     std::string line;
     while (nextRecord(f, line)) {
         std::istringstream ls(line);
-        ColmapImage img;
-        uint32_t imageId;
-        ls >> imageId
+        ColmapImage img = {};
+        ls >> img.id
            >> img.quat[0] >> img.quat[1] >> img.quat[2] >> img.quat[3]
            >> img.t[0] >> img.t[1] >> img.t[2]
            >> img.camId;
@@ -186,19 +186,22 @@ static std::vector<ColmapImage> readImagesText(const std::string &path) {
     return images;
 }
 
-static Points readPointsText(const std::string &path) {
+static SparsePointSet readPointsText(const std::string &path) {
     std::ifstream f(path);
     if (!f.is_open()) throw std::runtime_error("Cannot open " + path);
 
-    Points pts;
+    SparsePointSet pts;
     std::string line;
     while (nextRecord(f, line)) {
         std::istringstream ls(line);
         uint64_t pointId;
         double x, y, z;
         int r, g, b;
-        ls >> pointId >> x >> y >> z >> r >> g >> b;
+        double error;
+        ls >> pointId >> x >> y >> z >> r >> g >> b >> error;
         if (!ls) throw std::runtime_error("Truncated point record in " + path);
+        if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255)
+            throw std::runtime_error("Invalid point color in " + path);
 
         pts.xyz.push_back((float)x);
         pts.xyz.push_back((float)y);
@@ -206,8 +209,9 @@ static Points readPointsText(const std::string &path) {
         pts.rgb.push_back((uint8_t)r);
         pts.rgb.push_back((uint8_t)g);
         pts.rgb.push_back((uint8_t)b);
+        pts.sourceIds.push_back(pointId);
+        pts.reprojectionErrors.push_back((float)error);
     }
-    pts.count = (int64_t)(pts.xyz.size() / 3);
     return pts;
 }
 
@@ -233,7 +237,7 @@ static void w2cToCamToWorld(const double quat[4], const double t[3], float out[1
     out[12] = 0;     out[13] = 0;      out[14] = 0;      out[15] = 1;
 }
 
-InputData loaders::loadColmap(const std::string &projectRoot, const std::string &imageSourcePath) {
+DatasetDescriptor loaders::loadColmap(const std::string &projectRoot, const std::string &imageSourcePath) {
     // Find sparse dir — dispatcher already confirmed a cameras file exists
     fs::path root(projectRoot);
     auto hasModel = [](const fs::path &dir) {
@@ -257,21 +261,37 @@ InputData loaders::loadColmap(const std::string &projectRoot, const std::string 
     std::sort(images.begin(), images.end(),
         [](const ColmapImage &a, const ColmapImage &b) { return a.filename < b.filename; });
 
-    InputData data;
-    data.cameras.reserve(images.size());
+    DatasetDescriptor data;
+    data.provenance.adapter = "colmap";
+    data.provenance.source = projectRoot;
+    data.frames.reserve(images.size());
 
     for (auto &img : images) {
         auto it = cameras.find(img.camId);
-        if (it == cameras.end()) continue;
+        if (it == cameras.end()) {
+            throw std::runtime_error(
+                "COLMAP image " + std::to_string(img.id) +
+                " references unknown camera " + std::to_string(img.camId));
+        }
         auto &cc = it->second;
 
-        Camera cam;
-        cam.width = cc.width; cam.height = cc.height;
-        cam.fx = cc.fx; cam.fy = cc.fy; cam.cx = cc.cx; cam.cy = cc.cy;
-        cam.k1 = cc.k1; cam.k2 = cc.k2; cam.p1 = cc.p1; cam.p2 = cc.p2;
-        cam.filePath = imageDir + "/" + img.filename;
-        w2cToCamToWorld(img.quat, img.t, cam.camToWorld);
-        data.cameras.push_back(cam);
+        DatasetFrameDescriptor frame;
+        frame.id = std::to_string(img.id);
+        frame.calibrationId = std::to_string(img.camId);
+        frame.imagePath = (fs::path(imageDir) / img.filename).string();
+        frame.rasterOrientation = RasterOrientation::EncodedPixels;
+        frame.calibration.width = cc.width;
+        frame.calibration.height = cc.height;
+        frame.calibration.fx = cc.fx;
+        frame.calibration.fy = cc.fy;
+        frame.calibration.cx = cc.cx;
+        frame.calibration.cy = cc.cy;
+        frame.calibration.k1 = cc.k1;
+        frame.calibration.k2 = cc.k2;
+        frame.calibration.p1 = cc.p1;
+        frame.calibration.p2 = cc.p2;
+        w2cToCamToWorld(img.quat, img.t, frame.cameraToWorld.data());
+        data.frames.push_back(std::move(frame));
     }
 
     // Point cloud
@@ -282,6 +302,5 @@ InputData loaders::loadColmap(const std::string &projectRoot, const std::string 
     else if (fs::exists(sparse / "points3D.ply"))
         data.points = readPly((sparse / "points3D.ply").string());
 
-    autoScaleAndCenter(data);
     return data;
 }

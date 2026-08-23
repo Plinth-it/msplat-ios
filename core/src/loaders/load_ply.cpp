@@ -32,7 +32,7 @@ struct PlyProp {
     int offset;     // byte offset within a vertex record
 };
 
-Points readPly(const std::string &path) {
+SparsePointSet readPly(const std::string &path) {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) throw std::runtime_error("Cannot open PLY file: " + path);
 
@@ -90,8 +90,7 @@ Points readPly(const std::string &path) {
     if (ix < 0 || iy < 0 || iz < 0)
         throw std::runtime_error("PLY missing x/y/z properties");
 
-    Points pts;
-    pts.count = numVertices;
+    SparsePointSet pts;
     pts.xyz.resize(numVertices * 3);
     pts.rgb.resize(numVertices * 3, 128); // default gray if no color
 
@@ -155,26 +154,27 @@ Points readPly(const std::string &path) {
         }
     }
 
-    // point count available via pts.count
     return pts;
 }
 
 // COLMAP points3D.bin reader
-Points readColmapPoints(const std::string &path) {
+SparsePointSet readColmapPoints(const std::string &path) {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) throw std::runtime_error("Cannot open points3D.bin: " + path);
 
     uint64_t numPoints;
     f.read(reinterpret_cast<char*>(&numPoints), 8);
 
-    Points pts;
-    pts.count = (int64_t)numPoints;
+    SparsePointSet pts;
     pts.xyz.resize(numPoints * 3);
     pts.rgb.resize(numPoints * 3);
+    pts.sourceIds.resize(numPoints);
+    pts.reprojectionErrors.resize(numPoints);
 
     for (uint64_t i = 0; i < numPoints; i++) {
         uint64_t pointId;
         f.read(reinterpret_cast<char*>(&pointId), 8);
+        pts.sourceIds[i] = pointId;
 
         double x, y, z;
         f.read(reinterpret_cast<char*>(&x), 8);
@@ -194,12 +194,12 @@ Points readColmapPoints(const std::string &path) {
 
         double error;
         f.read(reinterpret_cast<char*>(&error), 8);
+        pts.reprojectionErrors[i] = (float)error;
 
         uint64_t trackLen;
         f.read(reinterpret_cast<char*>(&trackLen), 8);
         f.seekg(trackLen * 8, std::ios::cur); // skip track entries (imageId u32 + point2dIdx u32 each)
     }
 
-    // point count available via pts.count
     return pts;
 }
