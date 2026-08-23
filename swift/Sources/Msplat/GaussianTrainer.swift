@@ -13,7 +13,24 @@ public class GaussianTrainer {
     public init(dataset: GaussianDataset, config: TrainingConfig = TrainingConfig()) {
         self.dataset = dataset
         handle = withNativeEngineLock {
-            msplat_trainer_create(dataset.handle, config.toC())
+            var nativeConfig = config.toC()
+            var limits = msplat_default_training_limits()
+            var refinementOptions = config.toRefinementOptionsV8()
+            var trainer: MsplatTrainer?
+            var nativeError = MsplatErrorInfo()
+            let status = msplat_trainer_create_v8(
+                dataset.handle,
+                &nativeConfig,
+                MemoryLayout<MsplatConfig>.size,
+                &limits,
+                MemoryLayout<MsplatTrainingLimits>.size,
+                &refinementOptions,
+                MemoryLayout<MsplatRefinementOptionsV8>.size,
+                &trainer,
+                &nativeError
+            )
+            guard status == MSPLAT_STATUS_OK else { return nil }
+            return trainer
         }
     }
 

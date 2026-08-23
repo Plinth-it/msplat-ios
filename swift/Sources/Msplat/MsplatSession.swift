@@ -521,8 +521,9 @@ public final class MsplatSession {
             let dataset = try createDataset()
 
             do {
-                var config = config.toC()
+                var nativeConfig = config.toC()
                 var limits = msplat_default_training_limits()
+                var refinementOptions = config.toRefinementOptionsV8()
                 if let maximumGaussianCount {
                     guard let nativeLimit = Int32(exactly: maximumGaussianCount) else {
                         throw MsplatError.invalidArgument(
@@ -533,12 +534,14 @@ public final class MsplatSession {
                 }
                 var trainer: MsplatTrainer?
                 var nativeError = MsplatErrorInfo()
-                let trainerStatus = msplat_trainer_create_v3(
+                let trainerStatus = msplat_trainer_create_v8(
                     dataset,
-                    &config,
+                    &nativeConfig,
                     MemoryLayout<MsplatConfig>.size,
                     &limits,
                     MemoryLayout<MsplatTrainingLimits>.size,
+                    &refinementOptions,
+                    MemoryLayout<MsplatRefinementOptionsV8>.size,
                     &trainer,
                     &nativeError
                 )

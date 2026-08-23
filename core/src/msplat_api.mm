@@ -210,7 +210,8 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.iterations, config.keepCrs,
         config.bgColor,
         config.stopDensifyAt,
-        config.maxGaussians
+        config.maxGaussians,
+        config.refinePhotometricGains
     );
 
     impl->camIndices.resize(impl->ds->trainIndices.size());
@@ -243,7 +244,8 @@ Stats Trainer::step() {
 
         msplat_training_step_mark_cpu_start(logicalStep);
         impl->model->fullIteration(
-            cam, nextStep, target, impl->config.ssimWeight);
+            cam, impl->ds->trainIndices[camIdx], nextStep, target,
+            impl->config.ssimWeight);
         impl->model->schedulersStep(nextStep);
         impl->model->afterTrain(nextStep);
 
@@ -1024,6 +1026,17 @@ void validateTrainingLimits(const MsplatTrainingLimits& limits) {
             "maxGaussians must be -1 or greater than zero");
 }
 
+void validateRefinementOptionsV8(
+    const MsplatRefinementOptionsV8& options) {
+    constexpr uint32_t knownFlags =
+        MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS;
+    require((options.flags & ~knownFlags) == 0u,
+            "Refinement options contain unknown flags");
+    for (uint32_t reserved : options.reserved)
+        require(reserved == 0u,
+                "Refinement options reserved fields must be zero");
+}
+
 msplat::Config configFromC(const MsplatConfig& c) {
     msplat::Config cfg;
     cfg.iterations = c.iterations;
@@ -1269,6 +1282,32 @@ MsplatStatus msplat_trainer_create_v3(MsplatDataset ds,
                                       size_t limitsSize,
                                       MsplatTrainer* outTrainer,
                                       MsplatErrorInfo* error) {
+    const MsplatRefinementOptionsV8 refinementOptions =
+        msplat_default_refinement_options_v8();
+    return msplat_trainer_create_v8(
+        ds, config, configSize, limits, limitsSize,
+        &refinementOptions, sizeof(refinementOptions), outTrainer, error);
+}
+
+MsplatStatus msplat_refinement_options_validate_v8(
+    const MsplatRefinementOptionsV8* options, size_t optionsSize,
+    MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INVALID_ARGUMENT, [&] {
+        require(options != nullptr, "Refinement options must not be null");
+        require(optionsSize == sizeof(MsplatRefinementOptionsV8),
+                "Refinement options size does not match this msplat ABI");
+        validateRefinementOptionsV8(*options);
+    });
+}
+
+MsplatStatus msplat_trainer_create_v8(
+    MsplatDataset ds,
+    const MsplatConfig* config, size_t configSize,
+    const MsplatTrainingLimits* limits, size_t limitsSize,
+    const MsplatRefinementOptionsV8* refinementOptions,
+    size_t refinementOptionsSize,
+    MsplatTrainer* outTrainer,
+    MsplatErrorInfo* error) {
     if (outTrainer) *outTrainer = nullptr;
     return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
         require(ds != nullptr, "Dataset handle must not be null");
@@ -1278,13 +1317,21 @@ MsplatStatus msplat_trainer_create_v3(MsplatDataset ds,
         require(limits != nullptr, "Training limits must not be null");
         require(limitsSize == sizeof(MsplatTrainingLimits),
                 "Training limits size does not match this msplat ABI");
+        require(refinementOptions != nullptr,
+                "Refinement options must not be null");
+        require(refinementOptionsSize == sizeof(MsplatRefinementOptionsV8),
+                "Refinement options size does not match this msplat ABI");
         require(outTrainer != nullptr, "outTrainer must not be null");
         validateConfig(*config);
         validateTrainingLimits(*limits);
+        validateRefinementOptionsV8(*refinementOptions);
         auto dataset = datasetHandle(ds).dataset;
         require(dataset->numTrain() > 0, "Dataset has no training cameras");
         auto cfg = configFromC(*config);
         cfg.maxGaussians = limits->maxGaussians;
+        cfg.refinePhotometricGains =
+            (refinementOptions->flags &
+             MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS) != 0u;
         auto handle = std::make_unique<CApiTrainerHandle>();
         handle->dataset = std::move(dataset);
         handle->trainer = std::make_unique<msplat::Trainer>(*handle->dataset, cfg);

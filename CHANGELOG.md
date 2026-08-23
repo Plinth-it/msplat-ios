@@ -30,6 +30,11 @@
   per-frame and aggregate reprojection residuals, source-reported point errors,
   track coverage, out-of-frame features, behind-camera points, and non-finite
   projections without decoding assets or initializing Metal.
+- Added ABI v8 opt-in per-camera log-RGB photometric refinement with bounded,
+  independently stepped Adam state. Because training pixels are sRGB encoded,
+  the learned values are photometric gains rather than physical exposure.
+  Canonical render, evaluation, and export paths remain unchanged; checkpoint
+  v2 preserves gains, moments, per-camera visit counts, and exact frame IDs.
 - Corrected the image-edge versus array-index conversion in Brown-Conrady
   rectification, including alpha=0 crop endpoints and paired mask sampling.
   The renderer now uses an exact homogeneous divide, propagates the missing

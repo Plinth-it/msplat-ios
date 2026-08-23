@@ -70,6 +70,9 @@ def main():
         keep_crs: bool = False
         """Keep input coordinate reference system"""
 
+        refine_photometric_gains: bool = False
+        """Optimize bounded per-camera RGB gains during training"""
+
         save_every: int = -1
         """Save every N steps (-1 to disable)"""
 
@@ -99,6 +102,7 @@ def main():
         max_gaussians=args.max_gaussians,
         split_screen_size=args.split_screen_size,
         keep_crs=args.keep_crs,
+        refine_photometric_gains=args.refine_photometric_gains,
         downscale_factor=args.downscale_factor,
         output=args.output,
         save_every=args.save_every,

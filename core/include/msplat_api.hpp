@@ -33,6 +33,10 @@ struct Config {
     int stopDensifyAt = -1;
     // Hard population and backing-buffer ceiling. -1 means unlimited.
     int maxGaussians = -1;
+    // Learn bounded per-camera log-RGB gains during training. Their mean is
+    // exposure-like and their zero-mean residual is channel balance; source
+    // pixels remain sRGB encoded, so this is not a physical exposure model.
+    bool refinePhotometricGains = false;
     float splitScreenSize = 0.05f;
     bool keepCrs = false;
     float downscaleFactor = 1.0f; // Legacy field retained for ABI compatibility; unused.

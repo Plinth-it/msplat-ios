@@ -41,6 +41,7 @@ struct TrainingConfig {
     int max_gaussians = -1;
     float split_screen_size = 0.05f;
     bool keep_crs = false;
+    bool refine_photometric_gains = false;
     float downscale_factor = 1.0f;
     std::string output = "splat.ply";
     int save_every = -1;
@@ -138,7 +139,8 @@ public:
             cfg.iterations, cfg.keep_crs,
             cfg.bg_color.data(),
             -1,
-            cfg.max_gaussians
+            cfg.max_gaussians,
+            cfg.refine_photometric_gains
         );
 
         cam_indices.resize(dataset.train_cams.size());
@@ -169,7 +171,8 @@ public:
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
-        model->fullIteration(cam, current_step, gt, config.ssim_weight);
+        model->fullIteration(cam, dataset_ptr->train_cams[cam_idx],
+                             current_step, gt, config.ssim_weight);
         model->schedulersStep(current_step);
         model->afterTrain(current_step);
         msplat_commit();
@@ -320,7 +323,8 @@ NB_MODULE(_core, m) {
                 int stop_screen_size_at, float split_screen_size,
                 bool keep_crs, float downscale_factor,
                 const std::string &output, int save_every,
-                std::vector<float> bg_color, int max_gaussians) {
+                std::vector<float> bg_color, int max_gaussians,
+                bool refine_photometric_gains) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -340,6 +344,7 @@ NB_MODULE(_core, m) {
             cfg->output = output;
             cfg->save_every = save_every;
             cfg->max_gaussians = max_gaussians;
+            cfg->refine_photometric_gains = refine_photometric_gains;
             if (bg_color.size() != 3)
                 throw std::invalid_argument("bg_color must have exactly 3 elements [R, G, B]");
             cfg->bg_color = bg_color;
@@ -362,7 +367,8 @@ NB_MODULE(_core, m) {
             "output"_a = "splat.ply",
             "save_every"_a = -1,
             "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f},
-            "max_gaussians"_a = -1)
+            "max_gaussians"_a = -1,
+            "refine_photometric_gains"_a = false)
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
@@ -378,6 +384,8 @@ NB_MODULE(_core, m) {
         .def_rw("max_gaussians", &TrainingConfig::max_gaussians)
         .def_rw("split_screen_size", &TrainingConfig::split_screen_size)
         .def_rw("keep_crs", &TrainingConfig::keep_crs)
+        .def_rw("refine_photometric_gains", &TrainingConfig::refine_photometric_gains,
+            "Optimize bounded per-camera RGB gains during training. Disabled by default.")
         .def_rw("downscale_factor", &TrainingConfig::downscale_factor)
         .def_rw("output", &TrainingConfig::output)
         .def_rw("save_every", &TrainingConfig::save_every)

@@ -19,6 +19,8 @@ class TrainingConfig:
     max_gaussians: int
     split_screen_size: float
     keep_crs: bool
+    refine_photometric_gains: bool
+    """Optimize bounded per-camera RGB gains during training. Disabled by default."""
     downscale_factor: float
     output: str
     save_every: int
@@ -46,6 +48,7 @@ class TrainingConfig:
         save_every: int = -1,
         bg_color: list[float] = ...,
         max_gaussians: int = -1,
+        refine_photometric_gains: bool = False,
     ) -> None: ...
 
 class TrainingStats:

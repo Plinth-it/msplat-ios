@@ -92,6 +92,9 @@ int main(int argc, char *argv[]) {
     app.add_option("--split-screen-size", splitScreenSize, "Screen-space split threshold");
     bool keepCrs = false;
     app.add_flag("--keep-crs", keepCrs, "Retain input coordinate reference system");
+    bool refinePhotometricGains = false;
+    app.add_flag("--refine-photometric-gains", refinePhotometricGains,
+                 "Optimize bounded per-camera RGB gains during training");
     std::vector<float> bgColor = {0.6130f, 0.0101f, 0.3984f};
     app.add_option("--bg-color", bgColor, "Background RGB (0-1), default magenta")
         ->expected(3);
@@ -136,7 +139,8 @@ int main(int argc, char *argv[]) {
                      numIters, keepCrs,
                      bgColor.data(),
                      stopDensifyAt,
-                     maxGaussians);
+                     maxGaussians,
+                     refinePhotometricGains);
 
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);
@@ -163,7 +167,7 @@ int main(int argc, char *argv[]) {
             auto iter_start = cpu_now();
             MTensor gt = images.gpuImage(inputData.cameras, cams[camIdx],
                                          model.getDownscaleFactor(step));
-            model.fullIteration(cam, step, gt, ssimWeight);
+            model.fullIteration(cam, cams[camIdx], step, gt, ssimWeight);
             model.schedulersStep(step);
             model.afterTrain(step);
             msplat_commit();

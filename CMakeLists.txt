@@ -197,6 +197,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             tests/test_projection_math.cpp)
         add_test(NAME msplat_projection_math
             COMMAND msplat_projection_math_tests)
+        add_executable(msplat_photometric_refinement_tests
+            tests/test_photometric_refinement.cpp)
+        add_test(NAME msplat_photometric_refinement_math
+            COMMAND msplat_photometric_refinement_tests)
         add_executable(msplat_masked_metrics_tests
             tests/test_masked_metrics.cpp
             core/src/ssim.cpp)
@@ -218,6 +222,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
                 -P ${CMAKE_SOURCE_DIR}/tests/check_projection_contract.cmake)
+        add_test(NAME msplat_photometric_refinement_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_photometric_refinement_contract.cmake)
     endif()
 endif()
 

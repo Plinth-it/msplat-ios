@@ -31,15 +31,22 @@ def test_training_config_defaults():
     assert cfg.refine_every == 100
     assert cfg.warmup_length == 500
     assert cfg.max_gaussians == -1
+    assert cfg.refine_photometric_gains is False
 
 
 def test_training_config_custom():
     from msplat import TrainingConfig
 
-    cfg = TrainingConfig(iterations=100, sh_degree=1, ssim_weight=0.0)
+    cfg = TrainingConfig(
+        iterations=100,
+        sh_degree=1,
+        ssim_weight=0.0,
+        refine_photometric_gains=True,
+    )
     assert cfg.iterations == 100
     assert cfg.sh_degree == 1
     assert cfg.ssim_weight == 0.0
+    assert cfg.refine_photometric_gains is True
 
 
 def test_training_config_mutable():

@@ -3197,6 +3197,16 @@ constant float GAUSS_1D[11] = {
 
 #define SSIM_TG 16   // threadgroup dimension (16×16 = 256 threads)
 
+constant float PHOTOMETRIC_MAX_ABS_LOG_GAIN = 1.38629436112f; // log(4)
+
+inline float photometric_gain(
+    constant float* log_rgb_gains, uint camera_gain_offset, uint channel) {
+    return exp(clamp(
+        log_rgb_gains[camera_gain_offset + channel],
+        -PHOTOMETRIC_MAX_ABS_LOG_GAIN,
+        PHOTOMETRIC_MAX_ABS_LOG_GAIN));
+}
+
 // Forward pass 1: horizontal convolution of rendered and gt.
 // For each pixel, computes 5 horizontal partial sums per channel:
 //   h_mu_x, h_mu_y, h_sq_x, h_sq_y, h_cross_xy
@@ -3206,6 +3216,9 @@ kernel void ssim_h_fwd_kernel(
     constant float* gt,             // (H, W, 3) HWC
     constant uint2& img_size,       // (W, H)
     device float* ssim_h_buf,       // (H, W, 15)
+    constant float* log_rgb_gains,  // (cameraCount, 3)
+    constant uint& camera_gain_offset,
+    constant uint& photometric_enabled,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3223,6 +3236,14 @@ kernel void ssim_h_fwd_kernel(
     // Load all 3 channels at once: 6 × 16×26 × 4B = 9.75KB shared memory
     threadgroup float tg_gt[3][SSIM_TG][TILE_W];
     threadgroup float tg_rd[3][SSIM_TG][TILE_W];
+    threadgroup float tg_gain[3];
+
+    if (tr < 3) {
+        tg_gain[tr] = photometric_enabled != 0
+            ? photometric_gain(log_rgb_gains, camera_gain_offset, tr)
+            : 1.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint c = 0; c < 3; c++) {
         for (uint i = tr; i < TILE_PIXELS; i += SSIM_TG * SSIM_TG) {
@@ -3234,7 +3255,7 @@ kernel void ssim_h_fwd_kernel(
             if (gx >= 0 && gx < (int)W && gy >= 0 && gy < (int)H) {
                 uint idx = (gy * W + gx) * 3 + c;
                 gv = gt[idx];
-                rv = rendered[idx];
+                rv = rendered[idx] * tg_gain[c];
             }
             tg_gt[c][sy][sx] = gv;
             tg_rd[c][sy][sx] = rv;
@@ -3389,6 +3410,9 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     device atomic_float* loss_sum,
     constant uchar* coverage_mask, // (H, W), ignored when stride is zero
     constant uint& coverage_stride,
+    constant float* log_rgb_gains, // (cameraCount, 3)
+    constant uint& camera_gain_offset,
+    constant uint& photometric_enabled,
     uint2 gid [[thread_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]],
     uint2 tg_size [[threads_per_threadgroup]]
@@ -3400,8 +3424,17 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constexpr uint TILE_DIM = SSIM_TG + 2 * SSIM_HALF_WIN;
     constexpr uint TILE_PIXELS = TILE_DIM * TILE_DIM;
     float ssim_sum = 0.0f, l1_sum = 0.0f, coverage_sum = 0.0f;
+    threadgroup float tg_gain[3];
+
+    if (tr < 3) {
+        tg_gain[tr] = photometric_enabled != 0
+            ? photometric_gain(log_rgb_gains, camera_gain_offset, tr)
+            : 1.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     for (uint c = 0; c < 3; c++) {
+        const float gain = tg_gain[c];
         threadgroup float tg_hp[TILE_DIM][TILE_DIM][5];
         for (uint i = tr; i < TILE_PIXELS; i += SSIM_TG * SSIM_TG) {
             uint sy = i / TILE_DIM, sx = i % TILE_DIM;
@@ -3452,7 +3485,8 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                 if (valid_center) {
                     ssim_sum += coverage * (A * B) / (Cd * D);
                     l1_sum += coverage *
-                        fabs(gt[(gpy*W+gpx)*3+c] - rendered[(gpy*W+gpx)*3+c]);
+                        fabs(gt[(gpy*W+gpx)*3+c] -
+                             rendered[(gpy*W+gpx)*3+c] * gain);
                     coverage_sum += coverage;
                 }
             }
@@ -3585,6 +3619,10 @@ kernel void ssim_v_bwd_kernel(
     constant float& inv_n,          // 255 / (sum(coverage bytes) * 3)
     constant uchar* coverage_mask,  // (H, W), ignored when stride is zero
     constant uint& coverage_stride,
+    constant float* log_rgb_gains,  // (cameraCount, 3)
+    constant uint& camera_gain_offset,
+    device atomic_float* log_gain_gradient, // (3)
+    constant uint& photometric_enabled,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3603,6 +3641,14 @@ kernel void ssim_v_bwd_kernel(
     threadgroup float tg_h1[3][TILE_H][SSIM_TG];
     threadgroup float tg_h2[3][TILE_H][SSIM_TG];
     threadgroup float tg_h3[3][TILE_H][SSIM_TG];
+    threadgroup float tg_gain[3];
+    float3 local_log_gain_gradient = float3(0.0f);
+
+    if (tr < 3) {
+        tg_gain[tr] = photometric_enabled != 0
+            ? photometric_gain(log_rgb_gains, camera_gain_offset, tr)
+            : 1.0f;
+    }
 
     for (uint c = 0; c < 3; c++) {
         for (uint i = tr; i < TILE_PIXELS; i += SSIM_TG * SSIM_TG) {
@@ -3626,6 +3672,7 @@ kernel void ssim_v_bwd_kernel(
 
     if (px < W && py < H) {
         for (uint c = 0; c < 3; c++) {
+            const float gain = tg_gain[c];
             float conv_f1 = 0, conv_f2 = 0, conv_f3 = 0;
             for (uint dy = 0; dy < SSIM_WIN; dy++) {
                 float w = GAUSS_1D[SSIM_WIN - 1 - dy];
@@ -3635,7 +3682,8 @@ kernel void ssim_v_bwd_kernel(
             }
 
             uint pixel_channel = (py * W + px) * 3 + c;
-            float rend_val = rendered_gradient[pixel_channel];
+            const float raw_rend_val = rendered_gradient[pixel_channel];
+            const float rend_val = raw_rend_val * gain;
             float gt_val = gt[(py * W + px) * 3 + c];
 
             float v_ssim = conv_f1 + rend_val * conv_f2 + gt_val * conv_f3;
@@ -3646,11 +3694,76 @@ kernel void ssim_v_bwd_kernel(
                 (gt_val > rend_val) ? -1.0f :
                 ((gt_val < rend_val) ? 1.0f : 0.0f));
 
-            rendered_gradient[pixel_channel] = inv_n * (
+            const float adjusted_gradient = inv_n * (
                 -ssim_weight * v_ssim + (1.0f - ssim_weight) * v_l1
             );
+            rendered_gradient[pixel_channel] = adjusted_gradient * gain;
+            local_log_gain_gradient[c] = adjusted_gradient * rend_val;
         }
     }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (photometric_enabled != 0) {
+        for (uint c = 0; c < 3; ++c)
+            tg_h1[c][lid.y][lid.x] = local_log_gain_gradient[c];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const uint tg_total = SSIM_TG * SSIM_TG;
+        for (uint stride = tg_total / 2; stride > 0; stride >>= 1) {
+            if (tr < stride) {
+                const uint row = tr / SSIM_TG;
+                const uint column = tr % SSIM_TG;
+                const uint other = tr + stride;
+                const uint other_row = other / SSIM_TG;
+                const uint other_column = other % SSIM_TG;
+                for (uint c = 0; c < 3; ++c) {
+                    tg_h1[c][row][column] +=
+                        tg_h1[c][other_row][other_column];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (tr == 0) {
+            for (uint c = 0; c < 3; ++c) {
+                atomic_fetch_add_explicit(
+                    log_gain_gradient + c,
+                    tg_h1[c][0][0], memory_order_relaxed);
+            }
+        }
+    }
+}
+
+kernel void photometric_adam_kernel(
+    device float* log_rgb_gains,
+    constant float* log_gain_gradient,
+    device float* exp_avg,
+    device float* exp_avg_sq,
+    constant uint& camera_gain_offset,
+    constant float& step_size,
+    constant float& beta1,
+    constant float& beta2,
+    constant float& bias_correction2_sqrt,
+    constant float& eps,
+    constant float& regularization,
+    constant float& max_abs_log_gain,
+    uint channel [[thread_position_in_grid]]) {
+    if (channel >= 3) return;
+    const uint index = camera_gain_offset + channel;
+    const float parameter = log_rgb_gains[index];
+    const float gradient =
+        log_gain_gradient[channel] + regularization * parameter;
+    const float first_moment =
+        beta1 * exp_avg[index] + (1.0f - beta1) * gradient;
+    const float second_moment =
+        beta2 * exp_avg_sq[index] +
+        (1.0f - beta2) * gradient * gradient;
+    exp_avg[index] = first_moment;
+    exp_avg_sq[index] = second_moment;
+    const float denominator =
+        sqrt(second_moment) / bias_correction2_sqrt + eps;
+    log_rgb_gains[index] = clamp(
+        parameter - step_size * first_moment / denominator,
+        -max_abs_log_gain, max_abs_log_gain);
 }
 
 // ============================================================

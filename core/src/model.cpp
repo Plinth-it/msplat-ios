@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <random>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include "model.hpp"
 #include "atomic_output.hpp"
@@ -42,6 +43,13 @@ constexpr bool needsDensificationAfterStep(int64_t completedStep,
                                            int64_t stopStep) {
     return completedStep + 1 < stopStep;
 }
+
+constexpr float kPhotometricLearningRate = 1.0e-3f;
+constexpr float kPhotometricRegularization = 1.0e-4f;
+constexpr float kPhotometricMaxAbsLogGain = 1.38629436112f; // log(4)
+constexpr size_t kPhotometricMaxCameras = 1'000'000;
+constexpr size_t kPhotometricMaxFrameIdBytes = 1U << 20;
+constexpr size_t kPhotometricMaxFrameIdentityBytes = 64U << 20;
 
 static_assert(!collectsDensificationStats(1, 0));
 static_assert(!collectsDensificationStats(1, 1));
@@ -108,14 +116,18 @@ Model::Model(const InputData &inputData, int numCameras,
     int maxSteps, bool keepCrs,
     const float* bgColor,
     int stopDensifyAt,
-    int maxGaussians)
-    : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
+    int maxGaussians,
+    bool refinePhotometricGains)
+    : numCameras(numCameras),
+      datasetCameraCount(0),
+      numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), configuredSHDegree(shDegree),
       shDegreeInterval(shDegreeInterval),
       refineEvery(refineEvery), warmupLength(warmupLength), resetAlphaEvery(resetAlphaEvery),
       stopSplitAt(stopDensifyAt >= 0 ? stopDensifyAt : maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
-      maxSteps(maxSteps), maxGaussians(maxGaussians), keepCrs(keepCrs) {
+      maxSteps(maxSteps), maxGaussians(maxGaussians),
+      refinePhotometricGains(refinePhotometricGains), keepCrs(keepCrs) {
 
     if (inputData.points.count <= 0)
         throw std::invalid_argument("Dataset must contain sparse points");
@@ -125,8 +137,46 @@ Model::Model(const InputData &inputData, int numCameras,
         throw std::invalid_argument("Dataset contains too many sparse points");
     if (maxGaussians > 0 && inputData.points.count > maxGaussians)
         throw std::invalid_argument("maxGaussians is below the initial Gaussian count");
-    if (numCameras <= 0)
+    if (inputData.cameras.empty() ||
+        inputData.cameras.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument(
+            "Dataset camera count is outside the supported range");
+    }
+    if (numCameras <= 0 ||
+        numCameras > static_cast<int>(inputData.cameras.size()))
         throw std::invalid_argument("Dataset must contain training cameras");
+    datasetCameraCount = static_cast<int>(inputData.cameras.size());
+    if (refinePhotometricGains) {
+        if (inputData.cameras.size() > kPhotometricMaxCameras) {
+            throw std::invalid_argument(
+                "Photometric refinement camera count is too large");
+        }
+        if (inputData.metadata.frameIds.size() != inputData.cameras.size()) {
+            throw std::invalid_argument(
+                "Photometric refinement requires a stable ID for every camera");
+        }
+        std::unordered_set<std::string> uniqueFrameIds;
+        uniqueFrameIds.reserve(inputData.metadata.frameIds.size());
+        size_t totalFrameIdBytes = 0;
+        for (const std::string& frameId : inputData.metadata.frameIds) {
+            if (frameId.empty() ||
+                frameId.size() > kPhotometricMaxFrameIdBytes) {
+                throw std::invalid_argument(
+                    "Photometric camera IDs must be non-empty and bounded");
+            }
+            if (frameId.size() >
+                kPhotometricMaxFrameIdentityBytes - totalFrameIdBytes) {
+                throw std::invalid_argument(
+                    "Photometric camera IDs exceed the aggregate size limit");
+            }
+            totalFrameIdBytes += frameId.size();
+            if (!uniqueFrameIds.insert(frameId).second) {
+                throw std::invalid_argument(
+                    "Photometric camera IDs must be unique");
+            }
+        }
+    }
     if (numDownscales < 0 || numDownscales > 30)
         throw std::invalid_argument("numDownscales must be in 0...30");
     if (resolutionSchedule <= 0)
@@ -160,6 +210,8 @@ Model::Model(const InputData &inputData, int numCameras,
     }
 
     int64_t numPoints = inputData.points.count;
+    if (refinePhotometricGains)
+        cameraFrameIds = inputData.metadata.frameIds;
     scale = inputData.scale;
     memcpy(translation, inputData.translation, sizeof(translation));
 
@@ -256,6 +308,20 @@ void Model::setupOptimizers(){
     means_lr_init = 0.00016f;
     means_lr_final = 0.0000016f;
 
+    const int photometricRows = refinePhotometricGains
+        ? datasetCameraCount
+        : 1;
+    cameraLogGains = gpu_zeros(
+        {photometricRows, 3}, DType::Float32);
+    if (refinePhotometricGains) {
+        cameraLogGainExpAvg = gpu_zeros(
+            {photometricRows, 3}, DType::Float32);
+        cameraLogGainExpAvgSq = gpu_zeros(
+            {photometricRows, 3}, DType::Float32);
+        cameraLogGainStepCounts.assign(
+            static_cast<size_t>(datasetCameraCount), 0);
+    }
+
     refreshViews();
 }
 
@@ -318,6 +384,9 @@ void Model::releaseOptimizers(){
     }
     means_buf.reset(); scales_buf.reset(); quats_buf.reset();
     featuresDc_buf.reset(); featuresRest_buf.reset(); opacities_buf.reset();
+    cameraLogGains.reset();
+    cameraLogGainExpAvg.reset(); cameraLogGainExpAvgSq.reset();
+    cameraLogGainStepCounts.clear();
     resetDensificationScratch();
 }
 
@@ -348,7 +417,8 @@ size_t Model::estimatedGpuBytes() const {
         &densify_compact_scratch, &densify_random_samples,
         // `radii` is a non-owning alias of the shared render cache's radii_out
         // buffer, so counting it here would report the same allocation twice.
-        &xysGradNorm, &visCounts, &max2DSize, &backgroundColor
+        &xysGradNorm, &visCounts, &max2DSize, &backgroundColor,
+        &cameraLogGains, &cameraLogGainExpAvg, &cameraLogGainExpAvgSq
     };
     for (const MTensor* tensor : tensors) {
         if (tensor->defined()) bytes += tensor->nbytes();
@@ -607,9 +677,16 @@ int Model::loadPly(const std::string &filename){
 // ── Checkpoint save/load ────────────────────────────────────────────────────
 
 static constexpr uint32_t CKPT_MAGIC = 0x4C50534D; // "MSPL"
-static constexpr uint32_t CKPT_VERSION = 1;
+static constexpr uint32_t CKPT_VERSION = 2;
+static constexpr uint32_t CKPT_MIN_VERSION = 1;
+static constexpr uint32_t CKPT_MAX_CAMERAS =
+    static_cast<uint32_t>(kPhotometricMaxCameras);
+static constexpr uint32_t CKPT_MAX_FRAME_ID_BYTES =
+    static_cast<uint32_t>(kPhotometricMaxFrameIdBytes);
+static constexpr uint64_t CKPT_MAX_FRAME_ID_TOTAL_BYTES =
+    kPhotometricMaxFrameIdentityBytes;
 
-static_assert(sizeof(float) == 4, "Checkpoint v1 requires 32-bit floats");
+static_assert(sizeof(float) == 4, "Checkpoint format requires 32-bit floats");
 
 static void writeTensor(std::ofstream &f, MTensor &t) {
     uint32_t ndim = t.ndim();
@@ -621,6 +698,15 @@ static void writeTensor(std::ofstream &f, MTensor &t) {
     uint64_t bytes = t.nbytes();
     f.write(reinterpret_cast<const char*>(&bytes), sizeof(bytes));
     f.write(reinterpret_cast<const char*>(t.data_ptr()), bytes);
+}
+
+static void writeCheckpointString(std::ofstream &f, const std::string &value) {
+    if (value.size() > CKPT_MAX_FRAME_ID_BYTES)
+        throw std::runtime_error("Checkpoint frame ID is too long");
+    const uint32_t length = static_cast<uint32_t>(value.size());
+    f.write(reinterpret_cast<const char*>(&length), sizeof(length));
+    if (length > 0)
+        f.write(value.data(), static_cast<std::streamsize>(length));
 }
 
 namespace {
@@ -704,6 +790,7 @@ public:
     }
 
     uint64_t offset() const { return cursor; }
+    uint64_t remaining() const { return totalBytes - cursor; }
 
     void requireFullyConsumed() const {
         if (cursor != totalBytes)
@@ -754,7 +841,7 @@ CheckpointTensorRecord readTensorRecord(CheckpointReader &reader,
             checkpointError(name + " has an incompatible shape");
     }
 
-    // Checkpoint v1 stores Float32 tensors without a separate dtype tag. An
+    // Checkpoint tensors are Float32 without a separate dtype tag. An
     // exact shape-derived byte count is therefore also its dtype validation.
     const uint64_t expectedBytes = tensorByteCount(expectedShape, name);
     const uint64_t declaredBytes = reader.scalar<uint64_t>(name + ".bytes");
@@ -770,6 +857,7 @@ CheckpointTensorRecord readTensorRecord(CheckpointReader &reader,
 }
 
 struct ParsedCheckpoint {
+    uint32_t version = 0;
     uint32_t step = 0;
     uint32_t numPoints = 0;
     uint32_t shDegree = 0;
@@ -780,6 +868,11 @@ struct ParsedCheckpoint {
     std::array<CheckpointTensorRecord, Model::N_ADAM_GROUPS> parameters;
     std::array<CheckpointTensorRecord, Model::N_ADAM_GROUPS> adamExpAvg;
     std::array<CheckpointTensorRecord, Model::N_ADAM_GROUPS> adamExpAvgSq;
+    bool photometricEnabled = false;
+    uint32_t cameraCount = 0;
+    std::vector<std::string> cameraFrameIds;
+    std::vector<uint32_t> cameraStepCounts;
+    std::array<CheckpointTensorRecord, 3> photometricTensors;
 };
 
 ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
@@ -787,11 +880,12 @@ ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
     const uint32_t version = reader.scalar<uint32_t>("version");
     if (magic != CKPT_MAGIC)
         throw std::runtime_error("Not a valid msplat checkpoint file");
-    if (version != CKPT_VERSION)
+    if (version < CKPT_MIN_VERSION || version > CKPT_VERSION)
         throw std::runtime_error("Unsupported checkpoint version: " +
                                  std::to_string(version));
 
     ParsedCheckpoint checkpoint;
+    checkpoint.version = version;
     checkpoint.step = reader.scalar<uint32_t>("step");
     checkpoint.numPoints = reader.scalar<uint32_t>("num_points");
     checkpoint.shDegree = reader.scalar<uint32_t>("sh_degree");
@@ -847,6 +941,93 @@ ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
         checkpoint.adamExpAvgSq[group] = readTensorRecord(
             reader, expectedShapes[group],
             std::string("adam_exp_avg_sq.") + parameterNames[group]);
+
+    if (version >= 2) {
+        const uint32_t photometricEnabled =
+            reader.scalar<uint32_t>("photometric enabled");
+        if (photometricEnabled > 1)
+            checkpointError("photometric enabled flag is invalid");
+        checkpoint.photometricEnabled = photometricEnabled != 0;
+        if (checkpoint.photometricEnabled) {
+            checkpoint.cameraCount =
+                reader.scalar<uint32_t>("photometric camera count");
+            if (checkpoint.cameraCount == 0 ||
+                checkpoint.cameraCount > CKPT_MAX_CAMERAS ||
+                checkpoint.cameraCount >
+                    static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+                checkpointError(
+                    "photometric camera count is outside the supported range");
+            }
+
+            // Reject a tiny file with an attacker-sized count before reserving
+            // per-camera containers. A complete enabled payload needs at least
+            // one ID byte, its length/count fields, three tensor records, and
+            // three Float32 RGB tensor payloads per camera.
+            constexpr uint64_t minimumTensorRecordBytes =
+                sizeof(uint32_t) + 2 * sizeof(int64_t) + sizeof(uint64_t);
+            constexpr uint64_t minimumPerCameraBytes =
+                sizeof(uint32_t) + 1 + sizeof(uint32_t) +
+                3 * 3 * sizeof(float);
+            const uint64_t minimumRemainingBytes =
+                checkedMultiply(checkpoint.cameraCount,
+                                minimumPerCameraBytes,
+                                "photometric checkpoint minimum") +
+                3 * minimumTensorRecordBytes;
+            if (reader.remaining() < minimumRemainingBytes)
+                checkpointError("truncated photometric checkpoint payload");
+
+            checkpoint.cameraFrameIds.reserve(checkpoint.cameraCount);
+            std::unordered_set<std::string> uniqueFrameIds;
+            uniqueFrameIds.reserve(checkpoint.cameraCount);
+            uint64_t totalFrameIdBytes = 0;
+            for (uint32_t camera = 0; camera < checkpoint.cameraCount; ++camera) {
+                const uint32_t length =
+                    reader.scalar<uint32_t>("photometric frame ID length");
+                if (length == 0 || length > CKPT_MAX_FRAME_ID_BYTES)
+                    checkpointError("photometric frame ID length is invalid");
+                if (length >
+                    CKPT_MAX_FRAME_ID_TOTAL_BYTES - totalFrameIdBytes) {
+                    checkpointError(
+                        "photometric frame IDs exceed the aggregate size limit");
+                }
+                totalFrameIdBytes += length;
+                std::string frameId(length, '\0');
+                reader.bytes(frameId.data(), length, "photometric frame ID");
+                if (!uniqueFrameIds.insert(frameId).second)
+                    checkpointError("photometric frame IDs are not unique");
+                checkpoint.cameraFrameIds.push_back(std::move(frameId));
+            }
+
+            checkpoint.cameraStepCounts.resize(checkpoint.cameraCount);
+            reader.bytes(
+                checkpoint.cameraStepCounts.data(),
+                checkedMultiply(checkpoint.cameraCount, sizeof(uint32_t),
+                                "photometric step counts"),
+                "photometric step counts");
+            uint64_t totalPhotometricSteps = 0;
+            for (uint32_t count : checkpoint.cameraStepCounts) {
+                if (count > checkpoint.adamSteps ||
+                    totalPhotometricSteps >
+                        static_cast<uint64_t>(checkpoint.adamSteps - count)) {
+                    checkpointError(
+                        "photometric step counts are inconsistent with Adam state");
+                }
+                totalPhotometricSteps += count;
+            }
+
+            const std::vector<int64_t> photometricShape = {
+                static_cast<int64_t>(checkpoint.cameraCount), 3};
+            static constexpr const char* photometricNames[3] = {
+                "photometric.log_rgb_gains",
+                "photometric.adam_exp_avg",
+                "photometric.adam_exp_avg_sq",
+            };
+            for (size_t tensor = 0; tensor < 3; ++tensor) {
+                checkpoint.photometricTensors[tensor] = readTensorRecord(
+                    reader, photometricShape, photometricNames[tensor]);
+            }
+        }
+    }
 
     reader.requireFullyConsumed();
     return checkpoint;
@@ -912,6 +1093,87 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
     for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg[g]);
     for (int g = 0; g < N_ADAM_GROUPS; g++) writeTensor(f, adam_exp_avg_sq[g]);
 
+    // Version 2 extension. Gains model the source images only; stable frame
+    // identities prevent optimizer rows from silently attaching to a different
+    // camera order after resume.
+    u = refinePhotometricGains ? 1u : 0u;
+    f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+    if (refinePhotometricGains) {
+        auto hasPhotometricShape = [&](const MTensor& tensor) {
+            return tensor.defined() && tensor.isGpu() &&
+                tensor.dtype() == DType::Float32 && tensor.ndim() == 2 &&
+                tensor.size(0) == datasetCameraCount && tensor.size(1) == 3;
+        };
+        if (datasetCameraCount <= 0 || adam_step_count < 0 ||
+            static_cast<size_t>(datasetCameraCount) >
+                kPhotometricMaxCameras ||
+            cameraFrameIds.size() !=
+                static_cast<size_t>(datasetCameraCount) ||
+            cameraLogGainStepCounts.size() !=
+                static_cast<size_t>(datasetCameraCount) ||
+            !hasPhotometricShape(cameraLogGains) ||
+            !hasPhotometricShape(cameraLogGainExpAvg) ||
+            !hasPhotometricShape(cameraLogGainExpAvgSq)) {
+            throw std::runtime_error(
+                "Photometric checkpoint state is incomplete");
+        }
+
+        std::unordered_set<std::string> uniqueFrameIds;
+        uniqueFrameIds.reserve(cameraFrameIds.size());
+        size_t totalFrameIdBytes = 0;
+        for (const std::string& frameId : cameraFrameIds) {
+            if (frameId.empty() ||
+                frameId.size() > kPhotometricMaxFrameIdBytes ||
+                frameId.size() >
+                    kPhotometricMaxFrameIdentityBytes - totalFrameIdBytes ||
+                !uniqueFrameIds.insert(frameId).second) {
+                throw std::runtime_error(
+                    "Photometric checkpoint camera identities are invalid");
+            }
+            totalFrameIdBytes += frameId.size();
+        }
+
+        uint64_t totalPhotometricSteps = 0;
+        for (uint32_t count : cameraLogGainStepCounts) {
+            if (count > static_cast<uint32_t>(adam_step_count) ||
+                totalPhotometricSteps >
+                    static_cast<uint64_t>(adam_step_count) - count) {
+                throw std::runtime_error(
+                    "Photometric checkpoint step counts are invalid");
+            }
+            totalPhotometricSteps += count;
+        }
+
+        const int64_t valueCount =
+            static_cast<int64_t>(datasetCameraCount) * 3;
+        const float* gains = cameraLogGains.data<float>();
+        const float* firstMoments = cameraLogGainExpAvg.data<float>();
+        const float* secondMoments = cameraLogGainExpAvgSq.data<float>();
+        for (int64_t value = 0; value < valueCount; ++value) {
+            if (!std::isfinite(gains[value]) ||
+                std::abs(gains[value]) >
+                    kPhotometricMaxAbsLogGain + 1.0e-6f ||
+                !std::isfinite(firstMoments[value]) ||
+                !std::isfinite(secondMoments[value]) ||
+                secondMoments[value] < 0.0f) {
+                throw std::runtime_error(
+                    "Photometric checkpoint tensor data is invalid");
+            }
+        }
+
+        u = static_cast<uint32_t>(datasetCameraCount);
+        f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+        for (const std::string& frameId : cameraFrameIds)
+            writeCheckpointString(f, frameId);
+        f.write(
+            reinterpret_cast<const char*>(cameraLogGainStepCounts.data()),
+            static_cast<std::streamsize>(
+                cameraLogGainStepCounts.size() * sizeof(uint32_t)));
+        writeTensor(f, cameraLogGains);
+        writeTensor(f, cameraLogGainExpAvg);
+        writeTensor(f, cameraLogGainExpAvgSq);
+    }
+
     f.flush();
     if (!f) throw std::runtime_error("Failed while writing checkpoint file: " + filename);
     f.close();
@@ -935,6 +1197,15 @@ int Model::loadCheckpoint(const std::string &filename) {
         checkpointError("SH degree does not match the configured training degree");
     if (maxGaussians > 0 && activeCount > maxGaussians)
         checkpointError("Gaussian count exceeds maxGaussians");
+    if (checkpoint.photometricEnabled && !refinePhotometricGains)
+        checkpointError(
+            "checkpoint requires photometric refinement to be enabled");
+    if (checkpoint.photometricEnabled &&
+        (checkpoint.cameraCount != static_cast<uint32_t>(datasetCameraCount) ||
+         checkpoint.cameraFrameIds != cameraFrameIds)) {
+        checkpointError(
+            "photometric camera identities do not match the dataset");
+    }
     const int capacity = capacityFor(activeCount);
     if (capacity < activeCount)
         checkpointError("Gaussian capacity calculation overflowed");
@@ -958,6 +1229,52 @@ int Model::loadCheckpoint(const std::string &filename) {
         newAdamExpAvgSqBuffers[group] = loadCheckpointBuffer(
             reader, checkpoint.adamExpAvgSq[group], capacity,
             std::string("adam_exp_avg_sq.") + parameterNames[group]);
+    }
+
+    const int photometricRows = refinePhotometricGains
+        ? datasetCameraCount
+        : 1;
+    MTensor newCameraLogGains;
+    MTensor newCameraLogGainExpAvg;
+    MTensor newCameraLogGainExpAvgSq;
+    std::vector<uint32_t> newCameraLogGainStepCounts;
+    if (checkpoint.photometricEnabled) {
+        newCameraLogGains = loadCheckpointBuffer(
+            reader, checkpoint.photometricTensors[0], datasetCameraCount,
+            "photometric.log_rgb_gains");
+        newCameraLogGainExpAvg = loadCheckpointBuffer(
+            reader, checkpoint.photometricTensors[1], datasetCameraCount,
+            "photometric.adam_exp_avg");
+        newCameraLogGainExpAvgSq = loadCheckpointBuffer(
+            reader, checkpoint.photometricTensors[2], datasetCameraCount,
+            "photometric.adam_exp_avg_sq");
+        newCameraLogGainStepCounts = checkpoint.cameraStepCounts;
+
+        const int64_t valueCount =
+            static_cast<int64_t>(datasetCameraCount) * 3;
+        const float* gains = newCameraLogGains.data<float>();
+        const float* firstMoments = newCameraLogGainExpAvg.data<float>();
+        const float* secondMoments = newCameraLogGainExpAvgSq.data<float>();
+        for (int64_t value = 0; value < valueCount; ++value) {
+            if (!std::isfinite(gains[value]) ||
+                std::abs(gains[value]) > kPhotometricMaxAbsLogGain + 1.0e-6f ||
+                !std::isfinite(firstMoments[value]) ||
+                !std::isfinite(secondMoments[value]) ||
+                secondMoments[value] < 0.0f) {
+                checkpointError("photometric tensor data is invalid");
+            }
+        }
+    } else {
+        newCameraLogGains = gpu_zeros(
+            {photometricRows, 3}, DType::Float32);
+        if (refinePhotometricGains) {
+            newCameraLogGainExpAvg = gpu_zeros(
+                {photometricRows, 3}, DType::Float32);
+            newCameraLogGainExpAvgSq = gpu_zeros(
+                {photometricRows, 3}, DType::Float32);
+            newCameraLogGainStepCounts.assign(
+                static_cast<size_t>(datasetCameraCount), 0);
+        }
     }
 
     DensificationScratch newDensificationScratch;
@@ -1011,6 +1328,10 @@ int Model::loadCheckpoint(const std::string &filename) {
         adam_exp_avg_sq_buf[group] = std::move(newAdamExpAvgSqBuffers[group]);
         adam_exp_avg_sq[group] = std::move(newAdamExpAvgSqViews[group]);
     }
+    cameraLogGains = std::move(newCameraLogGains);
+    cameraLogGainExpAvg = std::move(newCameraLogGainExpAvg);
+    cameraLogGainExpAvgSq = std::move(newCameraLogGainExpAvgSq);
+    cameraLogGainStepCounts = std::move(newCameraLogGainStepCounts);
 
     densify_split_flag = std::move(newDensificationScratch.splitFlag);
     densify_dup_flag = std::move(newDensificationScratch.dupFlag);
@@ -1128,9 +1449,37 @@ void Model::fullIteration(Camera& cam, int step, MTensor& gt,
     fullIteration(cam, step, target, ssimWeight);
 }
 
+void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
+                          MTensor& gt, float ssimWeight) {
+    uint64_t coverageUnits = 0;
+    if (gt.ndim() >= 2 && gt.size(0) > 0 && gt.size(1) > 0) {
+        const uint64_t pixels = static_cast<uint64_t>(gt.size(0)) *
+            static_cast<uint64_t>(gt.size(1));
+        if (pixels <= std::numeric_limits<uint64_t>::max() / 255u)
+            coverageUnits = pixels * 255u;
+    }
+    CameraTrainingTarget target{&gt, nullptr, coverageUnits};
+    fullIteration(cam, cameraIndex, step, target, ssimWeight);
+}
+
 void Model::fullIteration(Camera& cam, int step,
                           const CameraTrainingTarget& target,
                           float ssimWeight){
+    if (refinePhotometricGains) {
+        throw std::invalid_argument(
+            "Photometric refinement requires a canonical camera index");
+    }
+    fullIteration(cam, 0, step, target, ssimWeight);
+}
+
+void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
+                          const CameraTrainingTarget& target,
+                          float ssimWeight){
+    if (refinePhotometricGains &&
+        cameraIndex >= static_cast<size_t>(datasetCameraCount)) {
+        throw std::out_of_range(
+            "Photometric camera index is out of range");
+    }
     const bool collectDensificationStats =
         collectsDensificationStats(step, stopSplitAt);
     if (!collectDensificationStats) {
@@ -1208,12 +1557,41 @@ void Model::fullIteration(Camera& cam, int step,
         adam_bc2s[i] = std::sqrt(bc2);
     }
 
+    MsplatPhotometricRefinementStep photometric;
+    photometric.enabled = refinePhotometricGains;
+    photometric.cameraIndex = refinePhotometricGains
+        ? static_cast<uint32_t>(cameraIndex)
+        : 0u;
+    photometric.logRgbGains = &cameraLogGains;
+    uint32_t previousPhotometricStep = 0;
+    uint32_t nextPhotometricStep = 0;
+    if (refinePhotometricGains) {
+        previousPhotometricStep = cameraLogGainStepCounts[cameraIndex];
+        if (previousPhotometricStep == std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error(
+                "Photometric optimizer step count cannot be incremented further");
+        }
+        nextPhotometricStep = previousPhotometricStep + 1;
+        const float photoBc1 = 1.0f -
+            std::pow(adam_beta1, static_cast<float>(nextPhotometricStep));
+        const float photoBc2 = 1.0f -
+            std::pow(adam_beta2, static_cast<float>(nextPhotometricStep));
+        photometric.expAvg = &cameraLogGainExpAvg;
+        photometric.expAvgSq = &cameraLogGainExpAvgSq;
+        photometric.adamStepSize = kPhotometricLearningRate / photoBc1;
+        photometric.adamBiasCorrection2Sqrt = std::sqrt(photoBc2);
+        photometric.regularization = kPhotometricRegularization;
+        photometric.maxAbsLogGain = kPhotometricMaxAbsLogGain;
+    }
+
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     const float lossInvN = static_cast<float>(
         255.0 / (static_cast<double>(target.coverageUnits) * 3.0));
 
     MTensor r;
     adam_step_count = nextAdamStep;
+    if (refinePhotometricGains)
+        cameraLogGainStepCounts[cameraIndex] = nextPhotometricStep;
     try {
         r = msplat_train_step(
             numPoints, means, scales, 1.0f,
@@ -1227,10 +1605,13 @@ void Model::fullIteration(Camera& cam, int step,
             adam_p, adam_ea, adam_eas,
             adam_ss, adam_bc2s,
             adam_beta1, adam_beta2, adam_eps,
+            photometric,
             collectDensificationStats,
             visCounts, xysGradNorm, max2DSize, invMaxDim);
     } catch (...) {
         adam_step_count = previousAdamStep;
+        if (refinePhotometricGains)
+            cameraLogGainStepCounts[cameraIndex] = previousPhotometricStep;
         throw;
     }
 

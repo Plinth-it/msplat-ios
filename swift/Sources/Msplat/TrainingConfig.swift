@@ -18,6 +18,10 @@ public struct TrainingConfig: Sendable {
     public var stopDensifyAt: Int32 = -1
     public var splitScreenSize: Float = 0.05
     public var keepCrs: Bool = false
+    /// Learn bounded per-camera RGB gains while evaluating the training loss.
+    /// The source images are sRGB encoded, so this is a photometric correction,
+    /// not a physical linear-light exposure model. Canonical renders are unchanged.
+    public var refinePhotometricGains: Bool = false
     /// Legacy ABI field. Use `DatasetOptions.downscaleFactor`; this value does
     /// not affect training resolution.
     public var downscaleFactor: Float = 1.0
@@ -104,5 +108,13 @@ public struct TrainingConfig: Sendable {
         c.downscaleFactor = downscaleFactor
         c.bgColor = (bgColor.0, bgColor.1, bgColor.2)
         return c
+    }
+
+    func toRefinementOptionsV8() -> MsplatRefinementOptionsV8 {
+        var options = msplat_default_refinement_options_v8()
+        if refinePhotometricGains {
+            options.flags |= UInt32(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS)
+        }
+        return options
     }
 }

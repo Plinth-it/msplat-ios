@@ -11,7 +11,21 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(config.iterations, 30_000)
         XCTAssertEqual(config.shDegree, 3)
         XCTAssertEqual(config.ssimWeight, 0.2, accuracy: 0.001)
+        XCTAssertFalse(config.refinePhotometricGains)
+        XCTAssertEqual(config.toRefinementOptionsV8().flags, 0)
         XCTAssertNoThrow(try config.validate())
+    }
+
+    func testPhotometricRefinementMapsToVersionedNativeOptions() {
+        var config = TrainingConfig()
+        config.refinePhotometricGains = true
+
+        let options = config.toRefinementOptionsV8()
+        XCTAssertEqual(
+            options.flags,
+            UInt32(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS)
+        )
+        XCTAssertEqual(MemoryLayout<MsplatRefinementOptionsV8>.size, 16)
     }
 
     func testInvalidConfigIsRejected() {

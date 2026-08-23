@@ -728,6 +728,7 @@ struct MetalContext {
     id<MTLComputePipelineState> ssim_v_fwd_kernel_cpso = nil;
     id<MTLComputePipelineState> ssim_fused_v_fwd_h_bwd_kernel_cpso = nil;
     id<MTLComputePipelineState> ssim_v_bwd_kernel_cpso = nil;
+    id<MTLComputePipelineState> photometric_adam_kernel_cpso = nil;
     // Backward pipeline kernels
     id<MTLComputePipelineState> project_and_sh_backward_kernel_cpso = nil;
     id<MTLComputePipelineState> fused_adam_kernel_cpso = nil;
@@ -770,6 +771,7 @@ struct MetalContext {
             ssim_v_fwd_kernel_cpso,
             ssim_fused_v_fwd_h_bwd_kernel_cpso,
             ssim_v_bwd_kernel_cpso,
+            photometric_adam_kernel_cpso,
             project_and_sh_backward_kernel_cpso,
             fused_adam_kernel_cpso,
             accumulate_grad_stats_kernel_cpso,
@@ -969,6 +971,7 @@ MetalContext* init_msplat_metal_context() {
     ctx->ssim_v_fwd_kernel_cpso                   = load(@"ssim_v_fwd_kernel");
     ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso       = load(@"ssim_fused_v_fwd_h_bwd_kernel");
     ctx->ssim_v_bwd_kernel_cpso                   = load(@"ssim_v_bwd_kernel");
+    ctx->photometric_adam_kernel_cpso              = load(@"photometric_adam_kernel");
     // Backward pipeline
     ctx->project_and_sh_backward_kernel_cpso      = load(@"project_and_sh_backward_kernel");
     ctx->fused_adam_kernel_cpso                    = load(@"fused_adam_kernel");
@@ -1210,6 +1213,7 @@ struct FusedTensorCache {
 
     // Training-only image and backward depth-chunked buffers
     MTensor ssim_deriv_h_buf, ssim_h_buf, loss_sum;
+    MTensor photometric_gradient;
     int backward_chunk_K_max = -1, backward_chunk_height = -1, backward_chunk_width = -1;
     MTensor prefix_T, after_C;
 
@@ -1236,6 +1240,7 @@ struct FusedTensorCache {
     size_t trainingEstimatedBytes() const {
         const MTensor* tensors[] = {
             &ssim_deriv_h_buf, &ssim_h_buf, &loss_sum,
+            &photometric_gradient,
             &prefix_T, &after_C,
             &v_xy, &v_conic, &v_colors_rast, &v_opacity, &v_depth,
             &v_mean3d, &v_scale, &v_quat
@@ -1366,19 +1371,20 @@ struct FusedTensorCache {
     void ensure_training_image(int ih, int iw, id<MTLDevice> dev) {
         if (ih == training_img_height && iw == training_img_width &&
             ssim_deriv_h_buf.defined() && ssim_h_buf.defined() &&
-            loss_sum.defined()) {
+            loss_sum.defined() && photometric_gradient.defined()) {
             return;
         }
 
         training_img_height = -1; training_img_width = -1;
         ssim_deriv_h_buf.reset(); ssim_h_buf.reset();
-        loss_sum.reset();
+        loss_sum.reset(); photometric_gradient.reset();
 
         ssim_deriv_h_buf = mtensor_empty(
             dev, {(int64_t)ih, (int64_t)iw, 9}, DType::Float32);
         ssim_h_buf = mtensor_empty(
             dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
         loss_sum = mtensor_empty(dev, {1}, DType::Float32);
+        photometric_gradient = mtensor_empty(dev, {3}, DType::Float32);
         training_img_height = ih; training_img_width = iw;
     }
 
@@ -1829,6 +1835,7 @@ MTensor msplat_train_step(
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
+    const MsplatPhotometricRefinementStep& photometric,
     bool collect_densification_stats,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
     float inv_max_dim
@@ -1873,6 +1880,63 @@ MTensor msplat_train_step(
     const MTensor& loss_coverage_buffer = coverage_mask ? *coverage_mask : gt;
     const uint32_t coverage_stride = coverage_mask ? img_width : 0u;
 
+    auto validatePhotometricTensor = [](const MTensor* tensor,
+                                        const char* name) {
+        if (!tensor || !tensor->defined() || !tensor->isGpu() ||
+            tensor->dtype() != DType::Float32 || tensor->ndim() != 2 ||
+            tensor->size(0) <= 0 || tensor->size(1) != 3) {
+            throw std::invalid_argument(
+                std::string(name) + " must be a non-empty GPU Float32 [N,3] tensor");
+        }
+    };
+    validatePhotometricTensor(photometric.logRgbGains,
+                              "Photometric log-RGB gains");
+    if (photometric.cameraIndex >
+            std::numeric_limits<uint32_t>::max() / 3u ||
+        static_cast<int64_t>(photometric.cameraIndex) >=
+            photometric.logRgbGains->size(0)) {
+        throw std::invalid_argument("Photometric camera index is out of range");
+    }
+    if (!photometric.enabled && photometric.cameraIndex != 0u) {
+        throw std::invalid_argument(
+            "Disabled photometric refinement must use the identity gain row");
+    }
+    if (photometric.enabled) {
+        validatePhotometricTensor(photometric.expAvg,
+                                  "Photometric Adam first moment");
+        validatePhotometricTensor(photometric.expAvgSq,
+                                  "Photometric Adam second moment");
+        if (photometric.expAvg->size(0) !=
+                photometric.logRgbGains->size(0) ||
+            photometric.expAvgSq->size(0) !=
+                photometric.logRgbGains->size(0)) {
+            throw std::invalid_argument(
+                "Photometric Adam tensors must match the gain tensor shape");
+        }
+        constexpr float expectedMaxAbsLogGain = 1.38629436112f; // log(4)
+        if (!std::isfinite(photometric.adamStepSize) ||
+            photometric.adamStepSize <= 0.0f ||
+            !std::isfinite(photometric.adamBiasCorrection2Sqrt) ||
+            photometric.adamBiasCorrection2Sqrt <= 0.0f ||
+            !std::isfinite(photometric.regularization) ||
+            photometric.regularization < 0.0f ||
+            !std::isfinite(photometric.maxAbsLogGain) ||
+            std::abs(photometric.maxAbsLogGain - expectedMaxAbsLogGain) >
+                1.0e-6f) {
+            throw std::invalid_argument(
+                "Photometric optimizer parameters are invalid");
+        }
+    }
+    MTensor& photometricLogGains = *photometric.logRgbGains;
+    MTensor& photometricExpAvg = photometric.enabled
+        ? *photometric.expAvg
+        : photometricLogGains;
+    MTensor& photometricExpAvgSq = photometric.enabled
+        ? *photometric.expAvgSq
+        : photometricLogGains;
+    const uint32_t cameraGainOffset = photometric.cameraIndex * 3u;
+    const uint32_t photometricEnabled = photometric.enabled ? 1u : 0u;
+
     // --- Cached buffer pool ---
     g_tcache.ensure_shared_forward(
         num_points, img_height, img_width, num_tiles, ctx->device);
@@ -1894,6 +1958,7 @@ MTensor msplat_train_step(
     MTensor &final_Ts = g_tcache.final_Ts;
     MTensor &final_idx = g_tcache.final_idx;
     MTensor &ssim_deriv_h_buf = g_tcache.ssim_deriv_h_buf;
+    MTensor &photometric_gradient = g_tcache.photometric_gradient;
 
     // SSIM V-backward reads and writes only the same pixel. Training no longer
     // needs the rendered image afterward, so reuse it in place for dL/dRGB.
@@ -2129,6 +2194,9 @@ MTensor msplat_train_step(
         ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
         ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
+        ENC_BUF(enc, photometricLogGains, 4);
+        ENC_SCALAR(enc, cameraGainOffset, 5);
+        ENC_SCALAR(enc, photometricEnabled, 6);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 2: Fused V fwd + H bwd
@@ -2140,6 +2208,9 @@ MTensor msplat_train_step(
         ENC_BUF(enc, ssim_deriv_h_buf, 6); ENC_BUF(enc, loss_sum, 7);
         ENC_BUF(enc, loss_coverage_buffer, 8);
         ENC_SCALAR(enc, coverage_stride, 9);
+        ENC_BUF(enc, photometricLogGains, 10);
+        ENC_SCALAR(enc, cameraGainOffset, 11);
+        ENC_SCALAR(enc, photometricEnabled, 12);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 3: V bwd
@@ -2150,7 +2221,30 @@ MTensor msplat_train_step(
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, loss_coverage_buffer, 6);
         ENC_SCALAR(enc, coverage_stride, 7);
+        ENC_BUF(enc, photometricLogGains, 8);
+        ENC_SCALAR(enc, cameraGainOffset, 9);
+        ENC_BUF(enc, photometric_gradient, 10);
+        ENC_SCALAR(enc, photometricEnabled, 11);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
+
+        if (photometric.enabled) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->photometric_adam_kernel_cpso];
+            ENC_BUF(enc, photometricLogGains, 0);
+            ENC_BUF(enc, photometric_gradient, 1);
+            ENC_BUF(enc, photometricExpAvg, 2);
+            ENC_BUF(enc, photometricExpAvgSq, 3);
+            ENC_SCALAR(enc, cameraGainOffset, 4);
+            ENC_SCALAR(enc, photometric.adamStepSize, 5);
+            ENC_SCALAR(enc, adam_beta1, 6);
+            ENC_SCALAR(enc, adam_beta2, 7);
+            ENC_SCALAR(enc, photometric.adamBiasCorrection2Sqrt, 8);
+            ENC_SCALAR(enc, adam_eps, 9);
+            ENC_SCALAR(enc, photometric.regularization, 10);
+            ENC_SCALAR(enc, photometric.maxAbsLogGain, 11);
+            [enc dispatchThreads:MTLSizeMake(3, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(3, 1, 1)];
+        }
     };
 
     auto encode_rast_bwd = [&](id<MTLComputeCommandEncoder> enc) {
@@ -2288,6 +2382,8 @@ MTensor msplat_train_step(
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
         if (!blit) return false;
         [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
+        [blit fillBuffer:photometric_gradient.buffer()
+                   range:NSMakeRange(0, photometric_gradient.nbytes()) value:0];
         [blit fillBuffer:overflow_flag.buffer()
                    range:NSMakeRange(0, sizeof(uint32_t)) value:0];
         [blit fillBuffer:g_tcache.tile_scatter_counters.buffer()

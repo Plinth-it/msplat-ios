@@ -4,6 +4,10 @@
 #include "metal_tensor.hpp"
 #include "ssim.hpp"
 #include "input_data.hpp"
+#include <cstddef>
+#include <cstdint>
+#include <string>
+#include <vector>
 
 int numShBases(int degree);
 /// Validate checkpoint structure and tensor metadata without allocating Metal
@@ -17,7 +21,8 @@ struct Model{
         int maxSteps, bool keepCrs,
         const float* bgColor = nullptr,
         int stopDensifyAt = -1,
-        int maxGaussians = -1);
+        int maxGaussians = -1,
+        bool refinePhotometricGains = false);
 
   ~Model(){ releaseOptimizers(); }
 
@@ -43,7 +48,11 @@ struct Model{
   CamSetup prepareCam(Camera& cam, int step);
   // Compatibility path for callers that do not load training masks.
   void fullIteration(Camera& cam, int step, MTensor& gt, float ssimWeight);
+  void fullIteration(Camera& cam, size_t cameraIndex, int step,
+                     MTensor& gt, float ssimWeight);
   void fullIteration(Camera& cam, int step,
+                     const CameraTrainingTarget& target, float ssimWeight);
+  void fullIteration(Camera& cam, size_t cameraIndex, int step,
                      const CameraTrainingTarget& target, float ssimWeight);
   MTensor render(Camera& cam, int step);
 
@@ -93,7 +102,17 @@ struct Model{
 
   MTensor backgroundColor;
 
+  // Per-canonical-camera log-domain RGB gain. Applying exp(logGain) to the
+  // render inside the loss models source exposure/white-balance variation
+  // without changing canonical renders or exported Gaussian colors.
+  MTensor cameraLogGains;
+  MTensor cameraLogGainExpAvg;
+  MTensor cameraLogGainExpAvgSq;
+  std::vector<uint32_t> cameraLogGainStepCounts;
+  std::vector<std::string> cameraFrameIds;
+
   int numCameras;
+  int datasetCameraCount;
   int numDownscales;
   int resolutionSchedule;
   int shDegree;
@@ -111,6 +130,7 @@ struct Model{
   int maxSteps;
   /// Hard population and backing-buffer limit. -1 means unlimited.
   int maxGaussians;
+  bool refinePhotometricGains;
   bool keepCrs;
 
   float scale;

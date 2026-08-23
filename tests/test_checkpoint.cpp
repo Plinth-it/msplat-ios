@@ -22,7 +22,8 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr uint32_t checkpointMagic = 0x4C50534D;
-constexpr uint32_t checkpointVersion = 1;
+constexpr uint32_t checkpointVersionV1 = 1;
+constexpr uint32_t checkpointVersionV2 = 2;
 
 template <typename T>
 void appendScalar(std::vector<uint8_t> &bytes, T value) {
@@ -65,7 +66,7 @@ std::vector<uint8_t> validCheckpoint(size_t &firstTensorByteCountOffset) {
 
     std::vector<uint8_t> bytes;
     appendScalar(bytes, checkpointMagic);
-    appendScalar(bytes, checkpointVersion);
+    appendScalar(bytes, checkpointVersionV1);
     appendScalar(bytes, uint32_t{17});
     appendScalar(bytes, numPoints);
     appendScalar(bytes, shDegree);
@@ -80,6 +81,43 @@ std::vector<uint8_t> validCheckpoint(size_t &firstTensorByteCountOffset) {
             appendTensor(bytes, shapes[group],
                          copy == 0 && group == 0 ? &firstTensorByteCountOffset : nullptr);
         }
+    }
+    return bytes;
+}
+
+void appendString(std::vector<uint8_t> &bytes, const std::string &value) {
+    appendScalar(bytes, static_cast<uint32_t>(value.size()));
+    bytes.insert(bytes.end(), value.begin(), value.end());
+}
+
+std::vector<uint8_t> validV2Checkpoint(
+    bool photometricEnabled,
+    size_t &firstTensorByteCountOffset,
+    size_t &photometricFlagOffset,
+    size_t &firstPhotometricStepOffset,
+    size_t &firstPhotometricTensorByteCountOffset,
+    const std::array<std::string, 2> &frameIds = {"frame-0", "frame-1"}) {
+    std::vector<uint8_t> bytes = validCheckpoint(firstTensorByteCountOffset);
+    std::memcpy(bytes.data() + sizeof(uint32_t), &checkpointVersionV2,
+                sizeof(checkpointVersionV2));
+    photometricFlagOffset = bytes.size();
+    appendScalar(bytes, photometricEnabled ? uint32_t{1} : uint32_t{0});
+    firstPhotometricStepOffset = 0;
+    firstPhotometricTensorByteCountOffset = 0;
+    if (!photometricEnabled)
+        return bytes;
+
+    appendScalar(bytes, uint32_t{2});
+    for (const std::string &frameId : frameIds)
+        appendString(bytes, frameId);
+    firstPhotometricStepOffset = bytes.size();
+    appendScalar(bytes, uint32_t{3});
+    appendScalar(bytes, uint32_t{7});
+    for (int copy = 0; copy < 3; ++copy) {
+        appendTensor(bytes, {2, 3},
+                     copy == 0
+                         ? &firstPhotometricTensorByteCountOffset
+                         : nullptr);
     }
     return bytes;
 }
@@ -131,10 +169,27 @@ int main() {
     const fs::path maxStepPath = prefix.string() + "-max-step.msplat";
     const fs::path maxAdamStepPath = prefix.string() + "-max-adam-step.msplat";
     const fs::path zeroMeansRatePath = prefix.string() + "-zero-means-rate.msplat";
+    const fs::path validV2DisabledPath = prefix.string() + "-valid-v2-disabled.msplat";
+    const fs::path validV2EnabledPath = prefix.string() + "-valid-v2-enabled.msplat";
+    const fs::path invalidPhotoFlagPath = prefix.string() + "-photo-flag.msplat";
+    const fs::path duplicatePhotoIdPath = prefix.string() + "-photo-id.msplat";
+    const fs::path maxPhotoStepPath = prefix.string() + "-photo-step.msplat";
+    const fs::path inconsistentPhotoStepsPath =
+        prefix.string() + "-photo-step-sum.msplat";
+    const fs::path badPhotoTensorPath = prefix.string() + "-photo-tensor.msplat";
+    const fs::path hugePhotoCountPath = prefix.string() + "-photo-count.msplat";
+    const fs::path truncatedPhotoPayloadPath =
+        prefix.string() + "-photo-payload.msplat";
+    const fs::path trailingV2Path = prefix.string() + "-trailing-v2.msplat";
     const fs::path atomicDestination = prefix.string() + "-atomic.bin";
     const fs::path atomicSentinel = atomicDestination.string() + ".tmp";
     RemoveFiles cleanup{{validPath, truncatedPath, badByteCountPath,
                          maxStepPath, maxAdamStepPath, zeroMeansRatePath,
+                         validV2DisabledPath, validV2EnabledPath,
+                         invalidPhotoFlagPath, duplicatePhotoIdPath,
+                         maxPhotoStepPath, inconsistentPhotoStepsPath,
+                         badPhotoTensorPath, hugePhotoCountPath,
+                         truncatedPhotoPayloadPath, trailingV2Path,
                          atomicDestination, atomicSentinel}};
 
     size_t firstTensorByteCountOffset = 0;
@@ -172,6 +227,84 @@ int main() {
     std::memcpy(zeroMeansRate.data() + 48, &zero, sizeof(zero));
     writeFile(zeroMeansRatePath, zeroMeansRate);
     CHECK(rejects(zeroMeansRatePath, "means learning rates"));
+
+    size_t v2TensorOffset = 0;
+    size_t photoFlagOffset = 0;
+    size_t photoStepOffset = 0;
+    size_t photoTensorOffset = 0;
+    const std::vector<uint8_t> validV2Disabled = validV2Checkpoint(
+        false, v2TensorOffset, photoFlagOffset, photoStepOffset,
+        photoTensorOffset);
+    writeFile(validV2DisabledPath, validV2Disabled);
+    validateCheckpointFile(validV2DisabledPath.string());
+
+    const std::vector<uint8_t> validV2Enabled = validV2Checkpoint(
+        true, v2TensorOffset, photoFlagOffset, photoStepOffset,
+        photoTensorOffset);
+    writeFile(validV2EnabledPath, validV2Enabled);
+    validateCheckpointFile(validV2EnabledPath.string());
+
+    std::vector<uint8_t> invalidPhotoFlag = validV2Disabled;
+    const uint32_t invalidFlag = 2;
+    std::memcpy(invalidPhotoFlag.data() + photoFlagOffset, &invalidFlag,
+                sizeof(invalidFlag));
+    writeFile(invalidPhotoFlagPath, invalidPhotoFlag);
+    CHECK(rejects(invalidPhotoFlagPath, "enabled flag"));
+
+    size_t ignoredOffset = 0;
+    std::vector<uint8_t> duplicatePhotoId = validV2Checkpoint(
+        true, ignoredOffset, ignoredOffset, ignoredOffset, ignoredOffset,
+        {"same", "same"});
+    writeFile(duplicatePhotoIdPath, duplicatePhotoId);
+    CHECK(rejects(duplicatePhotoIdPath, "not unique"));
+
+    std::vector<uint8_t> maxPhotoStep = validV2Enabled;
+    const uint32_t maxPhotoCount = std::numeric_limits<uint32_t>::max();
+    std::memcpy(maxPhotoStep.data() + photoStepOffset, &maxPhotoCount,
+                sizeof(maxPhotoCount));
+    writeFile(maxPhotoStepPath, maxPhotoStep);
+    CHECK(rejects(maxPhotoStepPath, "step count"));
+
+    std::vector<uint8_t> inconsistentPhotoSteps = validV2Enabled;
+    const uint32_t tenVisits = 10;
+    std::memcpy(inconsistentPhotoSteps.data() + photoStepOffset, &tenVisits,
+                sizeof(tenVisits));
+    std::memcpy(inconsistentPhotoSteps.data() + photoStepOffset + sizeof(uint32_t),
+                &tenVisits, sizeof(tenVisits));
+    writeFile(inconsistentPhotoStepsPath, inconsistentPhotoSteps);
+    CHECK(rejects(inconsistentPhotoStepsPath, "inconsistent with Adam"));
+
+    std::vector<uint8_t> badPhotoTensor = validV2Enabled;
+    uint64_t photoBytes = 0;
+    std::memcpy(&photoBytes, badPhotoTensor.data() + photoTensorOffset,
+                sizeof(photoBytes));
+    ++photoBytes;
+    std::memcpy(badPhotoTensor.data() + photoTensorOffset, &photoBytes,
+                sizeof(photoBytes));
+    writeFile(badPhotoTensorPath, badPhotoTensor);
+    CHECK(rejects(badPhotoTensorPath, "byte count"));
+
+    std::vector<uint8_t> hugePhotoCount = valid;
+    std::memcpy(hugePhotoCount.data() + sizeof(uint32_t),
+                &checkpointVersionV2, sizeof(checkpointVersionV2));
+    appendScalar(hugePhotoCount, uint32_t{1});
+    appendScalar(hugePhotoCount, uint32_t{1'000'001});
+    writeFile(hugePhotoCountPath, hugePhotoCount);
+    CHECK(rejects(hugePhotoCountPath, "camera count"));
+
+    std::vector<uint8_t> truncatedPhotoPayload = valid;
+    std::memcpy(truncatedPhotoPayload.data() + sizeof(uint32_t),
+                &checkpointVersionV2, sizeof(checkpointVersionV2));
+    appendScalar(truncatedPhotoPayload, uint32_t{1});
+    appendScalar(truncatedPhotoPayload, uint32_t{1'000'000});
+    writeFile(truncatedPhotoPayloadPath, truncatedPhotoPayload);
+    CHECK(rejects(truncatedPhotoPayloadPath,
+                  "truncated photometric checkpoint payload"));
+
+    std::vector<uint8_t> trailingV2 = validV2Disabled;
+    trailingV2.push_back(0);
+    writeFile(trailingV2Path, trailingV2);
+    CHECK(rejects(trailingV2Path, "trailing data"));
 
     {
         std::ofstream sentinel(atomicSentinel, std::ios::binary | std::ios::trunc);

@@ -17,7 +17,19 @@
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
-static_assert(MSPLAT_ABI_VERSION == 7u);
+static_assert(MSPLAT_ABI_VERSION == 8u);
+static_assert(sizeof(MsplatConfig) == 76);
+static_assert(alignof(MsplatConfig) == 4);
+static_assert(offsetof(MsplatConfig, keepCrs) == 56);
+static_assert(offsetof(MsplatConfig, downscaleFactor) == 60);
+static_assert(offsetof(MsplatConfig, bgColor) == 64);
+static_assert(sizeof(MsplatTrainingLimits) == 4);
+static_assert(alignof(MsplatTrainingLimits) == 4);
+static_assert(std::is_standard_layout<MsplatRefinementOptionsV8>::value);
+static_assert(sizeof(MsplatRefinementOptionsV8) == 16);
+static_assert(alignof(MsplatRefinementOptionsV8) == 4);
+static_assert(offsetof(MsplatRefinementOptionsV8, flags) == 0);
+static_assert(offsetof(MsplatRefinementOptionsV8, reserved) == 4);
 static_assert(sizeof(MsplatSubmittedTrainingStep) == 32);
 static_assert(alignof(MsplatSubmittedTrainingStep) == 4);
 static_assert(sizeof(MsplatCompletedTrainingStep) == 64);
@@ -1017,12 +1029,49 @@ int main() {
     CHECK(msplat_training_limits_validate_v3(&limits, sizeof(limits) - 1, &error) ==
           MSPLAT_STATUS_INVALID_ARGUMENT);
 
+    MsplatRefinementOptionsV8 refinementOptions =
+        msplat_default_refinement_options_v8();
+    CHECK(refinementOptions.flags == 0u);
+    CHECK(refinementOptions.reserved[0] == 0u);
+    CHECK(refinementOptions.reserved[1] == 0u);
+    CHECK(refinementOptions.reserved[2] == 0u);
+    CHECK(msplat_refinement_options_validate_v8(
+              &refinementOptions, sizeof(refinementOptions), &error) ==
+          MSPLAT_STATUS_OK);
+    refinementOptions.flags = MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS;
+    CHECK(msplat_refinement_options_validate_v8(
+              &refinementOptions, sizeof(refinementOptions), &error) ==
+          MSPLAT_STATUS_OK);
+    refinementOptions.flags = 1u << 31;
+    CHECK(msplat_refinement_options_validate_v8(
+              &refinementOptions, sizeof(refinementOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    refinementOptions = msplat_default_refinement_options_v8();
+    refinementOptions.reserved[1] = 1u;
+    CHECK(msplat_refinement_options_validate_v8(
+              &refinementOptions, sizeof(refinementOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    refinementOptions = msplat_default_refinement_options_v8();
+    CHECK(msplat_refinement_options_validate_v8(
+              &refinementOptions, sizeof(refinementOptions) - 1, &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(msplat_refinement_options_validate_v8(
+              nullptr, sizeof(refinementOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+
     MsplatTrainer trainer = reinterpret_cast<MsplatTrainer>(1);
     config = msplat_default_config();
     limits = msplat_default_training_limits();
     CHECK(msplat_trainer_create_v3(
               nullptr, &config, sizeof(config), &limits, sizeof(limits),
               &trainer, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(trainer == nullptr);
+    trainer = reinterpret_cast<MsplatTrainer>(1);
+    refinementOptions = msplat_default_refinement_options_v8();
+    CHECK(msplat_trainer_create_v8(
+              nullptr, &config, sizeof(config), &limits, sizeof(limits),
+              &refinementOptions, sizeof(refinementOptions), &trainer,
+              &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
     CHECK(trainer == nullptr);
 
     // Legacy entry points route through the same exception boundary.

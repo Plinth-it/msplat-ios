@@ -19,8 +19,10 @@ extern "C" {
 // ABI v6 adds optional per-frame training masks without changing the v5 frame
 // or descriptor layouts.
 // ABI v7 adds CPU-only capture diagnostics over canonical observations.
+// ABI v8 adds versioned refinement options without changing MsplatConfig's
+// locked layout.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 7u
+#define MSPLAT_ABI_VERSION 8u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -106,6 +108,27 @@ static inline MsplatTrainingLimits msplat_default_training_limits(void) {
     MsplatTrainingLimits limits;
     limits.maxGaussians = -1;
     return limits;
+}
+
+/// Optional training refinements introduced in ABI v8. These flags are kept
+/// outside MsplatConfig so its established binary layout remains unchanged.
+/// Photometric RGB gains affect only the training objective; rendering and
+/// evaluation continue to use the canonical model colors.
+#define MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS (1u << 0)
+
+typedef struct {
+    uint32_t flags;
+    uint32_t reserved[3];
+} MsplatRefinementOptionsV8;
+
+static inline MsplatRefinementOptionsV8
+msplat_default_refinement_options_v8(void) {
+    MsplatRefinementOptionsV8 options;
+    options.flags = 0u;
+    options.reserved[0] = 0u;
+    options.reserved[1] = 0u;
+    options.reserved[2] = 0u;
+    return options;
 }
 
 // ── Stats ───────────────────────────────────────────────────────────────────
@@ -453,6 +476,19 @@ MsplatStatus msplat_trainer_create_v3(MsplatDataset ds,
                                       size_t limitsSize,
                                       MsplatTrainer* outTrainer,
                                       MsplatErrorInfo* error);
+// ABI v8 trainer creation. Refinement options are versioned separately from
+// MsplatConfig. Unknown flags and non-zero reserved fields are rejected.
+MsplatStatus msplat_refinement_options_validate_v8(
+    const MsplatRefinementOptionsV8* options, size_t optionsSize,
+    MsplatErrorInfo* error);
+MsplatStatus msplat_trainer_create_v8(
+    MsplatDataset ds,
+    const MsplatConfig* config, size_t configSize,
+    const MsplatTrainingLimits* limits, size_t limitsSize,
+    const MsplatRefinementOptionsV8* refinementOptions,
+    size_t refinementOptionsSize,
+    MsplatTrainer* outTrainer,
+    MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_destroy_v2(MsplatTrainer t, MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_step_v2(MsplatTrainer t, MsplatStats* outStats,
                                     MsplatErrorInfo* error);
