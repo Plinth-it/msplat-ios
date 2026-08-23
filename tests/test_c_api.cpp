@@ -49,6 +49,30 @@ int main() {
     CHECK(msplat_config_validate_v2(&config, sizeof(config) - 1, &error) ==
           MSPLAT_STATUS_INVALID_ARGUMENT);
 
+    MsplatTrainingLimits limits = msplat_default_training_limits();
+    CHECK(limits.maxGaussians == -1);
+    CHECK(msplat_training_limits_validate_v3(&limits, sizeof(limits), &error) ==
+          MSPLAT_STATUS_OK);
+    limits.maxGaussians = 750000;
+    CHECK(msplat_training_limits_validate_v3(&limits, sizeof(limits), &error) ==
+          MSPLAT_STATUS_OK);
+    limits.maxGaussians = 0;
+    CHECK(msplat_training_limits_validate_v3(&limits, sizeof(limits), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    limits.maxGaussians = -2;
+    CHECK(msplat_training_limits_validate_v3(&limits, sizeof(limits), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(msplat_training_limits_validate_v3(&limits, sizeof(limits) - 1, &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+
+    MsplatTrainer trainer = reinterpret_cast<MsplatTrainer>(1);
+    config = msplat_default_config();
+    limits = msplat_default_training_limits();
+    CHECK(msplat_trainer_create_v3(
+              nullptr, &config, sizeof(config), &limits, sizeof(limits),
+              &trainer, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(trainer == nullptr);
+
     // Legacy entry points route through the same exception boundary.
     CHECK(msplat_dataset_create(nullptr, 1.0f, false, 8) == nullptr);
     CHECK(msplat_last_status() == MSPLAT_STATUS_INVALID_ARGUMENT);

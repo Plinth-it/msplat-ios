@@ -5,8 +5,36 @@ import os
 
 @MainActor
 final class TrainingSession: ObservableObject {
+    enum QualityProfile: String, CaseIterable, Identifiable {
+        case preview = "Preview"
+        case balanced = "Balanced"
+
+        var id: Self { self }
+
+        var longestEdge: Int {
+            switch self {
+            case .preview: 1_600
+            case .balanced: 1_920
+            }
+        }
+
+        var shDegree: Int32 {
+            switch self {
+            case .preview: 1
+            case .balanced: 2
+            }
+        }
+
+        var maximumGaussianCount: Int {
+            switch self {
+            case .preview: 250_000
+            case .balanced: 400_000
+            }
+        }
+    }
+
     enum Phase: Equatable {
-        case idle, loading, training, cancelled, finished, failed(String)
+        case idle, planning, loading, training, cancelled, finished, failed(String)
     }
 
     @Published private(set) var phase: Phase = .idle
@@ -18,29 +46,40 @@ final class TrainingSession: ObservableObject {
     @Published private(set) var footprintMB = 0
     @Published private(set) var availableMB = 0
     @Published private(set) var exportedPly: URL?
+    @Published private(set) var plannedStages: [ResolvedTrainingResolutionStage] = []
+    @Published private(set) var estimatedPeakMB = 0
+    @Published private(set) var plannedSHDegree = 0
+    @Published private(set) var plannedMaximumGaussians = 0
 
     /// Total steps. Kept modest by default: on a phone this is a battery and
     /// thermal budget as much as a quality one.
     @Published var iterations = 2_000
-    /// Longest image edge the trainer works at. Full-resolution captures are
-    /// where a phone runs out of memory first, so the default halves them.
-    @Published var downscale: Float = 2
+    @Published var qualityProfile: QualityProfile = .preview
 
     private var worker: Task<Void, Never>?
 
     func start(folder: DatasetFolder) {
         guard phase == .idle || phase == .cancelled || phase == .finished || isFailed else { return }
-        phase = .loading
+        phase = .planning
         iteration = 0
+        splatCount = 0
+        msPerStep = 0
+        preview = nil
+        trainingCameras = 0
+        footprintMB = 0
+        availableMB = 0
         exportedPly = nil
+        plannedStages = []
+        estimatedPeakMB = 0
+        plannedSHDegree = 0
+        plannedMaximumGaussians = 0
 
-        let datasetURL = folder.url
         let steps = iterations
-        let scale = downscale
+        let profile = qualityProfile
 
         worker = Task { [weak self] in
             guard let self else { return }
-            await self.run(datasetURL: datasetURL, steps: steps, downscale: scale)
+            await self.run(folder: folder, steps: steps, profile: profile)
         }
     }
 
@@ -48,7 +87,11 @@ final class TrainingSession: ObservableObject {
 
     private var isFailed: Bool { if case .failed = phase { return true }; return false }
 
-    private func run(datasetURL: URL, steps: Int, downscale: Float) async {
+    private func run(
+        folder: DatasetFolder,
+        steps: Int,
+        profile: QualityProfile
+    ) async {
         var session: MsplatSession?
         var resultURL: URL?
         var finalSplatCount = 0
@@ -56,17 +99,41 @@ final class TrainingSession: ObservableObject {
         var wasCancelled = false
 
         do {
-            var config = TrainingConfig()
-            config.iterations = Int32(steps)
-            // The UI's Full/Half/Quarter choice is the complete resolution
-            // policy for this short mobile preview; do not apply the desktop
-            // trainer's additional progressive 4x downscale.
-            config.numDownscales = 0
+            let datasetURL = folder.url
+            let dimensionScan = Task.detached(priority: .userInitiated) {
+                try DatasetFolder.maximumSourceDimensions(at: datasetURL)
+            }
+            let sourceDimensions = try await withTaskCancellationHandler {
+                try await dimensionScan.value
+            } onCancel: {
+                dimensionScan.cancel()
+            }
+            let plan = try Self.makePlan(
+                sourceDimensions: sourceDimensions,
+                steps: steps,
+                profile: profile
+            )
+            plannedStages = plan.resolvedStages
+            estimatedPeakMB = Self.megabytes(plan.estimatedPeakMemory)
+            plannedSHDegree = Int(plan.targetSHDegree)
+            plannedMaximumGaussians = plan.maximumGaussianCount
+            availableMB = Self.availableMB()
+
+            let availableBytes = Int64(availableMB) * 1_024 * 1_024
+            guard availableBytes == 0 || plan.estimatedPeakMemory <= availableBytes else {
+                throw MsplatError.outOfMemory(
+                    "The \(profile.rawValue) plan estimates \(estimatedPeakMB) MB, " +
+                    "but iOS currently reports \(availableMB) MB available. " +
+                    "Choose a smaller plan or close other apps."
+                )
+            }
+
+            phase = .loading
+            try Task.checkCancellation()
 
             let activeSession = try await MsplatSession(
-                datasetURL: datasetURL,
-                options: DatasetOptions(downscaleFactor: downscale),
-                config: config
+                datasetURL: folder.url,
+                trainingPlan: plan
             )
             session = activeSession
             try Task.checkCancellation()
@@ -138,6 +205,63 @@ final class TrainingSession: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    private nonisolated static func makePlan(
+        sourceDimensions: TrainingImageDimensions,
+        steps: Int,
+        profile: QualityProfile
+    ) throws -> TrainingPlan {
+        guard let iterationBudget = Int32(exactly: steps) else {
+            throw MsplatError.invalidArgument("Iteration budget is outside the native range")
+        }
+
+        let sourceLongestEdge = max(sourceDimensions.width, sourceDimensions.height)
+        let inputDecodeScale = min(
+            32,
+            max(1, Float(sourceLongestEdge) / Float(profile.longestEdge))
+        )
+
+        let stages: [TrainingResolutionStage]
+        switch profile {
+        case .preview:
+            stages = [
+                try TrainingResolutionStage(
+                    iterations: 1...iterationBudget,
+                    downscaleFactor: 1
+                ),
+            ]
+        case .balanced:
+            guard iterationBudget >= 2 else {
+                throw MsplatError.invalidArgument(
+                    "Balanced training requires at least two iterations"
+                )
+            }
+            let coarseEnd = max(1, iterationBudget / 2)
+            stages = [
+                try TrainingResolutionStage(
+                    iterations: 1...coarseEnd,
+                    downscaleFactor: 2
+                ),
+                try TrainingResolutionStage(
+                    iterations: (coarseEnd + 1)...iterationBudget,
+                    downscaleFactor: 1
+                ),
+            ]
+        }
+
+        return try TrainingPlan(
+            inputDimensions: sourceDimensions,
+            inputDecodeScale: inputDecodeScale,
+            iterationBudget: iterationBudget,
+            stages: stages,
+            targetSHDegree: profile.shDegree,
+            maximumGaussianCount: profile.maximumGaussianCount
+        )
+    }
+
+    private nonisolated static func megabytes(_ bytes: Int64) -> Int {
+        Int((bytes + 1_048_575) / 1_048_576)
+    }
 
     private nonisolated static func image(from frame: RGBAFrame) -> UIImage? {
         guard frame.width > 0, frame.height > 0,

@@ -30,6 +30,7 @@ def test_training_config_defaults():
     assert cfg.ssim_weight == pytest.approx(0.2)
     assert cfg.refine_every == 100
     assert cfg.warmup_length == 500
+    assert cfg.max_gaussians == -1
 
 
 def test_training_config_custom():
@@ -47,6 +48,16 @@ def test_training_config_mutable():
     cfg = TrainingConfig()
     cfg.iterations = 500
     assert cfg.iterations == 500
+
+
+@pytest.mark.skipif(not HAS_GARDEN, reason="garden dataset not found")
+def test_gaussian_cap_below_initial_population_is_rejected():
+    from msplat import TrainingConfig, Dataset, GaussianTrainer
+
+    ds = Dataset(GARDEN, downscale_factor=4.0)
+    cfg = TrainingConfig(iterations=1, num_downscales=0, max_gaussians=1)
+    with pytest.raises(ValueError, match="initial Gaussian count"):
+        GaussianTrainer(ds, cfg)
 
 
 # ── Dataset tests ────────────────────────────────────────────────────────────

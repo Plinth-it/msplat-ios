@@ -38,6 +38,7 @@ struct TrainingConfig {
     float densify_grad_thresh = 0.0002f;
     float densify_size_thresh = 0.01f;
     int stop_screen_size_at = 4000;
+    int max_gaussians = -1;
     float split_screen_size = 0.05f;
     bool keep_crs = false;
     float downscale_factor = 1.0f;
@@ -135,7 +136,9 @@ public:
             cfg.densify_grad_thresh, cfg.densify_size_thresh,
             cfg.stop_screen_size_at, cfg.split_screen_size,
             cfg.iterations, cfg.keep_crs,
-            cfg.bg_color.data()
+            cfg.bg_color.data(),
+            -1,
+            cfg.max_gaussians
         );
 
         cam_indices.resize(dataset.train_cams.size());
@@ -315,7 +318,7 @@ NB_MODULE(_core, m) {
                 int stop_screen_size_at, float split_screen_size,
                 bool keep_crs, float downscale_factor,
                 const std::string &output, int save_every,
-                std::vector<float> bg_color) {
+                std::vector<float> bg_color, int max_gaussians) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -334,6 +337,7 @@ NB_MODULE(_core, m) {
             cfg->downscale_factor = downscale_factor;
             cfg->output = output;
             cfg->save_every = save_every;
+            cfg->max_gaussians = max_gaussians;
             if (bg_color.size() != 3)
                 throw std::invalid_argument("bg_color must have exactly 3 elements [R, G, B]");
             cfg->bg_color = bg_color;
@@ -355,7 +359,8 @@ NB_MODULE(_core, m) {
             "downscale_factor"_a = 1.0f,
             "output"_a = "splat.ply",
             "save_every"_a = -1,
-            "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f})
+            "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f},
+            "max_gaussians"_a = -1)
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
@@ -368,6 +373,7 @@ NB_MODULE(_core, m) {
         .def_rw("densify_grad_thresh", &TrainingConfig::densify_grad_thresh)
         .def_rw("densify_size_thresh", &TrainingConfig::densify_size_thresh)
         .def_rw("stop_screen_size_at", &TrainingConfig::stop_screen_size_at)
+        .def_rw("max_gaussians", &TrainingConfig::max_gaussians)
         .def_rw("split_screen_size", &TrainingConfig::split_screen_size)
         .def_rw("keep_crs", &TrainingConfig::keep_crs)
         .def_rw("downscale_factor", &TrainingConfig::downscale_factor)

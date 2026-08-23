@@ -16,6 +16,7 @@ class TrainingConfig:
     densify_grad_thresh: float
     densify_size_thresh: float
     stop_screen_size_at: int
+    max_gaussians: int
     split_screen_size: float
     keep_crs: bool
     downscale_factor: float
@@ -44,6 +45,7 @@ class TrainingConfig:
         output: str = "splat.ply",
         save_every: int = -1,
         bg_color: list[float] = ...,
+        max_gaussians: int = -1,
     ) -> None: ...
 
 class TrainingStats:

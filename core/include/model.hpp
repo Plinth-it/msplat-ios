@@ -18,7 +18,8 @@ struct Model{
         int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
         int maxSteps, bool keepCrs,
         const float* bgColor = nullptr,
-        int stopDensifyAt = -1);
+        int stopDensifyAt = -1,
+        int maxGaussians = -1);
 
   ~Model(){ releaseOptimizers(); }
 
@@ -68,6 +69,7 @@ struct Model{
   /// and the densification scratch. Sized by capacity, not active count.
   size_t estimatedGpuBytes() const;
   void ensureCapacity(int needed);
+  int capacityFor(int needed) const;
 
   MTensor densify_split_flag, densify_dup_flag;
   MTensor densify_split_prefix, densify_dup_prefix;
@@ -91,6 +93,8 @@ struct Model{
   int numDownscales;
   int resolutionSchedule;
   int shDegree;
+  /// Checkpoint SH degree required by this model's fixed parameter layout.
+  int configuredSHDegree;
   int shDegreeInterval;
   int refineEvery;
   int warmupLength;
@@ -101,6 +105,8 @@ struct Model{
   int stopScreenSizeAt;
   float splitScreenSize;
   int maxSteps;
+  /// Hard population and backing-buffer limit. -1 means unlimited.
+  int maxGaussians;
   bool keepCrs;
 
   float scale;

@@ -4,8 +4,28 @@
 
 - Added ABI v2 checked C entry points with structured errors, input and buffer
   validation, ABI/config-size checks, and exception containment.
+- Added ABI v3 checked trainer creation with a size-validated
+  `MsplatTrainingLimits` structure. Its `maxGaussians` field provides an
+  optional hard population and backing-buffer ceiling while ABI v2 creation
+  retains the unlimited behavior.
+- Enforced the Gaussian ceiling during initialization, densification, PLY
+  import, and checkpoint restore. Capacity-constrained densification keeps the
+  highest normalized-gradient candidates, and `--max-gaussians` exposes the
+  limit in the native CLI and Python CLI.
 - Added the actor-isolated, throwing `MsplatSession` Swift API while preserving
   the existing Swift and C symbols for source compatibility.
+- Added Swift `TrainingPlan` validation for input decoding, exact native
+  resolution-stage mapping, target SH degree, and the required Gaussian limit.
+  Its code-derived peak-memory estimate includes native model/training buffers,
+  image-cache insertion, the current full-source decode transient, and
+  recommended headroom; it remains a conservative planning aid, not a jetsam
+  guarantee.
+- Checkpoint restore now requires the saved SH degree to match the configured
+  training degree, preventing a planned memory/quality contract from changing
+  silently during resume.
+- Added Preview and Balanced plans to the iOS example. The app displays the
+  resolved stages, SH degree, Gaussian ceiling, and estimated peak, then rejects
+  a plan when that estimate exceeds the memory iOS currently reports available.
 - Fixed Metal context construction, initialization races, resource teardown,
   full submitted-chain command completion checks, and recoverable encoder
   failures.

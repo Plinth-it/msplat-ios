@@ -12,9 +12,10 @@
 extern "C" {
 #endif
 
-// ABI v2 adds checked, error-returning entry points while retaining the v1
-// symbols below for existing clients. New integrations should use the v2 API.
-#define MSPLAT_ABI_VERSION 2u
+// ABI v2 added checked, error-returning entry points. ABI v3 adds an optional
+// hard training-limit contract without changing MsplatConfig's v2 layout.
+// All earlier symbols remain available for existing clients.
+#define MSPLAT_ABI_VERSION 3u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 typedef enum {
@@ -83,6 +84,18 @@ static inline MsplatConfig msplat_default_config(void) {
     return c;
 }
 
+/// Limits introduced in ABI v3. `maxGaussians` is a hard population and
+/// backing-buffer ceiling. Use -1 for the legacy unlimited behavior.
+typedef struct {
+    int maxGaussians;
+} MsplatTrainingLimits;
+
+static inline MsplatTrainingLimits msplat_default_training_limits(void) {
+    MsplatTrainingLimits limits;
+    limits.maxGaussians = -1;
+    return limits;
+}
+
 // ── Stats ───────────────────────────────────────────────────────────────────
 
 typedef struct {
@@ -146,6 +159,18 @@ MsplatStatus msplat_config_validate_v2(const MsplatConfig* config,
 MsplatStatus msplat_trainer_create_v2(MsplatDataset ds,
                                       const MsplatConfig* config,
                                       size_t configSize,
+                                      MsplatTrainer* outTrainer,
+                                      MsplatErrorInfo* error);
+// ABI v3 trainer creation. Both structure sizes must match the headers used by
+// the caller. ABI v2 creation remains available and uses no Gaussian limit.
+MsplatStatus msplat_training_limits_validate_v3(
+    const MsplatTrainingLimits* limits, size_t limitsSize,
+    MsplatErrorInfo* error);
+MsplatStatus msplat_trainer_create_v3(MsplatDataset ds,
+                                      const MsplatConfig* config,
+                                      size_t configSize,
+                                      const MsplatTrainingLimits* limits,
+                                      size_t limitsSize,
                                       MsplatTrainer* outTrainer,
                                       MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_destroy_v2(MsplatTrainer t, MsplatErrorInfo* error);

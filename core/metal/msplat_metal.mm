@@ -6,19 +6,23 @@
 
 #import <Metal/Metal.h>
 #import <MetalPerformanceShaders/MetalPerformanceShaders.h>
+#import <algorithm>
 #import <chrono>
 #import <atomic>
+#import <cmath>
 #import <condition_variable>
 #import <cstdlib>
 #import <dlfcn.h>
 #import <unordered_map>
 #import <functional>
 #import <array>
+#import <limits>
 #import <memory>
 #import <mutex>
 #import <new>
 #import <stdexcept>
 #import <string>
+#import <vector>
 #import <mach/mach_time.h>
 
 // GPU profiling infrastructure.
@@ -1164,12 +1168,15 @@ static void forward_pipeline(
         // High-res: enough tiles for good GPU occupancy, skip chunking
         K_max = 1;
     } else {
-        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
-        uint32_t conservative_max = avg_per_tile * 6;  // 6x average — covers heavy-tailed distributions
-        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        if (K_max < 2) K_max = 2;
-        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
-        if (K_max > abs_max) K_max = abs_max;
+        const uint64_t avg_per_tile = static_cast<uint64_t>(
+            capacity / std::max(1, num_tiles));
+        const uint64_t conservative_max = avg_per_tile * 6;
+        uint64_t chunks =
+            (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        chunks = std::max<uint64_t>(chunks, 2);
+        const uint64_t absolute_max =
+            (static_cast<uint64_t>(capacity) + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        K_max = static_cast<uint32_t>(std::min(chunks, absolute_max));
     }
     g_tcache.current_K_max = K_max;
     g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
@@ -1349,12 +1356,15 @@ std::tuple<MTensor, float> msplat_train_step(
     if (num_tiles >= 400) {
         K_max = 1;
     } else {
-        uint32_t avg_per_tile = (uint32_t)(capacity / std::max(1, num_tiles));
-        uint32_t conservative_max = avg_per_tile * 6;
-        K_max = (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
-        if (K_max < 2) K_max = 2;
-        uint32_t abs_max = (uint32_t)((capacity + CHUNK_SIZE - 1) / CHUNK_SIZE);
-        if (K_max > abs_max) K_max = abs_max;
+        const uint64_t avg_per_tile = static_cast<uint64_t>(
+            capacity / std::max(1, num_tiles));
+        const uint64_t conservative_max = avg_per_tile * 6;
+        uint64_t chunks =
+            (conservative_max + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        chunks = std::max<uint64_t>(chunks, 2);
+        const uint64_t absolute_max =
+            (static_cast<uint64_t>(capacity) + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        K_max = static_cast<uint32_t>(std::min(chunks, absolute_max));
     }
     g_tcache.current_K_max = K_max;
     g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
@@ -1862,7 +1872,7 @@ std::tuple<MTensor, float> msplat_train_step(
 // parameter and Adam buffers at every refine step, which is the difference
 // between fitting on a phone and not.
 void msplat_prepare_densify(
-    int N,
+    int N, int max_population,
     float grad_thresh, float size_thresh, float screen_thresh, int check_screen,
     MTensor &xys_grad_norm, MTensor &vis_counts, MTensor &max_2d_size,
     float half_max_dim,
@@ -1873,10 +1883,33 @@ void msplat_prepare_densify(
     int &num_splits, int &num_dups
 ) {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
+    if (N <= 0)
+        throw std::invalid_argument("msplat_prepare_densify requires a positive population");
+    if (max_population > 0 && max_population < N)
+        throw std::invalid_argument("Densification population already exceeds its limit");
+
+    auto requireElements = [](const MTensor &tensor, int64_t required,
+                              const char *name) {
+        if (!tensor.defined() || required < 0 || tensor.numel() < required)
+            throw std::runtime_error(std::string("Densification buffer is too small: ") + name);
+    };
+    requireElements(xys_grad_norm, N, "xys_grad_norm");
+    requireElements(vis_counts, N, "vis_counts");
+    requireElements(max_2d_size, N, "max_2d_size");
+    requireElements(scales_buf, 3LL * N, "scales");
+    requireElements(split_flag, N, "split_flag");
+    requireElements(dup_flag, N, "dup_flag");
+    requireElements(split_prefix, N, "split_prefix");
+    requireElements(dup_prefix, N, "dup_prefix");
+    requireElements(block_totals,
+                    (static_cast<int64_t>(N) + 1023) / 1024,
+                    "block_totals");
+
     MetalContext* ctx = get_global_context();
 
     uint32_t N_u32 = (uint32_t)N;
-    uint32_t K = (uint32_t)((N + 1023) / 1024);
+    uint32_t K = static_cast<uint32_t>(
+        (static_cast<int64_t>(N) + 1023) / 1024);
     int check_screen_int = check_screen;
 
     id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
@@ -1953,6 +1986,82 @@ void msplat_prepare_densify(
     ctx->syncCB();
     num_splits = N > 0 ? split_prefix.data<int32_t>()[N - 1] : 0;
     num_dups = N > 0 ? dup_prefix.data<int32_t>()[N - 1] : 0;
+    if (num_splits < 0 || num_splits > N || num_dups < 0 || num_dups > N ||
+        num_splits > N - num_dups) {
+        throw std::runtime_error("Densification classification produced invalid totals");
+    }
+
+    // A split writes two children before its parent is culled; a duplicate
+    // writes one. Trim the classification itself so neither the temporary
+    // population nor any backing allocation can cross the hard limit. Metal
+    // buffers use shared storage, and syncCB completed the GPU writes above,
+    // so these prefix arrays can be safely rewritten before the next command
+    // buffer consumes them.
+    const int64_t population = static_cast<int64_t>(N) +
+        2LL * num_splits + num_dups;
+    if (max_population > 0 && population > max_population) {
+        struct Candidate {
+            int index;
+            int cost;
+            float score;
+        };
+
+        int remaining = max_population - N;
+        int32_t *split_flags = split_flag.data<int32_t>();
+        int32_t *dup_flags = dup_flag.data<int32_t>();
+        int32_t *split_prefixes = split_prefix.data<int32_t>();
+        int32_t *dup_prefixes = dup_prefix.data<int32_t>();
+        const float *gradients = xys_grad_norm.data<float>();
+        const float *visibility = vis_counts.data<float>();
+        std::vector<Candidate> candidates;
+        candidates.reserve(static_cast<size_t>(num_splits + num_dups));
+
+        for (int index = 0; index < N; ++index) {
+            const bool is_split = split_flags[index] != 0;
+            const bool is_dup = dup_flags[index] != 0;
+            if (is_split && is_dup)
+                throw std::runtime_error("Densification classified one Gaussian twice");
+            if (!is_split && !is_dup) continue;
+
+            float score = gradients[index] / visibility[index];
+            if (std::isnan(score)) score = -std::numeric_limits<float>::infinity();
+            candidates.push_back({index, is_split ? 2 : 1, score});
+            split_flags[index] = 0;
+            dup_flags[index] = 0;
+        }
+        if (candidates.size() != static_cast<size_t>(num_splits + num_dups))
+            throw std::runtime_error("Densification flags do not match their prefix totals");
+
+        std::sort(candidates.begin(), candidates.end(),
+                  [](const Candidate &lhs, const Candidate &rhs) {
+            if (lhs.score > rhs.score) return true;
+            if (lhs.score < rhs.score) return false;
+            return lhs.index < rhs.index;
+        });
+
+        for (const Candidate &candidate : candidates) {
+            if (candidate.cost > remaining) continue;
+            if (candidate.cost == 2) {
+                split_flags[candidate.index] = 1;
+            } else {
+                dup_flags[candidate.index] = 1;
+            }
+            remaining -= candidate.cost;
+            if (remaining == 0) break;
+        }
+
+        int accepted_splits = 0;
+        int accepted_dups = 0;
+        for (int index = 0; index < N; ++index) {
+            accepted_splits += split_flags[index];
+            accepted_dups += dup_flags[index];
+            split_prefixes[index] = accepted_splits;
+            dup_prefixes[index] = accepted_dups;
+        }
+
+        num_splits = accepted_splits;
+        num_dups = accepted_dups;
+    }
 }
 
 // Runs the prepared grow -> cull -> compact pipeline. `population` is
@@ -1974,16 +2083,12 @@ int msplat_densify(
     MTensor &random_samples
 ) {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
-    MetalContext* ctx = get_global_context();
-
-    int worst_case = population;
-
-    float log_size_fac = std::log(1.6f);
+    if (N <= 0 || population < N || fr_stride < 0)
+        throw std::invalid_argument("Invalid densification dimensions");
 
     // Strides for each of the 18 buffers (6 params + 12 optimizer states)
     // Order: means(3), scales(3), quats(4), featuresDc(3), featuresRest(fr_stride), opacities(1)
-    int strides[6] = {3, 3, 4, 3, fr_stride, 1};
-    int max_stride = fr_stride;  // featuresRest has the largest stride
+    int max_stride = std::max(fr_stride, 4);
 
     // Collect all 18 buffers in order for compact loops (std::array for block capture)
     std::array<MTensor*, 18> all_bufs = {{
@@ -1999,8 +2104,50 @@ int msplat_densify(
         3, 3, 4, 3, fr_stride, 1
     }};
 
+    auto requireElements = [](const MTensor &tensor, int64_t required,
+                              const char *name) {
+        if (!tensor.defined() || required < 0 || tensor.numel() < required)
+            throw std::runtime_error(std::string("Densification buffer is too small: ") + name);
+    };
+
+    requireElements(split_flag, N, "split_flag");
+    requireElements(dup_flag, N, "dup_flag");
+    requireElements(split_prefix, N, "split_prefix");
+    requireElements(dup_prefix, N, "dup_prefix");
+    requireElements(max_2d_size, N, "max_2d_size");
+    requireElements(keep_flag, population, "keep_flag");
+    requireElements(keep_prefix, population, "keep_prefix");
+    requireElements(block_totals,
+                    (static_cast<int64_t>(population) + 1023) / 1024,
+                    "block_totals");
+
+    const int num_splits = split_prefix.data<int32_t>()[N - 1];
+    const int num_dups = dup_prefix.data<int32_t>()[N - 1];
+    if (num_splits < 0 || num_splits > N || num_dups < 0 || num_dups > N ||
+        num_splits > N - num_dups ||
+        static_cast<int64_t>(N) + 2LL * num_splits + num_dups != population) {
+        throw std::runtime_error("Densification population does not match its prefixes");
+    }
+
+    requireElements(random_samples, 6LL * num_splits, "random_samples");
+    const int64_t compact_elements = static_cast<int64_t>(population) * max_stride;
+    requireElements(compact_scratch, compact_elements, "compact_scratch");
+    if (compact_elements > std::numeric_limits<uint32_t>::max())
+        throw std::runtime_error("Densification compaction exceeds the kernel index range");
+
+    for (size_t index = 0; index < all_bufs.size(); ++index) {
+        if (all_bufs[index]->stride0() != all_strides[index])
+            throw std::runtime_error("Densification buffer has an unexpected row stride");
+        requireElements(*all_bufs[index],
+                        static_cast<int64_t>(population) * all_strides[index],
+                        "parameter or optimizer state");
+    }
+
+    MetalContext* ctx = get_global_context();
+    int worst_case = population;
+    float log_size_fac = std::log(1.6f);
+
     uint32_t N_u32 = (uint32_t)N;
-    uint32_t K = (uint32_t)((N + 1023) / 1024);  // threadgroups for prefix sum on N elements
     int check_screen_int = check_screen;
     int check_huge_int = check_huge;
 
@@ -2106,7 +2253,8 @@ int msplat_densify(
         // Over worst_case elements (includes padding zeros for unused slots)
         {
             uint32_t wc = (uint32_t)worst_case;
-            uint32_t K2 = (uint32_t)((worst_case + 1023) / 1024);
+            uint32_t K2 = static_cast<uint32_t>(
+                (static_cast<int64_t>(worst_case) + 1023) / 1024);
             [enc setComputePipelineState:ctx->block_reduce_kernel_cpso];
             ENC_SCALAR(enc, wc, 0); ENC_BUF(enc, keep_flag, 1);
             ENC_BUF(enc, block_totals, 2);
@@ -2115,7 +2263,8 @@ int msplat_densify(
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         {
             uint32_t wc = (uint32_t)worst_case;
-            uint32_t K2 = (uint32_t)((worst_case + 1023) / 1024);
+            uint32_t K2 = static_cast<uint32_t>(
+                (static_cast<int64_t>(worst_case) + 1023) / 1024);
             [enc setComputePipelineState:ctx->block_scan_propagate_kernel_cpso];
             ENC_SCALAR(enc, wc, 0); ENC_BUF(enc, keep_flag, 1);
             ENC_BUF(enc, keep_prefix, 2); ENC_BUF(enc, block_totals, 3);
@@ -2127,6 +2276,9 @@ int msplat_densify(
         // For each buffer: scatter kept elements into compact_scratch
         // Then copy back. We reuse compact_scratch at different offsets per stride.
         for (int b = 0; b < 18; b++) {
+            // SH degree 0 has no rest coefficients, so this logical buffer has
+            // a zero row stride and requires no compaction dispatch.
+            if (all_strides[b] == 0) continue;
             uint32_t wc = (uint32_t)worst_case;
             uint32_t stride_u32 = (uint32_t)all_strides[b];
             uint32_t total_threads = wc * stride_u32;

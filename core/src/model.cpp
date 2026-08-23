@@ -69,16 +69,24 @@ Model::Model(const InputData &inputData, int numCameras,
     int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
     int maxSteps, bool keepCrs,
     const float* bgColor,
-    int stopDensifyAt)
+    int stopDensifyAt,
+    int maxGaussians)
     : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
-      shDegree(shDegree), shDegreeInterval(shDegreeInterval),
+      shDegree(shDegree), configuredSHDegree(shDegree),
+      shDegreeInterval(shDegreeInterval),
       refineEvery(refineEvery), warmupLength(warmupLength), resetAlphaEvery(resetAlphaEvery),
       stopSplitAt(stopDensifyAt >= 0 ? stopDensifyAt : maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
-      maxSteps(maxSteps), keepCrs(keepCrs) {
+      maxSteps(maxSteps), maxGaussians(maxGaussians), keepCrs(keepCrs) {
 
     if (inputData.points.count <= 0)
         throw std::invalid_argument("Dataset must contain sparse points");
+    if (maxGaussians != -1 && maxGaussians <= 0)
+        throw std::invalid_argument("maxGaussians must be -1 or greater than zero");
+    if (inputData.points.count > std::numeric_limits<int>::max())
+        throw std::invalid_argument("Dataset contains too many sparse points");
+    if (maxGaussians > 0 && inputData.points.count > maxGaussians)
+        throw std::invalid_argument("maxGaussians is below the initial Gaussian count");
     if (numCameras <= 0)
         throw std::invalid_argument("Dataset must contain training cameras");
     if (numDownscales < 0 || numDownscales > 30)
@@ -180,9 +188,10 @@ Model::Model(const InputData &inputData, int numCameras,
 void Model::setupOptimizers(){
     releaseOptimizers();
 
-
-    num_active = means.size(0);
-    buf_capacity = capacityWithSlack(num_active);
+    if (means.size(0) <= 0 || means.size(0) > std::numeric_limits<int>::max())
+        throw std::runtime_error("Gaussian population is outside the supported range");
+    num_active = static_cast<int>(means.size(0));
+    buf_capacity = capacityFor(num_active);
     auto allocBuf = [&](MTensor &buf, const MTensor &param) {
         auto shape = param.shape();
         shape[0] = buf_capacity;
@@ -215,10 +224,13 @@ void Model::setupOptimizers(){
     densify_dup_prefix = gpu_zeros({buf_capacity}, DType::Int32);
     densify_keep_flag = gpu_zeros({buf_capacity}, DType::Int32);
     densify_keep_prefix = gpu_zeros({buf_capacity}, DType::Int32);
-    int max_blocks = (buf_capacity + 1023) / 1024;
+    int max_blocks = static_cast<int>(
+        (static_cast<int64_t>(buf_capacity) + 1023) / 1024);
     densify_block_totals = gpu_zeros({max_blocks}, DType::Int32);
     int64_t fr_stride = featuresRest.numel() / featuresRest.size(0);
-    densify_compact_scratch = gpu_zeros({(int64_t)buf_capacity * fr_stride}, DType::Float32);
+    int64_t compact_stride = std::max<int64_t>(fr_stride, 4);
+    densify_compact_scratch = gpu_zeros(
+        {static_cast<int64_t>(buf_capacity) * compact_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({buf_capacity, 3}, DType::Float32);
 
     refreshViews();
@@ -276,7 +288,10 @@ size_t Model::estimatedGpuBytes() const {
 
 void Model::ensureCapacity(int needed){
     if (needed <= buf_capacity) return;
+    if (maxGaussians > 0 && needed > maxGaussians)
+        throw std::runtime_error("Gaussian population exceeds maxGaussians");
     int new_cap = std::max(needed, capacityWithSlack(buf_capacity));
+    if (maxGaussians > 0) new_cap = std::min(new_cap, maxGaussians);
 
     struct ResizeTask {
         MTensor* tensor;
@@ -311,10 +326,13 @@ void Model::ensureCapacity(int needed){
     addLeadingCapacityTask(densify_keep_flag, false);
     addLeadingCapacityTask(densify_keep_prefix, false);
 
-    int max_blocks = (new_cap + 1023) / 1024;
+    int max_blocks = static_cast<int>(
+        (static_cast<int64_t>(new_cap) + 1023) / 1024);
     int64_t fr_stride = featuresRest_buf.stride0();
+    int64_t compact_stride = std::max<int64_t>(fr_stride, 4);
     tasks.push_back({&densify_block_totals, {max_blocks}, false});
-    tasks.push_back({&densify_compact_scratch, {(int64_t)new_cap * fr_stride}, false});
+    tasks.push_back({&densify_compact_scratch,
+                     {static_cast<int64_t>(new_cap) * compact_stride}, false});
     tasks.push_back({&densify_random_samples, {new_cap, 3}, false});
 
     // Replacing the largest allocations first minimizes the final transient:
@@ -336,6 +354,17 @@ void Model::ensureCapacity(int needed){
     refreshViews();
 }
 
+int Model::capacityFor(int needed) const {
+    if (needed <= 0)
+        throw std::invalid_argument("Gaussian capacity must be positive");
+    if (maxGaussians > 0) {
+        if (needed > maxGaussians)
+            throw std::runtime_error("Gaussian population exceeds maxGaussians");
+        return std::min(capacityWithSlack(needed), maxGaussians);
+    }
+    return capacityWithSlack(needed);
+}
+
 int Model::getDownscaleFactor(int step) {
     int remaining = numDownscales - step / resolutionSchedule;
     return 1 << std::max(remaining, 0);
@@ -346,7 +375,8 @@ void Model::afterTrain(int step){
 
     if (step % refineEvery == 0 && step > warmupLength){
         int resetInterval = resetAlphaEvery * refineEvery;
-        bool doDensification = step < stopSplitAt && step % resetInterval > numCameras + refineEvery;
+        bool doDensification = step < stopSplitAt &&
+            step % resetInterval > numCameras + refineEvery;
 
         if (doDensification){
             int numPointsBefore = num_active;
@@ -359,7 +389,7 @@ void Model::afterTrain(int step){
             int numSplits = 0;
             int numDups = 0;
             msplat_prepare_densify(
-                num_active,
+                num_active, maxGaussians,
                 densifyGradThresh, densifySizeThresh, splitScreenSize, check_screen,
                 xysGradNorm, visCounts, max2DSize, half_max_dim,
                 scales_buf,
@@ -386,7 +416,7 @@ void Model::afterTrain(int step){
             }
 
             int fr_stride = (int)featuresRest_buf.stride0();
-            num_active = msplat_densify(
+            int densifiedCount = msplat_densify(
                 num_active, population,
                 0.1f, 0.5f, 0.15f, check_screen, checkHuge ? 1 : 0,
                 max2DSize,
@@ -399,6 +429,11 @@ void Model::afterTrain(int step){
                 densify_block_totals, densify_compact_scratch,
                 densify_random_samples
             );
+            if (densifiedCount < 0 || densifiedCount > population ||
+                (maxGaussians > 0 && densifiedCount > maxGaussians)) {
+                throw std::runtime_error("Densification returned an invalid Gaussian count");
+            }
+            num_active = densifiedCount;
 
             refreshViews();
             std::cout << "Densified: " << numPointsBefore << " -> " << num_active << " gaussians" << std::endl;
@@ -452,7 +487,36 @@ void Model::saveSpz(const std::string &filename){
 }
 
 int Model::loadPly(const std::string &filename){
+    if (maxGaussians > 0) {
+        std::ifstream header(filename, std::ios::binary);
+        if (!header.is_open())
+            throw std::runtime_error("Cannot open PLY file: " + filename);
+
+        const std::string vertexPrefix = "element vertex ";
+        std::string line;
+        while (std::getline(header, line)) {
+            while (!line.empty() &&
+                   (line.back() == '\r' || line.back() == ' ' || line.back() == '\t')) {
+                line.pop_back();
+            }
+            if (line == "end_header") break;
+            if (line.rfind(vertexPrefix, 0) != 0) continue;
+            size_t consumed = 0;
+            const long long declaredCount = std::stoll(
+                line.substr(vertexPrefix.size()), &consumed);
+            if (consumed != line.size() - vertexPrefix.size() || declaredCount <= 0)
+                throw std::runtime_error("PLY has an invalid vertex count");
+            if (declaredCount > maxGaussians)
+                throw std::runtime_error("PLY Gaussian population exceeds maxGaussians");
+            break;
+        }
+    }
+
     auto g = loadGaussianPly(filename, scale, translation, keepCrs);
+    if (g.means.size(0) <= 0 || g.means.size(0) > std::numeric_limits<int>::max())
+        throw std::runtime_error("PLY Gaussian population is outside the supported range");
+    if (maxGaussians > 0 && g.means.size(0) > maxGaussians)
+        throw std::runtime_error("PLY Gaussian population exceeds maxGaussians");
     means = g.means;
     scales = g.scales;
     quats = g.quats;
@@ -790,7 +854,11 @@ int Model::loadCheckpoint(const std::string &filename) {
     CheckpointReader reader(filename);
     const ParsedCheckpoint checkpoint = parseCheckpointMetadata(reader);
     const int activeCount = static_cast<int>(checkpoint.numPoints);
-    const int capacity = capacityWithSlack(activeCount);
+    if (checkpoint.shDegree != static_cast<uint32_t>(configuredSHDegree))
+        checkpointError("SH degree does not match the configured training degree");
+    if (maxGaussians > 0 && activeCount > maxGaussians)
+        checkpointError("Gaussian count exceeds maxGaussians");
+    const int capacity = capacityFor(activeCount);
     if (capacity < activeCount)
         checkpointError("Gaussian capacity calculation overflowed");
 
@@ -830,8 +898,9 @@ int Model::loadCheckpoint(const std::string &filename) {
         static_cast<uint64_t>(featuresRestShape[1]),
         static_cast<uint64_t>(featuresRestShape[2]),
         "features_rest stride");
+    const uint64_t compactStride = std::max<uint64_t>(featuresRestStride, 4);
     const uint64_t compactElements = checkedMultiply(
-        static_cast<uint64_t>(capacity), featuresRestStride,
+        static_cast<uint64_t>(capacity), compactStride,
         "densification compact scratch");
     if (compactElements > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
         checkpointError("densification compact scratch exceeds the supported range");

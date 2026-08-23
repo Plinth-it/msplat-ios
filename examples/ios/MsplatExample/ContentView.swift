@@ -39,7 +39,7 @@ struct ContentView: View {
             } label: {
                 Label(folder?.name ?? "Choose a folder…", systemImage: "folder")
             }
-            .disabled(session.phase == .training || session.phase == .loading)
+            .disabled(isBusy)
 
             if let folder {
                 LabeledContent("Contents", value: folder.summary)
@@ -54,28 +54,45 @@ struct ContentView: View {
         Section {
             Stepper("Iterations: \(session.iterations)",
                     value: $session.iterations, in: 200...20_000, step: 200)
-            Picker("Resolution", selection: $session.downscale) {
-                Text("Full").tag(Float(1))
-                Text("Half").tag(Float(2))
-                Text("Quarter").tag(Float(4))
+            Picker("Quality", selection: $session.qualityProfile) {
+                ForEach(TrainingSession.QualityProfile.allCases) { profile in
+                    Text(profile.rawValue).tag(profile)
+                }
             }
 
-            Button(session.phase == .training ? "Training…" : "Train") {
+            Button(trainButtonTitle) {
                 if let folder { session.start(folder: folder) }
             }
-            .disabled(session.phase == .training || session.phase == .loading)
+            .disabled(isBusy)
 
-            if session.phase == .training {
+            if isBusy {
                 Button("Stop", role: .destructive) { session.cancel() }
             }
         } footer: {
-            Text("Half resolution is the default: full-resolution captures are where a phone runs out of memory first.")
+            Text("Preview targets a 1,600-pixel edge, SH1, and 250K Gaussians. Balanced targets 1,920 pixels, SH2, and 400K Gaussians when preflight memory permits.")
         }
     }
 
     private var progressSection: some View {
         Section("Progress") {
+            if !session.plannedStages.isEmpty {
+                ForEach(Array(session.plannedStages.enumerated()), id: \.offset) { _, stage in
+                    LabeledContent(
+                        "Steps \(stage.iterations.lowerBound)–\(stage.iterations.upperBound)",
+                        value: "\(stage.dimensions.width) × \(stage.dimensions.height)"
+                    )
+                }
+                LabeledContent("Final SH degree", value: "\(session.plannedSHDegree)")
+                LabeledContent(
+                    "Gaussian limit",
+                    value: session.plannedMaximumGaussians.formatted()
+                )
+                LabeledContent("Estimated peak", value: "\(session.estimatedPeakMB) MB")
+            }
+
             switch session.phase {
+            case .planning:
+                LabeledContent("Status", value: "Planning device-safe training…")
             case .loading:
                 LabeledContent("Status", value: "Loading dataset…")
             case .cancelled:
@@ -103,6 +120,21 @@ struct ContentView: View {
                     ? "\(session.footprintMB) MB used, \(session.availableMB) MB free"
                     : "\(session.footprintMB) MB used")
             }
+        }
+    }
+
+    private var isBusy: Bool {
+        switch session.phase {
+        case .planning, .loading, .training: return true
+        default: return false
+        }
+    }
+
+    private var trainButtonTitle: String {
+        switch session.phase {
+        case .planning, .loading: "Preparing…"
+        case .training: "Training…"
+        default: "Train"
         }
     }
 

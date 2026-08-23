@@ -28,11 +28,32 @@ root or under `sparse/0`, alongside an `images` directory.
 
 ## What it shows
 
-Training reports the step, the gaussian count, CPU encode/submission time, and
-the memory figures that matter on a phone: `phys_footprint`, which is what
-jetsam counts, and `os_proc_available_memory`, which is how much headroom is
-left before the app is killed. Resolution defaults to half, because
-full-resolution captures are where a phone runs out of memory first.
+Before loading the dataset, the app reads image dimensions from ImageIO
+metadata and builds one of two explicit plans:
+
+- Preview targets a 1,600-pixel longest edge, SH degree 1, one resolution
+  stage, and a hard limit of 250,000 Gaussians.
+- Balanced targets a 1,920-pixel longest edge, trains its first half at an
+  additional 2x downscale before moving to the final resolution, reaches SH
+  degree 2, and limits the population to 400,000 Gaussians.
+
+The plan screen shows each effective resolution stage, target SH degree,
+Gaussian ceiling, and a conservative code-derived peak-memory estimate. The
+estimate covers native model and training buffers, image-cache insertion, the
+current full-source decode transient, and recommended headroom. The app refuses
+to start when that estimate exceeds a nonzero `os_proc_available_memory` value
+at preflight (the simulator reports zero and skips this comparison).
+
+This check is a planning aid, not a jetsam guarantee. Metal driver state,
+framework allocations, other process memory, and changing system pressure are
+not fully modeled. The current image path also still materializes each source
+image at full resolution before resizing it, so very large captures can create
+a short-lived decode spike even when the planned training resolution is small.
+
+During training the app reports the step, Gaussian count, CPU
+encode/submission time, `phys_footprint`, and the memory iOS currently reports
+available. It also samples a rendered preview rather than rendering every
+iteration.
 
 The exported PLY goes to the app's Documents folder and is offered through the
 share sheet.

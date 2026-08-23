@@ -6,8 +6,10 @@ the full training pipeline as fused Metal compute kernels, with no dependency
 beyond system frameworks.
 
 This fork reduces model and transient growth, adds a byte-budgeted image cache,
-fixes three correctness bugs, and provides an iOS build plus a COLMAP-to-PLY
-example app. It does not yet impose a hard model-memory or Gaussian-count cap.
+enforces an optional hard Gaussian population limit, fixes correctness bugs,
+and provides an iOS build plus a COLMAP-to-PLY example app. Its Swift
+`TrainingPlan` also validates resolution stages and derives a conservative
+peak-memory estimate before a session is created.
 
 ## Memory
 
@@ -25,6 +27,21 @@ example app. It does not yet impose a hard model-memory or Gaussian-count cap.
   off. They are released.
 - Training images were all decoded up front. A byte-budgeted LRU holds what fits
   and reloads the rest.
+- `maxGaussians` bounds the active population and its backing buffers. When a
+  densification step has more eligible candidates than remaining capacity, the
+  highest normalized-gradient candidates are retained; pruning still runs at
+  the limit. Oversized initial models, PLY imports, and checkpoints are rejected
+  before their Gaussian storage is allocated.
+
+`TrainingPlan` derives its estimate from the selected Gaussian ceiling, SH
+degree, source dimensions, resolution stages, intersection bounds, native image
+cache, and an additional headroom allowance. It is intentionally conservative,
+but it is not a jetsam guarantee: Metal driver state, framework allocations,
+other process memory, and changing system pressure are outside the model. The
+current image path also materializes a full-source decode before resizing; the
+estimate includes a transient allowance for that behavior. A valid
+`MSPLAT_IMAGE_CACHE_MB` override is reflected automatically; use
+`memoryEstimate(imageCacheBudgetBytes:)` to evaluate another budget explicitly.
 
 ## Correctness
 
@@ -49,8 +66,14 @@ dataset declared on every call.
 
 - COLMAP text models (`cameras.txt` / `images.txt` / `points3D.txt`)
 - `.spz` export
-- `--stop-densify-at`, stopping topology growth after a chosen step (not a hard
-  Gaussian-count or memory cap)
+- `--stop-densify-at`, stopping topology growth after a chosen step
+- `--max-gaussians`, a hard Gaussian population and backing-buffer ceiling
+  (`-1` keeps the legacy unlimited behavior)
+- ABI v3 checked trainer creation with a size-validated
+  `MsplatTrainingLimits` structure; ABI v2 creation remains available and
+  unlimited
+- Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
+  code-derived peak-memory estimate
 - XCFramework slices for `macos-arm64`, `ios-arm64` and
   `ios-arm64_x86_64-simulator`, each with its own metallib
 
@@ -73,15 +96,34 @@ import Msplat
 
 @MsplatRuntimeActor
 func train() throws {
-    var config = TrainingConfig()
-    config.iterations = 2_000
-    config.numDownscales = 0 // train at the dataset's selected decode scale
-    config.stopDensifyAt = 750
+    let plan = try TrainingPlan(
+        // Maximum source dimensions, before input decoding.
+        inputDimensions: TrainingImageDimensions(width: 4_032, height: 3_024),
+        inputDecodeScale: 2,
+        iterationBudget: 2_000,
+        stages: [
+            try TrainingResolutionStage(
+                iterations: 1...1_000,
+                downscaleFactor: 2
+            ),
+            try TrainingResolutionStage(
+                iterations: 1_001...2_000,
+                downscaleFactor: 1
+            ),
+        ],
+        targetSHDegree: 2,
+        maximumGaussianCount: 400_000
+    )
+
+    print("Conservative peak: \(plan.estimatedPeakMemory / 1_048_576) MiB")
+
+    var baseConfig = TrainingConfig()
+    baseConfig.stopDensifyAt = 750
 
     let session = try MsplatSession(
         datasetURL: URL(fileURLWithPath: "path/to/colmap/"),
-        options: DatasetOptions(downscaleFactor: 2.0),
-        config: config
+        trainingPlan: plan,
+        baseConfig: baseConfig
     )
     defer { try? session.close() }
 
@@ -101,7 +143,7 @@ CLI:
 
 ```sh
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
-./build/msplat path/to/dataset -n 7000 --eval
+./build/msplat path/to/dataset -n 7000 --max-gaussians 400000 --eval
 ```
 
 ## Reference

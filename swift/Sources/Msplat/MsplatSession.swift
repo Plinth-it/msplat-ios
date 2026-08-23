@@ -67,14 +67,38 @@ public struct RGBAFrame: Sendable, Equatable {
 public final class MsplatSession {
     private let resources: SessionResources
 
+    /// Creates a session from one explicit resolution, SH, and topology plan.
+    public convenience init(
+        datasetURL: URL,
+        trainingPlan plan: TrainingPlan,
+        baseConfig: TrainingConfig = TrainingConfig(),
+        evalMode: Bool = false,
+        testEvery: Int32 = 8
+    ) throws {
+        try self.init(
+            datasetURL: datasetURL,
+            options: plan.makeDatasetOptions(evalMode: evalMode, testEvery: testEvery),
+            config: plan.makeTrainingConfig(startingFrom: baseConfig),
+            maximumGaussianCount: plan.maximumGaussianCount
+        )
+    }
+
     /// Creates the native dataset and trainer and retains the dataset URL's
     /// security scope until ``close()`` completes.
     public init(
         datasetURL: URL,
         options: DatasetOptions = DatasetOptions(),
-        config: TrainingConfig = TrainingConfig()
+        config: TrainingConfig = TrainingConfig(),
+        maximumGaussianCount: Int? = nil
     ) throws {
         try config.validate()
+        if let maximumGaussianCount {
+            guard (1...Int(Int32.max)).contains(maximumGaussianCount) else {
+                throw MsplatError.invalidArgument(
+                    "maximumGaussianCount must be in 1...2147483647"
+                )
+            }
+        }
         guard datasetURL.isFileURL, !datasetURL.path.isEmpty else {
             throw MsplatError.invalidArgument(
                 "The dataset URL must be a file URL with a non-empty path"
@@ -87,7 +111,8 @@ public final class MsplatSession {
             let handles = try Self.createHandles(
                 path: datasetURL.path,
                 options: options,
-                config: config
+                config: config,
+                maximumGaussianCount: maximumGaussianCount
             )
             resources = SessionResources(
                 dataset: handles.dataset,
@@ -320,7 +345,8 @@ public final class MsplatSession {
     private static func createHandles(
         path: String,
         options: DatasetOptions,
-        config: TrainingConfig
+        config: TrainingConfig,
+        maximumGaussianCount: Int?
     ) throws -> (dataset: MsplatDataset, trainer: MsplatTrainer) {
         try withConfiguredNativeEngine(metallibResourceName) {
             var dataset: MsplatDataset?
@@ -340,11 +366,22 @@ public final class MsplatSession {
 
             do {
                 var config = config.toC()
+                var limits = msplat_default_training_limits()
+                if let maximumGaussianCount {
+                    guard let nativeLimit = Int32(exactly: maximumGaussianCount) else {
+                        throw MsplatError.invalidArgument(
+                            "maximumGaussianCount is outside the native range"
+                        )
+                    }
+                    limits.maxGaussians = nativeLimit
+                }
                 var trainer: MsplatTrainer?
-                let trainerStatus = msplat_trainer_create_v2(
+                let trainerStatus = msplat_trainer_create_v3(
                     dataset,
                     &config,
                     MemoryLayout<MsplatConfig>.size,
+                    &limits,
+                    MemoryLayout<MsplatTrainingLimits>.size,
                     &trainer,
                     &nativeError
                 )

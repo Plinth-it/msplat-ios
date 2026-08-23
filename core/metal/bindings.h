@@ -76,8 +76,10 @@ std::tuple<MTensor, float> msplat_train_step(
 
 // Classification and its prefix sums, split out so the caller learns how many
 // gaussians will actually be written before it allocates room for them.
+// A positive max_population keeps the highest-gradient candidates whose
+// temporary append population fits; non-positive preserves unlimited behavior.
 void msplat_prepare_densify(
-    int N,
+    int N, int max_population,
     float grad_thresh, float size_thresh, float screen_thresh, int check_screen,
     MTensor &xys_grad_norm, MTensor &vis_counts, MTensor &max_2d_size,
     float half_max_dim,

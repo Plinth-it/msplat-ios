@@ -155,6 +155,8 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
     : impl(std::make_unique<Impl>())
 {
     std::lock_guard lock(g_trainerTransactionMutex);
+    if (config.maxGaussians != -1 && config.maxGaussians <= 0)
+        throw std::invalid_argument("maxGaussians must be -1 or greater than zero");
     impl->config = config;
     impl->ds = static_cast<Dataset::Impl*>(dataset._handle());
 
@@ -168,7 +170,8 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.stopScreenSizeAt, config.splitScreenSize,
         config.iterations, config.keepCrs,
         config.bgColor,
-        config.stopDensifyAt
+        config.stopDensifyAt,
+        config.maxGaussians
     );
 
     impl->camIndices.resize(impl->ds->trainIndices.size());
@@ -534,6 +537,11 @@ void validateConfig(const MsplatConfig& c) {
                 "bgColor components must be finite and in 0...1");
 }
 
+void validateTrainingLimits(const MsplatTrainingLimits& limits) {
+    require(limits.maxGaussians == -1 || limits.maxGaussians > 0,
+            "maxGaussians must be -1 or greater than zero");
+}
+
 msplat::Config configFromC(const MsplatConfig& c) {
     msplat::Config cfg;
     cfg.iterations = c.iterations;
@@ -640,17 +648,45 @@ MsplatStatus msplat_trainer_create_v2(MsplatDataset ds,
                                       size_t configSize,
                                       MsplatTrainer* outTrainer,
                                       MsplatErrorInfo* error) {
+    const MsplatTrainingLimits limits = msplat_default_training_limits();
+    return msplat_trainer_create_v3(
+        ds, config, configSize, &limits, sizeof(limits), outTrainer, error);
+}
+
+MsplatStatus msplat_training_limits_validate_v3(
+    const MsplatTrainingLimits* limits, size_t limitsSize,
+    MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INVALID_ARGUMENT, [&] {
+        require(limits != nullptr, "Training limits must not be null");
+        require(limitsSize == sizeof(MsplatTrainingLimits),
+                "Training limits size does not match this msplat ABI");
+        validateTrainingLimits(*limits);
+    });
+}
+
+MsplatStatus msplat_trainer_create_v3(MsplatDataset ds,
+                                      const MsplatConfig* config,
+                                      size_t configSize,
+                                      const MsplatTrainingLimits* limits,
+                                      size_t limitsSize,
+                                      MsplatTrainer* outTrainer,
+                                      MsplatErrorInfo* error) {
     if (outTrainer) *outTrainer = nullptr;
     return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
         require(ds != nullptr, "Dataset handle must not be null");
         require(config != nullptr, "Training config must not be null");
         require(configSize == sizeof(MsplatConfig),
                 "Training config size does not match this msplat ABI");
+        require(limits != nullptr, "Training limits must not be null");
+        require(limitsSize == sizeof(MsplatTrainingLimits),
+                "Training limits size does not match this msplat ABI");
         require(outTrainer != nullptr, "outTrainer must not be null");
         validateConfig(*config);
+        validateTrainingLimits(*limits);
         auto dataset = datasetHandle(ds).dataset;
         require(dataset->numTrain() > 0, "Dataset has no training cameras");
         auto cfg = configFromC(*config);
+        cfg.maxGaussians = limits->maxGaussians;
         auto handle = std::make_unique<CApiTrainerHandle>();
         handle->dataset = std::move(dataset);
         handle->trainer = std::make_unique<msplat::Trainer>(*handle->dataset, cfg);

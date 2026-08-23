@@ -85,6 +85,9 @@ int main(int argc, char *argv[]) {
     app.add_option("--stop-screen-size-at", stopScreenSizeAt, "Stop splitting large gaussians after N steps");
     int stopDensifyAt = -1;
     app.add_option("--stop-densify-at", stopDensifyAt, "Stop growing the topology after N steps (default: half of -n)");
+    int maxGaussians = -1;
+    app.add_option("--max-gaussians", maxGaussians,
+                   "Hard Gaussian population limit (-1 for unlimited)");
     float splitScreenSize = 0.05f;
     app.add_option("--split-screen-size", splitScreenSize, "Screen-space split threshold");
     bool keepCrs = false;
@@ -96,6 +99,11 @@ int main(int argc, char *argv[]) {
     app.add_option("--colmap-image-path", colmapImagePath, "Override COLMAP image directory");
 
     CLI11_PARSE(app, argc, argv);
+
+    if (maxGaussians != -1 && maxGaussians <= 0) {
+        std::cerr << "--max-gaussians must be -1 or greater than zero" << std::endl;
+        return 2;
+    }
 
     if (validate || !valRender.empty()) validate = true;
     if (!valRender.empty() && !fs::exists(valRender)) fs::create_directories(valRender);
@@ -127,7 +135,8 @@ int main(int argc, char *argv[]) {
                      densifySizeThresh, stopScreenSizeAt, splitScreenSize,
                      numIters, keepCrs,
                      bgColor.data(),
-                     stopDensifyAt);
+                     stopDensifyAt,
+                     maxGaussians);
 
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);

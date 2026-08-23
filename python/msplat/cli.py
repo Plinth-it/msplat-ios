@@ -61,6 +61,9 @@ def main():
         stop_screen_size_at: int = 4000
         """Stop screen-size split after this step"""
 
+        max_gaussians: int = -1
+        """Hard Gaussian population limit (-1 for unlimited)"""
+
         split_screen_size: float = 0.05
         """Screen-space split threshold"""
 
@@ -93,6 +96,7 @@ def main():
         densify_grad_thresh=args.densify_grad_thresh,
         densify_size_thresh=args.densify_size_thresh,
         stop_screen_size_at=args.stop_screen_size_at,
+        max_gaussians=args.max_gaussians,
         split_screen_size=args.split_screen_size,
         keep_crs=args.keep_crs,
         downscale_factor=args.downscale_factor,
