@@ -274,7 +274,7 @@ size_t Model::estimatedGpuBytes() const {
         &densify_split_flag, &densify_dup_flag, &densify_split_prefix, &densify_dup_prefix,
         &densify_keep_flag, &densify_keep_prefix, &densify_block_totals,
         &densify_compact_scratch, &densify_random_samples,
-        &radii, &xysGradNorm, &visCounts, &max2DSize, &backgroundColor, &window2d
+        &radii, &xysGradNorm, &visCounts, &max2DSize, &backgroundColor
     };
     for (const MTensor* tensor : tensors) {
         if (tensor->defined()) bytes += tensor->nbytes();
@@ -1044,13 +1044,6 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     lastHeight = s.height; lastWidth = s.width;
     int numPoints = means.size(0);
 
-    // Initialize SSIM window (once)
-    if (!window2d.defined()) {
-        auto w = createSSIMWindow(11, 1.5f);
-        window2d = gpu_empty({11, 11}, DType::Float32);
-        memcpy(window2d.data_ptr(), w.data(), w.size() * sizeof(float));
-    }
-
     if (adam_step_count == std::numeric_limits<int>::max())
         throw std::overflow_error("Adam step count cannot be incremented further");
     adam_step_count++;
@@ -1083,8 +1076,8 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-        opacities, backgroundColor, gt, window2d, ssimWeight,
-        lossInvN, (int)featuresRest.size(-2),
+        opacities, backgroundColor, gt, ssimWeight,
+        lossInvN,
         N_ADAM_GROUPS,
         adam_p, adam_ea, adam_eas,
         adam_ss, adam_bc2s,

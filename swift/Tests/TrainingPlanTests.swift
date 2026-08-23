@@ -64,7 +64,7 @@ final class TrainingPlanTests: XCTestCase {
             TrainingMemoryEstimate.defaultIOSImageCacheBudgetBytes
         )
         XCTAssertEqual(estimate.modelStorageBytes, 441_002_932)
-        XCTAssertEqual(estimate.modelLifecycleBytes, 564_003_428)
+        XCTAssertEqual(estimate.modelLifecycleBytes, 564_002_944)
         XCTAssertEqual(estimate.stages.map(\.pixelCount), [172_800, 691_200])
         XCTAssertEqual(estimate.stages.map(\.tileCount), [690, 2_700])
         XCTAssertEqual(
@@ -78,22 +78,22 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(estimate.stages.map(\.chunkCount), [1, 1])
         XCTAssertEqual(
             estimate.stages.map(\.trainingCacheBytes),
-            [697_584_540, 809_345_340]
+            [616_581_608, 728_342_408]
         )
-        XCTAssertEqual(estimate.peakTrainingCacheBytes, 809_345_340)
+        XCTAssertEqual(estimate.peakTrainingCacheBytes, 728_342_408)
         XCTAssertEqual(estimate.largestImageCacheEntryBytes, 16_588_800)
         XCTAssertEqual(estimate.imageDecodeTransientBytes, 24_883_200)
         XCTAssertEqual(estimate.imageInsertionPeakBytes, 561_754_112)
-        XCTAssertEqual(estimate.codeDerivedBytes, 1_935_102_880)
-        XCTAssertEqual(estimate.recommendedHeadroomBytes, 387_020_576)
-        XCTAssertEqual(estimate.estimatedPeakMemory, 2_322_123_456)
+        XCTAssertEqual(estimate.codeDerivedBytes, 1_854_099_464)
+        XCTAssertEqual(estimate.recommendedHeadroomBytes, 370_819_893)
+        XCTAssertEqual(estimate.estimatedPeakMemory, 2_224_919_357)
         let customEstimate = try plan.memoryEstimate(
             imageCacheBudgetBytes: 64 * 1_024 * 1_024
         )
         XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 91_992_064)
-        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_465_340_832)
-        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 293_068_167)
-        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_758_408_999)
+        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_384_337_416)
+        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 276_867_484)
+        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_661_204_900)
     }
 
     func testSingleCoarseStageDoesNotTransitionWithinBudget() throws {

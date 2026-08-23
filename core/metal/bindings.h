@@ -31,6 +31,10 @@ void msplat_gpu_sync();
 // Bytes held by the cached per-iteration intermediates (the "temp" line in
 // MSPLAT_MEM_LOG_EVERY). These dwarf the model at full resolution.
 size_t msplat_cached_tensor_bytes();
+// Internal accounting split for native tests and diagnostics. The shared side
+// is sufficient for a cold render; the training side is allocated lazily.
+size_t msplat_shared_cached_tensor_bytes();
+size_t msplat_training_cached_tensor_bytes();
 
 // GPU timing — non-invasive, uses completion handlers on committed CBs
 void msplat_enable_gpu_timing(bool enable);
@@ -64,8 +68,8 @@ std::tuple<MTensor, float> msplat_train_step(
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
-    MTensor &gt, MTensor &window2d, float ssim_weight,
-    float loss_inv_n, int features_rest_bases,
+    MTensor &gt, float ssim_weight,
+    float loss_inv_n,
     int num_adam_groups,
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],

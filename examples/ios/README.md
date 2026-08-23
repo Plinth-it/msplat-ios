@@ -40,7 +40,8 @@ metadata and builds one of two explicit plans:
 The plan screen shows each effective resolution stage, target SH degree,
 Gaussian ceiling, and a conservative code-derived peak-memory estimate. The
 estimate covers native model and training buffers, image-cache insertion,
-target-resolution app-owned decode buffers, and recommended headroom. The app
+target-resolution app-owned decode buffers, and recommended headroom. The
+current formula reflects the split cache and removal of dead workspaces. The app
 refuses to start when that estimate exceeds a nonzero
 `os_proc_available_memory` value at preflight (the simulator reports zero and
 skips this comparison).

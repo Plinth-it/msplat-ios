@@ -668,8 +668,10 @@ struct FusedTensorCache {
     // -1 means "this group holds nothing usable" — the state a group is left in
     // when one of its allocations fails partway through, so the next call
     // rebuilds it instead of binding buffers that were never allocated.
-    int fwd_num_points = -1, img_height = -1, img_width = -1, num_tiles = -1;
-    int bwd_num_points = -1, features_rest_bases = -1;
+    int fwd_num_points = -1, shared_img_height = -1, shared_img_width = -1;
+    int num_tiles = -1;
+    int training_img_height = -1, training_img_width = -1;
+    int bwd_num_points = -1;
     int64_t capacity = -1;
     // Intersections the GPU last reported needing (tile_offsets' final entry).
     // Sizes the packed buffers — see intersection_capacity().
@@ -680,42 +682,37 @@ struct FusedTensorCache {
     MTensor gaussian_ids;
     MTensor packed_xy_opac, packed_conic, packed_rgb;
     MTensor out_img, final_Ts, final_idx;
-    MTensor loss_intermediates;
-    MTensor ssim_h_buf;
-    MTensor tile_bins, loss_sum;
+    MTensor tile_bins;
 
     // Tile-local sorting buffers
     MTensor tile_offsets, tile_scatter_counters;
     MTensor prealloc_bins;  // [num_tiles × MAX_TILE_ELEMS] uint64 — pre-allocated per-tile bins
 
-    // Multi-threadgroup prefix sum temp buffer
-    MTensor block_totals;
-
     // Intersection overflow detection
     MTensor overflow_flag;
     int64_t capacity_multiplier = 16;
 
-    // Depth-chunked rasterization buffers
-    uint32_t current_K_max = 1;
-    int chunk_K_max = -1, chunk_height = -1, chunk_width = -1;
+    // Shared forward depth-chunked rasterization buffers
+    int forward_chunk_K_max = -1, forward_chunk_height = -1, forward_chunk_width = -1;
     MTensor chunk_T, chunk_C, chunk_final_idx;
+
+    // Training-only image and backward depth-chunked buffers
+    MTensor loss_intermediates, ssim_h_buf, loss_sum, v_rendered;
+    int backward_chunk_K_max = -1, backward_chunk_height = -1, backward_chunk_width = -1;
     MTensor prefix_T, after_C;
 
-    // Backward gradient accumulators
-    MTensor v_rendered;
+    // Training-only backward gradient accumulators
     MTensor v_xy, v_conic, v_colors_rast, v_opacity, v_depth;
-    MTensor v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest;
+    MTensor v_mean3d, v_scale, v_quat;
 
-    size_t estimatedBytes() const {
+    size_t sharedEstimatedBytes() const {
         const MTensor* tensors[] = {
             &xys, &depths, &radii_out, &conics, &num_tiles_hit, &colors, &aabb,
             &gaussian_ids, &packed_xy_opac, &packed_conic, &packed_rgb,
-            &out_img, &final_Ts, &final_idx, &loss_intermediates, &ssim_h_buf,
-            &tile_bins, &loss_sum, &tile_offsets, &tile_scatter_counters,
-            &prealloc_bins, &block_totals, &overflow_flag,
-            &chunk_T, &chunk_C, &chunk_final_idx, &prefix_T, &after_C,
-            &v_rendered, &v_xy, &v_conic, &v_colors_rast, &v_opacity, &v_depth,
-            &v_mean3d, &v_scale, &v_quat, &v_features_dc, &v_features_rest
+            &out_img, &final_Ts, &final_idx,
+            &tile_bins, &tile_offsets, &tile_scatter_counters,
+            &prealloc_bins, &overflow_flag,
+            &chunk_T, &chunk_C, &chunk_final_idx
         };
         size_t bytes = 0;
         for (const MTensor* tensor : tensors) {
@@ -724,18 +721,36 @@ struct FusedTensorCache {
         return bytes;
     }
 
+    size_t trainingEstimatedBytes() const {
+        const MTensor* tensors[] = {
+            &loss_intermediates, &ssim_h_buf, &loss_sum, &v_rendered,
+            &prefix_T, &after_C,
+            &v_xy, &v_conic, &v_colors_rast, &v_opacity, &v_depth,
+            &v_mean3d, &v_scale, &v_quat
+        };
+        size_t bytes = 0;
+        for (const MTensor* tensor : tensors) {
+            if (tensor->defined()) bytes += tensor->nbytes();
+        }
+        return bytes;
+    }
+
+    size_t estimatedBytes() const {
+        return sharedEstimatedBytes() + trainingEstimatedBytes();
+    }
+
     // Each group releases the previous generation before allocating the new one.
     // At the last resolution step-up the new set is roughly 4x the old, so
     // holding both alive across the transition would raise the peak above what
     // the device can hand back. The size tracker is invalidated first, so an
     // allocation that throws partway leaves the group marked empty rather than
     // leaving stale sizes claiming buffers that no longer exist.
-    void ensure_forward(int np, int64_t cap, int ih, int iw, int nt,
-                        id<MTLDevice> dev) {
+    void ensure_shared_forward(int np, int64_t cap, int ih, int iw, int nt,
+                               id<MTLDevice> dev) {
         if (np != fwd_num_points) {
             fwd_num_points = -1;
             xys.reset(); depths.reset(); radii_out.reset(); conics.reset();
-            num_tiles_hit.reset(); colors.reset(); aabb.reset(); block_totals.reset();
+            num_tiles_hit.reset(); colors.reset(); aabb.reset();
 
             xys = mtensor_empty(dev, {np, 2}, DType::Float32);
             depths = mtensor_empty(dev, {np}, DType::Float32);
@@ -744,7 +759,6 @@ struct FusedTensorCache {
             num_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
             colors = mtensor_empty(dev, {np, 3}, DType::Float32);
             aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
-            block_totals = mtensor_empty(dev, {(np + 1023) / 1024}, DType::Int32);
             fwd_num_points = np;
         }
         if (cap != capacity) {
@@ -758,18 +772,14 @@ struct FusedTensorCache {
             packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
             capacity = cap;
         }
-        if (ih != img_height || iw != img_width) {
-            img_height = -1; img_width = -1;
+        if (ih != shared_img_height || iw != shared_img_width) {
+            shared_img_height = -1; shared_img_width = -1;
             out_img.reset(); final_Ts.reset(); final_idx.reset();
-            loss_intermediates.reset(); ssim_h_buf.reset(); v_rendered.reset();
 
             out_img = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
             final_Ts = mtensor_empty(dev, {ih, iw}, DType::Float32);
             final_idx = mtensor_empty(dev, {ih, iw}, DType::Int32);
-            loss_intermediates = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
-            ssim_h_buf = mtensor_empty(dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
-            v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
-            img_height = ih; img_width = iw;
+            shared_img_height = ih; shared_img_width = iw;
         }
         if (nt != num_tiles) {
             num_tiles = -1;
@@ -782,52 +792,97 @@ struct FusedTensorCache {
             prealloc_bins = mtensor_empty(dev, {(int64_t)nt * 2048}, DType::Int64);
             num_tiles = nt;
         }
-        if (!loss_sum.defined()) {
-            loss_sum = mtensor_empty(dev, {1}, DType::Float32);
-        }
         if (!overflow_flag.defined()) {
             overflow_flag = mtensor_empty(dev, {1}, DType::Int32);
         }
     }
 
-    void ensure_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
+    void ensure_training_image(int ih, int iw, id<MTLDevice> dev) {
+        if (ih == training_img_height && iw == training_img_width &&
+            loss_intermediates.defined() && ssim_h_buf.defined() &&
+            loss_sum.defined() && v_rendered.defined()) {
+            return;
+        }
+
+        training_img_height = -1; training_img_width = -1;
+        loss_intermediates.reset(); ssim_h_buf.reset();
+        loss_sum.reset(); v_rendered.reset();
+
+        loss_intermediates = mtensor_empty(
+            dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
+        ssim_h_buf = mtensor_empty(
+            dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
+        loss_sum = mtensor_empty(dev, {1}, DType::Float32);
+        v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
+        training_img_height = ih; training_img_width = iw;
+    }
+
+    void ensure_forward_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
         if (K <= 1) {
             // Chunking is off at this resolution. Whatever the previous level
             // built can never be reused — on garden that is ~208MB, carried to
             // the end of training — so hand it back. Only on a resolution
             // change: within a level K_max climbs as the model densifies, so a
             // dip to 1 there would just churn the allocation.
-            if (chunk_T.defined() && (ih != chunk_height || iw != chunk_width)) {
-                chunk_K_max = -1; chunk_height = -1; chunk_width = -1;
+            const bool anyDefined = chunk_T.defined() || chunk_C.defined() ||
+                chunk_final_idx.defined();
+            if (anyDefined &&
+                (ih != forward_chunk_height || iw != forward_chunk_width)) {
+                forward_chunk_K_max = -1;
+                forward_chunk_height = -1; forward_chunk_width = -1;
                 chunk_T.reset(); chunk_C.reset(); chunk_final_idx.reset();
-                prefix_T.reset(); after_C.reset();
             }
             return;
         }
-        // Compared against img_height/img_width until now, which ensure_forward
-        // has already advanced to the new resolution by the time this runs — so
-        // the guard was comparing ih to itself and the chunk buffers kept the
-        // previous level's dimensions while the kernels indexed them at the new
-        // one. Track the dimensions this group was actually built for.
-        if (K <= chunk_K_max && ih == chunk_height && iw == chunk_width) return;
-        chunk_K_max = -1; chunk_height = -1; chunk_width = -1;
+        if (K <= forward_chunk_K_max && ih == forward_chunk_height &&
+            iw == forward_chunk_width && chunk_T.defined() &&
+            chunk_C.defined() && chunk_final_idx.defined()) {
+            return;
+        }
+        forward_chunk_K_max = -1;
+        forward_chunk_height = -1; forward_chunk_width = -1;
         chunk_T.reset(); chunk_C.reset(); chunk_final_idx.reset();
-        prefix_T.reset(); after_C.reset();
 
         chunk_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
         chunk_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
         chunk_final_idx = mtensor_empty(dev, {K, ih, iw}, DType::Int32);
-        prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
-        after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
-        chunk_K_max = K; chunk_height = ih; chunk_width = iw;
+        forward_chunk_K_max = K;
+        forward_chunk_height = ih; forward_chunk_width = iw;
     }
 
-    void ensure_backward(int np, int frb, id<MTLDevice> dev) {
-        if (np != bwd_num_points || frb != features_rest_bases || !v_xy.defined()) {
-            bwd_num_points = -1; features_rest_bases = -1;
+    void ensure_backward_chunks(int K, int ih, int iw, id<MTLDevice> dev) {
+        if (K <= 1) {
+            const bool anyDefined = prefix_T.defined() || after_C.defined();
+            if (anyDefined &&
+                (ih != backward_chunk_height || iw != backward_chunk_width)) {
+                backward_chunk_K_max = -1;
+                backward_chunk_height = -1; backward_chunk_width = -1;
+                prefix_T.reset(); after_C.reset();
+            }
+            return;
+        }
+        if (K <= backward_chunk_K_max && ih == backward_chunk_height &&
+            iw == backward_chunk_width && prefix_T.defined() && after_C.defined()) {
+            return;
+        }
+        backward_chunk_K_max = -1;
+        backward_chunk_height = -1; backward_chunk_width = -1;
+        prefix_T.reset(); after_C.reset();
+
+        prefix_T = mtensor_empty(dev, {K, ih, iw}, DType::Float32);
+        after_C = mtensor_empty(dev, {K, ih, iw, 3}, DType::Float32);
+        backward_chunk_K_max = K;
+        backward_chunk_height = ih; backward_chunk_width = iw;
+    }
+
+    void ensure_backward(int np, id<MTLDevice> dev) {
+        if (np != bwd_num_points || !v_xy.defined() || !v_conic.defined() ||
+            !v_colors_rast.defined() || !v_opacity.defined() ||
+            !v_depth.defined() || !v_mean3d.defined() ||
+            !v_scale.defined() || !v_quat.defined()) {
+            bwd_num_points = -1;
             v_xy.reset(); v_conic.reset(); v_colors_rast.reset(); v_opacity.reset();
             v_depth.reset(); v_mean3d.reset(); v_scale.reset(); v_quat.reset();
-            v_features_dc.reset(); v_features_rest.reset();
 
             v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
             v_conic = mtensor_empty(dev, {np, 3}, DType::Float32);
@@ -837,9 +892,7 @@ struct FusedTensorCache {
             v_mean3d = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_scale = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_quat = mtensor_empty(dev, {np, 4}, DType::Float32);
-            v_features_dc = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_features_rest = mtensor_empty(dev, {(int64_t)np, (int64_t)frb, 3}, DType::Float32);
-            bwd_num_points = np; features_rest_bases = frb;
+            bwd_num_points = np;
         }
     }
 };
@@ -848,6 +901,16 @@ static FusedTensorCache g_tcache;
 size_t msplat_cached_tensor_bytes() {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     return g_tcache.estimatedBytes();
+}
+
+size_t msplat_shared_cached_tensor_bytes() {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    return g_tcache.sharedEstimatedBytes();
+}
+
+size_t msplat_training_cached_tensor_bytes() {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    return g_tcache.trainingEstimatedBytes();
 }
 
 // Size of the packed intersection buffers (gaussian_ids, packed_xy_opac,
@@ -918,9 +981,9 @@ void cleanup_msplat_metal() {
     g_tcache = FusedTensorCache{};
 }
 
-// Internal forward pipeline — used by both msplat_render and msplat_train_step.
-// When compute_loss=false, gt/window2d/ssim_weight are ignored.
-static void forward_pipeline(
+// Render-only forward pipeline. Training has its own fused forward/backward
+// encoder below and lazily allocates the additional buffers it needs.
+static void render_pipeline(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
     MTensor &quats, MTensor &viewmat, MTensor &projmat,
     float fx, float fy, float cx, float cy,
@@ -928,9 +991,7 @@ static void forward_pipeline(
     const std::tuple<int, int, int> tile_bounds, float clip_thresh,
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background,
-    MTensor &gt, MTensor &window2d, float ssim_weight,
-    bool compute_loss
+    MTensor &opacities, MTensor &background
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -958,7 +1019,8 @@ static void forward_pipeline(
     uint32_t channels = 3;
 
     // --- Cached buffer pool: only reallocate on dimension change (densification) ---
-    g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, ctx->device);
+    g_tcache.ensure_shared_forward(
+        num_points, capacity, img_height, img_width, num_tiles, ctx->device);
     MTensor &xys = g_tcache.xys;
     MTensor &depths = g_tcache.depths;
     MTensor &radii_out = g_tcache.radii_out;
@@ -968,16 +1030,12 @@ static void forward_pipeline(
     MTensor &aabb = g_tcache.aabb;
     MTensor &gaussian_ids = g_tcache.gaussian_ids;
     MTensor &tile_bins = g_tcache.tile_bins;
-    MTensor &loss_sum = g_tcache.loss_sum;
     MTensor &packed_xy_opac = g_tcache.packed_xy_opac;
     MTensor &packed_conic = g_tcache.packed_conic;
     MTensor &packed_rgb = g_tcache.packed_rgb;
     MTensor &out_img = g_tcache.out_img;
     MTensor &final_Ts = g_tcache.final_Ts;
     MTensor &final_idx = g_tcache.final_idx;
-    MTensor &loss_intermediates = g_tcache.loss_intermediates;
-
-    auto loss_img_size = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
 
     // --- Constants (heap-allocated for Obj-C block) ---
     auto proj_intrins = std::make_shared<std::array<float, 4>>(std::array<float, 4>{fx, fy, cx, cy});
@@ -1132,30 +1190,6 @@ static void forward_pipeline(
         }
     };
 
-    auto encode_loss_fwd = [&](id<MTLComputeCommandEncoder> enc) {
-        // Separable SSIM forward: H conv → barrier → V conv + SSIM + reduction
-        MTLSize grid = MTLSizeMake(img_width, img_height, 1);
-        MTLSize tg = MTLSizeMake(16, 16, 1);
-
-        // Pass 1: horizontal convolution
-        [enc setComputePipelineState:ctx->ssim_h_fwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
-        [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
-        ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-        // Pass 2: vertical convolution + SSIM/L1 + loss reduction
-        [enc setComputePipelineState:ctx->ssim_v_fwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
-        ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
-        [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
-        ENC_SCALAR(enc, ssim_weight, 4);
-        ENC_BUF(enc, loss_intermediates, 5); ENC_BUF(enc, loss_sum, 6);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
-    };
-
     // Zero cached buffers will be done inside the command encoder via blit.
     // (CPU memset would race with previous CB's GPU reads.)
 
@@ -1178,8 +1212,7 @@ static void forward_pipeline(
             (static_cast<uint64_t>(capacity) + CHUNK_SIZE - 1) / CHUNK_SIZE;
         K_max = static_cast<uint32_t>(std::min(chunks, absolute_max));
     }
-    g_tcache.current_K_max = K_max;
-    g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
+    g_tcache.ensure_forward_chunks(K_max, img_height, img_width, ctx->device);
 
     {
         id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
@@ -1194,7 +1227,6 @@ static void forward_pipeline(
                 return;
             }
             // tile_bins written by sort kernel, tile_counts no longer used
-            [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
             [blit fillBuffer:g_tcache.overflow_flag.buffer() range:NSMakeRange(0, g_tcache.overflow_flag.nbytes()) value:0];
             [blit fillBuffer:g_tcache.tile_scatter_counters.buffer() range:NSMakeRange(0, g_tcache.tile_scatter_counters.nbytes()) value:0];
             [blit endEncoding];
@@ -1210,10 +1242,6 @@ static void forward_pipeline(
             encode_prefix_map(encoder);
             [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_rast_fwd(encoder);
-            if (compute_loss) {
-                [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
-                encode_loss_fwd(encoder);
-            }
 
             [encoder endEncoding];
         });
@@ -1237,12 +1265,11 @@ MTensor msplat_render(
     MTensor &opacities, MTensor &background
 ) {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
-    MTensor dummyGt, dummyWindow;
-    forward_pipeline(num_points, means3d, scales, glob_scale,
+    render_pipeline(num_points, means3d, scales, glob_scale,
         quats, viewmat, projmat, fx, fy, cx, cy,
         img_height, img_width, tile_bounds, clip_thresh,
         degree, degrees_to_use, cam_pos, features_dc, features_rest,
-        opacities, background, dummyGt, dummyWindow, 0.0f, false);
+        opacities, background);
     return g_tcache.out_img;
 }
 
@@ -1255,8 +1282,8 @@ std::tuple<MTensor, float> msplat_train_step(
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
-    MTensor &gt, MTensor &window2d, float ssim_weight,
-    float loss_inv_n, int features_rest_bases,
+    MTensor &gt, float ssim_weight,
+    float loss_inv_n,
     int num_adam_groups,
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
@@ -1291,8 +1318,10 @@ std::tuple<MTensor, float> msplat_train_step(
     uint32_t channels = 3;
 
     // --- Cached buffer pool ---
-    g_tcache.ensure_forward(num_points, capacity, img_height, img_width, num_tiles, ctx->device);
-    g_tcache.ensure_backward(num_points, features_rest_bases, ctx->device);
+    g_tcache.ensure_shared_forward(
+        num_points, capacity, img_height, img_width, num_tiles, ctx->device);
+    g_tcache.ensure_training_image(img_height, img_width, ctx->device);
+    g_tcache.ensure_backward(num_points, ctx->device);
 
     MTensor &xys = g_tcache.xys;
     MTensor &depths = g_tcache.depths;
@@ -1321,12 +1350,10 @@ std::tuple<MTensor, float> msplat_train_step(
     MTensor &v_mean3d = g_tcache.v_mean3d;
     MTensor &v_scale = g_tcache.v_scale;
     MTensor &v_quat = g_tcache.v_quat;
-    MTensor &v_features_dc = g_tcache.v_features_dc;
-    MTensor &v_features_rest = g_tcache.v_features_rest;
-
     // Wire backward outputs as Adam grads (MTensor references for gradient buffers)
     auto adam_grads = std::make_shared<std::array<MTensor, 6>>(
-        std::array<MTensor, 6>{v_mean3d, v_scale, v_quat, v_features_dc, v_features_rest, v_opacity});
+        std::array<MTensor, 6>{
+            v_mean3d, v_scale, v_quat, MTensor{}, MTensor{}, v_opacity});
 
     // --- Constants (heap-allocated for Obj-C block capture) ---
     auto loss_img_size = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
@@ -1366,8 +1393,8 @@ std::tuple<MTensor, float> msplat_train_step(
             (static_cast<uint64_t>(capacity) + CHUNK_SIZE - 1) / CHUNK_SIZE;
         K_max = static_cast<uint32_t>(std::min(chunks, absolute_max));
     }
-    g_tcache.current_K_max = K_max;
-    g_tcache.ensure_chunks(K_max, img_height, img_width, ctx->device);
+    g_tcache.ensure_forward_chunks(K_max, img_height, img_width, ctx->device);
+    g_tcache.ensure_backward_chunks(K_max, img_height, img_width, ctx->device);
 
     uint32_t bwd_K_max = K_max;
     constexpr uint32_t BWD_CHUNK_SIZE = 512;
@@ -1654,7 +1681,6 @@ std::tuple<MTensor, float> msplat_train_step(
         [blit fillBuffer:v_mean3d.buffer() range:NSMakeRange(0, v_mean3d.nbytes()) value:0];
         [blit fillBuffer:v_scale.buffer() range:NSMakeRange(0, v_scale.nbytes()) value:0];
         [blit fillBuffer:v_quat.buffer() range:NSMakeRange(0, v_quat.nbytes()) value:0];
-        // v_features_dc and v_features_rest no longer needed — SH grads fused into Adam
         [blit endEncoding];
         return true;
     };

@@ -24,6 +24,10 @@
   resolution into an explicit sRGB canvas. COLMAP paths validate EXIF metadata
   while preserving encoded raster coordinates so pixels, intrinsics, and poses
   remain in the same frame.
+- Render-only calls now allocate only shared forward workspaces. Loss, SSIM,
+  and backward buffers are added lazily by training, while unused transient
+  prefix, spherical-harmonics gradient, and SSIM-window storage was removed;
+  `TrainingPlan` memory estimates reflect the smaller live set.
 - Checkpoint restore now requires the saved SH degree to match the configured
   training degree, preventing a planned memory/quality contract from changing
   silently during resume.

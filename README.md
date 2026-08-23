@@ -16,7 +16,7 @@ peak-memory estimate before a session is created.
 | | Before | After | Measured on |
 |---|---|---|---|
 | Model buffers | 979.1 MB | 239.7 MB | garden, 2000 iters, 2 downscales |
-| Transient buffers | 561.4 MB | 353.5 MB | garden, 4 resolution levels, step 600+ |
+| Transient buffers | 561.4 MB | 353.5 MB (pre cache split) | garden, 4 resolution levels, step 600+ |
 | Training images | whole dataset | 512 MB budget (iOS default) | `MSPLAT_IMAGE_CACHE_MB` |
 
 - Densification reserved `3 × num_active` for the case where every gaussian
@@ -25,6 +25,9 @@ peak-memory estimate before a session is created.
   written.
 - Depth-chunk buffers were carried to the end of training after chunking turned
   off. They are released.
+- Render-only calls retain just the shared forward cache. Loss, SSIM, and
+  backward workspaces are allocated on the first training step, and unused
+  prefix, spherical-harmonics gradient, and SSIM-window buffers were removed.
 - Training images were all decoded up front. A byte-budgeted LRU holds what fits
   and reloads the rest.
 - `maxGaussians` bounds the active population and its backing buffers. When a
@@ -172,7 +175,8 @@ MSPLAT_MEM step=1000 splats=232313 phys=2908.4MB accounted=2863.5MB \
 
 `phys` is `phys_footprint`, what jetsam counts. `model` is gaussian parameters
 and Adam state, `temp` the cached per-iteration buffers, `images` the decoded
-training images.
+training images. This captured example predates the render/training cache split;
+use a device run for current footprint values.
 
 ## Building
 

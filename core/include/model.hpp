@@ -87,7 +87,6 @@ struct Model{
   MTensor max2DSize;
 
   MTensor backgroundColor;
-  MTensor window2d;  // SSIM window (11,11) f32
 
   int numCameras;
   int numDownscales;

@@ -468,7 +468,7 @@ public struct TrainingPlan: Sendable, Equatable {
         let modelLifecycleBytes = try checkedSum([
             modelStorageBytes,
             try checkedProduct([12, gaussianCount], component: "model lifecycle"),
-            496,
+            12,
             try checkedProduct(
                 [4, gaussianCount, featureStride],
                 component: "model lifecycle"
@@ -561,10 +561,9 @@ public struct TrainingPlan: Sendable, Equatable {
 
             var trainingCacheBytes = try checkedSum([
                 try checkedProduct(
-                    [132 + 12 * bases, gaussianCount],
+                    [132, gaussianCount],
                     component: "training Gaussian cache"
                 ),
-                try checkedProduct([4, gaussianBlocks], component: "training block cache"),
                 try checkedProduct(
                     [40, intersectionCapacity],
                     component: "training intersection cache"
