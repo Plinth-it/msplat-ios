@@ -149,6 +149,8 @@ void validateDatasetDescriptor(const DatasetDescriptor &descriptor) {
             reject("point reprojection errors must be finite and non-negative");
     }
 
+    uint64_t previousObservationKey = 0;
+    bool hasPreviousObservation = false;
     for (const SparseObservation &observation : descriptor.observations) {
         if (static_cast<size_t>(observation.frameIndex) >=
             descriptor.frames.size()) {
@@ -161,5 +163,15 @@ void validateDatasetDescriptor(const DatasetDescriptor &descriptor) {
         }
         if (!std::isfinite(observation.x) || !std::isfinite(observation.y))
             reject("observation coordinates must be finite");
+
+        const uint64_t observationKey =
+            (static_cast<uint64_t>(observation.frameIndex) << 32) |
+            observation.frameObservationIndex;
+        if (hasPreviousObservation &&
+            observationKey <= previousObservationKey) {
+            reject("observations must be strictly ordered by frame and source index");
+        }
+        previousObservationKey = observationKey;
+        hasPreviousObservation = true;
     }
 }

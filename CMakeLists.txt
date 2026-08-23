@@ -174,6 +174,12 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         add_test(NAME msplat_dataset_descriptor
             COMMAND msplat_dataset_descriptor_tests)
 
+        add_executable(msplat_colmap_loader_tests
+            tests/test_colmap_loader.cpp)
+        target_link_libraries(msplat_colmap_loader_tests PRIVATE msplat_core)
+        add_test(NAME msplat_colmap_loader
+            COMMAND msplat_colmap_loader_tests)
+
         add_executable(msplat_intersection_layout_tests
             tests/test_intersection_layout.cpp)
         target_include_directories(msplat_intersection_layout_tests PRIVATE

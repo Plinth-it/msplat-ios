@@ -14,9 +14,6 @@ namespace loaders {
 // PLY point cloud reader
 SparsePointSet readPly(const std::string &path);
 
-// COLMAP binary point cloud reader
-SparsePointSet readColmapPoints(const std::string &path);
-
 // Image I/O
 struct ImageSourceInfo {
     int rawWidth = 0;

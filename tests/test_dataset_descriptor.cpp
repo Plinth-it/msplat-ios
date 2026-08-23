@@ -66,8 +66,8 @@ DatasetDescriptor validDescriptor() {
     // Pixel coordinates are deliberately outside the calibrated canvas. The
     // descriptor preserves source observations without clipping them.
     descriptor.observations = {
-        {0, 0, -20.0f, 900.0f},
-        {1, -1, 12.0f, 18.0f},
+        {0, 0, 0, -20.0f, 900.0f},
+        {1, 0, -1, 12.0f, 18.0f},
     };
     descriptor.provenance = {"test", "synthetic"};
     return descriptor;
@@ -485,6 +485,14 @@ int main() {
     }));
     CHECK(rejects(valid, [](auto &value) {
         value.observations[0].pointIndex = 2;
+    }));
+    CHECK(rejects(valid, [](auto &value) {
+        value.observations[1].frameIndex = value.observations[0].frameIndex;
+        value.observations[1].frameObservationIndex =
+            value.observations[0].frameObservationIndex;
+    }));
+    CHECK(rejects(valid, [](auto &value) {
+        std::swap(value.observations[0], value.observations[1]);
     }));
     CHECK(rejects(valid, [](auto &value) {
         value.observations[0].x = std::numeric_limits<float>::quiet_NaN();

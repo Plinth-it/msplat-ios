@@ -1,306 +1,991 @@
 #include "loaders.hpp"
-#include <fstream>
-#include <iostream>
-#include <filesystem>
+
 #include <algorithm>
+#include <charconv>
+#include <cmath>
+#include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <sstream>
+#include <stdexcept>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace fs = std::filesystem;
 
-// Quaternion [w,x,y,z] → row-major 3x3 rotation matrix
-static void quatToRotMat(const double q[4], float R[9]) {
-    double w = q[0], x = q[1], y = q[2], z = q[3];
-    double n = std::sqrt(w*w + x*x + y*y + z*z);
-    w /= n; x /= n; y /= n; z /= n;
+namespace {
 
-    R[0] = (float)(1 - 2*(y*y + z*z));  R[1] = (float)(2*(x*y - w*z));      R[2] = (float)(2*(x*z + w*y));
-    R[3] = (float)(2*(x*y + w*z));      R[4] = (float)(1 - 2*(x*x + z*z));  R[5] = (float)(2*(y*z - w*x));
-    R[6] = (float)(2*(x*z - w*y));      R[7] = (float)(2*(y*z + w*x));      R[8] = (float)(1 - 2*(x*x + y*y));
-}
+constexpr uint64_t kInvalidPointId = std::numeric_limits<uint64_t>::max();
+constexpr uint64_t kMaxFilenameBytes = 1024 * 1024;
+constexpr size_t kMaxTextRecordBytes = 16 * 1024 * 1024;
+constexpr uint64_t kMaxDescriptorCount =
+    static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
 
-enum ColmapModel { SIMPLE_PINHOLE=0, PINHOLE=1, SIMPLE_RADIAL=2, RADIAL=3, OPENCV=4 };
+enum ColmapModel {
+    SIMPLE_PINHOLE = 0,
+    PINHOLE = 1,
+    SIMPLE_RADIAL = 2,
+    RADIAL = 3,
+    OPENCV = 4,
+};
 
 struct ColmapCamera {
-    uint32_t id;
-    int model;
-    int width, height;
-    float fx, fy, cx, cy;
-    float k1, k2, p1, p2;
+    uint32_t id = 0;
+    int32_t model = 0;
+    int32_t width = 0;
+    int32_t height = 0;
+    float fx = 0.0f;
+    float fy = 0.0f;
+    float cx = 0.0f;
+    float cy = 0.0f;
+    float k1 = 0.0f;
+    float k2 = 0.0f;
+    float p1 = 0.0f;
+    float p2 = 0.0f;
+};
+
+struct ColmapImageObservation {
+    float x = 0.0f;
+    float y = 0.0f;
+    uint64_t pointId = kInvalidPointId;
 };
 
 struct ColmapImage {
-    uint32_t id;
-    uint32_t camId;
-    double quat[4]; // w, x, y, z
-    double t[3];    // world-to-camera translation
+    uint32_t id = 0;
+    uint32_t cameraId = 0;
+    double quaternion[4] = {};
+    double translation[3] = {};
     std::string filename;
+    std::vector<ColmapImageObservation> observations;
 };
 
-static std::unordered_map<uint32_t, ColmapCamera> readCamerasBin(const std::string &path) {
-    std::ifstream f(path, std::ios::binary);
-    uint64_t n;
-    f.read(reinterpret_cast<char*>(&n), 8);
+struct ColmapTrackValidation {
+    std::unordered_map<uint32_t, size_t> imageIndexById;
+    std::vector<std::vector<uint8_t>> markers;
+    size_t totalObservationCount = 0;
+};
 
-    std::unordered_map<uint32_t, ColmapCamera> cams;
-    for (uint64_t i = 0; i < n; i++) {
-        ColmapCamera c = {};
-        uint32_t model;
-        uint64_t w, h;
-        f.read(reinterpret_cast<char*>(&c.id), 4);
-        f.read(reinterpret_cast<char*>(&model), 4);
-        f.read(reinterpret_cast<char*>(&w), 8);
-        f.read(reinterpret_cast<char*>(&h), 8);
-        c.model = (int)model;
-        c.width = (int)w;
-        c.height = (int)h;
+[[noreturn]] void malformed(const std::string &path, const std::string &detail) {
+    throw std::runtime_error("Malformed COLMAP file " + path + ": " + detail);
+}
 
-        auto rd = [&]() -> double { double v; f.read(reinterpret_cast<char*>(&v), 8); return v; };
+size_t checkedSize(uint64_t value, size_t maximum,
+                   const std::string &path, const std::string &label) {
+    if (value > static_cast<uint64_t>(maximum)) {
+        malformed(path, label + " is too large");
+    }
+    return static_cast<size_t>(value);
+}
 
-        switch (c.model) {
-            case SIMPLE_PINHOLE: c.fx = c.fy = (float)rd(); c.cx = (float)rd(); c.cy = (float)rd(); break;
-            case PINHOLE:        c.fx = (float)rd(); c.fy = (float)rd(); c.cx = (float)rd(); c.cy = (float)rd(); break;
-            case SIMPLE_RADIAL:  c.fx = c.fy = (float)rd(); c.cx = (float)rd(); c.cy = (float)rd(); c.k1 = (float)rd(); break;
-            case RADIAL:         c.fx = c.fy = (float)rd(); c.cx = (float)rd(); c.cy = (float)rd(); c.k1 = (float)rd(); c.k2 = (float)rd(); break;
-            case OPENCV:         c.fx = (float)rd(); c.fy = (float)rd(); c.cx = (float)rd(); c.cy = (float)rd();
-                                 c.k1 = (float)rd(); c.k2 = (float)rd(); c.p1 = (float)rd(); c.p2 = (float)rd(); break;
-            default: throw std::runtime_error("Unsupported COLMAP camera model: " + std::to_string(c.model));
+size_t checkedProduct(size_t lhs, size_t rhs, size_t maximum,
+                      const std::string &path, const std::string &label) {
+    if (rhs != 0 && lhs > maximum / rhs) {
+        malformed(path, label + " size overflows");
+    }
+    return lhs * rhs;
+}
+
+float checkedFloat(double value, const std::string &path,
+                   const std::string &label) {
+    constexpr double limit = static_cast<double>(std::numeric_limits<float>::max());
+    if (!std::isfinite(value) || value < -limit || value > limit) {
+        malformed(path, label + " is not a finite float");
+    }
+    return static_cast<float>(value);
+}
+
+int32_t checkedDimension(uint64_t value, const std::string &path,
+                         const std::string &label) {
+    if (value == 0 || value > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+        malformed(path, label + " is outside the supported range");
+    }
+    return static_cast<int32_t>(value);
+}
+
+class BinaryReader {
+public:
+    explicit BinaryReader(const std::string &path) : path_(path), stream_(path, std::ios::binary) {
+        if (!stream_.is_open()) {
+            throw std::runtime_error("Cannot open " + path);
         }
-        cams[c.id] = c;
+        stream_.seekg(0, std::ios::end);
+        const std::streampos end = stream_.tellg();
+        if (end < 0) {
+            malformed(path_, "cannot determine file size");
+        }
+        remaining_ = static_cast<uint64_t>(end);
+        stream_.seekg(0, std::ios::beg);
+        if (!stream_) {
+            malformed(path_, "cannot seek to the beginning");
+        }
     }
-    return cams;
+
+    uint64_t remaining() const noexcept { return remaining_; }
+
+    template <typename T>
+    T read(const std::string &label) {
+        static_assert(std::is_trivially_copyable<T>::value,
+                      "BinaryReader only supports trivially copyable values");
+        T value{};
+        readBytes(&value, sizeof(T), label);
+        return value;
+    }
+
+    std::string readCString(const std::string &label) {
+        std::string value;
+        value.reserve(static_cast<size_t>(std::min<uint64_t>(remaining_, 256)));
+        while (remaining_ != 0) {
+            const char byte = read<char>(label);
+            if (byte == '\0') {
+                return value;
+            }
+            if (value.size() == kMaxFilenameBytes) {
+                malformed(path_, label + " exceeds the supported length");
+            }
+            value.push_back(byte);
+        }
+        malformed(path_, label + " is not NUL-terminated");
+    }
+
+    void requireRecords(uint64_t count, uint64_t maximum, uint64_t minimumBytes,
+                        const std::string &label) const {
+        if (count > maximum) {
+            malformed(path_, label + " count is outside the supported range");
+        }
+        if (minimumBytes != 0 && count > remaining_ / minimumBytes) {
+            malformed(path_, label + " count exceeds the remaining file size");
+        }
+    }
+
+    void requireEnd(const std::string &label) const {
+        if (remaining_ != 0) {
+            malformed(path_, "unexpected trailing bytes after " + label);
+        }
+    }
+
+private:
+    void readBytes(void *destination, size_t byteCount, const std::string &label) {
+        if (byteCount > remaining_) {
+            malformed(path_, "truncated " + label);
+        }
+        stream_.read(static_cast<char *>(destination),
+                     static_cast<std::streamsize>(byteCount));
+        if (!stream_ || static_cast<size_t>(stream_.gcount()) != byteCount) {
+            malformed(path_, "truncated " + label);
+        }
+        remaining_ -= byteCount;
+    }
+
+    std::string path_;
+    std::ifstream stream_;
+    uint64_t remaining_ = 0;
+};
+
+uint64_t parseUnsigned(const std::string &token, uint64_t maximum,
+                       const std::string &path, const std::string &label) {
+    uint64_t value = 0;
+    if (token.empty() || token.front() == '-') {
+        malformed(path, "invalid " + label);
+    }
+    const char *begin = token.data();
+    const char *end = begin + token.size();
+    const auto result = std::from_chars(begin, end, value);
+    if (result.ec != std::errc() || result.ptr != end || value > maximum) {
+        malformed(path, "invalid " + label);
+    }
+    return value;
 }
 
-static std::vector<ColmapImage> readImagesBin(const std::string &path) {
-    std::ifstream f(path, std::ios::binary);
-    uint64_t n;
-    f.read(reinterpret_cast<char*>(&n), 8);
-
-    std::vector<ColmapImage> images;
-    images.reserve(n);
-
-    for (uint64_t i = 0; i < n; i++) {
-        ColmapImage img = {};
-        f.read(reinterpret_cast<char*>(&img.id), 4);
-        f.read(reinterpret_cast<char*>(img.quat), 32); // 4 doubles
-        f.read(reinterpret_cast<char*>(img.t), 24);     // 3 doubles
-        f.read(reinterpret_cast<char*>(&img.camId), 4);
-
-        char ch;
-        while (f.read(&ch, 1) && ch != '\0') img.filename += ch;
-
-        uint64_t numPts2D;
-        f.read(reinterpret_cast<char*>(&numPts2D), 8);
-        f.seekg(numPts2D * 24, std::ios::cur);
-
-        images.push_back(img);
-    }
-    return images;
+uint32_t parseUint32(const std::string &token, const std::string &path,
+                     const std::string &label) {
+    return static_cast<uint32_t>(
+        parseUnsigned(token, std::numeric_limits<uint32_t>::max(), path, label));
 }
 
-// ── Text model ──────────────────────────────────────────────────────────────
-// COLMAP writes the same model as either .bin or .txt. The text form is what
-// tooling that assembles a reconstruction by hand tends to produce, and what
-// COLMAP itself writes with --output_type TXT.
+uint64_t parsePointReference(const std::string &token, const std::string &path) {
+    if (token == "-1") {
+        return kInvalidPointId;
+    }
+    return parseUnsigned(token, kInvalidPointId - 1, path, "point3D ID");
+}
 
-static bool nextRecord(std::istream &f, std::string &line) {
-    while (std::getline(f, line)) {
-        size_t start = line.find_first_not_of(" \t\r");
-        if (start == std::string::npos || line[start] == '#') continue;
+double readFiniteDouble(std::istringstream &stream, const std::string &path,
+                        const std::string &label) {
+    double value = 0.0;
+    if (!(stream >> value) || !std::isfinite(value)) {
+        malformed(path, "invalid " + label);
+    }
+    return value;
+}
+
+std::string readToken(std::istringstream &stream, const std::string &path,
+                      const std::string &label) {
+    std::string token;
+    if (!(stream >> token)) {
+        malformed(path, "missing " + label);
+    }
+    return token;
+}
+
+void requireNoExtraTokens(std::istringstream &stream, const std::string &path,
+                          const std::string &label) {
+    std::string extra;
+    if (stream >> extra) {
+        malformed(path, "unexpected data after " + label);
+    }
+}
+
+bool readBoundedLine(std::istream &stream, std::string &line,
+                     const std::string &path, const std::string &label) {
+    line.clear();
+    char byte = 0;
+    while (stream.get(byte)) {
+        if (byte == '\n') {
+            return true;
+        }
+        if (line.size() == kMaxTextRecordBytes) {
+            malformed(path, label + " exceeds the supported line length");
+        }
+        line.push_back(byte);
+    }
+    if (stream.bad()) {
+        malformed(path, "failed while reading " + label);
+    }
+    return !line.empty();
+}
+
+bool nextRecord(std::istream &stream, std::string &line,
+                const std::string &path, const std::string &label) {
+    while (readBoundedLine(stream, line, path, label)) {
+        const size_t start = line.find_first_not_of(" \t\r");
+        if (start == std::string::npos || line[start] == '#') {
+            continue;
+        }
         return true;
     }
     return false;
 }
 
-static int colmapModelId(const std::string &name) {
+int32_t colmapModelId(const std::string &name) {
     if (name == "SIMPLE_PINHOLE") return SIMPLE_PINHOLE;
-    if (name == "PINHOLE")        return PINHOLE;
-    if (name == "SIMPLE_RADIAL")  return SIMPLE_RADIAL;
-    if (name == "RADIAL")         return RADIAL;
-    if (name == "OPENCV")         return OPENCV;
+    if (name == "PINHOLE") return PINHOLE;
+    if (name == "SIMPLE_RADIAL") return SIMPLE_RADIAL;
+    if (name == "RADIAL") return RADIAL;
+    if (name == "OPENCV") return OPENCV;
     throw std::runtime_error("Unsupported COLMAP camera model: " + name);
 }
 
-static std::unordered_map<uint32_t, ColmapCamera> readCamerasText(const std::string &path) {
-    std::ifstream f(path);
-    if (!f.is_open()) throw std::runtime_error("Cannot open " + path);
-
-    std::unordered_map<uint32_t, ColmapCamera> cams;
-    std::string line;
-    while (nextRecord(f, line)) {
-        std::istringstream ls(line);
-        ColmapCamera c = {};
-        std::string model;
-        ls >> c.id >> model >> c.width >> c.height;
-        c.model = colmapModelId(model);
-
-        auto rd = [&]() -> float {
-            double v;
-            if (!(ls >> v)) throw std::runtime_error("Truncated camera record in " + path);
-            return (float)v;
-        };
-        switch (c.model) {
-            case SIMPLE_PINHOLE: c.fx = c.fy = rd(); c.cx = rd(); c.cy = rd(); break;
-            case PINHOLE:        c.fx = rd(); c.fy = rd(); c.cx = rd(); c.cy = rd(); break;
-            case SIMPLE_RADIAL:  c.fx = c.fy = rd(); c.cx = rd(); c.cy = rd(); c.k1 = rd(); break;
-            case RADIAL:         c.fx = c.fy = rd(); c.cx = rd(); c.cy = rd(); c.k1 = rd(); c.k2 = rd(); break;
-            case OPENCV:         c.fx = rd(); c.fy = rd(); c.cx = rd(); c.cy = rd();
-                                 c.k1 = rd(); c.k2 = rd(); c.p1 = rd(); c.p2 = rd(); break;
-        }
-        cams[c.id] = c;
+size_t cameraParameterCount(int32_t model) {
+    switch (model) {
+        case SIMPLE_PINHOLE: return 3;
+        case PINHOLE: return 4;
+        case SIMPLE_RADIAL: return 4;
+        case RADIAL: return 5;
+        case OPENCV: return 8;
+        default:
+            throw std::runtime_error(
+                "Unsupported COLMAP camera model: " + std::to_string(model));
     }
-    return cams;
 }
 
-static std::vector<ColmapImage> readImagesText(const std::string &path) {
-    std::ifstream f(path);
-    if (!f.is_open()) throw std::runtime_error("Cannot open " + path);
+void assignCameraParameters(ColmapCamera &camera, const double *parameters,
+                            const std::string &path) {
+    auto parameter = [&](size_t index, const std::string &label) {
+        return checkedFloat(parameters[index], path, label);
+    };
+    switch (camera.model) {
+        case SIMPLE_PINHOLE:
+            camera.fx = camera.fy = parameter(0, "focal length");
+            camera.cx = parameter(1, "principal point x");
+            camera.cy = parameter(2, "principal point y");
+            break;
+        case PINHOLE:
+            camera.fx = parameter(0, "focal length x");
+            camera.fy = parameter(1, "focal length y");
+            camera.cx = parameter(2, "principal point x");
+            camera.cy = parameter(3, "principal point y");
+            break;
+        case SIMPLE_RADIAL:
+            camera.fx = camera.fy = parameter(0, "focal length");
+            camera.cx = parameter(1, "principal point x");
+            camera.cy = parameter(2, "principal point y");
+            camera.k1 = parameter(3, "radial distortion k1");
+            break;
+        case RADIAL:
+            camera.fx = camera.fy = parameter(0, "focal length");
+            camera.cx = parameter(1, "principal point x");
+            camera.cy = parameter(2, "principal point y");
+            camera.k1 = parameter(3, "radial distortion k1");
+            camera.k2 = parameter(4, "radial distortion k2");
+            break;
+        case OPENCV:
+            camera.fx = parameter(0, "focal length x");
+            camera.fy = parameter(1, "focal length y");
+            camera.cx = parameter(2, "principal point x");
+            camera.cy = parameter(3, "principal point y");
+            camera.k1 = parameter(4, "radial distortion k1");
+            camera.k2 = parameter(5, "radial distortion k2");
+            camera.p1 = parameter(6, "tangential distortion p1");
+            camera.p2 = parameter(7, "tangential distortion p2");
+            break;
+        default:
+            throw std::runtime_error(
+                "Unsupported COLMAP camera model: " + std::to_string(camera.model));
+    }
+    if (!(camera.fx > 0.0f) || !(camera.fy > 0.0f)) {
+        malformed(path, "camera focal lengths must be positive");
+    }
+}
+
+std::unordered_map<uint32_t, ColmapCamera> readCamerasBinary(const std::string &path) {
+    BinaryReader reader(path);
+    const uint64_t count = reader.read<uint64_t>("camera count");
+    reader.requireRecords(count, kMaxDescriptorCount, 48, "camera");
+
+    std::unordered_map<uint32_t, ColmapCamera> cameras;
+    cameras.reserve(checkedSize(count, cameras.max_size(), path, "camera count"));
+    for (uint64_t index = 0; index < count; ++index) {
+        ColmapCamera camera;
+        camera.id = reader.read<uint32_t>("camera ID");
+        camera.model = reader.read<int32_t>("camera model");
+        camera.width = checkedDimension(reader.read<uint64_t>("camera width"), path,
+                                        "camera width");
+        camera.height = checkedDimension(reader.read<uint64_t>("camera height"), path,
+                                         "camera height");
+
+        double parameters[8] = {};
+        const size_t parameterCount = cameraParameterCount(camera.model);
+        for (size_t parameterIndex = 0; parameterIndex < parameterCount; ++parameterIndex) {
+            parameters[parameterIndex] = reader.read<double>("camera parameter");
+        }
+        assignCameraParameters(camera, parameters, path);
+        if (!cameras.emplace(camera.id, camera).second) {
+            malformed(path, "duplicate camera ID " + std::to_string(camera.id));
+        }
+    }
+    reader.requireEnd("camera records");
+    return cameras;
+}
+
+std::unordered_map<uint32_t, ColmapCamera> readCamerasText(const std::string &path) {
+    std::ifstream stream(path);
+    if (!stream.is_open()) {
+        throw std::runtime_error("Cannot open " + path);
+    }
+
+    std::unordered_map<uint32_t, ColmapCamera> cameras;
+    std::string line;
+    while (nextRecord(stream, line, path, "camera record")) {
+        if (cameras.size() == kMaxDescriptorCount) {
+            malformed(path, "camera count is outside the supported range");
+        }
+        std::istringstream record(line);
+        ColmapCamera camera;
+        camera.id = parseUint32(readToken(record, path, "camera ID"), path, "camera ID");
+        camera.model = colmapModelId(readToken(record, path, "camera model"));
+        camera.width = checkedDimension(
+            parseUnsigned(readToken(record, path, "camera width"),
+                          std::numeric_limits<uint64_t>::max(), path, "camera width"),
+            path, "camera width");
+        camera.height = checkedDimension(
+            parseUnsigned(readToken(record, path, "camera height"),
+                          std::numeric_limits<uint64_t>::max(), path, "camera height"),
+            path, "camera height");
+
+        double parameters[8] = {};
+        const size_t parameterCount = cameraParameterCount(camera.model);
+        for (size_t index = 0; index < parameterCount; ++index) {
+            parameters[index] = readFiniteDouble(record, path, "camera parameter");
+        }
+        requireNoExtraTokens(record, path, "camera record");
+        assignCameraParameters(camera, parameters, path);
+        if (!cameras.emplace(camera.id, camera).second) {
+            malformed(path, "duplicate camera ID " + std::to_string(camera.id));
+        }
+    }
+    return cameras;
+}
+
+void validateImagePose(const ColmapImage &image, const std::string &path) {
+    for (double component : image.quaternion) {
+        if (!std::isfinite(component)) {
+            malformed(path, "image quaternion is not finite");
+        }
+    }
+    for (double component : image.translation) {
+        if (!std::isfinite(component)) {
+            malformed(path, "image translation is not finite");
+        }
+    }
+    const double norm = std::hypot(
+        std::hypot(image.quaternion[0], image.quaternion[1]),
+        std::hypot(image.quaternion[2], image.quaternion[3]));
+    if (!(norm > 0.0) || !std::isfinite(norm)) {
+        malformed(path, "image quaternion has invalid length");
+    }
+}
+
+std::vector<ColmapImage> readImagesBinary(const std::string &path) {
+    BinaryReader reader(path);
+    const uint64_t count = reader.read<uint64_t>("image count");
+    reader.requireRecords(count, kMaxDescriptorCount, 73, "image");
 
     std::vector<ColmapImage> images;
+    images.reserve(checkedSize(count, images.max_size(), path, "image count"));
+    std::unordered_set<uint32_t> imageIds;
+    imageIds.reserve(images.capacity());
+
+    for (uint64_t index = 0; index < count; ++index) {
+        ColmapImage image;
+        image.id = reader.read<uint32_t>("image ID");
+        for (double &component : image.quaternion) {
+            component = reader.read<double>("image quaternion");
+        }
+        for (double &component : image.translation) {
+            component = reader.read<double>("image translation");
+        }
+        image.cameraId = reader.read<uint32_t>("image camera ID");
+        image.filename = reader.readCString("image filename");
+        if (image.filename.empty()) {
+            malformed(path, "image filename is empty");
+        }
+        validateImagePose(image, path);
+
+        const uint64_t observationCount = reader.read<uint64_t>("image observation count");
+        reader.requireRecords(observationCount,
+                              std::numeric_limits<uint32_t>::max(), 24,
+                              "image observation");
+        image.observations.reserve(checkedSize(
+            observationCount, image.observations.max_size(), path,
+            "image observation count"));
+        for (uint64_t observationIndex = 0;
+             observationIndex < observationCount; ++observationIndex) {
+            ColmapImageObservation observation;
+            observation.x = checkedFloat(reader.read<double>("observation x"), path,
+                                         "observation x");
+            observation.y = checkedFloat(reader.read<double>("observation y"), path,
+                                         "observation y");
+            observation.pointId = reader.read<uint64_t>("observation point3D ID");
+            image.observations.push_back(observation);
+        }
+
+        if (!imageIds.insert(image.id).second) {
+            malformed(path, "duplicate image ID " + std::to_string(image.id));
+        }
+        images.push_back(std::move(image));
+    }
+    reader.requireEnd("image records");
+    return images;
+}
+
+std::vector<ColmapImage> readImagesText(const std::string &path) {
+    std::ifstream stream(path);
+    if (!stream.is_open()) {
+        throw std::runtime_error("Cannot open " + path);
+    }
+
+    std::vector<ColmapImage> images;
+    std::unordered_set<uint32_t> imageIds;
     std::string line;
-    while (nextRecord(f, line)) {
-        std::istringstream ls(line);
-        ColmapImage img = {};
-        ls >> img.id
-           >> img.quat[0] >> img.quat[1] >> img.quat[2] >> img.quat[3]
-           >> img.t[0] >> img.t[1] >> img.t[2]
-           >> img.camId;
-        if (!ls) throw std::runtime_error("Truncated image record in " + path);
+    while (nextRecord(stream, line, path, "image record")) {
+        if (images.size() == kMaxDescriptorCount) {
+            malformed(path, "image count is outside the supported range");
+        }
+        std::istringstream record(line);
+        ColmapImage image;
+        image.id = parseUint32(readToken(record, path, "image ID"), path, "image ID");
+        for (double &component : image.quaternion) {
+            component = readFiniteDouble(record, path, "image quaternion");
+        }
+        for (double &component : image.translation) {
+            component = readFiniteDouble(record, path, "image translation");
+        }
+        image.cameraId = parseUint32(
+            readToken(record, path, "image camera ID"), path, "image camera ID");
 
-        // The name is the rest of the line, not a token — COLMAP permits
-        // spaces in it and writes it unquoted.
-        std::getline(ls, img.filename);
-        size_t start = img.filename.find_first_not_of(" \t");
-        size_t end = img.filename.find_last_not_of(" \t\r");
-        img.filename = (start == std::string::npos)
-            ? std::string() : img.filename.substr(start, end - start + 1);
+        std::getline(record, image.filename);
+        const size_t start = image.filename.find_first_not_of(" \t");
+        const size_t end = image.filename.find_last_not_of(" \t\r");
+        image.filename = start == std::string::npos
+            ? std::string()
+            : image.filename.substr(start, end - start + 1);
+        if (image.filename.empty()) {
+            malformed(path, "image filename is empty");
+        }
+        if (image.filename.size() > kMaxFilenameBytes) {
+            malformed(path, "image filename exceeds the supported length");
+        }
+        validateImagePose(image, path);
 
-        // Every record is two lines. The second holds the 2D observations,
-        // which are not needed here, and is blank for an image with none —
-        // so it has to be consumed unconditionally rather than skipped as
-        // whitespace by the next nextRecord().
-        std::getline(f, line);
+        if (!readBoundedLine(stream, line, path, "2D observation record")) {
+            malformed(path, "missing 2D observation line for image " +
+                                std::to_string(image.id));
+        }
+        std::istringstream observationLine(line);
+        while (true) {
+            double x = 0.0;
+            if (!(observationLine >> x)) {
+                if (!observationLine.eof()) {
+                    malformed(path, "invalid observation x");
+                }
+                break;
+            }
+            const double y = readFiniteDouble(observationLine, path, "observation y");
+            const std::string pointId = readToken(
+                observationLine, path, "observation point3D ID");
+            if (image.observations.size() == std::numeric_limits<uint32_t>::max()) {
+                malformed(path, "too many observations for image " +
+                                    std::to_string(image.id));
+            }
+            image.observations.push_back({
+                checkedFloat(x, path, "observation x"),
+                checkedFloat(y, path, "observation y"),
+                parsePointReference(pointId, path),
+            });
+        }
 
-        images.push_back(img);
+        if (!imageIds.insert(image.id).second) {
+            malformed(path, "duplicate image ID " + std::to_string(image.id));
+        }
+        images.push_back(std::move(image));
     }
     return images;
 }
 
-static SparsePointSet readPointsText(const std::string &path) {
-    std::ifstream f(path);
-    if (!f.is_open()) throw std::runtime_error("Cannot open " + path);
-
-    SparsePointSet pts;
-    std::string line;
-    while (nextRecord(f, line)) {
-        std::istringstream ls(line);
-        uint64_t pointId;
-        double x, y, z;
-        int r, g, b;
-        double error;
-        ls >> pointId >> x >> y >> z >> r >> g >> b >> error;
-        if (!ls) throw std::runtime_error("Truncated point record in " + path);
-        if (r < 0 || r > 255 || g < 0 || g > 255 || b < 0 || b > 255)
-            throw std::runtime_error("Invalid point color in " + path);
-
-        pts.xyz.push_back((float)x);
-        pts.xyz.push_back((float)y);
-        pts.xyz.push_back((float)z);
-        pts.rgb.push_back((uint8_t)r);
-        pts.rgb.push_back((uint8_t)g);
-        pts.rgb.push_back((uint8_t)b);
-        pts.sourceIds.push_back(pointId);
-        pts.reprojectionErrors.push_back((float)error);
+ColmapTrackValidation makeTrackValidation(
+    const std::vector<ColmapImage> &images, const std::string &path) {
+    ColmapTrackValidation validation;
+    validation.imageIndexById.reserve(images.size());
+    validation.markers.reserve(images.size());
+    for (size_t imageIndex = 0; imageIndex < images.size(); ++imageIndex) {
+        if (!validation.imageIndexById.emplace(images[imageIndex].id,
+                                                imageIndex).second) {
+            malformed(path, "duplicate image ID " +
+                                std::to_string(images[imageIndex].id));
+        }
+        if (images[imageIndex].observations.size() >
+            std::numeric_limits<size_t>::max() -
+                validation.totalObservationCount) {
+            malformed(path, "total image observation count overflows");
+        }
+        validation.totalObservationCount +=
+            images[imageIndex].observations.size();
+        validation.markers.emplace_back(
+            images[imageIndex].observations.size(), uint8_t{0});
     }
-    return pts;
+    return validation;
 }
 
-// w2c rotation + translation → 4x4 c2w row-major with OpenGL Y/Z flip
-static void w2cToCamToWorld(const double quat[4], const double t[3], float out[16]) {
-    float R[9];
-    quatToRotMat(quat, R);
+void validateAndMarkTrack(const std::vector<ColmapImage> &images,
+                          ColmapTrackValidation &validation,
+                          uint64_t pointId, uint32_t imageId,
+                          uint32_t observationIndex,
+                          const std::string &path) {
+    const auto image = validation.imageIndexById.find(imageId);
+    if (image == validation.imageIndexById.end()) {
+        malformed(path, "point " + std::to_string(pointId) +
+                            " track references unknown image " +
+                            std::to_string(imageId));
+    }
+    const size_t imageIndex = image->second;
+    if (observationIndex >= images[imageIndex].observations.size()) {
+        malformed(path, "point " + std::to_string(pointId) +
+                            " track references image " +
+                            std::to_string(imageId) + " observation " +
+                            std::to_string(observationIndex) +
+                            " outside its observation list");
+    }
 
-    // R^T (transpose = inverse for rotation)
-    float Ri[9] = { R[0], R[3], R[6], R[1], R[4], R[7], R[2], R[5], R[8] };
+    const ColmapImageObservation &observation =
+        images[imageIndex].observations[observationIndex];
+    if (observation.pointId == kInvalidPointId) {
+        malformed(path, "point " + std::to_string(pointId) +
+                            " track references an unlinked image observation");
+    }
+    if (observation.pointId != pointId) {
+        malformed(path, "point track and image observation disagree for image " +
+                            std::to_string(imageId) + " observation " +
+                            std::to_string(observationIndex));
+    }
 
-    // -R^T * t
-    float Ti[3] = {
-        -(Ri[0]*(float)t[0] + Ri[1]*(float)t[1] + Ri[2]*(float)t[2]),
-        -(Ri[3]*(float)t[0] + Ri[4]*(float)t[1] + Ri[5]*(float)t[2]),
-        -(Ri[6]*(float)t[0] + Ri[7]*(float)t[1] + Ri[8]*(float)t[2])
-    };
-
-    // OpenGL flip: negate columns 1,2 (camera Y-down→Y-up, Z-fwd→Z-back)
-    out[0]  = Ri[0]; out[1]  = -Ri[1]; out[2]  = -Ri[2]; out[3]  = Ti[0];
-    out[4]  = Ri[3]; out[5]  = -Ri[4]; out[6]  = -Ri[5]; out[7]  = Ti[1];
-    out[8]  = Ri[6]; out[9]  = -Ri[7]; out[10] = -Ri[8]; out[11] = Ti[2];
-    out[12] = 0;     out[13] = 0;      out[14] = 0;      out[15] = 1;
+    uint8_t &marker = validation.markers[imageIndex][observationIndex];
+    if (marker != 0) {
+        malformed(path, "duplicate track entry for image " +
+                            std::to_string(imageId) + " observation " +
+                            std::to_string(observationIndex));
+    }
+    marker = 1;
 }
 
-DatasetDescriptor loaders::loadColmap(const std::string &projectRoot, const std::string &imageSourcePath) {
-    // Find sparse dir — dispatcher already confirmed a cameras file exists
-    fs::path root(projectRoot);
-    auto hasModel = [](const fs::path &dir) {
-        return fs::exists(dir / "cameras.bin") || fs::exists(dir / "cameras.txt");
+SparsePointSet readPointsBinary(const std::string &path,
+                                const std::vector<ColmapImage> &images,
+                                ColmapTrackValidation &trackValidation) {
+    BinaryReader reader(path);
+    const uint64_t count = reader.read<uint64_t>("point count");
+    reader.requireRecords(count, kMaxDescriptorCount, 51, "point");
+
+    SparsePointSet points;
+    const size_t pointCount = checkedSize(
+        count, points.sourceIds.max_size(), path, "point count");
+    const size_t coordinateCount = checkedProduct(
+        pointCount, 3, points.xyz.max_size(), path, "point coordinate");
+    if (coordinateCount > points.rgb.max_size()) {
+        malformed(path, "point color size overflows");
+    }
+    if (pointCount > points.reprojectionErrors.max_size()) {
+        malformed(path, "point reprojection-error size overflows");
+    }
+    points.xyz.reserve(coordinateCount);
+    points.rgb.reserve(coordinateCount);
+    points.sourceIds.reserve(pointCount);
+    points.reprojectionErrors.reserve(pointCount);
+    std::unordered_set<uint64_t> pointIds;
+    pointIds.reserve(pointCount);
+
+    for (uint64_t index = 0; index < count; ++index) {
+        const uint64_t pointId = reader.read<uint64_t>("point ID");
+        if (pointId == kInvalidPointId) {
+            malformed(path, "point ID UINT64_MAX is reserved for unlinked observations");
+        }
+        if (!pointIds.insert(pointId).second) {
+            malformed(path, "duplicate point ID " + std::to_string(pointId));
+        }
+
+        for (size_t component = 0; component < 3; ++component) {
+            points.xyz.push_back(checkedFloat(
+                reader.read<double>("point coordinate"), path, "point coordinate"));
+        }
+        for (size_t component = 0; component < 3; ++component) {
+            points.rgb.push_back(reader.read<uint8_t>("point color"));
+        }
+        const double error = reader.read<double>("point reprojection error");
+        if (error < 0.0) {
+            malformed(path, "point reprojection error is negative");
+        }
+        points.sourceIds.push_back(pointId);
+        points.reprojectionErrors.push_back(
+            checkedFloat(error, path, "point reprojection error"));
+
+        const uint64_t trackCount = reader.read<uint64_t>("point track count");
+        reader.requireRecords(trackCount, std::numeric_limits<uint32_t>::max(), 8,
+                              "point track");
+        for (uint64_t trackIndex = 0; trackIndex < trackCount; ++trackIndex) {
+            const uint32_t imageId =
+                reader.read<uint32_t>("track image ID");
+            const uint32_t observationIndex =
+                reader.read<uint32_t>("track observation index");
+            validateAndMarkTrack(images, trackValidation, pointId, imageId,
+                                 observationIndex, path);
+        }
+    }
+    reader.requireEnd("point records");
+    return points;
+}
+
+SparsePointSet readPointsText(const std::string &path,
+                              const std::vector<ColmapImage> &images,
+                              ColmapTrackValidation &trackValidation) {
+    std::ifstream stream(path);
+    if (!stream.is_open()) {
+        throw std::runtime_error("Cannot open " + path);
+    }
+
+    SparsePointSet points;
+    std::unordered_set<uint64_t> pointIds;
+    std::string line;
+    while (nextRecord(stream, line, path, "point record")) {
+        if (points.sourceIds.size() == kMaxDescriptorCount) {
+            malformed(path, "point count is outside the supported range");
+        }
+        std::istringstream record(line);
+        const uint64_t pointId = parseUnsigned(
+            readToken(record, path, "point ID"), kInvalidPointId - 1,
+            path, "point ID");
+        if (!pointIds.insert(pointId).second) {
+            malformed(path, "duplicate point ID " + std::to_string(pointId));
+        }
+
+        for (size_t component = 0; component < 3; ++component) {
+            points.xyz.push_back(checkedFloat(
+                readFiniteDouble(record, path, "point coordinate"), path,
+                "point coordinate"));
+        }
+        for (size_t component = 0; component < 3; ++component) {
+            const uint64_t color = parseUnsigned(
+                readToken(record, path, "point color"), 255, path, "point color");
+            points.rgb.push_back(static_cast<uint8_t>(color));
+        }
+        const double error = readFiniteDouble(record, path, "point reprojection error");
+        if (error < 0.0) {
+            malformed(path, "point reprojection error is negative");
+        }
+        points.sourceIds.push_back(pointId);
+        points.reprojectionErrors.push_back(
+            checkedFloat(error, path, "point reprojection error"));
+
+        uint64_t trackCount = 0;
+        while (true) {
+            std::string imageId;
+            if (!(record >> imageId)) {
+                if (!record.eof()) {
+                    malformed(path, "invalid track image ID");
+                }
+                break;
+            }
+            const std::string observationIndex = readToken(
+                record, path, "track observation index");
+            if (trackCount == std::numeric_limits<uint32_t>::max()) {
+                malformed(path, "point track count is outside the supported range");
+            }
+            validateAndMarkTrack(
+                images, trackValidation, pointId,
+                parseUint32(imageId, path, "track image ID"),
+                parseUint32(observationIndex, path, "track observation index"),
+                path);
+            ++trackCount;
+        }
+    }
+    return points;
+}
+
+void worldToCameraToCameraToWorld(const ColmapImage &image,
+                                  std::array<float, 16> &output,
+                                  const std::string &path) {
+    const double norm = std::hypot(
+        std::hypot(image.quaternion[0], image.quaternion[1]),
+        std::hypot(image.quaternion[2], image.quaternion[3]));
+    if (!(norm > 0.0) || !std::isfinite(norm)) {
+        malformed(path, "image quaternion has invalid length");
+    }
+    const double w = image.quaternion[0] / norm;
+    const double x = image.quaternion[1] / norm;
+    const double y = image.quaternion[2] / norm;
+    const double z = image.quaternion[3] / norm;
+
+    const double rotation[9] = {
+        1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z),
+        2.0 * (x * z + w * y), 2.0 * (x * y + w * z),
+        1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x),
+        2.0 * (x * z - w * y), 2.0 * (y * z + w * x),
+        1.0 - 2.0 * (x * x + y * y),
     };
-    fs::path sparse = hasModel(root) ? root : root / "sparse" / "0";
+    const double inverse[9] = {
+        rotation[0], rotation[3], rotation[6],
+        rotation[1], rotation[4], rotation[7],
+        rotation[2], rotation[5], rotation[8],
+    };
+    const double inverseTranslation[3] = {
+        -(inverse[0] * image.translation[0] + inverse[1] * image.translation[1] +
+          inverse[2] * image.translation[2]),
+        -(inverse[3] * image.translation[0] + inverse[4] * image.translation[1] +
+          inverse[5] * image.translation[2]),
+        -(inverse[6] * image.translation[0] + inverse[7] * image.translation[1] +
+          inverse[8] * image.translation[2]),
+    };
+    const double values[16] = {
+        inverse[0], -inverse[1], -inverse[2], inverseTranslation[0],
+        inverse[3], -inverse[4], -inverse[5], inverseTranslation[1],
+        inverse[6], -inverse[7], -inverse[8], inverseTranslation[2],
+        0.0, 0.0, 0.0, 1.0,
+    };
+    for (size_t index = 0; index < output.size(); ++index) {
+        output[index] = checkedFloat(values[index], path, "camera-to-world transform");
+    }
+}
 
-    std::string imageDir = !imageSourcePath.empty() ? imageSourcePath
-        : fs::exists(root / "images") ? (root / "images").string()
-        : projectRoot;
+void appendObservationsAndFinishTrackValidation(
+    DatasetDescriptor &descriptor,
+    std::vector<ColmapImage> &images,
+    const SparsePointSet *colmapPoints,
+    ColmapTrackValidation *trackValidation,
+    bool usesPlyPoints,
+    const std::string &source) {
+    std::unordered_map<uint64_t, uint32_t> pointIndexById;
+    if (colmapPoints != nullptr) {
+        pointIndexById.reserve(colmapPoints->sourceIds.size());
+        for (size_t index = 0; index < colmapPoints->sourceIds.size(); ++index) {
+            pointIndexById.emplace(colmapPoints->sourceIds[index],
+                                   static_cast<uint32_t>(index));
+        }
+    }
 
-    // Chosen per file rather than once for the model: COLMAP writes all three
-    // in the same format, but a dataset assembled by hand often mixes them.
-    auto cameras = fs::exists(sparse / "cameras.bin")
-        ? readCamerasBin((sparse / "cameras.bin").string())
+    size_t totalObservationCount = 0;
+    if (trackValidation != nullptr) {
+        if (colmapPoints == nullptr ||
+            trackValidation->markers.size() != images.size()) {
+            throw std::runtime_error(
+                "Internal COLMAP track-validation state mismatch in " + source);
+        }
+        totalObservationCount = trackValidation->totalObservationCount;
+        trackValidation->imageIndexById.clear();
+        trackValidation->imageIndexById.rehash(0);
+    } else {
+        for (const ColmapImage &image : images) {
+            if (image.observations.size() >
+                descriptor.observations.max_size() - totalObservationCount) {
+                throw std::runtime_error(
+                    "COLMAP observation count is too large in " + source);
+            }
+            totalObservationCount += image.observations.size();
+        }
+    }
+    if (totalObservationCount > descriptor.observations.max_size()) {
+        throw std::runtime_error("COLMAP observation count is too large in " + source);
+    }
+    // Allocate the exact retained size once. Geometric vector growth can
+    // otherwise leave nearly 2x observation capacity in InputData and briefly
+    // hold both old and new allocations during a late reallocation.
+    descriptor.observations.reserve(totalObservationCount);
+
+    for (size_t frameIndex = 0; frameIndex < images.size(); ++frameIndex) {
+        ColmapImage &image = images[frameIndex];
+        std::vector<uint8_t> *markers = trackValidation == nullptr
+            ? nullptr : &trackValidation->markers[frameIndex];
+        if (markers != nullptr && markers->size() != image.observations.size()) {
+            throw std::runtime_error(
+                "Internal COLMAP observation-marker size mismatch in " + source);
+        }
+        for (size_t observationIndex = 0;
+             observationIndex < image.observations.size(); ++observationIndex) {
+            const ColmapImageObservation &sourceObservation =
+                image.observations[observationIndex];
+            int32_t pointIndex = -1;
+            if (sourceObservation.pointId != kInvalidPointId) {
+                if (usesPlyPoints) {
+                    throw std::runtime_error(
+                        "COLMAP image observations cannot be linked when points3D.ply "
+                        "is used: PLY has no COLMAP point IDs or tracks");
+                }
+                const auto point = pointIndexById.find(sourceObservation.pointId);
+                if (point == pointIndexById.end()) {
+                    throw std::runtime_error(
+                        "COLMAP image " + std::to_string(image.id) + " observation " +
+                        std::to_string(observationIndex) + " references unknown point " +
+                        std::to_string(sourceObservation.pointId));
+                }
+                if (markers != nullptr && (*markers)[observationIndex] == 0) {
+                    throw std::runtime_error(
+                        "COLMAP image " + std::to_string(image.id) +
+                        " observation " + std::to_string(observationIndex) +
+                        " is linked but missing from its point track");
+                }
+                pointIndex = static_cast<int32_t>(point->second);
+            } else if (markers != nullptr && (*markers)[observationIndex] != 0) {
+                throw std::runtime_error(
+                    "COLMAP image " + std::to_string(image.id) +
+                    " unlinked observation " +
+                    std::to_string(observationIndex) +
+                    " unexpectedly appears in a point track");
+            }
+
+            SparseObservation observation;
+            observation.frameIndex = static_cast<uint32_t>(frameIndex);
+            observation.frameObservationIndex = static_cast<uint32_t>(observationIndex);
+            observation.pointIndex = pointIndex;
+            observation.x = sourceObservation.x;
+            observation.y = sourceObservation.y;
+            descriptor.observations.push_back(observation);
+        }
+        std::vector<ColmapImageObservation>().swap(image.observations);
+        if (markers != nullptr) {
+            std::vector<uint8_t>().swap(*markers);
+        }
+    }
+}
+
+} // namespace
+
+DatasetDescriptor loaders::loadColmap(const std::string &projectRoot,
+                                      const std::string &imageSourcePath) {
+    const fs::path root(projectRoot);
+    const auto hasModel = [](const fs::path &directory) {
+        return fs::exists(directory / "cameras.bin") ||
+               fs::exists(directory / "cameras.txt");
+    };
+    const fs::path sparse = hasModel(root) ? root : root / "sparse" / "0";
+
+    const std::string imageDirectory = !imageSourcePath.empty()
+        ? imageSourcePath
+        : fs::exists(root / "images") ? (root / "images").string() : projectRoot;
+
+    const bool usesBinaryCameras = fs::exists(sparse / "cameras.bin");
+    const bool usesBinaryImages = fs::exists(sparse / "images.bin");
+    const auto cameras = usesBinaryCameras
+        ? readCamerasBinary((sparse / "cameras.bin").string())
         : readCamerasText((sparse / "cameras.txt").string());
-    auto images = fs::exists(sparse / "images.bin")
-        ? readImagesBin((sparse / "images.bin").string())
+    auto images = usesBinaryImages
+        ? readImagesBinary((sparse / "images.bin").string())
         : readImagesText((sparse / "images.txt").string());
 
-    std::sort(images.begin(), images.end(),
-        [](const ColmapImage &a, const ColmapImage &b) { return a.filename < b.filename; });
-
-    DatasetDescriptor data;
-    data.provenance.adapter = "colmap";
-    data.provenance.source = projectRoot;
-    data.frames.reserve(images.size());
-
-    for (auto &img : images) {
-        auto it = cameras.find(img.camId);
-        if (it == cameras.end()) {
-            throw std::runtime_error(
-                "COLMAP image " + std::to_string(img.id) +
-                " references unknown camera " + std::to_string(img.camId));
+    std::sort(images.begin(), images.end(), [](const ColmapImage &lhs,
+                                                const ColmapImage &rhs) {
+        if (lhs.filename != rhs.filename) {
+            return lhs.filename < rhs.filename;
         }
-        auto &cc = it->second;
+        return lhs.id < rhs.id;
+    });
+
+    DatasetDescriptor descriptor;
+    descriptor.provenance.adapter = "colmap";
+    descriptor.provenance.source = projectRoot;
+    descriptor.frames.reserve(images.size());
+    const std::string poseSource = (usesBinaryImages
+        ? sparse / "images.bin" : sparse / "images.txt").string();
+    for (const ColmapImage &image : images) {
+        const auto camera = cameras.find(image.cameraId);
+        if (camera == cameras.end()) {
+            throw std::runtime_error(
+                "COLMAP image " + std::to_string(image.id) +
+                " references unknown camera " + std::to_string(image.cameraId));
+        }
 
         DatasetFrameDescriptor frame;
-        frame.id = std::to_string(img.id);
-        frame.calibrationId = std::to_string(img.camId);
-        frame.imagePath = (fs::path(imageDir) / img.filename).string();
+        frame.id = std::to_string(image.id);
+        frame.calibrationId = std::to_string(image.cameraId);
+        frame.imagePath = (fs::path(imageDirectory) / image.filename).string();
         frame.rasterOrientation = RasterOrientation::EncodedPixels;
-        frame.calibration.width = cc.width;
-        frame.calibration.height = cc.height;
-        frame.calibration.fx = cc.fx;
-        frame.calibration.fy = cc.fy;
-        frame.calibration.cx = cc.cx;
-        frame.calibration.cy = cc.cy;
-        frame.calibration.k1 = cc.k1;
-        frame.calibration.k2 = cc.k2;
-        frame.calibration.p1 = cc.p1;
-        frame.calibration.p2 = cc.p2;
-        w2cToCamToWorld(img.quat, img.t, frame.cameraToWorld.data());
-        data.frames.push_back(std::move(frame));
+        frame.calibration.width = camera->second.width;
+        frame.calibration.height = camera->second.height;
+        frame.calibration.fx = camera->second.fx;
+        frame.calibration.fy = camera->second.fy;
+        frame.calibration.cx = camera->second.cx;
+        frame.calibration.cy = camera->second.cy;
+        frame.calibration.k1 = camera->second.k1;
+        frame.calibration.k2 = camera->second.k2;
+        frame.calibration.p1 = camera->second.p1;
+        frame.calibration.p2 = camera->second.p2;
+        worldToCameraToCameraToWorld(image, frame.cameraToWorld, poseSource);
+        descriptor.frames.push_back(std::move(frame));
     }
 
-    // Point cloud
-    if (fs::exists(sparse / "points3D.bin"))
-        data.points = readColmapPoints((sparse / "points3D.bin").string());
-    else if (fs::exists(sparse / "points3D.txt"))
-        data.points = readPointsText((sparse / "points3D.txt").string());
-    else if (fs::exists(sparse / "points3D.ply"))
-        data.points = readPly((sparse / "points3D.ply").string());
+    ColmapTrackValidation trackValidation;
+    ColmapTrackValidation *trackValidationState = nullptr;
+    const SparsePointSet *colmapPoints = nullptr;
+    bool usesPlyPoints = false;
+    if (fs::exists(sparse / "points3D.bin")) {
+        const std::string path = (sparse / "points3D.bin").string();
+        trackValidation = makeTrackValidation(images, path);
+        descriptor.points = readPointsBinary(path, images, trackValidation);
+        trackValidationState = &trackValidation;
+        colmapPoints = &descriptor.points;
+    } else if (fs::exists(sparse / "points3D.txt")) {
+        const std::string path = (sparse / "points3D.txt").string();
+        trackValidation = makeTrackValidation(images, path);
+        descriptor.points = readPointsText(path, images, trackValidation);
+        trackValidationState = &trackValidation;
+        colmapPoints = &descriptor.points;
+    } else if (fs::exists(sparse / "points3D.ply")) {
+        descriptor.points = readPly((sparse / "points3D.ply").string());
+        usesPlyPoints = true;
+    }
 
-    return data;
+    appendObservationsAndFinishTrackValidation(
+        descriptor, images, colmapPoints, trackValidationState,
+        usesPlyPoints, projectRoot);
+    return descriptor;
 }

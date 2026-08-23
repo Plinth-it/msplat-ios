@@ -39,6 +39,9 @@
   canonical dataset descriptor. It preserves stable frame/calibration IDs,
   COLMAP sparse-point IDs and reprojection errors, source provenance, and an
   explicit encoded or EXIF-normalized raster-coordinate policy.
+- COLMAP image observations and sparse-point tracks are now retained as one
+  canonical correspondence table. Text and binary imports reject inconsistent
+  tracks, duplicate source IDs, truncated records, and unsafe source counts.
 - Render-only calls now allocate only shared forward workspaces. Loss, SSIM,
   and backward buffers are added lazily by training, while unused transient
   prefix, spherical-harmonics gradient, and SSIM-window storage was removed;

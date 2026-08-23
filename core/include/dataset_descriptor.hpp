@@ -54,6 +54,9 @@ struct SparsePointSet {
 
 struct SparseObservation {
     uint32_t frameIndex = 0;
+    // Stable zero-based index within the source frame's observation list.
+    // For COLMAP this is POINT2D_IDX from the sparse reconstruction.
+    uint32_t frameObservationIndex = 0;
     int32_t pointIndex = -1;
     float x = 0.0f;
     float y = 0.0f;
@@ -67,6 +70,9 @@ struct DatasetProvenance {
 struct DatasetDescriptor {
     std::vector<DatasetFrameDescriptor> frames;
     SparsePointSet points;
+    // Strictly ordered by (frameIndex, frameObservationIndex). This keeps
+    // validation allocation-free and makes each frame's source feature order
+    // deterministic for diagnostics and track reconstruction.
     std::vector<SparseObservation> observations;
     DatasetProvenance provenance;
 };

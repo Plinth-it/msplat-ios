@@ -110,7 +110,8 @@ adapters can opt into tested EXIF-normalized materialization.
   explicit sRGB conversion, and raw-coordinate EXIF handling for COLMAP
 - A validated canonical descriptor shared by the COLMAP, Nerfstudio, and
   Polycam adapters, preserving source frame/calibration identity, sparse-point
-  IDs and reprojection errors, and adapter provenance
+  IDs, reprojection errors, image observations, and adapter provenance; COLMAP
+  track reciprocity is checked before the descriptor is materialized
 - XCFramework slices for `macos-arm64`, `ios-arm64` and
   `ios-arm64_x86_64-simulator`, each with its own metallib
 
