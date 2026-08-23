@@ -82,18 +82,18 @@ final class TrainingPlanTests: XCTestCase {
         )
         XCTAssertEqual(estimate.peakTrainingCacheBytes, 809_345_340)
         XCTAssertEqual(estimate.largestImageCacheEntryBytes, 16_588_800)
-        XCTAssertEqual(estimate.imageDecodeTransientBytes, 44_236_800)
-        XCTAssertEqual(estimate.imageInsertionPeakBytes, 581_107_712)
-        XCTAssertEqual(estimate.codeDerivedBytes, 1_954_456_480)
-        XCTAssertEqual(estimate.recommendedHeadroomBytes, 390_891_296)
-        XCTAssertEqual(estimate.estimatedPeakMemory, 2_345_347_776)
+        XCTAssertEqual(estimate.imageDecodeTransientBytes, 24_883_200)
+        XCTAssertEqual(estimate.imageInsertionPeakBytes, 561_754_112)
+        XCTAssertEqual(estimate.codeDerivedBytes, 1_935_102_880)
+        XCTAssertEqual(estimate.recommendedHeadroomBytes, 387_020_576)
+        XCTAssertEqual(estimate.estimatedPeakMemory, 2_322_123_456)
         let customEstimate = try plan.memoryEstimate(
             imageCacheBudgetBytes: 64 * 1_024 * 1_024
         )
-        XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 111_345_664)
-        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_484_694_432)
-        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 296_938_887)
-        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_781_633_319)
+        XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 91_992_064)
+        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_465_340_832)
+        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 293_068_167)
+        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_758_408_999)
     }
 
     func testSingleCoarseStageDoesNotTransitionWithinBudget() throws {

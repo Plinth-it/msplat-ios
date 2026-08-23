@@ -209,7 +209,6 @@ public struct TrainingPlan: Sendable, Equatable {
             decodedInputDimensions: decodedInputDimensions
         )
         let memoryEstimate = try Self.calculateMemoryEstimate(
-            inputDimensions: inputDimensions,
             decodedInputDimensions: decodedInputDimensions,
             resolvedStages: resolvedStages,
             targetSHDegree: targetSHDegree,
@@ -278,7 +277,6 @@ public struct TrainingPlan: Sendable, Equatable {
         imageCacheBudgetBytes: Int64
     ) throws -> TrainingMemoryEstimate {
         try Self.calculateMemoryEstimate(
-            inputDimensions: inputDimensions,
             decodedInputDimensions: decodedInputDimensions,
             resolvedStages: resolvedStages,
             targetSHDegree: targetSHDegree,
@@ -414,7 +412,6 @@ public struct TrainingPlan: Sendable, Equatable {
     }
 
     private static func calculateMemoryEstimate(
-        inputDimensions: TrainingImageDimensions,
         decodedInputDimensions: TrainingImageDimensions,
         resolvedStages: [ResolvedTrainingResolutionStage],
         targetSHDegree: Int32,
@@ -621,26 +618,13 @@ public struct TrainingPlan: Sendable, Equatable {
             ))
         }
 
-        let sourcePixelCount = try checkedProduct([
-            Int64(inputDimensions.width),
-            Int64(inputDimensions.height),
-        ], component: "source image pixels")
-        let imageDecodeTransientBytes = max(
-            try checkedProduct(
-                [16, sourcePixelCount],
-                component: "source decode transient"
-            ),
-            try checkedProduct(
-                [12, try checkedSum(
-                    [sourcePixelCount, decodedPixelCount],
-                    component: "source and decoded pixels"
-                )],
-                component: "resize transient"
-            ),
-            try checkedProduct(
-                [36, decodedPixelCount],
-                component: "decoded-image transient"
-            )
+        // ImageIO is asked for a thumbnail at the decoded-input dimensions, so
+        // app-owned RGBA, float RGB, resize, and undistortion buffers now scale
+        // with that target rather than with the encoded source raster. Codec-
+        // private allocations remain covered only by the general headroom.
+        let imageDecodeTransientBytes = try checkedProduct(
+            [36, decodedPixelCount],
+            component: "target-resolution image decode transient"
         )
         let imageInsertionPeakBytes = try checkedSum([
             max(imageCacheBudgetBytes, largestImageCacheEntryBytes),

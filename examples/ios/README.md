@@ -39,16 +39,19 @@ metadata and builds one of two explicit plans:
 
 The plan screen shows each effective resolution stage, target SH degree,
 Gaussian ceiling, and a conservative code-derived peak-memory estimate. The
-estimate covers native model and training buffers, image-cache insertion, the
-current full-source decode transient, and recommended headroom. The app refuses
-to start when that estimate exceeds a nonzero `os_proc_available_memory` value
-at preflight (the simulator reports zero and skips this comparison).
+estimate covers native model and training buffers, image-cache insertion,
+target-resolution app-owned decode buffers, and recommended headroom. The app
+refuses to start when that estimate exceeds a nonzero
+`os_proc_available_memory` value at preflight (the simulator reports zero and
+skips this comparison).
 
 This check is a planning aid, not a jetsam guarantee. Metal driver state,
 framework allocations, other process memory, and changing system pressure are
-not fully modeled. The current image path also still materializes each source
-image at full resolution before resizing it, so very large captures can create
-a short-lived decode spike even when the planned training resolution is small.
+not fully modeled. ImageIO now requests the selected input resolution directly,
+but a codec may still use private decoder surfaces that the estimate cannot
+observe. COLMAP camera calibration uses encoded raster coordinates, so valid
+EXIF orientation metadata is checked but intentionally not applied; an oriented
+image provider must transform its calibration and pose together with its pixels.
 
 During training the app reports the step, Gaussian count, CPU
 encode/submission time, `phys_footprint`, and the memory iOS currently reports

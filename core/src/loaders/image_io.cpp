@@ -2,99 +2,337 @@
 #include <cmath>
 #include <cstring>
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
+#include <utility>
 
 #include <CoreGraphics/CoreGraphics.h>
 #include <ImageIO/ImageIO.h>
 
 // ── Image loading (CoreGraphics) ─────────────────────────────────────────────
 
-Image imreadRGB(const std::string &path) {
-    CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
-    CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
-    CFRelease(cfPath);
+namespace {
 
-    CGImageSourceRef source = CGImageSourceCreateWithURL(url, nullptr);
-    CFRelease(url);
-    if (!source) {
-        throw std::runtime_error("Failed to load image: " + path);
+template <typename T>
+class CFHandle {
+public:
+    explicit CFHandle(T value = nullptr) : value_(value) {}
+    ~CFHandle() { reset(); }
+
+    CFHandle(const CFHandle &) = delete;
+    CFHandle &operator=(const CFHandle &) = delete;
+
+    CFHandle(CFHandle &&other) noexcept : value_(other.value_) {
+        other.value_ = nullptr;
     }
 
-    CGImageRef cgImage = CGImageSourceCreateImageAtIndex(source, 0, nullptr);
-    CFRelease(source);
-    if (!cgImage) {
-        throw std::runtime_error("Failed to decode image: " + path);
+    CFHandle &operator=(CFHandle &&other) noexcept {
+        if (this != &other) {
+            reset();
+            value_ = other.value_;
+            other.value_ = nullptr;
+        }
+        return *this;
     }
 
-    int w = (int)CGImageGetWidth(cgImage);
-    int h = (int)CGImageGetHeight(cgImage);
+    T get() const { return value_; }
+    explicit operator bool() const { return value_ != nullptr; }
 
-    // Render into RGBA buffer, then extract RGB and convert to float32
-    std::vector<uint8_t> rgba(w * h * 4);
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(
-        rgba.data(), w, h, 8, w * 4, colorSpace,
-        kCGImageAlphaNoneSkipLast | kCGBitmapByteOrderDefault
-    );
-    CGContextDrawImage(ctx, CGRectMake(0, 0, w, h), cgImage);
-    CGContextRelease(ctx);
-    CGColorSpaceRelease(colorSpace);
-    CGImageRelease(cgImage);
-
-    // RGBA → float32 RGB [0,1]
-    Image img;
-    img.width = w;
-    img.height = h;
-    img.data.resize(w * h * 3);
-    for (int i = 0; i < w * h; i++) {
-        img.data[i * 3 + 0] = rgba[i * 4 + 0] / 255.0f;
-        img.data[i * 3 + 1] = rgba[i * 4 + 1] / 255.0f;
-        img.data[i * 3 + 2] = rgba[i * 4 + 2] / 255.0f;
+    void reset(T value = nullptr) {
+        if (value_) CFRelease(value_);
+        value_ = value;
     }
-    return img;
+
+private:
+    T value_;
+};
+
+size_t checkedElementCount(int width, int height, size_t channels,
+                           size_t elementBytes,
+                           const std::string &context) {
+    if (width <= 0 || height <= 0 || channels == 0 || elementBytes == 0) {
+        throw std::runtime_error(context + " has invalid dimensions " +
+                                 std::to_string(width) + "x" +
+                                 std::to_string(height));
+    }
+
+    const size_t w = static_cast<size_t>(width);
+    const size_t h = static_cast<size_t>(height);
+    if (w > std::numeric_limits<size_t>::max() / h) {
+        throw std::overflow_error(context + " pixel count overflows size_t");
+    }
+    const size_t pixels = w * h;
+    if (pixels > std::numeric_limits<size_t>::max() / channels) {
+        throw std::overflow_error(context + " element count overflows size_t");
+    }
+    const size_t elements = pixels * channels;
+    if (elements > std::numeric_limits<size_t>::max() / elementBytes) {
+        throw std::overflow_error(context + " byte count overflows size_t");
+    }
+    return elements;
+}
+
+CFHandle<CFURLRef> makeFileURL(const std::string &path) {
+    if (path.empty() ||
+        path.size() > static_cast<size_t>(std::numeric_limits<CFIndex>::max())) {
+        throw std::invalid_argument("Image path is empty or too long");
+    }
+
+    CFHandle<CFURLRef> url(CFURLCreateFromFileSystemRepresentation(
+        nullptr,
+        reinterpret_cast<const UInt8 *>(path.data()),
+        static_cast<CFIndex>(path.size()),
+        false));
+    if (!url) throw std::runtime_error("Failed to create image URL: " + path);
+    return url;
+}
+
+CFHandle<CGImageSourceRef> openImageSource(const std::string &path) {
+    auto url = makeFileURL(path);
+    CFHandle<CGImageSourceRef> source(CGImageSourceCreateWithURL(url.get(), nullptr));
+    if (!source || CGImageSourceGetCount(source.get()) == 0) {
+        throw std::runtime_error("Failed to open image source: " + path);
+    }
+    return source;
+}
+
+int readPositiveInt(CFDictionaryRef properties, CFStringRef key,
+                    const char *label, const std::string &path) {
+    const void *value = CFDictionaryGetValue(properties, key);
+    if (!value || CFGetTypeID(value) != CFNumberGetTypeID()) {
+        throw std::runtime_error("Image " + std::string(label) +
+                                 " is missing: " + path);
+    }
+
+    int64_t number = 0;
+    if (!CFNumberGetValue(static_cast<CFNumberRef>(value),
+                          kCFNumberSInt64Type, &number) ||
+        number <= 0 || number > std::numeric_limits<int>::max()) {
+        throw std::runtime_error("Image " + std::string(label) +
+                                 " is invalid: " + path);
+    }
+    return static_cast<int>(number);
+}
+
+ImageSourceInfo sourceInfo(CGImageSourceRef source, const std::string &path) {
+    CFHandle<CFDictionaryRef> properties(
+        CGImageSourceCopyPropertiesAtIndex(source, 0, nullptr));
+    if (!properties) {
+        throw std::runtime_error("Failed to read image metadata: " + path);
+    }
+
+    ImageSourceInfo info;
+    info.rawWidth = readPositiveInt(properties.get(), kCGImagePropertyPixelWidth,
+                                    "pixel width", path);
+    info.rawHeight = readPositiveInt(properties.get(), kCGImagePropertyPixelHeight,
+                                     "pixel height", path);
+
+    if (const void *value = CFDictionaryGetValue(
+            properties.get(), kCGImagePropertyOrientation)) {
+        if (CFGetTypeID(value) != CFNumberGetTypeID()) {
+            throw std::runtime_error("Image EXIF orientation is invalid: " + path);
+        }
+        int32_t orientation = 0;
+        if (!CFNumberGetValue(static_cast<CFNumberRef>(value),
+                              kCFNumberSInt32Type, &orientation) ||
+            orientation < 1 || orientation > 8) {
+            throw std::runtime_error("Image EXIF orientation must be in 1...8: " + path);
+        }
+        info.exifOrientation = orientation;
+    }
+
+    const bool swapsDimensions = info.exifOrientation >= 5;
+    info.orientedWidth = swapsDimensions ? info.rawHeight : info.rawWidth;
+    info.orientedHeight = swapsDimensions ? info.rawWidth : info.rawHeight;
+    return info;
+}
+
+bool sameSourceInfo(const ImageSourceInfo &lhs, const ImageSourceInfo &rhs) {
+    return lhs.rawWidth == rhs.rawWidth &&
+           lhs.rawHeight == rhs.rawHeight &&
+           lhs.orientedWidth == rhs.orientedWidth &&
+           lhs.orientedHeight == rhs.orientedHeight &&
+           lhs.exifOrientation == rhs.exifOrientation;
+}
+
+} // namespace
+
+ImageSourceInfo inspectImageSource(const std::string &path) {
+    auto source = openImageSource(path);
+    return sourceInfo(source.get(), path);
+}
+
+Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceInfo,
+                int targetWidth, int targetHeight,
+                bool applyExifOrientation) {
+    const size_t rgbaElements = checkedElementCount(
+        targetWidth, targetHeight, 4, sizeof(uint8_t), "Decoded image");
+    const size_t rgbElements = checkedElementCount(
+        targetWidth, targetHeight, 3, sizeof(float), "Decoded image");
+    const size_t rowBytes = static_cast<size_t>(targetWidth) * 4;
+
+    auto source = openImageSource(path);
+    const ImageSourceInfo currentSourceInfo = sourceInfo(source.get(), path);
+    if (!sameSourceInfo(currentSourceInfo, expectedSourceInfo)) {
+        throw std::runtime_error(
+            "Image dimensions or orientation changed while loading: " + path);
+    }
+
+    const int64_t maximumPixelSize = std::max(targetWidth, targetHeight);
+    CFHandle<CFNumberRef> maximumPixelSizeNumber(CFNumberCreate(
+        nullptr, kCFNumberSInt64Type, &maximumPixelSize));
+    if (!maximumPixelSizeNumber) {
+        throw std::runtime_error("Failed to configure image thumbnail: " + path);
+    }
+
+    const void *keys[] = {
+        kCGImageSourceCreateThumbnailFromImageAlways,
+        kCGImageSourceCreateThumbnailWithTransform,
+        kCGImageSourceThumbnailMaxPixelSize,
+        kCGImageSourceShouldCacheImmediately,
+    };
+    const void *values[] = {
+        kCFBooleanTrue,
+        applyExifOrientation ? kCFBooleanTrue : kCFBooleanFalse,
+        maximumPixelSizeNumber.get(),
+        kCFBooleanTrue,
+    };
+    CFHandle<CFDictionaryRef> options(CFDictionaryCreate(
+        nullptr, keys, values, 4,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks));
+    if (!options) {
+        throw std::runtime_error("Failed to configure image thumbnail: " + path);
+    }
+
+    CFHandle<CGImageRef> thumbnail(CGImageSourceCreateThumbnailAtIndex(
+        source.get(), 0, options.get()));
+    if (!thumbnail || CGImageGetWidth(thumbnail.get()) == 0 ||
+        CGImageGetHeight(thumbnail.get()) == 0) {
+        throw std::runtime_error("Failed to decode image thumbnail: " + path);
+    }
+
+    // ImageIO performs the codec-aware downsample and, when requested by a
+    // calibration-aware caller, the EXIF transform. Rendering the thumbnail
+    // once more guarantees the exact truncation-sized canvas expected by the
+    // training plan (codec rounding can differ by one pixel).
+    std::vector<uint8_t> rgba(rgbaElements);
+    CFHandle<CGColorSpaceRef> colorSpace(
+        CGColorSpaceCreateWithName(kCGColorSpaceSRGB));
+    if (!colorSpace) {
+        throw std::runtime_error("Failed to create sRGB color space");
+    }
+
+    const CGBitmapInfo bitmapInfo = static_cast<CGBitmapInfo>(
+        kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big);
+    CFHandle<CGContextRef> context(CGBitmapContextCreate(
+        rgba.data(), static_cast<size_t>(targetWidth),
+        static_cast<size_t>(targetHeight), 8, rowBytes, colorSpace.get(),
+        bitmapInfo));
+    if (!context) {
+        throw std::runtime_error("Failed to allocate image decode context: " + path);
+    }
+
+    CGContextSetBlendMode(context.get(), kCGBlendModeCopy);
+    CGContextSetInterpolationQuality(context.get(), kCGInterpolationHigh);
+    CGContextDrawImage(
+        context.get(),
+        CGRectMake(0, 0, static_cast<CGFloat>(targetWidth),
+                   static_cast<CGFloat>(targetHeight)),
+        thumbnail.get());
+
+    Image image;
+    image.width = targetWidth;
+    image.height = targetHeight;
+    image.data.resize(rgbElements);
+    const size_t pixelCount = rgbElements / 3;
+    for (size_t i = 0; i < pixelCount; ++i) {
+        image.data[i * 3 + 0] = rgba[i * 4 + 0] / 255.0f;
+        image.data[i * 3 + 1] = rgba[i * 4 + 1] / 255.0f;
+        image.data[i * 3 + 2] = rgba[i * 4 + 2] / 255.0f;
+    }
+    return image;
 }
 
 // ── Image writing (CoreGraphics PNG) ─────────────────────────────────────────
 
 void imwriteRGB(const std::string &path, const Image &img) {
-    int w = img.width, h = img.height;
+    const size_t rgbElements = checkedElementCount(
+        img.width, img.height, 3, sizeof(float), "Image to write");
+    if (img.data.size() != rgbElements) {
+        throw std::invalid_argument(
+            "Image storage does not match its dimensions");
+    }
+    const size_t rgbaElements = checkedElementCount(
+        img.width, img.height, 4, sizeof(uint8_t), "Image to write");
+    const size_t rowBytes = static_cast<size_t>(img.width) * 4;
 
-    // float32 RGB → uint8 RGB
-    std::vector<uint8_t> rgb8(w * h * 3);
-    for (int i = 0; i < w * h * 3; i++) {
-        float v = std::clamp(img.data[i] * 255.0f, 0.0f, 255.0f);
-        rgb8[i] = (uint8_t)(v + 0.5f);
+    std::vector<uint8_t> rgba(rgbaElements);
+    const size_t width = static_cast<size_t>(img.width);
+    const size_t height = static_cast<size_t>(img.height);
+    for (size_t y = 0; y < height; ++y) {
+        for (size_t x = 0; x < width; ++x) {
+            const size_t sourcePixel = y * width + x;
+            for (size_t channel = 0; channel < 3; ++channel) {
+                const float value = img.data[sourcePixel * 3 + channel];
+                const float byteValue = std::isfinite(value)
+                    ? std::clamp(value * 255.0f, 0.0f, 255.0f)
+                    : 0.0f;
+                rgba[sourcePixel * 4 + channel] =
+                    static_cast<uint8_t>(byteValue + 0.5f);
+            }
+            rgba[sourcePixel * 4 + 3] = 255;
+        }
     }
 
-    CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-    CGContextRef ctx = CGBitmapContextCreate(
-        rgb8.data(), w, h, 8, w * 3, colorSpace,
-        kCGImageAlphaNone | kCGBitmapByteOrderDefault
-    );
-    CGImageRef cgImage = CGBitmapContextCreateImage(ctx);
-    CGContextRelease(ctx);
-    CGColorSpaceRelease(colorSpace);
+    CFHandle<CGColorSpaceRef> colorSpace(
+        CGColorSpaceCreateWithName(kCGColorSpaceSRGB));
+    if (!colorSpace) {
+        throw std::runtime_error("Failed to create sRGB color space");
+    }
+    const CGBitmapInfo bitmapInfo = static_cast<CGBitmapInfo>(
+        kCGImageAlphaNoneSkipLast | kCGBitmapByteOrder32Big);
+    CFHandle<CGContextRef> context(CGBitmapContextCreate(
+        rgba.data(), static_cast<size_t>(img.width),
+        static_cast<size_t>(img.height), 8, rowBytes, colorSpace.get(),
+        bitmapInfo));
+    if (!context) {
+        throw std::runtime_error("Failed to create image write context: " + path);
+    }
 
-    CFStringRef cfPath = CFStringCreateWithCString(nullptr, path.c_str(), kCFStringEncodingUTF8);
-    CFURLRef url = CFURLCreateWithFileSystemPath(nullptr, cfPath, kCFURLPOSIXPathStyle, false);
-    CFRelease(cfPath);
-
-    CGImageDestinationRef dest = CGImageDestinationCreateWithURL(url, CFSTR("public.png"), 1, nullptr);
-    CFRelease(url);
-    CGImageDestinationAddImage(dest, cgImage, nullptr);
-    CGImageDestinationFinalize(dest);
-
-    CFRelease(dest);
-    CGImageRelease(cgImage);
+    CFHandle<CGImageRef> image(CGBitmapContextCreateImage(context.get()));
+    if (!image) {
+        throw std::runtime_error("Failed to create image for writing: " + path);
+    }
+    auto url = makeFileURL(path);
+    CFHandle<CGImageDestinationRef> destination(
+        CGImageDestinationCreateWithURL(url.get(), CFSTR("public.png"), 1,
+                                        nullptr));
+    if (!destination) {
+        throw std::runtime_error("Failed to create PNG destination: " + path);
+    }
+    CGImageDestinationAddImage(destination.get(), image.get(), nullptr);
+    if (!CGImageDestinationFinalize(destination.get())) {
+        throw std::runtime_error("Failed to write PNG: " + path);
+    }
 }
 
 // ── Area-based image resize (box filter) ─────────────────────────────────────
 
 Image resizeArea(const Image &src, int dstW, int dstH) {
+    const size_t sourceElements = checkedElementCount(
+        src.width, src.height, 3, sizeof(float), "Source image");
+    if (src.data.size() != sourceElements) {
+        throw std::invalid_argument(
+            "Source image storage does not match its dimensions");
+    }
+    const size_t destinationElements = checkedElementCount(
+        dstW, dstH, 3, sizeof(float), "Resized image");
+
     Image dst;
     dst.width = dstW;
     dst.height = dstH;
-    dst.data.resize(dstW * dstH * 3, 0.0f);
+    dst.data.resize(destinationElements, 0.0f);
 
     float scaleX = (float)src.width / dstW;
     float scaleY = (float)src.height / dstH;
@@ -120,7 +358,9 @@ Image resizeArea(const Image &src, int dstW, int dstH) {
                 for (int ix = ix0; ix < ix1; ix++) {
                     float wx = std::min((float)(ix + 1), srcX1) - std::max((float)ix, srcX0);
                     float area = wx * wy;
-                    const float *p = &src.data[(iy * src.width + ix) * 3];
+                    const size_t sourceIndex =
+                        (static_cast<size_t>(iy) * src.width + ix) * 3;
+                    const float *p = &src.data[sourceIndex];
                     sum[0] += p[0] * area;
                     sum[1] += p[1] * area;
                     sum[2] += p[2] * area;
@@ -128,7 +368,9 @@ Image resizeArea(const Image &src, int dstW, int dstH) {
                 }
             }
 
-            float *out = &dst.data[(dy * dstW + dx) * 3];
+            const size_t destinationIndex =
+                (static_cast<size_t>(dy) * dstW + dx) * 3;
+            float *out = &dst.data[destinationIndex];
             float inv = 1.0f / totalArea;
             out[0] = sum[0] * inv;
             out[1] = sum[1] * inv;

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <random>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <cstdlib>
 #include <TargetConditionals.h>
@@ -15,11 +16,58 @@
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
+namespace {
+
+int targetDimension(int sourceDimension, float downscaleFactor,
+                    const char *axis, const std::string &path) {
+    // Match Swift's Float(...).rounded(.towardZero) planning contract exactly.
+    const float scaled = static_cast<float>(sourceDimension) / downscaleFactor;
+    if (!std::isfinite(scaled) || scaled < 1.0f ||
+        static_cast<double>(scaled) >
+            static_cast<double>(std::numeric_limits<int>::max())) {
+        throw std::invalid_argument(
+            "Image downscale produces an invalid " + std::string(axis) +
+            " for " + path);
+    }
+    return static_cast<int>(scaled);
+}
+
+bool dimensionsShareAspect(int lhsWidth, int lhsHeight,
+                           int rhsWidth, int rhsHeight) {
+    if (lhsWidth <= 0 || lhsHeight <= 0 || rhsWidth <= 0 || rhsHeight <= 0)
+        return false;
+
+    const long double lhs =
+        static_cast<long double>(lhsWidth) * rhsHeight;
+    const long double rhs =
+        static_cast<long double>(rhsWidth) * lhsHeight;
+    const long double denominator = std::max(lhs, rhs);
+    const long double smallestDimension = std::min({
+        static_cast<long double>(lhsWidth),
+        static_cast<long double>(lhsHeight),
+        static_cast<long double>(rhsWidth),
+        static_cast<long double>(rhsHeight),
+    });
+    // Permit at most one-pixel integer rounding for ordinary image sizes while
+    // keeping tiny or malformed calibration dimensions from creating a broad
+    // aspect-ratio tolerance.
+    const long double relativeTolerance =
+        std::min(0.002L, 1.0L / smallestDimension);
+    return std::abs(lhs - rhs) / denominator <= relativeTolerance;
+}
+
+} // namespace
+
 // ── Image loading ───────────────────────────────────────────────────────────
 
 void Camera::loadImage(float downscaleFactor) {
     if (!image.empty() && loadedImageDownscaleFactor == downscaleFactor) return;
     releaseImageMemory();
+
+    if (!std::isfinite(downscaleFactor) || downscaleFactor < 1.0f) {
+        throw std::invalid_argument(
+            "Image downscale factor must be finite and at least 1");
+    }
 
     // Capture the dataset's own numbers once, then always derive from them.
     if (!declared.captured) {
@@ -30,28 +78,62 @@ void Camera::loadImage(float downscaleFactor) {
     p1 = declared.p1; p2 = declared.p2;
     width = declared.width; height = declared.height;
 
-    Image raw = imreadRGB(filePath);
-    if (raw.empty()) return;
-
-    // If actual image dimensions differ from metadata, rescale intrinsics
-    if (width > 0 && height > 0 && (raw.width != width || raw.height != height)) {
-        float sx = (float)raw.width / (float)width;
-        float sy = (float)raw.height / (float)height;
-        fx *= sx; fy *= sy; cx *= sx; cy *= sy;
-        width = raw.width; height = raw.height;
-    } else if (width == 0 || height == 0) {
-        width = raw.width; height = raw.height;
+    if (width < 0 || height < 0 || (width == 0) != (height == 0)) {
+        throw std::invalid_argument(
+            "Camera dimensions must both be positive or both be omitted for " +
+            filePath);
     }
 
-    // Downscale
-    if (downscaleFactor > 1.0f) {
-        int newW = (int)(width / downscaleFactor);
-        int newH = (int)(height / downscaleFactor);
-        raw = resizeArea(raw, newW, newH);
-        float s = 1.0f / downscaleFactor;
-        fx *= s; fy *= s; cx *= s; cy *= s;
-        width = newW; height = newH;
+    const ImageSourceInfo sourceInfo = inspectImageSource(filePath);
+
+    // COLMAP and the current dataset adapters calibrate against the encoded
+    // raster (COLMAP explicitly reads with reorientation disabled). Preserve
+    // that coordinate frame here. The decode API can normalize EXIF for a
+    // future adapter that also transforms K and the camera pose explicitly.
+    if (width > 0 &&
+        !dimensionsShareAspect(width, height,
+                               sourceInfo.rawWidth, sourceInfo.rawHeight)) {
+        std::string detail;
+        if (sourceInfo.exifOrientation >= 5 &&
+            dimensionsShareAspect(width, height,
+                                  sourceInfo.orientedWidth,
+                                  sourceInfo.orientedHeight)) {
+            detail = " The declared dimensions instead match the EXIF-oriented "
+                     "raster, but this camera path preserves encoded pixel "
+                     "coordinates; normalize both pixels and calibration before "
+                     "training.";
+        }
+        throw std::invalid_argument(
+            "Camera dimensions " + std::to_string(width) + "x" +
+            std::to_string(height) + " do not match encoded image dimensions " +
+            std::to_string(sourceInfo.rawWidth) + "x" +
+            std::to_string(sourceInfo.rawHeight) + " for " + filePath + "." +
+            detail);
     }
+
+    const int targetWidth = targetDimension(
+        sourceInfo.rawWidth, downscaleFactor, "width", filePath);
+    const int targetHeight = targetDimension(
+        sourceInfo.rawHeight, downscaleFactor, "height", filePath);
+    Image raw = imreadRGB(filePath, sourceInfo, targetWidth, targetHeight,
+                          false);
+
+    // Scale from the calibration's declared pixel frame directly to the exact
+    // target canvas. COLMAP uses image-edge coordinates (the upper-left pixel
+    // center is 0.5, 0.5), so focal lengths and principal points both scale
+    // directly with their axis.
+    const int calibrationWidth = width > 0 ? width : sourceInfo.rawWidth;
+    const int calibrationHeight = height > 0 ? height : sourceInfo.rawHeight;
+    const float sx = static_cast<float>(targetWidth) /
+                     static_cast<float>(calibrationWidth);
+    const float sy = static_cast<float>(targetHeight) /
+                     static_cast<float>(calibrationHeight);
+    fx *= sx;
+    fy *= sy;
+    cx *= sx;
+    cy *= sy;
+    width = targetWidth;
+    height = targetHeight;
 
     // Undistort if needed
     if (hasDistortion()) {

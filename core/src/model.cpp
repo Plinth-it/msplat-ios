@@ -979,12 +979,17 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
     if (cam.width < downscale || cam.height < downscale)
         throw std::invalid_argument(
             "Training downscale produces a zero-sized image; reduce numDownscales");
-    const float sf = static_cast<float>(downscale);
     CamSetup s;
-    s.fx = cam.fx / sf; s.fy = cam.fy / sf;
-    s.cx = cam.cx / sf; s.cy = cam.cy / sf;
-    s.height = static_cast<int>(cam.height / sf);
-    s.width = static_cast<int>(cam.width / sf);
+    s.height = cam.height / downscale;
+    s.width = cam.width / downscale;
+    const float sx = static_cast<float>(s.width) /
+                     static_cast<float>(cam.width);
+    const float sy = static_cast<float>(s.height) /
+                     static_cast<float>(cam.height);
+    s.fx = cam.fx * sx;
+    s.fy = cam.fy * sy;
+    s.cx = cam.cx * sx;
+    s.cy = cam.cy * sy;
 
     float fovX = 2.0f * std::atan(s.width / (2.0f * s.fx));
     float fovY = 2.0f * std::atan(s.height / (2.0f * s.fy));

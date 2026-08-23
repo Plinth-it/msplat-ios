@@ -57,8 +57,8 @@ final class DatasetFolder {
     }
 
     /// Reads image headers only; ImageIO does not decode full pixel buffers.
-    /// The maxima are combined conservatively for preflight planning when a
-    /// dataset happens to contain more than one camera resolution.
+    /// COLMAP calibrates against encoded pixel coordinates, so EXIF orientation
+    /// is validated but intentionally not applied to these dimensions.
     static func maximumSourceDimensions(at datasetURL: URL) throws
         -> TrainingImageDimensions {
         let imageDirectory = datasetURL.appending(path: "images")
@@ -89,6 +89,13 @@ final class DatasetFolder {
                   let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
                   let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else {
                 continue
+            }
+            let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?
+                .intValue ?? 1
+            guard (1...8).contains(orientation) else {
+                throw MsplatError.invalidDataset(
+                    "An image has an invalid EXIF orientation value."
+                )
             }
             maximumWidth = max(maximumWidth, width.intValue)
             maximumHeight = max(maximumHeight, height.intValue)

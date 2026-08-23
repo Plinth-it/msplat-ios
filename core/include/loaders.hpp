@@ -17,7 +17,25 @@ Points readPly(const std::string &path);
 Points readColmapPoints(const std::string &path);
 
 // Image I/O
-Image imreadRGB(const std::string &path);       // returns float32 [0,1] directly
+struct ImageSourceInfo {
+    int rawWidth = 0;
+    int rawHeight = 0;
+    int orientedWidth = 0;
+    int orientedHeight = 0;
+    int exifOrientation = 1;
+};
+
+/// Reads dimensions and EXIF orientation without decoding the image pixels.
+ImageSourceInfo inspectImageSource(const std::string &path);
+
+/// Decodes directly near the requested size, optionally applies EXIF
+/// orientation, then renders into an exact-size sRGB float32 RGB image in
+/// [0, 1]. `sourceInfo` must come from `inspectImageSource` for the same
+/// unchanged file. Callers must only request orientation normalization when
+/// their camera calibration uses the orientation-normalized pixel frame.
+Image imreadRGB(const std::string &path, const ImageSourceInfo &sourceInfo,
+                int targetWidth, int targetHeight,
+                bool applyExifOrientation);
 Image resizeArea(const Image &src, int dstW, int dstH);  // box-filter downscale
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG
 

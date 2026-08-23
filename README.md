@@ -35,12 +35,12 @@ peak-memory estimate before a session is created.
 
 `TrainingPlan` derives its estimate from the selected Gaussian ceiling, SH
 degree, source dimensions, resolution stages, intersection bounds, native image
-cache, and an additional headroom allowance. It is intentionally conservative,
-but it is not a jetsam guarantee: Metal driver state, framework allocations,
-other process memory, and changing system pressure are outside the model. The
-current image path also materializes a full-source decode before resizing; the
-estimate includes a transient allowance for that behavior. A valid
-`MSPLAT_IMAGE_CACHE_MB` override is reflected automatically; use
+cache, and an additional headroom allowance. ImageIO is asked to decode a
+thumbnail at the selected input resolution, and the app-owned decode allowance
+therefore scales with that target. It is intentionally conservative, but it is
+not a jetsam guarantee: codec-private surfaces, Metal driver state, framework
+allocations, other process memory, and changing system pressure are outside the
+model. A valid `MSPLAT_IMAGE_CACHE_MB` override is reflected automatically; use
 `memoryEstimate(imageCacheBudgetBytes:)` to evaluate another budget explicitly.
 
 ## Correctness
@@ -62,6 +62,12 @@ coefficients in place, zeroing the coefficients after undistorting — harmless
 until a cache evicts and reloads. Intrinsics are re-derived from what the
 dataset declared on every call.
 
+**Image orientation and color.** COLMAP extracts features in encoded raster
+coordinates with EXIF reorientation disabled. Its adapter therefore validates
+EXIF orientation but deliberately preserves the raw pixel frame; applying a
+display transform without updating intrinsics and poses would corrupt the
+calibration. ImageIO converts decoded thumbnails into an explicit sRGB canvas.
+
 ## Additions
 
 - COLMAP text models (`cameras.txt` / `images.txt` / `points3D.txt`)
@@ -74,6 +80,8 @@ dataset declared on every call.
   unlimited
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
+- Target-resolution ImageIO thumbnail decoding with checked dimensions,
+  explicit sRGB conversion, and raw-coordinate EXIF handling for COLMAP
 - XCFramework slices for `macos-arm64`, `ios-arm64` and
   `ios-arm64_x86_64-simulator`, each with its own metallib
 

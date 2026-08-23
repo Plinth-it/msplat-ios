@@ -17,9 +17,13 @@
 - Added Swift `TrainingPlan` validation for input decoding, exact native
   resolution-stage mapping, target SH degree, and the required Gaussian limit.
   Its code-derived peak-memory estimate includes native model/training buffers,
-  image-cache insertion, the current full-source decode transient, and
+  image-cache insertion, target-resolution app-owned decode buffers, and
   recommended headroom; it remains a conservative planning aid, not a jetsam
   guarantee.
+- Images now decode through ImageIO thumbnails at the requested input
+  resolution into an explicit sRGB canvas. COLMAP paths validate EXIF metadata
+  while preserving encoded raster coordinates so pixels, intrinsics, and poses
+  remain in the same frame.
 - Checkpoint restore now requires the saved SH degree to match the configured
   training degree, preventing a planned memory/quality contract from changing
   silently during resume.

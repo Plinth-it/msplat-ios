@@ -162,6 +162,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         add_executable(msplat_checkpoint_tests tests/test_checkpoint.cpp)
         target_link_libraries(msplat_checkpoint_tests PRIVATE msplat_core)
         add_test(NAME msplat_checkpoint_validation COMMAND msplat_checkpoint_tests)
+
+        add_executable(msplat_image_io_tests tests/test_image_io.cpp)
+        target_link_libraries(msplat_image_io_tests PRIVATE msplat_core)
+        add_test(NAME msplat_image_io COMMAND msplat_image_io_tests)
     endif()
 endif()
 
