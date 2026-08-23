@@ -34,6 +34,10 @@ runtime memory and rasterizer overflow state.
 - Render-only calls retain just the shared forward cache. Loss, SSIM, and
   backward workspaces are allocated on the first training step, and unused
   prefix, spherical-harmonics gradient, and SSIM-window buffers were removed.
+- The active SSIM derivative workspace stores only its nine live FP32 values,
+  and the final pass overwrites rendered RGB with its gradient. This removes
+  36 bytes per pixel from the training cache (23.73 MiB at 960×720) without
+  reducing numerical precision.
 - Training images were all decoded up front. A byte-budgeted LRU holds what fits
   and reloads the rest.
 - `maxGaussians` bounds the active population and its backing buffers. When a
@@ -250,10 +254,10 @@ Forward:
   CPU checked prefix         exact offsets and grow-only arena sizing
   exact scatter + sort       compact checked tile ranges + packing
   nd_rasterize_forward       per-pixel alpha compositing (16×16 tiles)
-  ssim_h_fwd + ssim_v_fwd    separable 11-tap SSIM + L1 loss
+  ssim_h_fwd + fused_v_h_bwd separable 11-tap SSIM + L1 loss
 
 Backward:
-  ssim_h_bwd + ssim_v_bwd    separable SSIM gradient
+  ssim_v_bwd                 in-place final SSIM image gradient
   rasterize_backward         per-pixel backward compositing
   project_and_sh_backward    fused projection + SH VJP + SH Adam update
   fused_adam (×4 groups)     optimizer step

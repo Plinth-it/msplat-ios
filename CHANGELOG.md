@@ -39,6 +39,10 @@
   and backward buffers are added lazily by training, while unused transient
   prefix, spherical-harmonics gradient, and SSIM-window storage was removed;
   `TrainingPlan` memory estimates reflect the smaller live set.
+- Compacted the active FP32 SSIM derivative workspace from 15 to 9 values per
+  pixel and overwrote rendered RGB in place with its gradient, reducing the
+  training cache by 36 bytes per pixel. Full 16-by-16 threadgroups now preserve
+  SSIM shared-memory loads at image edges.
 - Densification scratch and gradient-stat buffers are now omitted when topology
   growth is disabled from the first step and released, after GPU completion, at
   the configured cutoff. Checkpoint resumes past that cutoff do not recreate

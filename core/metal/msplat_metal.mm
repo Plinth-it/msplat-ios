@@ -1208,7 +1208,7 @@ struct FusedTensorCache {
     MTensor chunk_T, chunk_C, chunk_final_idx;
 
     // Training-only image and backward depth-chunked buffers
-    MTensor loss_intermediates, ssim_h_buf, loss_sum, v_rendered;
+    MTensor ssim_deriv_h_buf, ssim_h_buf, loss_sum;
     int backward_chunk_K_max = -1, backward_chunk_height = -1, backward_chunk_width = -1;
     MTensor prefix_T, after_C;
 
@@ -1234,7 +1234,7 @@ struct FusedTensorCache {
 
     size_t trainingEstimatedBytes() const {
         const MTensor* tensors[] = {
-            &loss_intermediates, &ssim_h_buf, &loss_sum, &v_rendered,
+            &ssim_deriv_h_buf, &ssim_h_buf, &loss_sum,
             &prefix_T, &after_C,
             &v_xy, &v_conic, &v_colors_rast, &v_opacity, &v_depth,
             &v_mean3d, &v_scale, &v_quat
@@ -1364,21 +1364,20 @@ struct FusedTensorCache {
 
     void ensure_training_image(int ih, int iw, id<MTLDevice> dev) {
         if (ih == training_img_height && iw == training_img_width &&
-            loss_intermediates.defined() && ssim_h_buf.defined() &&
-            loss_sum.defined() && v_rendered.defined()) {
+            ssim_deriv_h_buf.defined() && ssim_h_buf.defined() &&
+            loss_sum.defined()) {
             return;
         }
 
         training_img_height = -1; training_img_width = -1;
-        loss_intermediates.reset(); ssim_h_buf.reset();
-        loss_sum.reset(); v_rendered.reset();
+        ssim_deriv_h_buf.reset(); ssim_h_buf.reset();
+        loss_sum.reset();
 
-        loss_intermediates = mtensor_empty(
-            dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
+        ssim_deriv_h_buf = mtensor_empty(
+            dev, {(int64_t)ih, (int64_t)iw, 9}, DType::Float32);
         ssim_h_buf = mtensor_empty(
             dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
         loss_sum = mtensor_empty(dev, {1}, DType::Float32);
-        v_rendered = mtensor_empty(dev, {ih, iw, 3}, DType::Float32);
         training_img_height = ih; training_img_width = iw;
     }
 
@@ -1865,9 +1864,11 @@ MTensor msplat_train_step(
     MTensor &out_img = g_tcache.out_img;
     MTensor &final_Ts = g_tcache.final_Ts;
     MTensor &final_idx = g_tcache.final_idx;
-    MTensor &loss_intermediates = g_tcache.loss_intermediates;
+    MTensor &ssim_deriv_h_buf = g_tcache.ssim_deriv_h_buf;
 
-    MTensor &v_rendered = g_tcache.v_rendered;
+    // SSIM V-backward reads and writes only the same pixel. Training no longer
+    // needs the rendered image afterward, so reuse it in place for dL/dRGB.
+    MTensor &rendered_gradient = out_img;
     MTensor &v_xy = g_tcache.v_xy;
     MTensor &v_conic = g_tcache.v_conic;
     MTensor &v_colors_rast = g_tcache.v_colors_rast;
@@ -2088,17 +2089,18 @@ MTensor msplat_train_step(
         }
     };
 
-    // Fused loss: ssim_h_fwd → fused_v_fwd_h_bwd → ssim_v_bwd
-    // Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
+    // Fused loss: ssim_h_fwd → fused_v_fwd_h_bwd → ssim_v_bwd.
+    // The fused middle pass writes only its compact horizontal derivatives.
     auto encode_loss_fwd_bwd = [&](id<MTLComputeCommandEncoder> enc) {
-        MTLSize grid = MTLSizeMake(img_width, img_height, 1);
+        MTLSize threadgroups = MTLSizeMake(
+            (img_width + 15) / 16, (img_height + 15) / 16, 1);
         MTLSize tg = MTLSizeMake(16, 16, 1);
         // Pass 1: H conv on images → ssim_h_buf
         [enc setComputePipelineState:ctx->ssim_h_fwd_kernel_cpso];
         ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
         ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 2: Fused V fwd + H bwd
         [enc setComputePipelineState:ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso];
@@ -2106,17 +2108,16 @@ MTensor msplat_train_step(
         ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
-        ENC_BUF(enc, loss_intermediates, 6); ENC_BUF(enc, loss_sum, 7);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        ENC_BUF(enc, ssim_deriv_h_buf, 6); ENC_BUF(enc, loss_sum, 7);
+        [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 3: V bwd
         [enc setComputePipelineState:ctx->ssim_v_bwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
-        ENC_BUF(enc, loss_intermediates, 2);
+        ENC_BUF(enc, rendered_gradient, 0); ENC_BUF(enc, gt, 1);
+        ENC_BUF(enc, ssim_deriv_h_buf, 2);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
-        ENC_BUF(enc, v_rendered, 6);
-        [enc dispatchThreads:grid threadsPerThreadgroup:tg];
+        [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
     };
 
     auto encode_rast_bwd = [&](id<MTLComputeCommandEncoder> enc) {
@@ -2130,7 +2131,7 @@ MTensor msplat_train_step(
             ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5);
             ENC_BUF(enc, packed_rgb, 6);
             ENC_BUF(enc, background, 7); ENC_BUF(enc, final_Ts, 8);
-            ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, v_rendered, 10);
+            ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, rendered_gradient, 10);
             ENC_BUF(enc, v_xy, 11); ENC_BUF(enc, v_conic, 12);
             ENC_BUF(enc, v_colors_rast, 13); ENC_BUF(enc, v_opacity, 14);
             [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
@@ -2160,7 +2161,7 @@ MTensor msplat_train_step(
             ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
             ENC_BUF(enc, g_tcache.prefix_T, 10); ENC_BUF(enc, g_tcache.chunk_T, 11);
             ENC_BUF(enc, g_tcache.after_C, 12);
-            ENC_BUF(enc, v_rendered, 13);
+            ENC_BUF(enc, rendered_gradient, 13);
             ENC_BUF(enc, v_xy, 14); ENC_BUF(enc, v_conic, 15);
             ENC_BUF(enc, v_colors_rast, 16); ENC_BUF(enc, v_opacity, 17);
             ENC_SCALAR(enc, BWD_CHUNK_SIZE, 18); ENC_SCALAR(enc, bwd_K_max, 19);

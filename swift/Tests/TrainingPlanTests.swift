@@ -78,22 +78,22 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(estimate.stages.map(\.chunkCount), [1, 1])
         XCTAssertEqual(
             estimate.stages.map(\.trainingCacheBytes),
-            [962_276_648, 1_041_105_608]
+            [956_055_848, 1_016_222_408]
         )
-        XCTAssertEqual(estimate.peakTrainingCacheBytes, 1_041_105_608)
+        XCTAssertEqual(estimate.peakTrainingCacheBytes, 1_016_222_408)
         XCTAssertEqual(estimate.largestImageCacheEntryBytes, 16_588_800)
         XCTAssertEqual(estimate.imageDecodeTransientBytes, 24_883_200)
         XCTAssertEqual(estimate.imageInsertionPeakBytes, 561_754_112)
-        XCTAssertEqual(estimate.codeDerivedBytes, 2_166_862_664)
-        XCTAssertEqual(estimate.recommendedHeadroomBytes, 433_372_533)
-        XCTAssertEqual(estimate.estimatedPeakMemory, 2_600_235_197)
+        XCTAssertEqual(estimate.codeDerivedBytes, 2_141_979_464)
+        XCTAssertEqual(estimate.recommendedHeadroomBytes, 428_395_893)
+        XCTAssertEqual(estimate.estimatedPeakMemory, 2_570_375_357)
         let customEstimate = try plan.memoryEstimate(
             imageCacheBudgetBytes: 64 * 1_024 * 1_024
         )
         XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 91_992_064)
-        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_697_100_616)
-        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 339_420_124)
-        XCTAssertEqual(customEstimate.estimatedPeakMemory, 2_036_520_740)
+        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_672_217_416)
+        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 334_443_484)
+        XCTAssertEqual(customEstimate.estimatedPeakMemory, 2_006_660_900)
     }
 
     func testSingleCoarseStageDoesNotTransitionWithinBudget() throws {
@@ -313,6 +313,26 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(stage.tileCount, 10_800)
         XCTAssertEqual(stage.estimatedIntersectionCount, 64)
         XCTAssertEqual(stage.intersectionCapacity, 4_160)
+    }
+
+    func testMemoryEstimateIncludesCompactSSIMAndChunkBuffers() throws {
+        let plan = try TrainingPlan(
+            inputDimensions: TrainingImageDimensions(width: 32, height: 32),
+            inputDecodeScale: 1,
+            iterationBudget: 1,
+            stages: [
+                TrainingResolutionStage(iterations: 1...1, downscaleFactor: 1),
+            ],
+            targetSHDegree: 0,
+            maximumGaussianCount: 1_000
+        )
+
+        let stage = plan.memoryEstimate.stages[0]
+        XCTAssertEqual(stage.pixelCount, 1_024)
+        XCTAssertEqual(stage.tileCount, 4)
+        XCTAssertEqual(stage.intersectionCapacity, 8_096)
+        XCTAssertEqual(stage.chunkCount, 8)
+        XCTAssertEqual(stage.trainingCacheBytes, 995_144)
     }
 
     func testRejectsNativeMemoryIndexOverflows() throws {

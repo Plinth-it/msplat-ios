@@ -3350,13 +3350,14 @@ kernel void ssim_v_fwd_kernel(
 }
 
 // Fused V-forward + H-backward: recomputes SSIM stats from ssim_h_buf (V conv),
-// computes loss + derivative fields, then H convs derivatives to output buffer.
-// Eliminates loss_intermediates round-trip (130 MB/iter bandwidth saved).
+// computes loss + derivative fields, then H convs derivatives to a compact
+// 3-float-per-channel output buffer.
 kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constant float* rendered, constant float* gt,
     constant float* ssim_h_buf, constant uint2& img_size,
     constant float& ssim_weight, constant float& inv_n,
-    device float* deriv_h_buf, device atomic_float* loss_sum,
+    device float* deriv_h_buf, // (H, W, 9): 3 values × 3 channels
+    device atomic_float* loss_sum,
     uint2 gid [[thread_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]],
     uint2 tg_size [[threads_per_threadgroup]]
@@ -3423,7 +3424,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                 float w = GAUSS_1D[SSIM_WIN-1-dx];
                 h1 += w*tg_f1[lid.y][lid.x+dx]; h2 += w*tg_f2[lid.y][lid.x+dx]; h3 += w*tg_f3[lid.y][lid.x+dx];
             }
-            uint out = (py*W+px)*15 + c*5;
+            uint out = (py*W+px)*9 + c*3;
             deriv_h_buf[out+0]=h1; deriv_h_buf[out+1]=h2; deriv_h_buf[out+2]=h3;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3520,16 +3521,15 @@ kernel void ssim_h_bwd_kernel(
     }
 }
 
-// Backward pass 2: vertical convolution + combine to produce v_rendered.
-// Output: v_rendered (H, W, 3)
+// Backward pass 2: vertical convolution + combine. The rendered image is
+// overwritten in place with its gradient; each thread touches only its pixel.
 kernel void ssim_v_bwd_kernel(
-    constant float* rendered,       // (H, W, 3)
+    device float* rendered_gradient,// (H, W, 3), rendered in / gradient out
     constant float* gt,             // (H, W, 3)
-    constant float* ssim_h_buf,     // (H, W, 15)
+    constant float* deriv_h_buf,    // (H, W, 9): 3 values × 3 channels
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
     constant float& inv_n,          // 1.0 / (H * W * 3)
-    device float* v_rendered,       // (H, W, 3)
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3557,10 +3557,10 @@ kernel void ssim_v_bwd_kernel(
             int gx = base_gx + (int)sx;
             float v1 = 0, v2 = 0, v3 = 0;
             if (gx >= 0 && gx < (int)W && gy >= 0 && gy < (int)H) {
-                uint hp = (gy * W + gx) * 15 + c * 5;
-                v1 = ssim_h_buf[hp + 0];
-                v2 = ssim_h_buf[hp + 1];
-                v3 = ssim_h_buf[hp + 2];
+                uint hp = (gy * W + gx) * 9 + c * 3;
+                v1 = deriv_h_buf[hp + 0];
+                v2 = deriv_h_buf[hp + 1];
+                v3 = deriv_h_buf[hp + 2];
             }
             tg_h1[c][sy][sx] = v1;
             tg_h2[c][sy][sx] = v2;
@@ -3579,13 +3579,14 @@ kernel void ssim_v_bwd_kernel(
                 conv_f3 += w * tg_h3[c][lid.y + dy][lid.x];
             }
 
-            float rend_val = rendered[(py * W + px) * 3 + c];
+            uint pixel_channel = (py * W + px) * 3 + c;
+            float rend_val = rendered_gradient[pixel_channel];
             float gt_val = gt[(py * W + px) * 3 + c];
 
             float v_ssim = conv_f1 + rend_val * conv_f2 + gt_val * conv_f3;
             float v_l1 = (gt_val > rend_val) ? -1.0f : ((gt_val < rend_val) ? 1.0f : 0.0f);
 
-            v_rendered[(py * W + px) * 3 + c] = inv_n * (
+            rendered_gradient[pixel_channel] = inv_n * (
                 -ssim_weight * v_ssim + (1.0f - ssim_weight) * v_l1
             );
         }

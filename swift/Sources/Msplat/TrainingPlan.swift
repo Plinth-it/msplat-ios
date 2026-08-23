@@ -576,7 +576,7 @@ public struct TrainingPlan: Sendable, Equatable {
                     [56, intersectionCapacity],
                     component: "exact intersection arenas and packed cache"
                 ),
-                try checkedProduct([152, pixelCount], component: "training pixel cache"),
+                try checkedProduct([116, pixelCount], component: "training pixel cache"),
                 try checkedProduct([16, tileCount], component: "training tile metadata"),
                 8,
             ], component: "training cache")
