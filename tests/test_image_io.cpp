@@ -302,6 +302,16 @@ void checkIndependentPPMRowOrder(const TempDirectory &temporary) {
 void checkMetadataAndRawOrientation(const TempDirectory &temporary) {
     std::vector<RGB8> colors(gridColors.begin(), gridColors.end());
     const std::vector<uint8_t> rgba = rgbaGrid(3, 2, colors);
+    constexpr std::array<std::array<int, 6>, 8> orientedPixelIndices = {{
+        {{0, 1, 2, 3, 4, 5}},
+        {{2, 1, 0, 5, 4, 3}},
+        {{5, 4, 3, 2, 1, 0}},
+        {{3, 4, 5, 0, 1, 2}},
+        {{0, 3, 1, 4, 2, 5}},
+        {{3, 0, 4, 1, 5, 2}},
+        {{5, 2, 4, 1, 3, 0}},
+        {{2, 5, 1, 4, 0, 3}},
+    }};
     Image rawBaseline;
 
     for (int orientation = 1; orientation <= 8; ++orientation) {
@@ -325,16 +335,17 @@ void checkMetadataAndRawOrientation(const TempDirectory &temporary) {
             checkSameImage(rawBaseline, decoded);
         }
 
-        if (orientation == 6) {
-            const Image oriented = imreadRGB(path.string(), info, 2, 3, true);
-            CHECK(oriented.width == 2);
-            CHECK(oriented.height == 3);
-            checkPixel(oriented, 0, 0, gridColors[3]);
-            checkPixel(oriented, 1, 0, gridColors[0]);
-            checkPixel(oriented, 0, 1, gridColors[4]);
-            checkPixel(oriented, 1, 1, gridColors[1]);
-            checkPixel(oriented, 0, 2, gridColors[5]);
-            checkPixel(oriented, 1, 2, gridColors[2]);
+        const int orientedWidth = orientation >= 5 ? 2 : 3;
+        const int orientedHeight = orientation >= 5 ? 3 : 2;
+        const Image oriented = imreadRGB(
+            path.string(), info, orientedWidth, orientedHeight, true);
+        CHECK(oriented.width == orientedWidth);
+        CHECK(oriented.height == orientedHeight);
+        for (int index = 0; index < 6; ++index) {
+            checkPixel(
+                oriented, index % orientedWidth, index / orientedWidth,
+                gridColors[orientedPixelIndices[
+                    static_cast<size_t>(orientation - 1)][index]]);
         }
     }
 
@@ -474,24 +485,164 @@ void checkCoverageMaskDecodeAndResize(const TempDirectory &temporary) {
 }
 
 void checkCoverageMaskOrientation(const TempDirectory &temporary) {
-    const fs::path path = temporary.path / "oriented-alpha-mask.tiff";
     std::vector<uint8_t> rgba(3 * 2 * 4, 0);
     const std::array<uint8_t, 6> values = {16, 32, 48, 64, 80, 96};
     for (size_t index = 0; index < values.size(); ++index)
         rgba[index * 4 + 3] = values[index];
-    writeTIFF(path, 3, 2, rgba, 6);
+    constexpr std::array<std::array<int, 6>, 8> orientedPixelIndices = {{
+        {{0, 1, 2, 3, 4, 5}},
+        {{2, 1, 0, 5, 4, 3}},
+        {{5, 4, 3, 2, 1, 0}},
+        {{3, 4, 5, 0, 1, 2}},
+        {{0, 3, 1, 4, 2, 5}},
+        {{3, 0, 4, 1, 5, 2}},
+        {{5, 2, 4, 1, 3, 0}},
+        {{2, 5, 1, 4, 0, 3}},
+    }};
 
-    const ImageSourceInfo info = inspectImageSource(path.string());
-    const CoverageMask oriented = imreadCoverageMask(
-        path.string(), info, 2, 3, true, TrainingMaskChannel::Alpha);
-    CHECK(oriented.width == 2);
-    CHECK(oriented.height == 3);
-    checkCoverageNear(oriented, 0, 0, values[3], 0);
-    checkCoverageNear(oriented, 1, 0, values[0], 0);
-    checkCoverageNear(oriented, 0, 1, values[4], 0);
-    checkCoverageNear(oriented, 1, 1, values[1], 0);
-    checkCoverageNear(oriented, 0, 2, values[5], 0);
-    checkCoverageNear(oriented, 1, 2, values[2], 0);
+    for (int orientation = 1; orientation <= 8; ++orientation) {
+        const fs::path path = temporary.path /
+            ("oriented-alpha-mask-" + std::to_string(orientation) + ".tiff");
+        writeTIFF(path, 3, 2, rgba, orientation);
+
+        const ImageSourceInfo info = inspectImageSource(path.string());
+        const int orientedWidth = orientation >= 5 ? 2 : 3;
+        const int orientedHeight = orientation >= 5 ? 3 : 2;
+        const CoverageMask oriented = imreadCoverageMask(
+            path.string(), info, orientedWidth, orientedHeight, true,
+            TrainingMaskChannel::Alpha);
+        CHECK(oriented.width == orientedWidth);
+        CHECK(oriented.height == orientedHeight);
+        for (int index = 0; index < 6; ++index) {
+            checkCoverageNear(
+                oriented, index % orientedWidth, index / orientedWidth,
+                values[orientedPixelIndices[
+                    static_cast<size_t>(orientation - 1)][index]], 0);
+        }
+    }
+}
+
+void checkMirroredCameraOrientationRejected(
+    const TempDirectory &temporary) {
+    for (int orientation : {2, 4, 5, 7}) {
+        const fs::path path = temporary.path /
+            ("mirrored-camera-" + std::to_string(orientation) + ".tiff");
+        writeTIFF(path, 3, 2,
+                  solidRGBA(3, 2, {24, 144, 208}), orientation);
+
+        Camera camera;
+        camera.filePath = path.string();
+        camera.rasterOrientation = RasterOrientation::ExifNormalized;
+        camera.width = orientation >= 5 ? 2 : 3;
+        camera.height = orientation >= 5 ? 3 : 2;
+        camera.fx = 10.0f;
+        camera.fy = 10.0f;
+        camera.cx = static_cast<float>(camera.width) * 0.5f;
+        camera.cy = static_cast<float>(camera.height) * 0.5f;
+        checkThrows<msplat::InvalidDatasetError>(
+            [&] { camera.loadImage(1.0f); },
+            "cannot represent mirrored EXIF orientation");
+    }
+}
+
+Image coordinateImage(int width, int height) {
+    Image image;
+    image.width = width;
+    image.height = height;
+    image.data.resize(static_cast<size_t>(width) * height * 3);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const size_t pixel = static_cast<size_t>(y) * width + x;
+            image.data[pixel * 3 + 0] =
+                static_cast<float>(pixel * 3 + 0) / 255.0f;
+            image.data[pixel * 3 + 1] =
+                static_cast<float>(pixel * 3 + 1) / 255.0f;
+            image.data[pixel * 3 + 2] =
+                static_cast<float>(pixel * 3 + 2) / 255.0f;
+        }
+    }
+    return image;
+}
+
+CoverageMask coordinateMask(int width, int height) {
+    CoverageMask mask;
+    mask.width = width;
+    mask.height = height;
+    mask.data.resize(static_cast<size_t>(width) * height);
+    for (size_t index = 0; index < mask.data.size(); ++index)
+        mask.data[index] = static_cast<uint8_t>(index + 1);
+    return mask;
+}
+
+void checkIdentityUndistortion() {
+    const Image image = coordinateImage(5, 4);
+    const CoverageMask mask = coordinateMask(5, 4);
+    const auto result = undistortImageAndCoverageMask(
+        image, mask, 8.0f, 7.0f, 2.5f, 2.0f,
+        0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+
+    CHECK(result.width == 5);
+    CHECK(result.height == 4);
+    CHECK(result.cx == 2.5f);
+    CHECK(result.cy == 2.0f);
+    CHECK(result.image.data == image.data);
+    CHECK(result.coverageMask.data == mask.data);
+}
+
+void checkUndistortionRasterEdges() {
+    const Image image = coordinateImage(9, 3);
+
+    // Every output center remains inside the distorted raster. Sampling the
+    // center locus instead of the raster edges would incorrectly crop a column
+    // from both sides.
+    const auto weak = undistortImage(
+        image, 10.0f, 1000.0f, 4.5f, 1.5f,
+        0.3f, 0.0f, 0.0f, 0.0f, 0.0f);
+    CHECK(weak.width == 9);
+    CHECK(weak.height == 3);
+    CHECK(weak.cx == 4.5f);
+    CHECK(weak.cy == 1.5f);
+
+    const auto strong = undistortImage(
+        image, 10.0f, 1000.0f, 4.5f, 1.5f,
+        1.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+    CHECK(strong.width == 7);
+    CHECK(strong.height == 3);
+    CHECK(strong.cx == 3.5f);
+    CHECK(strong.cy == 1.5f);
+}
+
+void checkUndistortionPixelCenter() {
+    const Image image = coordinateImage(9, 9);
+    const CoverageMask mask = coordinateMask(9, 9);
+    const auto result = undistortImageAndCoverageMask(
+        image, mask, 10.0f, 10.0f, 4.5f, 4.5f,
+        0.0f, 0.0f, 0.0f, 0.10f, 0.0f);
+
+    const int principalX = static_cast<int>(std::lround(result.cx - 0.5f));
+    const int principalY = static_cast<int>(std::lround(result.cy - 0.5f));
+    CHECK(principalX >= 0 && principalX < result.width);
+    CHECK(principalY >= 0 && principalY < result.height);
+
+    const size_t sourcePixel = 4 * 9 + 4;
+    const size_t outputPixel =
+        static_cast<size_t>(principalY) * result.width + principalX;
+    for (int channel = 0; channel < 3; ++channel) {
+        CHECK(result.image.data[outputPixel * 3 + channel] ==
+              image.data[sourcePixel * 3 + channel]);
+    }
+    CHECK(result.coverageMask.data[outputPixel] == mask.data[sourcePixel]);
+}
+
+void checkExtremeDistortionRejected() {
+    const Image image = coordinateImage(2, 2);
+    checkThrows<msplat::InvalidDatasetError>(
+        [&] {
+            (void)undistortImage(
+                image, 1.0f, 1.0f, 1.0f, 1.0f,
+                1.0e20f, 0.0f, 0.0f, 0.0f, 0.0f);
+        },
+        "Distortion model");
 }
 
 void checkJointUndistortion() {
@@ -643,7 +794,9 @@ void checkFractionalCameraScale(const TempDirectory &temporary) {
     normalizedCamera.height = 13;
     normalizedCamera.fx = 90.0f;
     normalizedCamera.fy = 130.0f;
-    normalizedCamera.cx = 4.0f;
+    // EXIF orientation 6 maps raw edge coordinates (u, v) to (H - v, u).
+    // The raw principal point (6, 4) therefore becomes (5, 6), not (4, 6).
+    normalizedCamera.cx = 5.0f;
     normalizedCamera.cy = 6.0f;
     normalizedCamera.loadImage(1.0f);
     CHECK(normalizedCamera.width == 9);
@@ -656,7 +809,7 @@ void checkFractionalCameraScale(const TempDirectory &temporary) {
     CHECK(normalizedCamera.height == 5);
     CHECK(std::abs(normalizedCamera.fx - 30.0f) < 1e-5f);
     CHECK(std::abs(normalizedCamera.fy - 50.0f) < 1e-5f);
-    CHECK(std::abs(normalizedCamera.cx - (4.0f / 3.0f)) < 1e-5f);
+    CHECK(std::abs(normalizedCamera.cx - (5.0f / 3.0f)) < 1e-5f);
     CHECK(std::abs(normalizedCamera.cy - (30.0f / 13.0f)) < 1e-5f);
 
     normalizedCamera.releaseImageMemory();
@@ -847,6 +1000,21 @@ int main() {
         });
         checkStage("coverage mask orientation", [&] {
             checkCoverageMaskOrientation(temporary);
+        });
+        checkStage("mirrored camera orientation rejection", [&] {
+            checkMirroredCameraOrientationRejected(temporary);
+        });
+        checkStage("identity undistortion", [&] {
+            checkIdentityUndistortion();
+        });
+        checkStage("undistortion raster edges", [&] {
+            checkUndistortionRasterEdges();
+        });
+        checkStage("undistortion pixel center", [&] {
+            checkUndistortionPixelCenter();
+        });
+        checkStage("extreme distortion rejection", [&] {
+            checkExtremeDistortionRejected();
         });
         checkStage("joint mask undistortion", [&] {
             checkJointUndistortion();

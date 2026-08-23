@@ -14,7 +14,9 @@ enum DatasetDescriptorNativeLimits {
 public enum DatasetRasterOrientation: UInt32, Sendable, Equatable {
     /// Calibration coordinates address pixels exactly as encoded in the file.
     case encodedPixels = 0
-    /// ImageIO applies the file's EXIF orientation before calibration is used.
+    /// ImageIO applies EXIF orientation after the caller has transformed the
+    /// calibration, observations, and pose into that pixel frame. Mirrored
+    /// EXIF tags are rejected because the camera model is right-handed.
     case exifNormalized = 1
 }
 

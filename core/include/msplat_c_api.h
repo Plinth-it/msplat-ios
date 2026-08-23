@@ -224,6 +224,9 @@ typedef struct {
 } MsplatStringViewV5;
 
 #define MSPLAT_RASTER_ORIENTATION_ENCODED_PIXELS 0u
+/// Pixels are EXIF-normalized only after the caller has transformed
+/// calibration, observations, and pose into that frame. Mirrored EXIF tags
+/// are rejected because the camera model is right-handed.
 #define MSPLAT_RASTER_ORIENTATION_EXIF_NORMALIZED 1u
 
 #define MSPLAT_MASK_COVERAGE_LUMINANCE 0u

@@ -97,6 +97,10 @@ struct DatasetMetadata {
     std::vector<std::string> calibrationIds;
     std::vector<uint64_t> pointSourceIds;
     std::vector<float> pointReprojectionErrors;
+    // Immutable descriptor/source-raster coordinates. Camera::loadImage may
+    // later scale, rectify, and crop its mutable training raster, so these
+    // observations must not be combined with effective Camera intrinsics
+    // without applying the same source-to-training transform.
     std::vector<SparseObservation> observations;
     DatasetProvenance provenance;
 };

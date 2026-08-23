@@ -1,7 +1,6 @@
 #include "loaders.hpp"
 #include "dataset_errors.hpp"
 #include <cmath>
-#include <cstring>
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -610,6 +609,90 @@ static void undistortPoint(float xd, float yd,
     }
 }
 
+// Camera calibration uses image-edge coordinates: the center of array element
+// (x, y) is (x + 0.5, y + 0.5). Bilinear sampling uses array-index
+// coordinates, so every undistortion lookup crosses that half-pixel boundary
+// exactly once in each direction.
+static void distortedSampleCoordinate(
+    int outputX, int outputY, int sourceWidth, int sourceHeight,
+    float fx, float fy, float cx, float cy,
+    float k1, float k2, float p1, float p2, float k3,
+    float &sourceX, float &sourceY) {
+    const float outputEdgeX = static_cast<float>(outputX) + 0.5f;
+    const float outputEdgeY = static_cast<float>(outputY) + 0.5f;
+    const float normalizedX = (outputEdgeX - cx) / fx;
+    const float normalizedY = (outputEdgeY - cy) / fy;
+    float distortedX = 0.0f;
+    float distortedY = 0.0f;
+    distortPoint(normalizedX, normalizedY,
+                 k1, k2, p1, p2, k3,
+                 distortedX, distortedY);
+    sourceX = distortedX * fx + cx - 0.5f;
+    sourceY = distortedY * fy + cy - 0.5f;
+    if (!std::isfinite(sourceX) || !std::isfinite(sourceY)) {
+        throw msplat::InvalidDatasetError(
+            "Distortion model produces a non-finite image sample");
+    }
+    const float minimumSample = -0.5f;
+    const float maximumSampleX = static_cast<float>(sourceWidth) - 0.5f;
+    const float maximumSampleY = static_cast<float>(sourceHeight) - 0.5f;
+    if (sourceX < minimumSample || sourceX > maximumSampleX ||
+        sourceY < minimumSample || sourceY > maximumSampleY) {
+        throw msplat::InvalidDatasetError(
+            "Distortion model maps the valid crop outside the source raster");
+    }
+
+    // Coordinates in the half-pixel border sample only the nearest edge
+    // texel. Clamp before floor so every subsequent float-to-int conversion is
+    // representable even when a source dimension approaches INT_MAX.
+    sourceX = std::clamp(
+        sourceX, 0.0f, static_cast<float>(sourceWidth - 1));
+    sourceY = std::clamp(
+        sourceY, 0.0f, static_cast<float>(sourceHeight - 1));
+}
+
+static void requireValidUndistortedPoint(
+    float distortedX, float distortedY,
+    float undistortedX, float undistortedY,
+    float k1, float k2, float p1, float p2, float k3) {
+    if (!std::isfinite(undistortedX) || !std::isfinite(undistortedY)) {
+        throw msplat::InvalidDatasetError(
+            "Distortion model produces a non-finite valid region");
+    }
+
+    float reconstructedX = 0.0f;
+    float reconstructedY = 0.0f;
+    distortPoint(undistortedX, undistortedY,
+                 k1, k2, p1, p2, k3,
+                 reconstructedX, reconstructedY);
+    const float scale = std::max({
+        1.0f, std::abs(distortedX), std::abs(distortedY),
+    });
+    constexpr float relativeTolerance = 1.0e-4f;
+    if (!std::isfinite(reconstructedX) || !std::isfinite(reconstructedY) ||
+        std::abs(reconstructedX - distortedX) > relativeTolerance * scale ||
+        std::abs(reconstructedY - distortedY) > relativeTolerance * scale) {
+        throw msplat::InvalidDatasetError(
+            "Distortion model does not converge over the source raster");
+    }
+}
+
+static int cropBoundary(float edgeCoordinate, int dimension) {
+    if (!std::isfinite(edgeCoordinate)) {
+        throw msplat::InvalidDatasetError(
+            "Distortion model produces a non-finite valid region");
+    }
+
+    // Pixel i has center i + 0.5 in image-edge coordinates. For either the
+    // inclusive lower edge or half-open upper edge, ceil(edge - 0.5) is the
+    // corresponding integer crop boundary.
+    const double boundary =
+        std::ceil(static_cast<double>(edgeCoordinate) - 0.5);
+    if (boundary <= 0.0) return 0;
+    if (boundary >= static_cast<double>(dimension)) return dimension;
+    return static_cast<int>(boundary);
+}
+
 // Bilinear sample from float32 image, returns pixel value at (x, y)
 static void bilinearSample(const Image &img, float x, float y, float out[3]) {
     int x0 = (int)std::floor(x);
@@ -671,111 +754,95 @@ UndistortResult undistortImage(const Image &src,
     float fx, float fy, float cx, float cy,
     float k1, float k2, float p1, float p2, float k3)
 {
-    int w = src.width, h = src.height;
-
-    // Find valid region by undistorting boundary points of the source image.
-    // For each point on the distorted boundary, find its undistorted position.
-    // The inner rectangle of all undistorted boundary points = valid region (alpha=0).
-    float minX = 1e9f, maxX = -1e9f, minY = 1e9f, maxY = -1e9f;
-    int nSamples = 200;
-    for (int i = 0; i < nSamples; i++) {
-        float t = (float)i / (nSamples - 1);
-        // Four edges of the distorted image
-        float edges[][2] = {
-            {t * w, 0.0f},          // top
-            {t * w, (float)(h-1)},  // bottom
-            {0.0f, t * h},          // left
-            {(float)(w-1), t * h},  // right
-        };
-        for (auto &pt : edges) {
-            float xd = (pt[0] - cx) / fx;
-            float yd = (pt[1] - cy) / fy;
-            float xu, yu;
-            undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
-            // Back to pixel coords using original intrinsics as the "new" camera
-            float pu = xu * fx + cx;
-            float pv = yu * fy + cy;
-            minX = std::min(minX, pu);
-            maxX = std::max(maxX, pu);
-            minY = std::min(minY, pv);
-            maxY = std::max(maxY, pv);
-        }
+    const size_t sourceElements = checkedElementCount(
+        src.width, src.height, 3, sizeof(float), "Image to undistort");
+    if (src.data.size() != sourceElements) {
+        throw std::invalid_argument(
+            "Image storage does not match its dimensions");
     }
+    const int w = src.width;
+    const int h = src.height;
 
-    // Inner rectangle: clamp to image bounds and take the inner edges
-    // For top/left edges: take the max (inner boundary)
-    // For bottom/right edges: take the min (inner boundary)
-    // But we need to separate inner from outer per edge...
-    // Top edge gives us maxY from top → that's minY constraint
-    // Bottom edge gives us minY from bottom → that's maxY constraint
-    // Actually, let me resample per-edge:
-    float topMax = -1e9f, bottomMin = 1e9f, leftMax = -1e9f, rightMin = 1e9f;
-    for (int i = 0; i < nSamples; i++) {
-        float t = (float)i / (nSamples - 1);
+    // Calibration coordinates describe the half-open raster [0, width) x
+    // [0, height), not array indices [0, width - 1]. Transform all four raster
+    // edges and keep their inner rectangle for an alpha=0 crop.
+    float topMax = -1e9f;
+    float bottomMin = 1e9f;
+    float leftMax = -1e9f;
+    float rightMin = 1e9f;
+    constexpr int boundarySampleCount = 200;
+    for (int i = 0; i < boundarySampleCount; ++i) {
+        const float t = static_cast<float>(i) /
+                        static_cast<float>(boundarySampleCount - 1);
+        const float edgeX = t * static_cast<float>(w);
+        const float edgeY = t * static_cast<float>(h);
 
-        // Top edge: all points along y=0
-        float xd = (t * w - cx) / fx, yd = (0.0f - cy) / fy;
-        float xu, yu;
+        float xu = 0.0f;
+        float yu = 0.0f;
+        float xd = (edgeX - cx) / fx;
+        float yd = (0.0f - cy) / fy;
         undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        requireValidUndistortedPoint(
+            xd, yd, xu, yu, k1, k2, p1, p2, k3);
         topMax = std::max(topMax, yu * fy + cy);
 
-        // Bottom edge: all points along y=h-1
-        xd = (t * w - cx) / fx; yd = ((float)(h-1) - cy) / fy;
+        xd = (edgeX - cx) / fx;
+        yd = (static_cast<float>(h) - cy) / fy;
         undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        requireValidUndistortedPoint(
+            xd, yd, xu, yu, k1, k2, p1, p2, k3);
         bottomMin = std::min(bottomMin, yu * fy + cy);
 
-        // Left edge: all points along x=0
-        xd = (0.0f - cx) / fx; yd = (t * h - cy) / fy;
+        xd = (0.0f - cx) / fx;
+        yd = (edgeY - cy) / fy;
         undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        requireValidUndistortedPoint(
+            xd, yd, xu, yu, k1, k2, p1, p2, k3);
         leftMax = std::max(leftMax, xu * fx + cx);
 
-        // Right edge: all points along x=w-1
-        xd = ((float)(w-1) - cx) / fx; yd = (t * h - cy) / fy;
+        xd = (static_cast<float>(w) - cx) / fx;
+        yd = (edgeY - cy) / fy;
         undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        requireValidUndistortedPoint(
+            xd, yd, xu, yu, k1, k2, p1, p2, k3);
         rightMin = std::min(rightMin, xu * fx + cx);
     }
 
-    // Inner rectangle (alpha=0: no black borders)
-    int roiX = std::max(0, (int)std::ceil(leftMax));
-    int roiY = std::max(0, (int)std::ceil(topMax));
-    int roiW = std::min(w, (int)std::floor(rightMin)) - roiX;
-    int roiH = std::min(h, (int)std::floor(bottomMin)) - roiY;
-    if (roiW <= 0 || roiH <= 0) { roiX = 0; roiY = 0; roiW = w; roiH = h; }
+    const int roiX = cropBoundary(leftMax, w);
+    const int roiY = cropBoundary(topMax, h);
+    const int roiRight = cropBoundary(rightMin, w);
+    const int roiBottom = cropBoundary(bottomMin, h);
+    const int roiW = roiRight - roiX;
+    const int roiH = roiBottom - roiY;
+    if (roiW <= 0 || roiH <= 0) {
+        throw msplat::InvalidDatasetError(
+            "Distortion model leaves no valid image region");
+    }
 
-    // Undistort: for each pixel in the output (undistorted) image,
-    // apply forward distortion to find source pixel in distorted input
-    Image undist;
-    undist.width = w;
-    undist.height = h;
-    undist.data.resize(w * h * 3);
-
-    for (int oy = 0; oy < h; oy++) {
-        for (int ox = 0; ox < w; ox++) {
-            float x = ((float)ox - cx) / fx;
-            float y = ((float)oy - cy) / fy;
-            float xd_n, yd_n;
-            distortPoint(x, y, k1, k2, p1, p2, k3, xd_n, yd_n);
-            float srcX = xd_n * fx + cx;
-            float srcY = yd_n * fy + cy;
+    // Write the crop directly so undistortion does not allocate another
+    // full-sized float image while the decoded source is resident.
+    Image cropped;
+    cropped.width = roiW;
+    cropped.height = roiH;
+    cropped.data.resize(checkedElementCount(
+        roiW, roiH, 3, sizeof(float), "Undistorted image"));
+    for (int y = 0; y < roiH; ++y) {
+        for (int x = 0; x < roiW; ++x) {
+            float sourceX = 0.0f;
+            float sourceY = 0.0f;
+            distortedSampleCoordinate(
+                x + roiX, y + roiY, w, h,
+                fx, fy, cx, cy, k1, k2, p1, p2, k3,
+                sourceX, sourceY);
 
             float pixel[3];
-            bilinearSample(src, srcX, srcY, pixel);
-            float *out = &undist.data[(oy * w + ox) * 3];
+            bilinearSample(src, sourceX, sourceY, pixel);
+            float *out = &cropped.data[
+                (static_cast<size_t>(y) * roiW + x) * 3];
             out[0] = pixel[0];
             out[1] = pixel[1];
             out[2] = pixel[2];
         }
-    }
-
-    // Crop to ROI
-    Image cropped;
-    cropped.width = roiW;
-    cropped.height = roiH;
-    cropped.data.resize(roiW * roiH * 3);
-    for (int y = 0; y < roiH; y++) {
-        memcpy(&cropped.data[y * roiW * 3],
-               &undist.data[((y + roiY) * w + roiX) * 3],
-               roiW * 3 * sizeof(float));
     }
 
     UndistortResult result;
@@ -819,17 +886,13 @@ UndistortTrainingTargetResult undistortImageAndCoverageMask(
         "Undistorted training mask"));
     for (int y = 0; y < croppedMask.height; ++y) {
         for (int x = 0; x < croppedMask.width; ++x) {
-            const float undistortedX = static_cast<float>(x + roiX);
-            const float undistortedY = static_cast<float>(y + roiY);
-            const float normalizedX = (undistortedX - cx) / fx;
-            const float normalizedY = (undistortedY - cy) / fy;
-            float distortedX = 0.0f;
-            float distortedY = 0.0f;
-            distortPoint(normalizedX, normalizedY,
-                         k1, k2, p1, p2, k3,
-                         distortedX, distortedY);
-            const float sourceX = distortedX * fx + cx;
-            const float sourceY = distortedY * fy + cy;
+            float sourceX = 0.0f;
+            float sourceY = 0.0f;
+            distortedSampleCoordinate(
+                x + roiX, y + roiY,
+                coverageMask.width, coverageMask.height,
+                fx, fy, cx, cy, k1, k2, p1, p2, k3,
+                sourceX, sourceY);
             croppedMask.data[static_cast<size_t>(y) * croppedMask.width + x] =
                 bilinearSampleCoverage(coverageMask, sourceX, sourceY);
         }

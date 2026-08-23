@@ -30,6 +30,13 @@
   per-frame and aggregate reprojection residuals, source-reported point errors,
   track coverage, out-of-frame features, behind-camera points, and non-finite
   projections without decoding assets or initializing Metal.
+- Corrected the image-edge versus array-index conversion in Brown-Conrady
+  rectification, including alpha=0 crop endpoints and paired mask sampling.
+  The renderer now uses an exact homogeneous divide, propagates the missing
+  perspective-depth projection gradient, and differentiates EWA FOV clamps
+  consistently with their forward pass. Synthetic pixel and finite-difference
+  contracts lock these conventions; mirrored EXIF camera normalization now
+  fails explicitly instead of producing pixels that cannot match its geometry.
 - Replaced fixed 2,048-entry per-tile bins with a two-pass exact intersection
   pipeline: projection counts each tile, the host builds checked offsets and
   grows compact arenas, and exact-range bitonic/radix sorting preserves every

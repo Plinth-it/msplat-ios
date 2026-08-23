@@ -30,7 +30,10 @@ ImageSourceInfo inspectImageSource(const std::string &path);
 /// orientation, then renders into an exact-size sRGB float32 RGB image in
 /// [0, 1]. `sourceInfo` must come from `inspectImageSource` for the same
 /// unchanged file. Callers must only request orientation normalization when
-/// their camera calibration uses the orientation-normalized pixel frame.
+/// their camera calibration uses the orientation-normalized pixel frame. This
+/// low-level pixel operation supports all EXIF transforms; Camera rejects
+/// mirrored transforms that its positive-focal, right-handed geometry cannot
+/// represent.
 Image imreadRGB(const std::string &path, const ImageSourceInfo &sourceInfo,
                 int targetWidth, int targetHeight,
                 bool applyExifOrientation);
@@ -43,7 +46,8 @@ CoverageMask resizeCoverageArea(
     const CoverageMask &src, int dstW, int dstH);  // box-filter, UInt8 round
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG
 
-// Undistortion (Brown-Conrady model, alpha=0 crop)
+// Undistortion (Brown-Conrady model, sampled alpha=0 crop). Intrinsics use
+// image-edge coordinates: the upper-left pixel center is (0.5, 0.5).
 struct UndistortResult {
     Image image;
     float fx, fy, cx, cy;  // updated intrinsics after crop

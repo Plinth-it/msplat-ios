@@ -194,6 +194,26 @@ inline void scale_rot_to_cov3d(
 
 // Project 3D covariance to 2D via EWA splatting.
 // Takes pre-computed view-space position; exploits J sparsity (5/9 nonzero).
+struct EWAClampedPosition {
+    float3 position;
+    float2 ratio_gradient;
+};
+
+inline EWAClampedPosition clamp_ewa_position(
+    const float3 p_view, const float tan_fovx, const float tan_fovy
+) {
+    const float2 limit = 1.3f * float2(tan_fovx, tan_fovy);
+    const float2 ratio = p_view.xy / p_view.z;
+    const float2 clamped_ratio = clamp(ratio, -limit, limit);
+    EWAClampedPosition result;
+    result.position = float3(p_view.z * clamped_ratio, p_view.z);
+    result.ratio_gradient = float2(
+        ratio.x >= -limit.x && ratio.x <= limit.x ? 1.f : 0.f,
+        ratio.y >= -limit.y && ratio.y <= limit.y ? 1.f : 0.f
+    );
+    return result;
+}
+
 float3 project_cov3d_ewa(
     device float* cov3d,
     constant float* viewmat,
@@ -204,10 +224,7 @@ float3 project_cov3d_ewa(
     float3 p_view
 ) {
     // Clamp view-space position to avoid extreme covariance at FOV edges
-    float lim_x = 1.3f * tan_fovx;
-    float lim_y = 1.3f * tan_fovy;
-    p_view.x = p_view.z * min(lim_x, max(-lim_x, p_view.x / p_view.z));
-    p_view.y = p_view.z * min(lim_y, max(-lim_y, p_view.y / p_view.z));
+    p_view = clamp_ewa_position(p_view, tan_fovx, tan_fovy).position;
 
     float rz = 1.f / p_view.z;
     float rz2 = rz * rz;
@@ -252,10 +269,7 @@ float3 project_cov3d_ewa(
     const float tan_fovy,
     float3 p_view
 ) {
-    float lim_x = 1.3f * tan_fovx;
-    float lim_y = 1.3f * tan_fovy;
-    p_view.x = p_view.z * min(lim_x, max(-lim_x, p_view.x / p_view.z));
-    p_view.y = p_view.z * min(lim_y, max(-lim_y, p_view.y / p_view.z));
+    p_view = clamp_ewa_position(p_view, tan_fovx, tan_fovy).position;
 
     float rz = 1.f / p_view.z;
     float rz2 = rz * rz;
@@ -314,7 +328,7 @@ inline float2 project_pix(
     constant float *mat, const float3 p, const uint2 img_size, const float2 pp
 ) {
     float4 p_hom = transform_4x4(mat, p);
-    float rw = 1.f / (p_hom.w + 1e-6f);
+    float rw = 1.f / p_hom.w;
     float3 p_proj = {p_hom.x * rw, p_hom.y * rw, p_hom.z * rw};
     return {
         ndc2pix(p_proj.x, (int)img_size.x, pp.x), ndc2pix(p_proj.y, (int)img_size.y, pp.y)
@@ -1225,18 +1239,24 @@ inline float3 project_pix_vjp(
 ) {
     // ROW MAJOR mat
     float4 p_hom = transform_4x4(mat, p);
-    float rw = 1.f / (p_hom.w + 1e-6f);
+    float rw = 1.f / p_hom.w;
 
-    float3 v_ndc = {0.5f * img_size.x * v_xy.x, 0.5f * img_size.y * v_xy.y, 0.0f};
-    float4 v_proj = {
-        v_ndc.x * rw, v_ndc.y * rw, 0., -(v_ndc.x + v_ndc.y) * rw * rw
+    float2 v_ndc = {
+        0.5f * img_size.x * v_xy.x,
+        0.5f * img_size.y * v_xy.y
     };
-    // df / d_world = df / d_cam * d_cam / d_world
-    // = v_proj * P[:3, :3]
+    float4 v_hom = {
+        v_ndc.x * rw,
+        v_ndc.y * rw,
+        0.f,
+        -(v_ndc.x * p_hom.x + v_ndc.y * p_hom.y) * rw * rw
+    };
+    // df / d_world = P[:4, :3]^T * df / d_homogeneous. The final
+    // row carries the perspective-depth contribution.
     return {
-        mat[0] * v_proj.x + mat[4] * v_proj.y + mat[8] * v_proj.z,
-        mat[1] * v_proj.x + mat[5] * v_proj.y + mat[9] * v_proj.z,
-        mat[2] * v_proj.x + mat[6] * v_proj.y + mat[10] * v_proj.z
+        mat[0] * v_hom.x + mat[4] * v_hom.y + mat[12] * v_hom.w,
+        mat[1] * v_hom.x + mat[5] * v_hom.y + mat[13] * v_hom.w,
+        mat[2] * v_hom.x + mat[6] * v_hom.y + mat[14] * v_hom.w
     };
 }
 
@@ -1284,10 +1304,9 @@ void project_cov3d_ewa_vjp(
     float3 p_view
 ) {
     // Apply same fov clipping as forward
-    float lim_x = 1.3f * tan_fovx;
-    float lim_y = 1.3f * tan_fovy;
-    p_view.x = p_view.z * min(lim_x, max(-lim_x, p_view.x / p_view.z));
-    p_view.y = p_view.z * min(lim_y, max(-lim_y, p_view.y / p_view.z));
+    EWAClampedPosition clamped =
+        clamp_ewa_position(p_view, tan_fovx, tan_fovy);
+    p_view = clamped.position;
 
     float rz = 1.f / p_view.z;
     float rz2 = rz * rz;
@@ -1332,10 +1351,12 @@ void project_cov3d_ewa_vjp(
     float fy_rz2 = fy * rz2;
     float rz3 = rz2 * rz;
     float3 v_t = float3(
-        -fx_rz2 * v_J[2][0],
-        -fy_rz2 * v_J[2][1],
-        -fx_rz2 * v_J[0][0] + 2.f * fx * p_view.x * rz3 * v_J[2][0] -
-            fy_rz2 * v_J[1][1] + 2.f * fy * p_view.y * rz3 * v_J[2][1]
+        -clamped.ratio_gradient.x * fx_rz2 * v_J[2][0],
+        -clamped.ratio_gradient.y * fy_rz2 * v_J[2][1],
+        -fx_rz2 * v_J[0][0] +
+            (1.f + clamped.ratio_gradient.x) * fx * p_view.x * rz3 * v_J[2][0] -
+            fy_rz2 * v_J[1][1] +
+            (1.f + clamped.ratio_gradient.y) * fy * p_view.y * rz3 * v_J[2][1]
     );
     v_mean3d[0] += (float)dot(v_t, W[0]);
     v_mean3d[1] += (float)dot(v_t, W[1]);
@@ -1355,10 +1376,9 @@ void project_cov3d_ewa_vjp(
     thread float* v_cov3d,
     float3 p_view
 ) {
-    float lim_x = 1.3f * tan_fovx;
-    float lim_y = 1.3f * tan_fovy;
-    p_view.x = p_view.z * min(lim_x, max(-lim_x, p_view.x / p_view.z));
-    p_view.y = p_view.z * min(lim_y, max(-lim_y, p_view.y / p_view.z));
+    EWAClampedPosition clamped =
+        clamp_ewa_position(p_view, tan_fovx, tan_fovy);
+    p_view = clamped.position;
 
     float rz = 1.f / p_view.z;
     float rz2 = rz * rz;
@@ -1403,10 +1423,12 @@ void project_cov3d_ewa_vjp(
     float fy_rz2 = fy * rz2;
     float rz3 = rz2 * rz;
     float3 v_t = float3(
-        -fx_rz2 * v_J[2][0],
-        -fy_rz2 * v_J[2][1],
-        -fx_rz2 * v_J[0][0] + 2.f * fx * p_view.x * rz3 * v_J[2][0] -
-            fy_rz2 * v_J[1][1] + 2.f * fy * p_view.y * rz3 * v_J[2][1]
+        -clamped.ratio_gradient.x * fx_rz2 * v_J[2][0],
+        -clamped.ratio_gradient.y * fy_rz2 * v_J[2][1],
+        -fx_rz2 * v_J[0][0] +
+            (1.f + clamped.ratio_gradient.x) * fx * p_view.x * rz3 * v_J[2][0] -
+            fy_rz2 * v_J[1][1] +
+            (1.f + clamped.ratio_gradient.y) * fy * p_view.y * rz3 * v_J[2][1]
     );
     v_mean3d[0] += (float)dot(v_t, W[0]);
     v_mean3d[1] += (float)dot(v_t, W[1]);

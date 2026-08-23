@@ -99,6 +99,11 @@ uint64_t maskCoverageUnits(
     return units;
 }
 
+bool isMirroredExifOrientation(int orientation) {
+    return orientation == 2 || orientation == 4 ||
+           orientation == 5 || orientation == 7;
+}
+
 } // namespace
 
 // ── Image loading ───────────────────────────────────────────────────────────
@@ -133,6 +138,14 @@ void Camera::loadImage(float downscaleFactor) {
     const ImageSourceInfo sourceInfo = inspectImageSource(filePath);
     const bool normalizeExif =
         rasterOrientation == RasterOrientation::ExifNormalized;
+    if (normalizeExif &&
+        isMirroredExifOrientation(sourceInfo.exifOrientation)) {
+        throw msplat::InvalidDatasetError(
+            "EXIF-normalized camera geometry cannot represent mirrored EXIF "
+            "orientation " + std::to_string(sourceInfo.exifOrientation) +
+            " for " + filePath +
+            "; preserve encoded pixels or provide an unmirrored source");
+    }
     const int sourceWidth = normalizeExif
         ? sourceInfo.orientedWidth : sourceInfo.rawWidth;
     const int sourceHeight = normalizeExif

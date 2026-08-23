@@ -84,6 +84,14 @@ coefficients in place, zeroing the coefficients after undistorting — harmless
 until a cache evicts and reloads. Intrinsics are re-derived from what the
 dataset declared on every call.
 
+**Raster geometry.** Calibration and sparse observations use image-edge
+coordinates, where the upper-left pixel center is `(0.5, 0.5)`; CPU image
+arrays and Metal rasterization use zero-based sample indices. Resize,
+Brown-Conrady rectification, crop offsets, and renderer projection cross that
+half-pixel boundary explicitly. Descriptor observations remain in immutable
+source-raster coordinates after lazy camera loading changes the effective
+training raster.
+
 **Image orientation and color.** COLMAP extracts features in encoded raster
 coordinates with EXIF reorientation disabled. Its adapter therefore validates
 EXIF orientation but deliberately preserves the raw pixel frame; applying a
@@ -91,7 +99,11 @@ display transform without updating intrinsics and poses would corrupt the
 calibration. ImageIO converts decoded thumbnails into an explicit sRGB canvas.
 The canonical dataset descriptor records that pixel-frame choice explicitly;
 existing file adapters use encoded pixels, while calibration-aware native
-adapters can opt into tested EXIF-normalized materialization.
+adapters can opt into tested EXIF-normalized materialization. Low-level decode
+tests cover all eight EXIF pixel transforms; camera loading rejects mirrored
+orientations 2, 4, 5, and 7 because a positive-focal, right-handed camera
+cannot represent that reflection. Normalize such assets before describing
+them, or preserve their encoded raster.
 
 ## Additions
 

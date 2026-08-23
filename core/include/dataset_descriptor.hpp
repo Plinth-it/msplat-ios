@@ -41,8 +41,14 @@ struct DatasetFrameDescriptor {
     std::string id;
     std::string calibrationId;
     std::string imagePath;
-    // Names the pixel frame used by calibration and cameraToWorld. The pose is
-    // a rigid, row-major OpenGL camera-to-world transform (Y-up, Z-back).
+    // Names the pixel frame used by calibration, observations, and
+    // cameraToWorld. ExifNormalized means the caller has already transformed
+    // all of that geometry into the normalized raster; it does not ask msplat
+    // to infer calibration or pose changes from the image tag. Mirrored EXIF
+    // transforms cannot be represented by the supported positive-focal,
+    // right-handed camera model and are rejected when the image is loaded.
+    // The pose is a rigid, row-major OpenGL camera-to-world transform (Y-up,
+    // Z-back).
     RasterOrientation rasterOrientation = RasterOrientation::EncodedPixels;
     // Optional soft training coverage in the same source pixel frame as the
     // image. Coverage remains 8-bit throughout loading; 0 excludes a pixel
@@ -73,6 +79,8 @@ struct SparseObservation {
     // For COLMAP this is POINT2D_IDX from the sparse reconstruction.
     uint32_t frameObservationIndex = 0;
     int32_t pointIndex = -1;
+    // Image-edge coordinates in the owning frame's declared source raster;
+    // the upper-left pixel center is (0.5, 0.5).
     float x = 0.0f;
     float y = 0.0f;
 };
