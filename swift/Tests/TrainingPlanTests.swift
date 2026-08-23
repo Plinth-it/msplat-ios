@@ -68,32 +68,32 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(estimate.stages.map(\.pixelCount), [172_800, 691_200])
         XCTAssertEqual(estimate.stages.map(\.tileCount), [690, 2_700])
         XCTAssertEqual(
-            estimate.stages.map(\.hardIntersectionCapacity),
-            [1_413_120, 5_529_600]
+            estimate.stages.map(\.estimatedIntersectionCount),
+            [12_000_000, 12_000_000]
         )
         XCTAssertEqual(
             estimate.stages.map(\.intersectionCapacity),
-            [12_000_000, 12_000_000]
+            [15_000_000, 15_000_000]
         )
         XCTAssertEqual(estimate.stages.map(\.chunkCount), [1, 1])
         XCTAssertEqual(
             estimate.stages.map(\.trainingCacheBytes),
-            [616_581_608, 728_342_408]
+            [962_276_648, 1_041_105_608]
         )
-        XCTAssertEqual(estimate.peakTrainingCacheBytes, 728_342_408)
+        XCTAssertEqual(estimate.peakTrainingCacheBytes, 1_041_105_608)
         XCTAssertEqual(estimate.largestImageCacheEntryBytes, 16_588_800)
         XCTAssertEqual(estimate.imageDecodeTransientBytes, 24_883_200)
         XCTAssertEqual(estimate.imageInsertionPeakBytes, 561_754_112)
-        XCTAssertEqual(estimate.codeDerivedBytes, 1_854_099_464)
-        XCTAssertEqual(estimate.recommendedHeadroomBytes, 370_819_893)
-        XCTAssertEqual(estimate.estimatedPeakMemory, 2_224_919_357)
+        XCTAssertEqual(estimate.codeDerivedBytes, 2_166_862_664)
+        XCTAssertEqual(estimate.recommendedHeadroomBytes, 433_372_533)
+        XCTAssertEqual(estimate.estimatedPeakMemory, 2_600_235_197)
         let customEstimate = try plan.memoryEstimate(
             imageCacheBudgetBytes: 64 * 1_024 * 1_024
         )
         XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 91_992_064)
-        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_384_337_416)
-        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 276_867_484)
-        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_661_204_900)
+        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_697_100_616)
+        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 339_420_124)
+        XCTAssertEqual(customEstimate.estimatedPeakMemory, 2_036_520_740)
     }
 
     func testSingleCoarseStageDoesNotTransitionWithinBudget() throws {
@@ -297,40 +297,72 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertThrowsError(try plan.memoryEstimate(imageCacheBudgetBytes: 0))
     }
 
+    func testIntersectionEstimateScalesMeasuredResolutionBaseline() throws {
+        let plan = try TrainingPlan(
+            inputDimensions: TrainingImageDimensions(width: 1_920, height: 1_440),
+            inputDecodeScale: 1,
+            iterationBudget: 1,
+            stages: [
+                TrainingResolutionStage(iterations: 1...1, downscaleFactor: 1),
+            ],
+            targetSHDegree: 0,
+            maximumGaussianCount: 1
+        )
+
+        let stage = plan.memoryEstimate.stages[0]
+        XCTAssertEqual(stage.tileCount, 10_800)
+        XCTAssertEqual(stage.estimatedIntersectionCount, 64)
+        XCTAssertEqual(stage.intersectionCapacity, 4_160)
+    }
+
     func testRejectsNativeMemoryIndexOverflows() throws {
         XCTAssertThrowsError(
             try TrainingImageDimensions(width: 65_536, height: 65_536)
         )
 
-        let tileOverflowDimensions = try TrainingImageDimensions(
+        // The exact pipeline has no tileCount * 2,048 layout, so large legal
+        // tile grids are planning inputs rather than false index overflows.
+        let formerlyRejectedTileDimensions = try TrainingImageDimensions(
             width: 16_384,
             height: 16_384
         )
-        XCTAssertThrowsError(
-            try TrainingPlan(
-                inputDimensions: tileOverflowDimensions,
-                inputDecodeScale: 1,
-                iterationBudget: 10,
-                stages: [
-                    TrainingResolutionStage(iterations: 1...10, downscaleFactor: 1),
-                ],
-                targetSHDegree: 0,
-                maximumGaussianCount: 2_048
-            )
+        let largeTilePlan = try TrainingPlan(
+            inputDimensions: formerlyRejectedTileDimensions,
+            inputDecodeScale: 1,
+            iterationBudget: 10,
+            stages: [
+                TrainingResolutionStage(iterations: 1...10, downscaleFactor: 1),
+            ],
+            targetSHDegree: 0,
+            maximumGaussianCount: 2_048
+        )
+        XCTAssertEqual(largeTilePlan.memoryEstimate.stages[0].tileCount,
+                       1_048_576)
+        XCTAssertGreaterThan(
+            largeTilePlan.memoryEstimate.stages[0].intersectionCapacity,
+            2_048 * 2_048
         )
 
-        let smallDimensions = try TrainingImageDimensions(width: 16, height: 16)
-        XCTAssertThrowsError(
-            try TrainingPlan(
-                inputDimensions: smallDimensions,
-                inputDecodeScale: 1,
-                iterationBudget: 10,
-                stages: [
-                    TrainingResolutionStage(iterations: 1...10, downscaleFactor: 1),
-                ],
-                targetSHDegree: 0,
-                maximumGaussianCount: 134_217_728
-            )
+        let smallDimensions = try TrainingImageDimensions(width: 64, height: 64)
+        let estimateBeyondNativeRange = try TrainingPlan(
+            inputDimensions: smallDimensions,
+            inputDecodeScale: 1,
+            iterationBudget: 10,
+            stages: [
+                TrainingResolutionStage(iterations: 1...10, downscaleFactor: 1),
+            ],
+            targetSHDegree: 0,
+            maximumGaussianCount: 134_217_728
+        )
+        XCTAssertEqual(
+            estimateBeyondNativeRange.memoryEstimate.stages[0]
+                .estimatedIntersectionCount,
+            2_147_483_648
+        )
+        XCTAssertEqual(
+            estimateBeyondNativeRange.memoryEstimate.stages[0]
+                .intersectionCapacity,
+            Int64(Int32.max)
         )
         XCTAssertThrowsError(
             try TrainingPlan(

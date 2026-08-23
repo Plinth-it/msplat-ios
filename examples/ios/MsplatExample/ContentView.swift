@@ -193,7 +193,7 @@ struct ContentView: View {
 
     private var overflowDescription: String {
         var sources: [String] = []
-        if session.overflowKinds.contains(.tileCapacity) { sources.append("tile cap") }
+        if session.overflowKinds.contains(.tileCapacity) { sources.append("legacy tile cap") }
         if session.overflowKinds.contains(.packedCapacity) { sources.append("packed arena") }
         return sources.isEmpty ? "earlier step" : sources.joined(separator: " + ")
     }
@@ -203,7 +203,7 @@ struct ContentView: View {
               let capacity = session.packedIntersectionCapacity else {
             return "—"
         }
-        return "\(retained.formatted()) / \(capacity.formatted()) retained"
+        return "\(retained.formatted()) / \(capacity.formatted()) used"
     }
 
     private var isBusy: Bool {

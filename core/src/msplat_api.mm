@@ -145,9 +145,13 @@ struct Trainer::Impl {
         camIterPos = 0;
     }
 
-    size_t nextCamera() {
+    size_t currentCamera() {
         if (camIterPos >= camIndices.size()) shuffleCameras();
-        return camIndices[camIterPos++];
+        return camIndices[camIterPos];
+    }
+
+    void advanceCamera() {
+        ++camIterPos;
     }
 };
 
@@ -188,37 +192,39 @@ Stats Trainer::step() {
     std::lock_guard lock(g_trainerTransactionMutex);
     if (impl->currentStep == std::numeric_limits<int>::max())
         throw std::overflow_error("Training iteration cannot be incremented further");
-    impl->currentStep++;
+    const int nextStep = impl->currentStep + 1;
     auto logicalStep = msplat_training_step_begin(
-        impl->telemetry, impl->currentStep);
+        impl->telemetry, nextStep);
     double cpuSubmitMs = 0.0;
     try {
-        size_t camIdx = impl->nextCamera();
+        size_t camIdx = impl->currentCamera();
         Camera& cam = impl->ds->trainCamera(camIdx);
 
-        int ds = impl->model->getDownscaleFactor(impl->currentStep);
+        int ds = impl->model->getDownscaleFactor(nextStep);
         MTensor& gt = impl->ds->gpuImageForTrainCamera(camIdx, ds);
 
         msplat_training_step_mark_cpu_start(logicalStep);
         impl->model->fullIteration(
-            cam, impl->currentStep, gt, impl->config.ssimWeight);
-        impl->model->schedulersStep(impl->currentStep);
-        impl->model->afterTrain(impl->currentStep);
+            cam, nextStep, gt, impl->config.ssimWeight);
+        impl->model->schedulersStep(nextStep);
+        impl->model->afterTrain(nextStep);
 
         MsplatTrainingStepDescriptor descriptor;
-        descriptor.iteration = impl->currentStep;
+        descriptor.iteration = nextStep;
         descriptor.splatCount = impl->model->means.size(0);
         descriptor.modelCapacity = impl->model->buf_capacity;
         descriptor.effectiveWidth = static_cast<int32_t>(gt.size(1));
         descriptor.effectiveHeight = static_cast<int32_t>(gt.size(0));
         descriptor.activeShDegree = std::min(
-            impl->currentStep / impl->config.shDegreeInterval,
+            nextStep / impl->config.shDegreeInterval,
             impl->config.shDegree);
         cpuSubmitMs = msplat_training_step_submit(logicalStep, descriptor);
     } catch (...) {
         msplat_training_step_abort(logicalStep);
         throw;
     }
+    impl->advanceCamera();
+    impl->currentStep = nextStep;
 
     reportMemory(impl->currentStep, (int)impl->model->means.size(0),
                  impl->model->estimatedGpuBytes(),

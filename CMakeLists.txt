@@ -166,6 +166,17 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         add_executable(msplat_image_io_tests tests/test_image_io.cpp)
         target_link_libraries(msplat_image_io_tests PRIVATE msplat_core)
         add_test(NAME msplat_image_io COMMAND msplat_image_io_tests)
+
+        add_executable(msplat_intersection_layout_tests
+            tests/test_intersection_layout.cpp)
+        target_include_directories(msplat_intersection_layout_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/include)
+        add_test(NAME msplat_intersection_layout
+            COMMAND msplat_intersection_layout_tests)
+        add_test(NAME msplat_exact_intersection_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_exact_intersection_contract.cmake)
     endif()
 endif()
 

@@ -1716,7 +1716,7 @@ kernel void project_and_sh_forward_kernel(
     device float* depths,
     device int* radii,
     device float* conics,
-    device int32_t* num_tiles_hit,
+    device atomic_uint* tile_counts,
     // SH args
     constant uint& degree,
     constant uint& degrees_to_use,
@@ -1732,7 +1732,6 @@ kernel void project_and_sh_forward_kernel(
         return;
     }
     radii[idx] = 0;
-    num_tiles_hit[idx] = 0;
 
     float3 p_world = read_packed_float3(means3d, idx);
     float3 p_view;
@@ -1776,12 +1775,22 @@ kernel void project_and_sh_forward_kernel(
         return;
     }
 
-    num_tiles_hit[idx] = tile_area;
     depths[idx] = p_view.z;
     radii[idx] = (int)radius;
     write_packed_float2(xys, idx, center);
     aabb[idx * 2] = aabb_x;
     aabb[idx * 2 + 1] = aabb_y;
+
+    // Phase one of the exact intersection pipeline. The host waits for this
+    // command buffer, builds checked inclusive tile offsets from these counts,
+    // and allocates enough compact storage before any intersection is written.
+    for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
+        for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
+            const uint tile_id = tile_y * tile_bounds.x + tile_x;
+            atomic_fetch_add_explicit(
+                &tile_counts[tile_id], 1u, memory_order_relaxed);
+        }
+    }
 
     // SH: compute colors for non-culled gaussians (reuse p_world from registers)
     float3 viewdir = normalize(p_world - cam_pos);
@@ -1992,175 +2001,269 @@ kernel void project_and_sh_backward_kernel(
     }
 }
 
-// ===== Pack Sorted Gaussians Kernel =====
+// ===== Exact Tile Intersection Pipeline =====
 
-kernel void pack_sorted_gaussians_kernel(
-    constant int32_t* gaussian_ids_sorted [[buffer(0)]],
-    constant float* xys              [[buffer(1)]],
-    constant float* conics           [[buffer(2)]],
-    constant float* colors           [[buffer(3)]],
-    constant float* opacities        [[buffer(4)]],
-    device float* packed_xy_opac     [[buffer(5)]],
-    device float* packed_conic       [[buffer(6)]],
-    device float* packed_rgb         [[buffer(7)]],
-    constant uint& N                 [[buffer(8)]],
-    constant int32_t* cum_tiles_hit  [[buffer(9)]],
-    constant uint& num_points        [[buffer(10)]],
-    uint idx [[thread_position_in_grid]]
-) {
-    uint actual_N = min(N, (uint)cum_tiles_hit[num_points - 1]);
-    if (idx >= actual_N) return;
-    int32_t g_id = gaussian_ids_sorted[idx];
-    float2 xy = read_packed_float2(xys, g_id);
-    float opac = 1.f / (1.f + exp(-opacities[g_id]));
-    float3 conic = read_packed_float3(conics, g_id);
-    float3 rgb = read_packed_float3(colors, g_id);
-    write_packed_float3(packed_xy_opac, idx, {xy.x, xy.y, opac});
-    write_packed_float3(packed_conic, idx, conic);
-    write_packed_float3(packed_rgb, idx, rgb);
-}
+#define EXACT_SORT_TG_SIZE 256
+#define EXACT_SORT_RADIX 256
+#define EXACT_BITONIC_FAST_PATH 2048
 
-// ===== Tile-Local Sorting Kernels =====
-// Pre-allocated per-tile bins: scatter directly to fixed-size bins, then sort in-place.
-// Eliminates count→prefix_sum→scatter pipeline (3 dispatches + 3 barriers saved).
-
-#define SORT_TG_SIZE 256
-#define MAX_TILE_ELEMS 2048
-
-// Scatter each gaussian's intersections directly into pre-allocated per-tile bins.
-// Each tile gets MAX_TILE_ELEMS slots. Per-tile atomics track fill count.
-kernel void scatter_to_prealloc_bins_kernel(
+// Scatter every Gaussian/tile intersection into the exact compact range that
+// the host built after reading tile_counts. Each tile owns a disjoint range, so
+// only its local cursor is atomic. The capacity check is defensive: with valid
+// offsets the exact total is known before this kernel is encoded.
+kernel void scatter_to_exact_bins_kernel(
     constant uint& num_points               [[buffer(0)]],
     constant float* xys                     [[buffer(1)]],
     constant float* depths                  [[buffer(2)]],
     constant int* radii                     [[buffer(3)]],
     constant float* aabb                    [[buffer(4)]],
     constant uint3& tile_bounds             [[buffer(5)]],
-    device atomic_uint* scatter_counters    [[buffer(6)]],
-    device uint64_t* prealloc_bins          [[buffer(7)]],
-    device atomic_uint* overflow_flag       [[buffer(8)]],
+    constant int* tile_offsets              [[buffer(6)]],
+    device atomic_uint* tile_cursors        [[buffer(7)]],
+    device uint64_t* keys_out               [[buffer(8)]],
+    constant uint& capacity                 [[buffer(9)]],
+    device atomic_uint* overflow_flag       [[buffer(10)]],
     uint idx [[thread_position_in_grid]]
 ) {
-    if (idx >= num_points) return;
-    if (radii[idx] <= 0) return;
+    if (idx >= num_points || radii[idx] <= 0) return;
 
-    float2 center = read_packed_float2(xys, idx);
+    const float2 center = read_packed_float2(xys, idx);
     uint2 tile_min, tile_max;
-    get_tile_bbox(center, read_packed_float2(aabb, idx), (int3)tile_bounds, tile_min, tile_max);
+    get_tile_bbox(
+        center, read_packed_float2(aabb, idx), (int3)tile_bounds,
+        tile_min, tile_max);
 
-    uint depth_bits = as_type<uint>(depths[idx]);
+    const uint64_t key =
+        ((uint64_t)as_type<uint>(depths[idx]) << 32) | (uint64_t)idx;
 
-    for (uint i = tile_min.y; i < tile_max.y; i++) {
-        for (uint j = tile_min.x; j < tile_max.x; j++) {
-            uint tile_id = i * tile_bounds.x + j;
-            uint pos = atomic_fetch_add_explicit(&scatter_counters[tile_id], 1u, memory_order_relaxed);
-            if (pos >= MAX_TILE_ELEMS) {
-                // Clamp counter so prefix_sum sees at most MAX_TILE_ELEMS
-                atomic_store_explicit(&scatter_counters[tile_id], MAX_TILE_ELEMS, memory_order_relaxed);
+    for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
+        for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
+            const uint tile_id = tile_y * tile_bounds.x + tile_x;
+            const int start_i = tile_id == 0 ? 0 : tile_offsets[tile_id - 1];
+            const int end_i = tile_offsets[tile_id];
+            if (start_i < 0 || end_i < start_i) {
                 atomic_fetch_or_explicit(
-                    overflow_flag, MSPLAT_OVERFLOW_TILE_CAP,
+                    overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
                     memory_order_relaxed);
                 continue;
             }
-            prealloc_bins[(uint64_t)tile_id * MAX_TILE_ELEMS + pos] = ((uint64_t)depth_bits << 32) | (uint64_t)idx;
+
+            const uint start = (uint)start_i;
+            const uint count = (uint)(end_i - start_i);
+            const uint local_index = atomic_fetch_add_explicit(
+                &tile_cursors[tile_id], 1u, memory_order_relaxed);
+            const uint64_t global_index =
+                (uint64_t)start + (uint64_t)local_index;
+            if (local_index >= count || global_index >= (uint64_t)capacity) {
+                atomic_fetch_or_explicit(
+                    overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                    memory_order_relaxed);
+                continue;
+            }
+            keys_out[global_index] = key;
         }
     }
 }
 
-// Bitonic sort per tile in shared memory. Reads from pre-allocated bins.
-// Writes sorted packed data to contiguous output (using tile_offsets from prefix sum).
-// Also writes tile_bins for the rasterizer.
-kernel void bitonic_sort_per_tile_kernel(
-    constant int* tile_offsets          [[buffer(0)]],
-    constant int* tile_counts_in        [[buffer(1)]],
-    constant uint64_t* prealloc_bins    [[buffer(2)]],
-    device int32_t* gaussian_ids_out    [[buffer(3)]],
-    constant uint& num_tiles            [[buffer(4)]],
-    // Pack buffers (fused sort+pack: eliminates separate pack dispatch)
-    constant float* xys                 [[buffer(5)]],
-    constant float* conics              [[buffer(6)]],
-    constant float* colors              [[buffer(7)]],
-    constant float* opacities           [[buffer(8)]],
-    device float* packed_xy_opac        [[buffer(9)]],
-    device float* packed_conic          [[buffer(10)]],
-    device float* packed_rgb            [[buffer(11)]],
-    device int* tile_bins               [[buffer(12)]],
-    constant uint& capacity             [[buffer(13)]],
-    device atomic_uint* overflow_flag   [[buffer(14)]],
-    uint tg_id [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]]
+// Exact segmented sort. The common <=2,048-entry case keeps the previous
+// threadgroup bitonic performance, but reads the exact compact range rather than
+// a fixed per-tile allocation. Larger tiles use stable LSD radix passes over
+// 256-entry waves. The host imposes an explicit work limit before dispatch so a
+// pathological tile fails the step instead of monopolizing a threadgroup.
+//
+// Projection clips Gaussians behind the near plane, so positive float depth
+// bits sort in the same order as their numeric values. The full 64-bit key is
+// sorted so Gaussian ID deterministically breaks equal-depth ties.
+// The host must dispatch exactly EXACT_SORT_TG_SIZE threads: one thread owns
+// each radix bucket and each slot in the shared wave metadata.
+kernel void radix_sort_per_tile_kernel(
+    constant int* tile_offsets       [[buffer(0)]],
+    device uint64_t* keys_a          [[buffer(1)]],
+    device uint64_t* keys_b          [[buffer(2)]],
+    constant uint& num_tiles         [[buffer(3)]],
+    device int* tile_bins            [[buffer(4)]],
+    constant uint& capacity          [[buffer(5)]],
+    device atomic_uint* overflow_flag [[buffer(6)]],
+    uint tile_id [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]],
+    uint simd_lane [[thread_index_in_simdgroup]],
+    uint simd_width [[threads_per_simdgroup]]
 ) {
-    if (tg_id >= num_tiles) return;
+    if (tile_id >= num_tiles) return;
 
-    int count_raw = tile_counts_in[tg_id];
-    int count = min(count_raw, MAX_TILE_ELEMS);
-    int end = tile_offsets[tg_id];
-    int start = end - count;
-
-    // tile_offsets is a prefix sum over every tile and is not bounded by the
-    // size of the packed output buffers, so clamp the write range here. Without
-    // this a tile whose range runs past `capacity` writes into whatever buffer
-    // was allocated next — at full resolution that is the model itself.
-    // The sort below still runs on the full count (it works in threadgroup
-    // memory, bounded by MAX_TILE_ELEMS), so the entries kept after clamping are
-    // the front-most ones, which is the right half to keep for alpha compositing.
-    int cap = (int)capacity;
-    int writable = clamp(cap - start, 0, count);
-    if (writable < count && tid == 0) {
-        atomic_fetch_or_explicit(
-            overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
-            memory_order_relaxed);
+    const int start_i = tile_id == 0 ? 0 : tile_offsets[tile_id - 1];
+    const int end_i = tile_offsets[tile_id];
+    if (start_i < 0 || end_i < start_i ||
+        (uint64_t)end_i > (uint64_t)capacity) {
+        if (tid == 0) {
+            write_packed_int2(tile_bins, tile_id, int2(0, 0));
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
     }
 
-    // Write tile_bins for rasterizer
+    const uint start = (uint)start_i;
+    const uint end = (uint)end_i;
+    const uint count = end - start;
     if (tid == 0) {
-        write_packed_int2(tile_bins, tg_id, int2(min(start, cap), min(start + writable, cap)));
+        write_packed_int2(tile_bins, tile_id, int2(start_i, end_i));
     }
+    if (count <= 1) return;
 
-    if (count == 0 || writable == 0) return;
+    threadgroup uint64_t bitonic_data[EXACT_BITONIC_FAST_PATH];
+    if (count <= EXACT_BITONIC_FAST_PATH) {
+        uint padded_count = 1;
+        while (padded_count < count) padded_count <<= 1;
 
-    // Round up to next power of 2
-    int n = 1;
-    while (n < count) n <<= 1;
+        for (uint index = tid; index < padded_count;
+             index += EXACT_SORT_TG_SIZE) {
+            bitonic_data[index] = index < count
+                ? keys_a[start + index]
+                : 0xFFFFFFFFFFFFFFFFULL;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    threadgroup uint64_t data[MAX_TILE_ELEMS];
-
-    // Load from pre-allocated bins
-    uint64_t bin_base = (uint64_t)tg_id * MAX_TILE_ELEMS;
-    for (int i = (int)tid; i < n; i += SORT_TG_SIZE) {
-        data[i] = (i < count) ? prealloc_bins[bin_base + i] : 0xFFFFFFFFFFFFFFFFULL;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Bitonic sort (ascending on uint64 — depth in upper 32 bits)
-    for (int k = 2; k <= n; k <<= 1) {
-        for (int j = k >> 1; j > 0; j >>= 1) {
-            for (int i = (int)tid; i < (n >> 1); i += SORT_TG_SIZE) {
-                int pos = 2 * i - (i & (j - 1));
-                int partner = pos ^ j;
-                bool ascending = ((pos & k) == 0);
-                uint64_t a = data[pos];
-                uint64_t b = data[partner];
-                if ((a > b) == ascending) {
-                    data[pos] = b;
-                    data[partner] = a;
+        for (uint sequence = 2; sequence <= padded_count; sequence <<= 1) {
+            for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+                for (uint pair = tid; pair < (padded_count >> 1);
+                     pair += EXACT_SORT_TG_SIZE) {
+                    const uint position = 2 * pair - (pair & (stride - 1));
+                    const uint partner = position ^ stride;
+                    const bool ascending = (position & sequence) == 0;
+                    const uint64_t a = bitonic_data[position];
+                    const uint64_t b = bitonic_data[partner];
+                    if ((a > b) == ascending) {
+                        bitonic_data[position] = b;
+                        bitonic_data[partner] = a;
+                    }
                 }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
+        }
+
+        for (uint index = tid; index < count;
+             index += EXACT_SORT_TG_SIZE) {
+            keys_a[start + index] = bitonic_data[index];
+        }
+        return;
+    }
+
+    threadgroup atomic_uint digit_histogram[EXACT_SORT_RADIX];
+    threadgroup atomic_uint wave_histogram[EXACT_SORT_RADIX];
+    threadgroup uint digit_offsets[EXACT_SORT_RADIX];
+    threadgroup uint processed_digits[EXACT_SORT_RADIX];
+    threadgroup ushort wave_digits[EXACT_SORT_TG_SIZE];
+
+    for (uint pass = 0; pass < 8; ++pass) {
+        device uint64_t* source = (pass & 1u) == 0u ? keys_a : keys_b;
+        device uint64_t* destination = (pass & 1u) == 0u ? keys_b : keys_a;
+        const uint shift = pass * 8u;
+
+        atomic_store_explicit(
+            &digit_histogram[tid], 0u, memory_order_relaxed);
+        processed_digits[tid] = 0u;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint local_index = tid; local_index < count;
+             local_index += EXACT_SORT_TG_SIZE) {
+            const uint digit =
+                (uint)((source[start + local_index] >> shift) & 0xFFu);
+            atomic_fetch_add_explicit(
+                &digit_histogram[digit], 1u, memory_order_relaxed);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0) {
+            uint running = 0;
+            for (uint digit = 0; digit < EXACT_SORT_RADIX; ++digit) {
+                digit_offsets[digit] = running;
+                running += atomic_load_explicit(
+                    &digit_histogram[digit], memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint wave_start = 0; wave_start < count;
+             wave_start += EXACT_SORT_TG_SIZE) {
+            atomic_store_explicit(
+                &wave_histogram[tid], 0u, memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            const uint local_index = wave_start + tid;
+            const bool valid = local_index < count;
+            uint64_t key = 0;
+            uint digit = EXACT_SORT_RADIX;
+            if (valid) {
+                key = source[start + local_index];
+                digit = (uint)((key >> shift) & 0xFFu);
+                atomic_fetch_add_explicit(
+                    &wave_histogram[digit], 1u, memory_order_relaxed);
+            }
+            wave_digits[tid] = (ushort)digit;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+
+            // Stable rank within this wave. SIMD broadcast handles preceding
+            // lanes in the current SIMD-group; shared digits cover preceding
+            // SIMD-groups. Invalid lanes carry sentinel 256 and never match.
+            uint rank = 0;
+            for (ushort lane = 0; lane < (ushort)simd_width; ++lane) {
+                const uint other = simd_broadcast(digit, lane);
+                if ((uint)lane < simd_lane && other == digit) ++rank;
+            }
+            const uint preceding_simd_entries = simd_group * simd_width;
+            for (uint preceding = 0; preceding < preceding_simd_entries;
+                 ++preceding) {
+                if ((uint)wave_digits[preceding] == digit) ++rank;
+            }
+
+            if (valid) {
+                const uint output_index = digit_offsets[digit] +
+                    processed_digits[digit] + rank;
+                destination[start + output_index] = key;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-    }
 
-    // Fused sort+pack: extract gaussian IDs, read per-gaussian data, write packed buffers
-    for (int i = (int)tid; i < writable; i += SORT_TG_SIZE) {
-        int32_t g_id = (int32_t)(data[i] & 0xFFFFFFFF);
-        int global_idx = start + i;
-        gaussian_ids_out[global_idx] = g_id;
-        float2 xy = read_packed_float2(xys, g_id);
-        float opac = 1.f / (1.f + exp(-opacities[g_id]));
-        write_packed_float3(packed_xy_opac, global_idx, {xy.x, xy.y, opac});
-        write_packed_float3(packed_conic, global_idx, read_packed_float3(conics, g_id));
-        write_packed_float3(packed_rgb, global_idx, read_packed_float3(colors, g_id));
+            processed_digits[tid] += atomic_load_explicit(
+                &wave_histogram[tid], memory_order_relaxed);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        // The next pass reads the device-memory writes made above. A single
+        // threadgroup owns each tile's disjoint source/destination range.
+        threadgroup_barrier(mem_flags::mem_device);
     }
+}
+
+// Extract Gaussian IDs from the sorted depth keys and pack the fields consumed
+// by both forward and backward rasterization. `exact_count` is the checked final
+// CPU prefix, not the allocated arena capacity.
+kernel void pack_sorted_gaussians_kernel(
+    constant uint64_t* sorted_keys    [[buffer(0)]],
+    constant float* xys               [[buffer(1)]],
+    constant float* conics            [[buffer(2)]],
+    constant float* colors            [[buffer(3)]],
+    constant float* opacities         [[buffer(4)]],
+    device int32_t* gaussian_ids      [[buffer(5)]],
+    device float* packed_xy_opac      [[buffer(6)]],
+    device float* packed_conic        [[buffer(7)]],
+    device float* packed_rgb          [[buffer(8)]],
+    constant uint& exact_count        [[buffer(9)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= exact_count) return;
+    const int32_t gaussian_id = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
+    gaussian_ids[idx] = gaussian_id;
+    const float2 xy = read_packed_float2(xys, gaussian_id);
+    const float opacity = 1.f / (1.f + exp(-opacities[gaussian_id]));
+    write_packed_float3(
+        packed_xy_opac, idx, float3(xy.x, xy.y, opacity));
+    write_packed_float3(
+        packed_conic, idx, read_packed_float3(conics, gaussian_id));
+    write_packed_float3(
+        packed_rgb, idx, read_packed_float3(colors, gaussian_id));
 }
 
 // ===== Radix Sort Kernels (legacy, kept for reference) =====

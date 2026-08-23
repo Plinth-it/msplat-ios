@@ -83,9 +83,15 @@ public struct TrainingStageMemoryEstimate: Sendable, Equatable {
     public let stage: ResolvedTrainingResolutionStage
     public let pixelCount: Int64
     public let tileCount: Int64
-    /// `Qhard`: the per-tile prefix-sum bound.
-    public let hardIntersectionCapacity: Int64
-    /// `Ihard`: the packed-intersection allocation bound.
+    /// Planning estimate for the frame's exact intersection count.
+    /// Runtime correctness does not depend on this heuristic.
+    public let estimatedIntersectionCount: Int64
+    @available(*, deprecated, renamed: "estimatedIntersectionCount")
+    public var hardIntersectionCapacity: Int64 {
+        estimatedIntersectionCount
+    }
+    /// Estimated arena capacity, including runtime-equivalent growth slack.
+    /// The native arena may grow beyond this value for a denser frame.
     public let intersectionCapacity: Int64
     public let chunkCount: Int64
     public let trainingCacheBytes: Int64
@@ -510,39 +516,41 @@ public struct TrainingPlan: Sendable, Equatable {
                 [tilesWide, tilesHigh],
                 component: "tile count"
             )
-            let hardIntersectionCapacity = try checkedProduct(
-                [tileCount, min(gaussianCount, 2_048)],
-                component: "hard intersection capacity"
+            // Exact runtime counts depend on camera and model geometry. An
+            // iPhone 15 Pro scene measured 10.4 intersections/Gaussian at
+            // 960x720 and 43.5 at 1920x1440. Use a padded 16-at-960x720
+            // planning baseline and scale it by tile count (64 at 1920x1440),
+            // bounded by the number of tiles a single Gaussian could hit.
+            // Runtime correctness never depends on this estimate: the GPU
+            // count pass sizes each frame before scatter.
+            let scaledIntersectionsPerGaussian = try checkedCeilDivide(
+                try checkedProduct(
+                    [16, tileCount],
+                    component: "resolution-scaled intersections"
+                ),
+                by: 2_700,
+                component: "resolution-scaled intersections"
             )
-            guard hardIntersectionCapacity <= Int64(Int32.max) else {
-                throw MsplatError.invalidArgument(
-                    "A resolution stage exceeds the native hard-intersection index range"
-                )
-            }
-
-            let gaussianIntersectionCapacity = try checkedProduct(
-                [16, gaussianCount],
-                component: "Gaussian intersection capacity"
+            let estimatedIntersectionsPerGaussian = min(
+                tileCount, max(16, scaledIntersectionsPerGaussian))
+            let estimatedIntersectionCount = try checkedProduct(
+                [estimatedIntersectionsPerGaussian, gaussianCount],
+                component: "estimated exact intersections"
             )
-            let hardCapacityWithHeadroom = try checkedSum(
-                [hardIntersectionCapacity, hardIntersectionCapacity / 2],
-                component: "hard intersection headroom"
+            let arenaSlack = max(estimatedIntersectionCount / 4, 4_096)
+            let capacityWithSlack = try checkedSum(
+                [estimatedIntersectionCount, arenaSlack],
+                component: "exact intersection arena headroom"
             )
-            let intersectionCapacity = max(
-                gaussianIntersectionCapacity,
-                hardCapacityWithHeadroom
-            )
-            guard intersectionCapacity <= Int64(Int32.max) else {
-                throw MsplatError.invalidArgument(
-                    "A resolution stage exceeds the native packed-intersection index range"
-                )
-            }
+            let intersectionCapacity = min(
+                capacityWithSlack, Int64(Int32.max))
 
             let chunkCount: Int64
             if tileCount >= 400 {
                 chunkCount = 1
             } else {
-                let averageIntersectionsPerTile = intersectionCapacity / tileCount
+                let averageIntersectionsPerTile =
+                    estimatedIntersectionCount / tileCount
                 let conservativeChunks = try checkedCeilDivide(
                     try checkedProduct(
                         [6, averageIntersectionsPerTile],
@@ -552,24 +560,24 @@ public struct TrainingPlan: Sendable, Equatable {
                     component: "conservative chunk count"
                 )
                 let absoluteChunks = try checkedCeilDivide(
-                    intersectionCapacity,
+                    estimatedIntersectionCount,
                     by: 512,
                     component: "absolute chunk count"
                 )
-                chunkCount = min(max(2, conservativeChunks), absoluteChunks)
+                chunkCount = min(max(1, conservativeChunks), absoluteChunks)
             }
 
             var trainingCacheBytes = try checkedSum([
                 try checkedProduct(
-                    [132, gaussianCount],
+                    [128, gaussianCount],
                     component: "training Gaussian cache"
                 ),
                 try checkedProduct(
-                    [40, intersectionCapacity],
-                    component: "training intersection cache"
+                    [56, intersectionCapacity],
+                    component: "exact intersection arenas and packed cache"
                 ),
                 try checkedProduct([152, pixelCount], component: "training pixel cache"),
-                try checkedProduct([16_400, tileCount], component: "training tile cache"),
+                try checkedProduct([16, tileCount], component: "training tile metadata"),
                 8,
             ], component: "training cache")
             if chunkCount > 1 {
@@ -610,7 +618,7 @@ public struct TrainingPlan: Sendable, Equatable {
                 stage: stage,
                 pixelCount: pixelCount,
                 tileCount: tileCount,
-                hardIntersectionCapacity: hardIntersectionCapacity,
+                estimatedIntersectionCount: estimatedIntersectionCount,
                 intersectionCapacity: intersectionCapacity,
                 chunkCount: chunkCount,
                 trainingCacheBytes: trainingCacheBytes

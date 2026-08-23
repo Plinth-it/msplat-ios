@@ -4,7 +4,7 @@ import MsplatCore
 public struct TrainingStats: Sendable {
     public let iteration: Int
     public let splatCount: Int
-    /// CPU encoding and command-submission time. This is not completed GPU time.
+    /// CPU encoding and command-submission time, excluding synchronous GPU waits.
     public let cpuSubmitMs: Float
 
     @available(*, deprecated, renamed: "cpuSubmitMs", message: "This value measures CPU submission, not completed GPU step time.")
@@ -17,7 +17,8 @@ public struct TrainingStats: Sendable {
     }
 }
 
-/// Reasons why a completed training step had to omit rasterizer intersections.
+/// Defensive rasterizer invariant flags. The exact intersection pipeline is
+/// expected to complete with this set empty.
 public struct RasterizerOverflowKinds: OptionSet, Sendable, Equatable {
     public let rawValue: UInt32
 
@@ -25,11 +26,11 @@ public struct RasterizerOverflowKinds: OptionSet, Sendable, Equatable {
         self.rawValue = rawValue
     }
 
-    /// At least one tile exceeded the fixed per-tile sorting capacity.
+    /// Legacy ABI bit from the removed fixed per-tile sorting path.
     public static let tileCapacity = RasterizerOverflowKinds(
         rawValue: UInt32(MSPLAT_RASTER_OVERFLOW_TILE_CAP)
     )
-    /// The packed intersection arena could not hold every retained entry.
+    /// Exact offsets and the allocated arena disagreed unexpectedly.
     public static let packedCapacity = RasterizerOverflowKinds(
         rawValue: UInt32(MSPLAT_RASTER_OVERFLOW_PACKED_CAPACITY)
     )
@@ -75,7 +76,7 @@ public struct CompletedTrainingStep: Sendable, Equatable {
     /// Mean training loss for this completed step.
     public let loss: Float?
     public let overflowKinds: RasterizerOverflowKinds
-    /// Entries retained after the fixed per-tile cap and packed-arena clamp.
+    /// Exact live intersection count for the completed frame.
     public let retainedPackedIntersectionCount: UInt64?
     public let packedIntersectionCapacity: UInt64?
 

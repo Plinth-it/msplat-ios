@@ -1158,9 +1158,10 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
 
     if (adam_step_count == std::numeric_limits<int>::max())
         throw std::overflow_error("Adam step count cannot be incremented further");
-    adam_step_count++;
-    float bc1 = 1.0f - std::pow(adam_beta1, adam_step_count);
-    float bc2 = 1.0f - std::pow(adam_beta2, adam_step_count);
+    const int previousAdamStep = adam_step_count;
+    const int nextAdamStep = previousAdamStep + 1;
+    float bc1 = 1.0f - std::pow(adam_beta1, nextAdamStep);
+    float bc2 = 1.0f - std::pow(adam_beta2, nextAdamStep);
     MTensor adam_p[N_ADAM_GROUPS];
     MTensor adam_ea[N_ADAM_GROUPS], adam_eas[N_ADAM_GROUPS];
     float adam_ss[N_ADAM_GROUPS], adam_bc2s[N_ADAM_GROUPS];
@@ -1176,19 +1177,26 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     float lossInvN = 1.0f / (float)(s.height * s.width * 3);
 
-    MTensor r = msplat_train_step(
-        numPoints, means, scales, 1.0f,
-        quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
-        s.height, s.width, s.tileBounds, 0.01f,
-        s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-        opacities, backgroundColor, gt, ssimWeight,
-        lossInvN,
-        N_ADAM_GROUPS,
-        adam_p, adam_ea, adam_eas,
-        adam_ss, adam_bc2s,
-        adam_beta1, adam_beta2, adam_eps,
-        collectDensificationStats,
-        visCounts, xysGradNorm, max2DSize, invMaxDim);
+    MTensor r;
+    adam_step_count = nextAdamStep;
+    try {
+        r = msplat_train_step(
+            numPoints, means, scales, 1.0f,
+            quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
+            s.height, s.width, s.tileBounds, 0.01f,
+            s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
+            opacities, backgroundColor, gt, ssimWeight,
+            lossInvN,
+            N_ADAM_GROUPS,
+            adam_p, adam_ea, adam_eas,
+            adam_ss, adam_bc2s,
+            adam_beta1, adam_beta2, adam_eps,
+            collectDensificationStats,
+            visCounts, xysGradNorm, max2DSize, invMaxDim);
+    } catch (...) {
+        adam_step_count = previousAdamStep;
+        throw;
+    }
 
     if (collectDensificationStats) radii = r;
 }

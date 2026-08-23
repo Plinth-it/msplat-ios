@@ -13,6 +13,12 @@
   rasterizer overflow incidence, categorized buffer ownership, image-cache
   hit/miss counts, `phys_footprint`, and iOS available memory. Legacy step
   statistics remain submission-only and ABI-compatible.
+- Replaced fixed 2,048-entry per-tile bins with a two-pass exact intersection
+  pipeline: projection counts each tile, the host builds checked offsets and
+  grows compact arenas, and exact-range bitonic/radix sorting preserves every
+  intersection. Allocation, native-index, and the explicit 65,536-per-tile
+  work-limit failures now abort before rasterization or Adam; the planner models
+  the 56-byte exact arena without treating its estimate as a correctness cap.
 - Enforced the Gaussian ceiling during initialization, densification, PLY
   import, and checkpoint restore. Capacity-constrained densification keeps the
   highest normalized-gradient candidates, and `--max-gaussians` exposes the

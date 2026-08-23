@@ -43,8 +43,12 @@ runtime memory and rasterizer overflow state.
   before their Gaussian storage is allocated.
 
 `TrainingPlan` derives its estimate from the selected Gaussian ceiling, SH
-degree, source dimensions, resolution stages, intersection bounds, native image
-cache, and an additional headroom allowance. ImageIO is asked to decode a
+degree, source dimensions, resolution stages, an estimated exact-intersection
+arena, native image cache, and an additional headroom allowance. The
+intersection estimate scales a padded 16-intersections-per-Gaussian baseline
+at 960×720 by tile count. That baseline is above the measured 10.4 at 960×720
+and scales to 64 at 1920×1440, above the measured 43.5. The runtime still counts
+and sizes each frame exactly. ImageIO is asked to decode a
 thumbnail at the selected input resolution, and the app-owned decode allowance
 therefore scales with that target. It is intentionally conservative, but it is
 not a jetsam guarantee: codec-private surfaces, Metal driver state, framework
@@ -56,13 +60,15 @@ after the densification cutoff.
 
 ## Correctness
 
-**Rasterizer intersection overflow.** The packed buffers were sized
-`num_points × 16`; the sort kernel wrote at offsets from a prefix sum over
-every tile, bounded by nothing about `num_points`. The overflow landed in the
-model, and far enough out faulted the GPU and killed the process's Metal
-context. iPhone 15 Pro, 20852 gaussians: 906292 slots needed against 333136
-allocated. The kernel now takes a capacity and clamps; buffers are sized from
-what the GPU last reported needing.
+**Rasterizer intersections.** The packed buffers were once sized
+`num_points × 16`, and later used fixed 2,048-entry bins per tile. Both designs
+could drop intersections or write beyond their useful capacity. The current
+pipeline projects and counts every tile intersection, waits for that count,
+builds checked exact offsets, grows compact arenas, and sorts the complete range
+with a bitonic fast path through 2,048 entries and a deterministic radix path
+through the explicit 65,536-per-tile work limit. Index, allocation, or work-limit
+failures stop the step before rasterization and optimizer work instead of
+training against an incomplete frame.
 
 **Chunk buffers across a resolution change.** The guard compared against a
 dimension already updated earlier in the same step, so kernels addressed
@@ -165,13 +171,14 @@ func train() throws {
 process-global Metal state. The legacy `GaussianDataset` and `GaussianTrainer`
 types remain available for source compatibility.
 
-`step()` returns a submission receipt: its `cpuSubmitMs` ends when Metal accepts
-the work and is not GPU duration. `trainingMetrics()` is a non-draining poll
-whose submitted and completed descriptors may name different iterations. A
-completed descriptor is published only after every command buffer in that
-logical step succeeds; `gpuExecutionMs` sums their Metal GPU intervals, while
-`endToEndMs` is completion-observed wall latency, including queueing,
-completion-handler scheduling, and any required synchronous readbacks.
+`step()` returns a submission receipt: its `cpuSubmitMs` measures active CPU
+encoding and submission time with required synchronous GPU waits excluded.
+`trainingMetrics()` is a non-draining poll whose submitted and completed
+descriptors may name different iterations. A completed descriptor is published
+only after every command buffer in that logical step succeeds;
+`gpuExecutionMs` sums their Metal GPU intervals, while `endToEndMs` is
+completion-observed wall latency, including queueing, completion-handler
+scheduling, and any required synchronous readbacks.
 `memoryMetrics()` separates model, render-transient, training-transient,
 telemetry-readback, and image-cache bytes from process `phys_footprint` and iOS
 available memory. The buffer categories are logical allocations, not a claim
@@ -233,13 +240,15 @@ at 2000 iterations, PSNR fell in 26.75–26.93 and the final gaussian count in
 
 ## Engine
 
-One training step, dispatched into a single Metal command encoder:
+One training step uses an exact-count command buffer followed by the remaining
+work. The synchronization between them is the correctness boundary that sizes
+the compact intersection arena:
 
 ```
 Forward:
-  project_and_sh_forward     fused 3D→2D projection + spherical harmonics
-  prefix_sum + scatter       gaussian→tile intersection mapping
-  bitonic_sort_per_tile      tile-local depth sort + inline data packing
+  project_and_sh_forward     fused projection + SH + exact per-tile counts
+  CPU checked prefix         exact offsets and grow-only arena sizing
+  exact scatter + sort       compact checked tile ranges + packing
   nd_rasterize_forward       per-pixel alpha compositing (16×16 tiles)
   ssim_h_fwd + ssim_v_fwd    separable 11-tap SSIM + L1 loss
 
