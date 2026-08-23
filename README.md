@@ -114,6 +114,14 @@ rendering, evaluation, and PLY/SPZ export remain unchanged. Checkpoint v2 keeps
 the gains, Adam moments, per-camera visit counts, and exact frame IDs so a
 resume cannot silently attach corrections to different cameras.
 
+**Camera-pose refinement.** Training can optionally learn small, bounded
+camera-space SE(3) corrections after warm-up. The first training camera is a
+fixed anchor, and the geometry-only pose gradient deliberately detaches the SH
+view-direction term. Imported poses and canonical rendering, evaluation, and
+export remain unchanged. Checkpoint v3 preserves corrections, Adam moments,
+per-camera visit counts, the anchor, exact frame IDs, and the immutable source
+poses.
+
 ## Additions
 
 - COLMAP text models (`cameras.txt` / `images.txt` / `points3D.txt`)
@@ -131,6 +139,8 @@ resume cannot silently attach corrections to different cameras.
   the existing folder-based ABI v2 entry point remains available.
 - ABI v8 opt-in per-camera photometric RGB-gain refinement, also exposed by
   Swift and the native/Python CLIs; it is disabled by default
+- ABI v9 opt-in bounded camera-pose refinement, exposed by Swift and the
+  native/Python CLIs; it is disabled by default and training-only
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,

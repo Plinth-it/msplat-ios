@@ -12,6 +12,7 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(config.shDegree, 3)
         XCTAssertEqual(config.ssimWeight, 0.2, accuracy: 0.001)
         XCTAssertFalse(config.refinePhotometricGains)
+        XCTAssertFalse(config.refineCameraPoses)
         XCTAssertEqual(config.toRefinementOptionsV8().flags, 0)
         XCTAssertNoThrow(try config.validate())
     }
@@ -26,6 +27,25 @@ final class MsplatTests: XCTestCase {
             UInt32(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS)
         )
         XCTAssertEqual(MemoryLayout<MsplatRefinementOptionsV8>.size, 16)
+    }
+
+    func testCameraPoseRefinementMapsToVersionedNativeOptions() {
+        var config = TrainingConfig()
+        config.refineCameraPoses = true
+
+        var options = config.toRefinementOptionsV8()
+        XCTAssertEqual(
+            options.flags,
+            UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS)
+        )
+
+        config.refinePhotometricGains = true
+        options = config.toRefinementOptionsV8()
+        XCTAssertEqual(
+            options.flags,
+            UInt32(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS)
+                | UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS)
+        )
     }
 
     func testInvalidConfigIsRejected() {

@@ -42,6 +42,7 @@ struct TrainingConfig {
     float split_screen_size = 0.05f;
     bool keep_crs = false;
     bool refine_photometric_gains = false;
+    bool refine_camera_poses = false;
     float downscale_factor = 1.0f;
     std::string output = "splat.ply";
     int save_every = -1;
@@ -140,7 +141,11 @@ public:
             cfg.bg_color.data(),
             -1,
             cfg.max_gaussians,
-            cfg.refine_photometric_gains
+            cfg.refine_photometric_gains,
+            cfg.refine_camera_poses,
+            cfg.refine_camera_poses && !dataset.train_cams.empty()
+                ? static_cast<int>(dataset.train_cams.front())
+                : -1
         );
 
         cam_indices.resize(dataset.train_cams.size());
@@ -324,7 +329,8 @@ NB_MODULE(_core, m) {
                 bool keep_crs, float downscale_factor,
                 const std::string &output, int save_every,
                 std::vector<float> bg_color, int max_gaussians,
-                bool refine_photometric_gains) {
+                bool refine_photometric_gains,
+                bool refine_camera_poses) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -345,6 +351,7 @@ NB_MODULE(_core, m) {
             cfg->save_every = save_every;
             cfg->max_gaussians = max_gaussians;
             cfg->refine_photometric_gains = refine_photometric_gains;
+            cfg->refine_camera_poses = refine_camera_poses;
             if (bg_color.size() != 3)
                 throw std::invalid_argument("bg_color must have exactly 3 elements [R, G, B]");
             cfg->bg_color = bg_color;
@@ -368,7 +375,8 @@ NB_MODULE(_core, m) {
             "save_every"_a = -1,
             "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f},
             "max_gaussians"_a = -1,
-            "refine_photometric_gains"_a = false)
+            "refine_photometric_gains"_a = false,
+            "refine_camera_poses"_a = false)
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
@@ -386,6 +394,8 @@ NB_MODULE(_core, m) {
         .def_rw("keep_crs", &TrainingConfig::keep_crs)
         .def_rw("refine_photometric_gains", &TrainingConfig::refine_photometric_gains,
             "Optimize bounded per-camera RGB gains during training. Disabled by default.")
+        .def_rw("refine_camera_poses", &TrainingConfig::refine_camera_poses,
+            "Optimize small regularized per-camera pose corrections after warm-up. Disabled by default.")
         .def_rw("downscale_factor", &TrainingConfig::downscale_factor)
         .def_rw("output", &TrainingConfig::output)
         .def_rw("save_every", &TrainingConfig::save_every)

@@ -35,6 +35,11 @@
   the learned values are photometric gains rather than physical exposure.
   Canonical render, evaluation, and export paths remain unchanged; checkpoint
   v2 preserves gains, moments, per-camera visit counts, and exact frame IDs.
+- Added ABI v9 opt-in camera-pose refinement with bounded, regularized SE(3)
+  corrections, a fixed first-training-camera anchor, and per-camera Adam state.
+  The initial geometry-only gradient detaches the SH view-direction term.
+  Imported poses and canonical render, evaluation, and export remain unchanged;
+  checkpoint v3 preserves pose state and validates frame IDs and source poses.
 - Corrected the image-edge versus array-index conversion in Brown-Conrady
   rectification, including alpha=0 crop endpoints and paired mask sampling.
   The renderer now uses an exact homogeneous divide, propagates the missing

@@ -95,6 +95,9 @@ int main(int argc, char *argv[]) {
     bool refinePhotometricGains = false;
     app.add_flag("--refine-photometric-gains", refinePhotometricGains,
                  "Optimize bounded per-camera RGB gains during training");
+    bool refineCameraPoses = false;
+    app.add_flag("--refine-camera-poses", refineCameraPoses,
+                 "Optimize small regularized per-camera pose corrections after warm-up");
     std::vector<float> bgColor = {0.6130f, 0.0101f, 0.3984f};
     app.add_option("--bg-color", bgColor, "Background RGB (0-1), default magenta")
         ->expected(3);
@@ -140,7 +143,11 @@ int main(int argc, char *argv[]) {
                      bgColor.data(),
                      stopDensifyAt,
                      maxGaussians,
-                     refinePhotometricGains);
+                     refinePhotometricGains,
+                     refineCameraPoses,
+                     refineCameraPoses && !cams.empty()
+                         ? static_cast<int>(cams.front())
+                         : -1);
 
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);

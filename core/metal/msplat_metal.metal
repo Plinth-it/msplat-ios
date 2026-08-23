@@ -112,6 +112,108 @@ inline float4 transform_4x4(constant float *mat, const float3 p) {
     return out;
 }
 
+// Small, regularized camera corrections use a camera-space rigid transform
+// left-multiplied onto the dataset's immutable world-to-camera matrix. The
+// stored six-vector is [translation, axis-angle rotation].
+inline float3x3 so3_exp(const float3 rotation) {
+    const float theta2 = dot(rotation, rotation);
+    float a;
+    float b;
+    if (theta2 < 1.0e-8f) {
+        const float theta4 = theta2 * theta2;
+        a = 1.0f - theta2 / 6.0f + theta4 / 120.0f;
+        b = 0.5f - theta2 / 24.0f + theta4 / 720.0f;
+    } else {
+        const float theta = sqrt(theta2);
+        a = sin(theta) / theta;
+        b = (1.0f - cos(theta)) / theta2;
+    }
+    const float x = rotation.x;
+    const float y = rotation.y;
+    const float z = rotation.z;
+    const float3x3 skew = float3x3(
+        float3(0.0f, z, -y),
+        float3(-z, 0.0f, x),
+        float3(y, -x, 0.0f)
+    );
+    return float3x3(1.0f) + a * skew + b * (skew * skew);
+}
+
+inline float3 se3_exp_translation(
+    const float3 translation_tangent, const float3 rotation_tangent
+) {
+    const float theta2 = dot(rotation_tangent, rotation_tangent);
+    float b;
+    float c;
+    if (theta2 < 1.0e-8f) {
+        const float theta4 = theta2 * theta2;
+        b = 0.5f - theta2 / 24.0f + theta4 / 720.0f;
+        c = 1.0f / 6.0f - theta2 / 120.0f + theta4 / 5040.0f;
+    } else {
+        const float theta = sqrt(theta2);
+        b = (1.0f - cos(theta)) / theta2;
+        c = (theta - sin(theta)) / (theta2 * theta);
+    }
+    const float x = rotation_tangent.x;
+    const float y = rotation_tangent.y;
+    const float z = rotation_tangent.z;
+    const float3x3 skew = float3x3(
+        float3(0.0f, z, -y),
+        float3(-z, 0.0f, x),
+        float3(y, -x, 0.0f)
+    );
+    const float3x3 left_jacobian =
+        float3x3(1.0f) + b * skew + c * (skew * skew);
+    return left_jacobian * translation_tangent;
+}
+
+inline float3 so3_log(const float3x3 rotation) {
+    const float cosine = clamp(
+        0.5f * (rotation[0][0] + rotation[1][1] + rotation[2][2] - 1.0f),
+        -1.0f, 1.0f);
+    const float theta = acos(cosine);
+    const float3 antisymmetric = float3(
+        rotation[1][2] - rotation[2][1],
+        rotation[2][0] - rotation[0][2],
+        rotation[0][1] - rotation[1][0]
+    );
+    if (theta < 1.0e-4f) {
+        return 0.5f * antisymmetric;
+    }
+    return (0.5f * theta / sin(theta)) * antisymmetric;
+}
+
+inline float3x3 view_rotation(constant float *viewmat) {
+    return float3x3(
+        viewmat[0], viewmat[4], viewmat[8],
+        viewmat[1], viewmat[5], viewmat[9],
+        viewmat[2], viewmat[6], viewmat[10]
+    );
+}
+
+inline float2 project_view_pix(
+    const float3 p_view, const float fx, const float fy,
+    const float cx, const float cy
+) {
+    const float inv_z = 1.0f / p_view.z;
+    return float2(
+        fx * p_view.x * inv_z + cx - 0.5f,
+        fy * p_view.y * inv_z + cy - 0.5f
+    );
+}
+
+inline float3 project_view_pix_vjp(
+    const float3 p_view, const float fx, const float fy, const float2 v_xy
+) {
+    const float inv_z = 1.0f / p_view.z;
+    const float inv_z2 = inv_z * inv_z;
+    return float3(
+        fx * inv_z * v_xy.x,
+        fy * inv_z * v_xy.y,
+        -(fx * p_view.x * v_xy.x + fy * p_view.y * v_xy.y) * inv_z2
+    );
+}
+
 // Normalized quaternion → 3x3 rotation matrix (column-major for Metal).
 inline float3x3 quat_to_rotmat(const float4 quat) {
     float s = rsqrt(
@@ -1435,6 +1537,73 @@ void project_cov3d_ewa_vjp(
     v_mean3d[2] += (float)dot(v_t, W[2]);
 }
 
+// Pose-refinement overload. In addition to the Gaussian covariance gradient,
+// expose camera-space position and view-rotation cotangents so one local
+// six-DoF camera gradient can be accumulated without materializing per-point
+// matrix gradients.
+void project_cov3d_ewa_pose_vjp(
+    thread float* cov3d,
+    constant float* viewmat,
+    const float fx,
+    const float fy,
+    const float tan_fovx,
+    const float tan_fovy,
+    float3 v_cov2d,
+    thread float* v_cov3d,
+    thread float3& v_p_view,
+    thread float3x3& v_view_rotation,
+    float3 p_view
+) {
+    EWAClampedPosition clamped =
+        clamp_ewa_position(p_view, tan_fovx, tan_fovy);
+    p_view = clamped.position;
+
+    const float rz = 1.0f / p_view.z;
+    const float rz2 = rz * rz;
+    const float3x3 W = view_rotation(viewmat);
+    const float3x3 J = float3x3(
+        fx * rz,                0.0f,                 0.0f,
+        0.0f,                   fy * rz,              0.0f,
+        -fx * p_view.x * rz2,  -fy * p_view.y * rz2, 0.0f
+    );
+    const float3x3 V = float3x3(
+        cov3d[0], cov3d[1], cov3d[2],
+        cov3d[1], cov3d[3], cov3d[4],
+        cov3d[2], cov3d[4], cov3d[5]
+    );
+    const float3x3 v_cov = float3x3(
+        v_cov2d.x,        0.5f * v_cov2d.y, 0.0f,
+        0.5f * v_cov2d.y, v_cov2d.z,        0.0f,
+        0.0f,             0.0f,             0.0f
+    );
+
+    const float3x3 T = J * W;
+    const float3x3 v_V = transpose(T) * v_cov * T;
+    const float3x3 v_T =
+        v_cov * T * transpose(V) + transpose(v_cov) * T * V;
+
+    v_cov3d[0] = v_V[0][0];
+    v_cov3d[1] = v_V[0][1] + v_V[1][0];
+    v_cov3d[2] = v_V[0][2] + v_V[2][0];
+    v_cov3d[3] = v_V[1][1];
+    v_cov3d[4] = v_V[1][2] + v_V[2][1];
+    v_cov3d[5] = v_V[2][2];
+
+    const float3x3 v_J = v_T * transpose(W);
+    const float fx_rz2 = fx * rz2;
+    const float fy_rz2 = fy * rz2;
+    const float rz3 = rz2 * rz;
+    v_p_view = float3(
+        -clamped.ratio_gradient.x * fx_rz2 * v_J[2][0],
+        -clamped.ratio_gradient.y * fy_rz2 * v_J[2][1],
+        -fx_rz2 * v_J[0][0] +
+            (1.f + clamped.ratio_gradient.x) * fx * p_view.x * rz3 * v_J[2][0] -
+            fy_rz2 * v_J[1][1] +
+            (1.f + clamped.ratio_gradient.y) * fy * p_view.y * rz3 * v_J[2][1]
+    );
+    v_view_rotation = transpose(J) * v_T;
+}
+
 inline float4 quat_to_rotmat_vjp(const float4 quat, const float3x3 v_R) {
     float s = rsqrt(
         quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z
@@ -1717,6 +1886,149 @@ kernel void fused_adam_kernel(
     exp_avg_sq[tid] = v;
 }
 
+// ===== Optional camera-pose refinement =====
+
+kernel void prepare_camera_pose_kernel(
+    constant float* declared_view,
+    constant float* pose_deltas,
+    constant uint& pose_offset,
+    device float* refined_view,
+    device float* refined_cam_pos,
+    uint index [[thread_position_in_grid]]
+) {
+    if (index != 0) return;
+
+    const float3 translation = float3(
+        pose_deltas[pose_offset],
+        pose_deltas[pose_offset + 1],
+        pose_deltas[pose_offset + 2]);
+    const float3 rotation_vector = float3(
+        pose_deltas[pose_offset + 3],
+        pose_deltas[pose_offset + 4],
+        pose_deltas[pose_offset + 5]);
+    const float3x3 correction_rotation = so3_exp(rotation_vector);
+    const float3x3 declared_rotation = view_rotation(declared_view);
+    const float3x3 rotation = correction_rotation * declared_rotation;
+    const float3 declared_translation = float3(
+        declared_view[3], declared_view[7], declared_view[11]);
+    const float3 view_translation =
+        correction_rotation * declared_translation + translation;
+
+    refined_view[0] = rotation[0][0];
+    refined_view[1] = rotation[1][0];
+    refined_view[2] = rotation[2][0];
+    refined_view[3] = view_translation.x;
+    refined_view[4] = rotation[0][1];
+    refined_view[5] = rotation[1][1];
+    refined_view[6] = rotation[2][1];
+    refined_view[7] = view_translation.y;
+    refined_view[8] = rotation[0][2];
+    refined_view[9] = rotation[1][2];
+    refined_view[10] = rotation[2][2];
+    refined_view[11] = view_translation.z;
+    refined_view[12] = 0.0f;
+    refined_view[13] = 0.0f;
+    refined_view[14] = 0.0f;
+    refined_view[15] = 1.0f;
+
+    const float3 camera_position =
+        -(transpose(rotation) * view_translation);
+    refined_cam_pos[0] = camera_position.x;
+    refined_cam_pos[1] = camera_position.y;
+    refined_cam_pos[2] = camera_position.z;
+}
+
+struct PoseAdamParams {
+    uint pose_offset;
+    float step_size;
+    float beta1;
+    float beta2;
+    float bias_correction2_sqrt;
+    float eps;
+    float regularization;
+    float max_translation;
+    float max_rotation;
+};
+
+kernel void camera_pose_adam_kernel(
+    device float* pose_deltas,
+    constant float* pose_gradient,
+    device float* exp_avg,
+    device float* exp_avg_sq,
+    constant PoseAdamParams& params,
+    uint index [[thread_position_in_grid]]
+) {
+    if (index != 0) return;
+
+    float3 translation = float3(
+        pose_deltas[params.pose_offset],
+        pose_deltas[params.pose_offset + 1],
+        pose_deltas[params.pose_offset + 2]);
+    const float3 rotation_vector = float3(
+        pose_deltas[params.pose_offset + 3],
+        pose_deltas[params.pose_offset + 4],
+        pose_deltas[params.pose_offset + 5]);
+    const float3x3 rotation = so3_exp(rotation_vector);
+
+    const float translation_scale2 =
+        params.max_translation * params.max_translation;
+    const float rotation_scale2 =
+        params.max_rotation * params.max_rotation;
+    const float3 rotation_regularizer =
+        params.regularization * 0.5f / rotation_scale2 * float3(
+            rotation[1][2] - rotation[2][1],
+            rotation[2][0] - rotation[0][2],
+            rotation[0][1] - rotation[1][0]);
+
+    float update[6];
+    for (uint component = 0; component < 6; ++component) {
+        const uint parameter_index = params.pose_offset + component;
+        float regularization_gradient = component < 3
+            ? params.regularization * translation[component] /
+                translation_scale2
+            : rotation_regularizer[component - 3];
+        const float gradient =
+            pose_gradient[component] + regularization_gradient;
+        const float first_moment = fma(
+            params.beta1, exp_avg[parameter_index],
+            (1.0f - params.beta1) * gradient);
+        const float second_moment = fma(
+            params.beta2, exp_avg_sq[parameter_index],
+            (1.0f - params.beta2) * gradient * gradient);
+        update[component] = -params.step_size * first_moment /
+            (sqrt(second_moment) / params.bias_correction2_sqrt + params.eps);
+        exp_avg[parameter_index] = first_moment;
+        exp_avg_sq[parameter_index] = second_moment;
+    }
+
+    const float3 increment_translation_tangent =
+        float3(update[0], update[1], update[2]);
+    const float3 increment_rotation_vector =
+        float3(update[3], update[4], update[5]);
+    const float3x3 increment_rotation = so3_exp(increment_rotation_vector);
+    const float3 increment_translation = se3_exp_translation(
+        increment_translation_tangent, increment_rotation_vector);
+    float3x3 updated_rotation = increment_rotation * rotation;
+    translation = increment_rotation * translation + increment_translation;
+
+    const float translation_norm = length(translation);
+    if (translation_norm > params.max_translation) {
+        translation *= params.max_translation / translation_norm;
+    }
+    float3 updated_rotation_vector = so3_log(updated_rotation);
+    const float rotation_norm = length(updated_rotation_vector);
+    if (rotation_norm > params.max_rotation) {
+        updated_rotation_vector *= params.max_rotation / rotation_norm;
+    }
+
+    pose_deltas[params.pose_offset] = translation.x;
+    pose_deltas[params.pose_offset + 1] = translation.y;
+    pose_deltas[params.pose_offset + 2] = translation.z;
+    pose_deltas[params.pose_offset + 3] = updated_rotation_vector.x;
+    pose_deltas[params.pose_offset + 4] = updated_rotation_vector.y;
+    pose_deltas[params.pose_offset + 5] = updated_rotation_vector.z;
+}
+
 // ===== Fused Projection + SH Kernels =====
 // Combines project_gaussians_forward_kernel + compute_sh_forward_kernel into one dispatch.
 // Saves 1 kernel dispatch + 1 read of means3d per direction. Skips SH for culled gaussians.
@@ -1747,6 +2059,7 @@ kernel void project_and_sh_forward_kernel(
     constant float* features_rest,
     device float* colors,
     device float* aabb, // float2: per-axis pixel extents
+    constant uint& pose_enabled,
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -1785,7 +2098,12 @@ kernel void project_and_sh_forward_kernel(
     }
     write_packed_float3(conics, idx, conic);
 
-    float2 center = project_pix(projmat, p_world, img_size, {cx, cy});
+    // The canonical path retains the established projection-matrix arithmetic
+    // exactly. Pose refinement projects the already-refined camera-space point;
+    // P * D * V cannot be formed by left-multiplying the cached P * V matrix.
+    float2 center = pose_enabled != 0
+        ? project_view_pix(p_view, fx, fy, cx, cy)
+        : project_pix(projmat, p_world, img_size, {cx, cy});
 
     float aabb_x = ceil(3.0f * sqrt(cov2d.x));
     float aabb_y = ceil(3.0f * sqrt(cov2d.z));
@@ -1879,27 +2197,52 @@ kernel void project_and_sh_backward_kernel(
     device float* rest_exp_avg,
     device float* rest_exp_avg_sq,
     constant SHAdamParams& adam_hp,
-    uint idx [[thread_position_in_grid]]
+    constant uint& pose_enabled,
+    device atomic_float* pose_gradient,
+    uint idx [[thread_position_in_grid]],
+    uint thread_index [[thread_index_in_threadgroup]]
 ) {
-    if (idx >= (uint)num_points || radii[idx] <= 0) {
-        return;
+    threadgroup atomic_float pose_group_gradient[6];
+    if (pose_enabled != 0) {
+        if (thread_index == 0) {
+            for (uint component = 0; component < 6; ++component) {
+                atomic_store_explicit(
+                    &pose_group_gradient[component], 0.0f,
+                    memory_order_relaxed);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    float3 p_world = read_packed_float3(means3d, idx);
-    float fx = intrins.x;
-    float fy = intrins.y;
 
-    // Projection backward: v_mean3d from v_xy
-    write_packed_float3(
-        v_mean3d, idx,
-        project_pix_vjp(projmat, p_world, img_size, read_packed_float2(v_xy, idx))
-    );
+    const bool active =
+        idx < (uint)num_points && radii[idx] > 0;
+    float3 p_world = float3(0.0f);
+    if (active) {
+    p_world = read_packed_float3(means3d, idx);
+    const float fx = intrins.x;
+    const float fy = intrins.y;
 
-    // z gradient contribution to mean3d
-    float v_z = v_depth[idx];
-    write_packed_float3(
-        v_mean3d, idx,
-        read_packed_float3(v_mean3d, idx) + float3(viewmat[8], viewmat[9], viewmat[10]) * v_z
-    );
+    const float3 p_view = transform_4x3(viewmat, p_world);
+    float3 pose_v_p_view = float3(0.0f);
+    float3x3 pose_v_view_rotation = float3x3(0.0f);
+    if (pose_enabled != 0) {
+        pose_v_p_view = project_view_pix_vjp(
+            p_view, fx, fy, read_packed_float2(v_xy, idx));
+        pose_v_p_view.z += v_depth[idx];
+    } else {
+        // Preserve the canonical projection VJP arithmetic exactly when pose
+        // refinement is disabled.
+        write_packed_float3(
+            v_mean3d, idx,
+            project_pix_vjp(
+                projmat, p_world, img_size, read_packed_float2(v_xy, idx))
+        );
+        write_packed_float3(
+            v_mean3d, idx,
+            read_packed_float3(v_mean3d, idx) +
+                float3(viewmat[8], viewmat[9], viewmat[10]) * v_depth[idx]
+        );
+    }
 
     // v_cov2d from v_conic (thread-local, no device memory round-trip)
     float local_v_cov2d[3];
@@ -1918,20 +2261,74 @@ kernel void project_and_sh_backward_kernel(
     // v_cov3d (thread-local) and v_mean3d contribution
     float tan_fovx = 0.5f * (float)img_size.x / fx;
     float tan_fovy = 0.5f * (float)img_size.y / fy;
-    float3 p_view = transform_4x3(viewmat, p_world);
     float local_v_cov3d[6];
-    project_cov3d_ewa_vjp(
-        local_cov3d,
-        viewmat,
-        fx,
-        fy,
-        tan_fovx,
-        tan_fovy,
-        float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
-        &(v_mean3d[3*idx]),
-        local_v_cov3d,
-        p_view
-    );
+    if (pose_enabled != 0) {
+        float3 covariance_v_p_view;
+        project_cov3d_ewa_pose_vjp(
+            local_cov3d,
+            viewmat,
+            fx,
+            fy,
+            tan_fovx,
+            tan_fovy,
+            float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
+            local_v_cov3d,
+            covariance_v_p_view,
+            pose_v_view_rotation,
+            p_view
+        );
+        pose_v_p_view += covariance_v_p_view;
+
+        const float3x3 W = view_rotation(viewmat);
+        write_packed_float3(
+            v_mean3d, idx,
+            float3(
+                dot(pose_v_p_view, W[0]),
+                dot(pose_v_p_view, W[1]),
+                dot(pose_v_p_view, W[2]))
+        );
+
+        // Gradient for a positive local left perturbation Exp([v,w]) * V.
+        // Appearance direction is deliberately detached: this geometric pose
+        // optimizer follows the renderer's existing mean-gradient policy.
+        const float3 translation_gradient = pose_v_p_view;
+        const float3 rotation_gradient =
+            cross(p_view, pose_v_p_view) +
+            cross(W[0], pose_v_view_rotation[0]) +
+            cross(W[1], pose_v_view_rotation[1]) +
+            cross(W[2], pose_v_view_rotation[2]);
+        atomic_fetch_add_explicit(
+            &pose_group_gradient[0], translation_gradient.x,
+            memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &pose_group_gradient[1], translation_gradient.y,
+            memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &pose_group_gradient[2], translation_gradient.z,
+            memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &pose_group_gradient[3], rotation_gradient.x,
+            memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &pose_group_gradient[4], rotation_gradient.y,
+            memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &pose_group_gradient[5], rotation_gradient.z,
+            memory_order_relaxed);
+    } else {
+        project_cov3d_ewa_vjp(
+            local_cov3d,
+            viewmat,
+            fx,
+            fy,
+            tan_fovx,
+            tan_fovy,
+            float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
+            &(v_mean3d[3*idx]),
+            local_v_cov3d,
+            p_view
+        );
+    }
 
     // v_scale and v_quat (reads v_cov3d from thread-local)
     scale_rot_to_cov3d_vjp(
@@ -1946,6 +2343,22 @@ kernel void project_and_sh_backward_kernel(
     v_scale[3*idx + 0] *= exp_scale.x;
     v_scale[3*idx + 1] *= exp_scale.y;
     v_scale[3*idx + 2] *= exp_scale.z;
+    }
+
+    if (pose_enabled != 0) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (thread_index == 0) {
+            for (uint component = 0; component < 6; ++component) {
+                atomic_fetch_add_explicit(
+                    &pose_gradient[component],
+                    atomic_load_explicit(
+                        &pose_group_gradient[component],
+                        memory_order_relaxed),
+                    memory_order_relaxed);
+            }
+        }
+    }
+    if (!active) return;
 
     // ---- Fused SH backward + Adam ----
     // Compute SH gradients in registers and apply Adam inline.

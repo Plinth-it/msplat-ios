@@ -21,6 +21,8 @@ class TrainingConfig:
     keep_crs: bool
     refine_photometric_gains: bool
     """Optimize bounded per-camera RGB gains during training. Disabled by default."""
+    refine_camera_poses: bool
+    """Optimize small regularized per-camera pose corrections after warm-up."""
     downscale_factor: float
     output: str
     save_every: int
@@ -49,6 +51,7 @@ class TrainingConfig:
         bg_color: list[float] = ...,
         max_gaussians: int = -1,
         refine_photometric_gains: bool = False,
+        refine_camera_poses: bool = False,
     ) -> None: ...
 
 class TrainingStats:

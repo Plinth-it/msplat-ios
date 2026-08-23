@@ -50,6 +50,10 @@ constexpr float kPhotometricMaxAbsLogGain = 1.38629436112f; // log(4)
 constexpr size_t kPhotometricMaxCameras = 1'000'000;
 constexpr size_t kPhotometricMaxFrameIdBytes = 1U << 20;
 constexpr size_t kPhotometricMaxFrameIdentityBytes = 64U << 20;
+constexpr float kPoseLearningRate = 1.0e-4f;
+constexpr float kPoseRegularization = 1.0e-4f;
+constexpr float kPoseMaxTranslation = 0.05f;
+constexpr float kPoseMaxRotation = 0.05235987756f; // 3 degrees
 
 static_assert(!collectsDensificationStats(1, 0));
 static_assert(!collectsDensificationStats(1, 1));
@@ -117,7 +121,9 @@ Model::Model(const InputData &inputData, int numCameras,
     const float* bgColor,
     int stopDensifyAt,
     int maxGaussians,
-    bool refinePhotometricGains)
+    bool refinePhotometricGains,
+    bool refineCameraPoses,
+    int poseAnchorCameraIndex)
     : numCameras(numCameras),
       datasetCameraCount(0),
       numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
@@ -127,7 +133,9 @@ Model::Model(const InputData &inputData, int numCameras,
       stopSplitAt(stopDensifyAt >= 0 ? stopDensifyAt : maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
       maxSteps(maxSteps), maxGaussians(maxGaussians),
-      refinePhotometricGains(refinePhotometricGains), keepCrs(keepCrs) {
+      refinePhotometricGains(refinePhotometricGains),
+      refineCameraPoses(refineCameraPoses),
+      poseAnchorCameraIndex(poseAnchorCameraIndex), keepCrs(keepCrs) {
 
     if (inputData.points.count <= 0)
         throw std::invalid_argument("Dataset must contain sparse points");
@@ -147,14 +155,24 @@ Model::Model(const InputData &inputData, int numCameras,
         numCameras > static_cast<int>(inputData.cameras.size()))
         throw std::invalid_argument("Dataset must contain training cameras");
     datasetCameraCount = static_cast<int>(inputData.cameras.size());
-    if (refinePhotometricGains) {
+    if (refineCameraPoses &&
+        (poseAnchorCameraIndex < 0 ||
+         poseAnchorCameraIndex >= datasetCameraCount)) {
+        throw std::invalid_argument(
+            "Pose refinement requires a canonical training-camera anchor");
+    }
+    if (!refineCameraPoses && poseAnchorCameraIndex != -1) {
+        throw std::invalid_argument(
+            "A pose anchor requires camera pose refinement");
+    }
+    if (refinePhotometricGains || refineCameraPoses) {
         if (inputData.cameras.size() > kPhotometricMaxCameras) {
             throw std::invalid_argument(
-                "Photometric refinement camera count is too large");
+                "Camera refinement camera count is too large");
         }
         if (inputData.metadata.frameIds.size() != inputData.cameras.size()) {
             throw std::invalid_argument(
-                "Photometric refinement requires a stable ID for every camera");
+                "Camera refinement requires a stable ID for every camera");
         }
         std::unordered_set<std::string> uniqueFrameIds;
         uniqueFrameIds.reserve(inputData.metadata.frameIds.size());
@@ -163,17 +181,17 @@ Model::Model(const InputData &inputData, int numCameras,
             if (frameId.empty() ||
                 frameId.size() > kPhotometricMaxFrameIdBytes) {
                 throw std::invalid_argument(
-                    "Photometric camera IDs must be non-empty and bounded");
+                    "Camera refinement IDs must be non-empty and bounded");
             }
             if (frameId.size() >
                 kPhotometricMaxFrameIdentityBytes - totalFrameIdBytes) {
                 throw std::invalid_argument(
-                    "Photometric camera IDs exceed the aggregate size limit");
+                    "Camera refinement IDs exceed the aggregate size limit");
             }
             totalFrameIdBytes += frameId.size();
             if (!uniqueFrameIds.insert(frameId).second) {
                 throw std::invalid_argument(
-                    "Photometric camera IDs must be unique");
+                    "Camera refinement IDs must be unique");
             }
         }
     }
@@ -210,8 +228,16 @@ Model::Model(const InputData &inputData, int numCameras,
     }
 
     int64_t numPoints = inputData.points.count;
-    if (refinePhotometricGains)
+    if (refinePhotometricGains || refineCameraPoses)
         cameraFrameIds = inputData.metadata.frameIds;
+    if (refineCameraPoses) {
+        cameraBasePoses.reserve(inputData.cameras.size() * 16);
+        for (const Camera& camera : inputData.cameras) {
+            cameraBasePoses.insert(
+                cameraBasePoses.end(), std::begin(camera.camToWorld),
+                std::end(camera.camToWorld));
+        }
+    }
     scale = inputData.scale;
     memcpy(translation, inputData.translation, sizeof(translation));
 
@@ -322,6 +348,15 @@ void Model::setupOptimizers(){
             static_cast<size_t>(datasetCameraCount), 0);
     }
 
+    const int poseRows = refineCameraPoses ? datasetCameraCount : 1;
+    cameraPoseDeltas = gpu_zeros({poseRows, 6}, DType::Float32);
+    if (refineCameraPoses) {
+        cameraPoseExpAvg = gpu_zeros({poseRows, 6}, DType::Float32);
+        cameraPoseExpAvgSq = gpu_zeros({poseRows, 6}, DType::Float32);
+        cameraPoseStepCounts.assign(
+            static_cast<size_t>(datasetCameraCount), 0);
+    }
+
     refreshViews();
 }
 
@@ -387,6 +422,9 @@ void Model::releaseOptimizers(){
     cameraLogGains.reset();
     cameraLogGainExpAvg.reset(); cameraLogGainExpAvgSq.reset();
     cameraLogGainStepCounts.clear();
+    cameraPoseDeltas.reset();
+    cameraPoseExpAvg.reset(); cameraPoseExpAvgSq.reset();
+    cameraPoseStepCounts.clear();
     resetDensificationScratch();
 }
 
@@ -418,7 +456,8 @@ size_t Model::estimatedGpuBytes() const {
         // `radii` is a non-owning alias of the shared render cache's radii_out
         // buffer, so counting it here would report the same allocation twice.
         &xysGradNorm, &visCounts, &max2DSize, &backgroundColor,
-        &cameraLogGains, &cameraLogGainExpAvg, &cameraLogGainExpAvgSq
+        &cameraLogGains, &cameraLogGainExpAvg, &cameraLogGainExpAvgSq,
+        &cameraPoseDeltas, &cameraPoseExpAvg, &cameraPoseExpAvgSq
     };
     for (const MTensor* tensor : tensors) {
         if (tensor->defined()) bytes += tensor->nbytes();
@@ -677,7 +716,7 @@ int Model::loadPly(const std::string &filename){
 // ── Checkpoint save/load ────────────────────────────────────────────────────
 
 static constexpr uint32_t CKPT_MAGIC = 0x4C50534D; // "MSPL"
-static constexpr uint32_t CKPT_VERSION = 2;
+static constexpr uint32_t CKPT_VERSION = 3;
 static constexpr uint32_t CKPT_MIN_VERSION = 1;
 static constexpr uint32_t CKPT_MAX_CAMERAS =
     static_cast<uint32_t>(kPhotometricMaxCameras);
@@ -698,6 +737,29 @@ static void writeTensor(std::ofstream &f, MTensor &t) {
     uint64_t bytes = t.nbytes();
     f.write(reinterpret_cast<const char*>(&bytes), sizeof(bytes));
     f.write(reinterpret_cast<const char*>(t.data_ptr()), bytes);
+}
+
+static void writeFloatTensor(
+    std::ofstream &f, const std::vector<float>& values,
+    const std::array<int64_t, 2>& shape
+) {
+    if (shape[0] <= 0 || shape[1] <= 0 ||
+        static_cast<uint64_t>(shape[0]) >
+            std::numeric_limits<uint64_t>::max() /
+                static_cast<uint64_t>(shape[1]) ||
+        static_cast<uint64_t>(shape[0]) *
+                static_cast<uint64_t>(shape[1]) != values.size()) {
+        throw std::runtime_error("Checkpoint Float32 tensor shape is invalid");
+    }
+    const uint32_t ndim = 2;
+    f.write(reinterpret_cast<const char*>(&ndim), sizeof(ndim));
+    f.write(reinterpret_cast<const char*>(shape.data()), sizeof(shape));
+    const uint64_t bytes = values.size() * sizeof(float);
+    f.write(reinterpret_cast<const char*>(&bytes), sizeof(bytes));
+    if (bytes > 0) {
+        f.write(reinterpret_cast<const char*>(values.data()),
+                static_cast<std::streamsize>(bytes));
+    }
 }
 
 static void writeCheckpointString(std::ofstream &f, const std::string &value) {
@@ -873,6 +935,13 @@ struct ParsedCheckpoint {
     std::vector<std::string> cameraFrameIds;
     std::vector<uint32_t> cameraStepCounts;
     std::array<CheckpointTensorRecord, 3> photometricTensors;
+    bool poseEnabled = false;
+    uint32_t poseCameraCount = 0;
+    uint32_t poseAnchorCameraIndex = 0;
+    std::vector<std::string> poseFrameIds;
+    std::vector<uint32_t> poseStepCounts;
+    CheckpointTensorRecord poseBasePoses;
+    std::array<CheckpointTensorRecord, 3> poseTensors;
 };
 
 ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
@@ -1029,6 +1098,113 @@ ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
         }
     }
 
+    if (version >= 3) {
+        const uint32_t poseEnabled =
+            reader.scalar<uint32_t>("pose enabled");
+        if (poseEnabled > 1)
+            checkpointError("pose enabled flag is invalid");
+        checkpoint.poseEnabled = poseEnabled != 0;
+        if (checkpoint.poseEnabled) {
+            checkpoint.poseCameraCount =
+                reader.scalar<uint32_t>("pose camera count");
+            if (checkpoint.poseCameraCount == 0 ||
+                checkpoint.poseCameraCount > CKPT_MAX_CAMERAS ||
+                checkpoint.poseCameraCount >
+                    static_cast<uint32_t>(std::numeric_limits<int>::max())) {
+                checkpointError(
+                    "pose camera count is outside the supported range");
+            }
+            checkpoint.poseAnchorCameraIndex =
+                reader.scalar<uint32_t>("pose anchor index");
+            if (checkpoint.poseAnchorCameraIndex >=
+                checkpoint.poseCameraCount) {
+                checkpointError("pose anchor index is out of range");
+            }
+
+            constexpr uint64_t minimumTensorRecordBytes =
+                sizeof(uint32_t) + 2 * sizeof(int64_t) + sizeof(uint64_t);
+            constexpr uint64_t minimumPerCameraBytes =
+                sizeof(uint32_t) + 1 + sizeof(uint32_t) +
+                (16 + 3 * 6) * sizeof(float);
+            const uint64_t minimumRemainingBytes =
+                checkedMultiply(checkpoint.poseCameraCount,
+                                minimumPerCameraBytes,
+                                "pose checkpoint minimum") +
+                4 * minimumTensorRecordBytes;
+            if (reader.remaining() < minimumRemainingBytes)
+                checkpointError("truncated pose checkpoint payload");
+
+            checkpoint.poseFrameIds.reserve(checkpoint.poseCameraCount);
+            std::unordered_set<std::string> uniqueFrameIds;
+            uniqueFrameIds.reserve(checkpoint.poseCameraCount);
+            uint64_t totalFrameIdBytes = 0;
+            for (uint32_t camera = 0;
+                 camera < checkpoint.poseCameraCount; ++camera) {
+                const uint32_t length =
+                    reader.scalar<uint32_t>("pose frame ID length");
+                if (length == 0 || length > CKPT_MAX_FRAME_ID_BYTES)
+                    checkpointError("pose frame ID length is invalid");
+                if (length >
+                    CKPT_MAX_FRAME_ID_TOTAL_BYTES - totalFrameIdBytes) {
+                    checkpointError(
+                        "pose frame IDs exceed the aggregate size limit");
+                }
+                totalFrameIdBytes += length;
+                std::string frameId(length, '\0');
+                reader.bytes(frameId.data(), length, "pose frame ID");
+                if (!uniqueFrameIds.insert(frameId).second)
+                    checkpointError("pose frame IDs are not unique");
+                checkpoint.poseFrameIds.push_back(std::move(frameId));
+            }
+            if (checkpoint.photometricEnabled &&
+                (checkpoint.cameraCount != checkpoint.poseCameraCount ||
+                 checkpoint.cameraFrameIds != checkpoint.poseFrameIds)) {
+                checkpointError(
+                    "photometric and pose camera identities do not match");
+            }
+
+            checkpoint.poseStepCounts.resize(checkpoint.poseCameraCount);
+            reader.bytes(
+                checkpoint.poseStepCounts.data(),
+                checkedMultiply(checkpoint.poseCameraCount,
+                                sizeof(uint32_t), "pose step counts"),
+                "pose step counts");
+            uint64_t totalPoseSteps = 0;
+            for (uint32_t camera = 0;
+                 camera < checkpoint.poseCameraCount; ++camera) {
+                const uint32_t count = checkpoint.poseStepCounts[camera];
+                if (count > checkpoint.adamSteps) {
+                    checkpointError(
+                        "pose step count exceeds the global Adam state");
+                }
+                if (totalPoseSteps >
+                    static_cast<uint64_t>(checkpoint.adamSteps - count)) {
+                    checkpointError(
+                        "pose step counts are inconsistent with Adam state");
+                }
+                totalPoseSteps += count;
+            }
+            if (checkpoint.poseStepCounts[
+                    checkpoint.poseAnchorCameraIndex] != 0) {
+                checkpointError("pose anchor step count must be zero");
+            }
+
+            const int64_t poseCameraCount =
+                static_cast<int64_t>(checkpoint.poseCameraCount);
+            checkpoint.poseBasePoses = readTensorRecord(
+                reader, {poseCameraCount, 16}, "pose.base_camera_to_world");
+            static constexpr const char* poseNames[3] = {
+                "pose.delta",
+                "pose.adam_exp_avg",
+                "pose.adam_exp_avg_sq",
+            };
+            for (size_t tensor = 0; tensor < 3; ++tensor) {
+                checkpoint.poseTensors[tensor] = readTensorRecord(
+                    reader, {poseCameraCount, 6}, poseNames[tensor]);
+            }
+        }
+    }
+
     reader.requireFullyConsumed();
     return checkpoint;
 }
@@ -1049,6 +1225,23 @@ MTensor loadCheckpointBuffer(CheckpointReader &reader,
     if (record.byteCount > 0)
         reader.readAt(record.dataOffset, buffer.data_ptr(), record.byteCount, name + ".data");
     return buffer;
+}
+
+std::vector<float> loadCheckpointFloatVector(
+    CheckpointReader& reader, const CheckpointTensorRecord& record,
+    const std::string& name
+) {
+    if (record.byteCount % sizeof(float) != 0)
+        checkpointError(name + " payload is not Float32-aligned");
+    const uint64_t valueCount = record.byteCount / sizeof(float);
+    if (valueCount > std::numeric_limits<size_t>::max())
+        checkpointError(name + " payload exceeds the platform size limit");
+    std::vector<float> values(static_cast<size_t>(valueCount));
+    if (record.byteCount > 0) {
+        reader.readAt(record.dataOffset, values.data(), record.byteCount,
+                      name + ".data");
+    }
+    return values;
 }
 
 } // namespace
@@ -1174,6 +1367,129 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
         writeTensor(f, cameraLogGainExpAvgSq);
     }
 
+    // Version 3 extension. Pose rows remain relative to the exact imported
+    // camera geometry recorded here; resume refuses to attach them to changed
+    // poses even when frame names are unchanged.
+    u = refineCameraPoses ? 1u : 0u;
+    f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+    if (refineCameraPoses) {
+        auto hasPoseShape = [&](const MTensor& tensor) {
+            return tensor.defined() && tensor.isGpu() &&
+                tensor.dtype() == DType::Float32 && tensor.ndim() == 2 &&
+                tensor.size(0) == datasetCameraCount && tensor.size(1) == 6;
+        };
+        const size_t cameraCount = static_cast<size_t>(datasetCameraCount);
+        if (datasetCameraCount <= 0 || adam_step_count < 0 ||
+            cameraCount > kPhotometricMaxCameras ||
+            poseAnchorCameraIndex < 0 ||
+            poseAnchorCameraIndex >= datasetCameraCount ||
+            cameraFrameIds.size() != cameraCount ||
+            cameraBasePoses.size() != cameraCount * 16 ||
+            cameraPoseStepCounts.size() != cameraCount ||
+            !hasPoseShape(cameraPoseDeltas) ||
+            !hasPoseShape(cameraPoseExpAvg) ||
+            !hasPoseShape(cameraPoseExpAvgSq)) {
+            throw std::runtime_error("Camera pose checkpoint state is incomplete");
+        }
+
+        std::unordered_set<std::string> uniqueFrameIds;
+        uniqueFrameIds.reserve(cameraFrameIds.size());
+        size_t totalFrameIdBytes = 0;
+        for (const std::string& frameId : cameraFrameIds) {
+            if (frameId.empty() ||
+                frameId.size() > kPhotometricMaxFrameIdBytes ||
+                frameId.size() >
+                    kPhotometricMaxFrameIdentityBytes - totalFrameIdBytes ||
+                !uniqueFrameIds.insert(frameId).second) {
+                throw std::runtime_error(
+                    "Camera pose checkpoint identities are invalid");
+            }
+            totalFrameIdBytes += frameId.size();
+        }
+
+        uint64_t totalPoseSteps = 0;
+        for (size_t camera = 0; camera < cameraCount; ++camera) {
+            const uint32_t count = cameraPoseStepCounts[camera];
+            if (count > static_cast<uint32_t>(adam_step_count) ||
+                totalPoseSteps >
+                    static_cast<uint64_t>(adam_step_count) - count) {
+                throw std::runtime_error(
+                    "Camera pose checkpoint step counts are invalid");
+            }
+            totalPoseSteps += count;
+        }
+        if (cameraPoseStepCounts[
+                static_cast<size_t>(poseAnchorCameraIndex)] != 0) {
+            throw std::runtime_error(
+                "Camera pose checkpoint anchor state is invalid");
+        }
+
+        for (float value : cameraBasePoses) {
+            if (!std::isfinite(value)) {
+                throw std::runtime_error(
+                    "Camera pose checkpoint base geometry is invalid");
+            }
+        }
+        const float* deltas = cameraPoseDeltas.data<float>();
+        const float* firstMoments = cameraPoseExpAvg.data<float>();
+        const float* secondMoments = cameraPoseExpAvgSq.data<float>();
+        for (size_t camera = 0; camera < cameraCount; ++camera) {
+            float translationNorm2 = 0.0f;
+            float rotationNorm2 = 0.0f;
+            for (size_t component = 0; component < 6; ++component) {
+                const size_t index = camera * 6 + component;
+                const float delta = deltas[index];
+                if (!std::isfinite(delta) ||
+                    !std::isfinite(firstMoments[index]) ||
+                    !std::isfinite(secondMoments[index]) ||
+                    secondMoments[index] < 0.0f) {
+                    throw std::runtime_error(
+                        "Camera pose checkpoint tensor data is invalid");
+                }
+                if (component < 3)
+                    translationNorm2 += delta * delta;
+                else
+                    rotationNorm2 += delta * delta;
+            }
+            if (translationNorm2 >
+                    (kPoseMaxTranslation + 1.0e-6f) *
+                    (kPoseMaxTranslation + 1.0e-6f) ||
+                rotationNorm2 >
+                    (kPoseMaxRotation + 1.0e-6f) *
+                    (kPoseMaxRotation + 1.0e-6f)) {
+                throw std::runtime_error(
+                    "Camera pose checkpoint delta is outside its bounds");
+            }
+        }
+        const size_t anchorOffset =
+            static_cast<size_t>(poseAnchorCameraIndex) * 6;
+        for (size_t component = 0; component < 6; ++component) {
+            if (deltas[anchorOffset + component] != 0.0f ||
+                firstMoments[anchorOffset + component] != 0.0f ||
+                secondMoments[anchorOffset + component] != 0.0f) {
+                throw std::runtime_error(
+                    "Camera pose checkpoint anchor state is invalid");
+            }
+        }
+
+        u = static_cast<uint32_t>(datasetCameraCount);
+        f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+        u = static_cast<uint32_t>(poseAnchorCameraIndex);
+        f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+        for (const std::string& frameId : cameraFrameIds)
+            writeCheckpointString(f, frameId);
+        f.write(
+            reinterpret_cast<const char*>(cameraPoseStepCounts.data()),
+            static_cast<std::streamsize>(
+                cameraPoseStepCounts.size() * sizeof(uint32_t)));
+        writeFloatTensor(
+            f, cameraBasePoses,
+            {static_cast<int64_t>(datasetCameraCount), 16});
+        writeTensor(f, cameraPoseDeltas);
+        writeTensor(f, cameraPoseExpAvg);
+        writeTensor(f, cameraPoseExpAvgSq);
+    }
+
     f.flush();
     if (!f) throw std::runtime_error("Failed while writing checkpoint file: " + filename);
     f.close();
@@ -1205,6 +1521,20 @@ int Model::loadCheckpoint(const std::string &filename) {
          checkpoint.cameraFrameIds != cameraFrameIds)) {
         checkpointError(
             "photometric camera identities do not match the dataset");
+    }
+    if (checkpoint.poseEnabled && !refineCameraPoses)
+        checkpointError(
+            "checkpoint requires camera pose refinement to be enabled");
+    if (checkpoint.poseEnabled &&
+        (checkpoint.poseCameraCount !=
+             static_cast<uint32_t>(datasetCameraCount) ||
+         checkpoint.poseFrameIds != cameraFrameIds)) {
+        checkpointError("pose camera identities do not match the dataset");
+    }
+    if (checkpoint.poseEnabled &&
+        checkpoint.poseAnchorCameraIndex !=
+            static_cast<uint32_t>(poseAnchorCameraIndex)) {
+        checkpointError("pose anchor does not match the training split");
     }
     const int capacity = capacityFor(activeCount);
     if (capacity < activeCount)
@@ -1277,6 +1607,86 @@ int Model::loadCheckpoint(const std::string &filename) {
         }
     }
 
+    const int poseRows = refineCameraPoses ? datasetCameraCount : 1;
+    MTensor newCameraPoseDeltas;
+    MTensor newCameraPoseExpAvg;
+    MTensor newCameraPoseExpAvgSq;
+    std::vector<uint32_t> newCameraPoseStepCounts;
+    if (checkpoint.poseEnabled) {
+        const std::vector<float> checkpointBasePoses =
+            loadCheckpointFloatVector(
+                reader, checkpoint.poseBasePoses,
+                "pose.base_camera_to_world");
+        for (float value : checkpointBasePoses) {
+            if (!std::isfinite(value))
+                checkpointError("pose base camera geometry is invalid");
+        }
+        if (checkpointBasePoses != cameraBasePoses)
+            checkpointError("pose base camera geometry does not match the dataset");
+
+        newCameraPoseDeltas = loadCheckpointBuffer(
+            reader, checkpoint.poseTensors[0], datasetCameraCount,
+            "pose.delta");
+        newCameraPoseExpAvg = loadCheckpointBuffer(
+            reader, checkpoint.poseTensors[1], datasetCameraCount,
+            "pose.adam_exp_avg");
+        newCameraPoseExpAvgSq = loadCheckpointBuffer(
+            reader, checkpoint.poseTensors[2], datasetCameraCount,
+            "pose.adam_exp_avg_sq");
+        newCameraPoseStepCounts = checkpoint.poseStepCounts;
+
+        const float* deltas = newCameraPoseDeltas.data<float>();
+        const float* firstMoments = newCameraPoseExpAvg.data<float>();
+        const float* secondMoments = newCameraPoseExpAvgSq.data<float>();
+        for (int camera = 0; camera < datasetCameraCount; ++camera) {
+            float translationNorm2 = 0.0f;
+            float rotationNorm2 = 0.0f;
+            for (int component = 0; component < 6; ++component) {
+                const int64_t index =
+                    static_cast<int64_t>(camera) * 6 + component;
+                const float delta = deltas[index];
+                if (!std::isfinite(delta) ||
+                    !std::isfinite(firstMoments[index]) ||
+                    !std::isfinite(secondMoments[index]) ||
+                    secondMoments[index] < 0.0f) {
+                    checkpointError("pose tensor data is invalid");
+                }
+                if (component < 3)
+                    translationNorm2 += delta * delta;
+                else
+                    rotationNorm2 += delta * delta;
+            }
+            if (translationNorm2 >
+                    (kPoseMaxTranslation + 1.0e-6f) *
+                    (kPoseMaxTranslation + 1.0e-6f) ||
+                rotationNorm2 >
+                    (kPoseMaxRotation + 1.0e-6f) *
+                    (kPoseMaxRotation + 1.0e-6f)) {
+                checkpointError("pose delta is outside its bounds");
+            }
+        }
+        const int64_t anchorOffset =
+            static_cast<int64_t>(poseAnchorCameraIndex) * 6;
+        for (int component = 0; component < 6; ++component) {
+            if (deltas[anchorOffset + component] != 0.0f ||
+                firstMoments[anchorOffset + component] != 0.0f ||
+                secondMoments[anchorOffset + component] != 0.0f) {
+                checkpointError("pose anchor optimizer state is not zero");
+            }
+        }
+    } else {
+        newCameraPoseDeltas = gpu_zeros(
+            {poseRows, 6}, DType::Float32);
+        if (refineCameraPoses) {
+            newCameraPoseExpAvg = gpu_zeros(
+                {poseRows, 6}, DType::Float32);
+            newCameraPoseExpAvgSq = gpu_zeros(
+                {poseRows, 6}, DType::Float32);
+            newCameraPoseStepCounts.assign(
+                static_cast<size_t>(datasetCameraCount), 0);
+        }
+    }
+
     DensificationScratch newDensificationScratch;
     if (needsDensificationAfterStep(checkpoint.step, stopSplitAt)) {
         const auto &featuresRestShape = checkpoint.parameters[4].shape;
@@ -1332,6 +1742,10 @@ int Model::loadCheckpoint(const std::string &filename) {
     cameraLogGainExpAvg = std::move(newCameraLogGainExpAvg);
     cameraLogGainExpAvgSq = std::move(newCameraLogGainExpAvgSq);
     cameraLogGainStepCounts = std::move(newCameraLogGainStepCounts);
+    cameraPoseDeltas = std::move(newCameraPoseDeltas);
+    cameraPoseExpAvg = std::move(newCameraPoseExpAvg);
+    cameraPoseExpAvgSq = std::move(newCameraPoseExpAvgSq);
+    cameraPoseStepCounts = std::move(newCameraPoseStepCounts);
 
     densify_split_flag = std::move(newDensificationScratch.splitFlag);
     densify_dup_flag = std::move(newDensificationScratch.dupFlag);
@@ -1465,9 +1879,9 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
 void Model::fullIteration(Camera& cam, int step,
                           const CameraTrainingTarget& target,
                           float ssimWeight){
-    if (refinePhotometricGains) {
+    if (refinePhotometricGains || refineCameraPoses) {
         throw std::invalid_argument(
-            "Photometric refinement requires a canonical camera index");
+            "Camera refinement requires a canonical camera index");
     }
     fullIteration(cam, 0, step, target, ssimWeight);
 }
@@ -1475,10 +1889,10 @@ void Model::fullIteration(Camera& cam, int step,
 void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
                           const CameraTrainingTarget& target,
                           float ssimWeight){
-    if (refinePhotometricGains &&
+    if ((refinePhotometricGains || refineCameraPoses) &&
         cameraIndex >= static_cast<size_t>(datasetCameraCount)) {
         throw std::out_of_range(
-            "Photometric camera index is out of range");
+            "Camera refinement index is out of range");
     }
     const bool collectDensificationStats =
         collectsDensificationStats(step, stopSplitAt);
@@ -1584,6 +1998,37 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
         photometric.maxAbsLogGain = kPhotometricMaxAbsLogGain;
     }
 
+    const bool poseStepEnabled = refineCameraPoses &&
+        step > warmupLength &&
+        cameraIndex != static_cast<size_t>(poseAnchorCameraIndex);
+    MsplatPoseRefinementStep pose;
+    pose.enabled = poseStepEnabled;
+    pose.cameraIndex = poseStepEnabled
+        ? static_cast<uint32_t>(cameraIndex)
+        : 0u;
+    pose.deltas = &cameraPoseDeltas;
+    uint32_t previousPoseStep = 0;
+    uint32_t nextPoseStep = 0;
+    if (poseStepEnabled) {
+        previousPoseStep = cameraPoseStepCounts[cameraIndex];
+        if (previousPoseStep == std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error(
+                "Camera pose optimizer step count cannot be incremented further");
+        }
+        nextPoseStep = previousPoseStep + 1;
+        const float poseBc1 = 1.0f -
+            std::pow(adam_beta1, static_cast<float>(nextPoseStep));
+        const float poseBc2 = 1.0f -
+            std::pow(adam_beta2, static_cast<float>(nextPoseStep));
+        pose.expAvg = &cameraPoseExpAvg;
+        pose.expAvgSq = &cameraPoseExpAvgSq;
+        pose.adamStepSize = kPoseLearningRate / poseBc1;
+        pose.adamBiasCorrection2Sqrt = std::sqrt(poseBc2);
+        pose.regularization = kPoseRegularization;
+        pose.maxTranslation = kPoseMaxTranslation;
+        pose.maxRotation = kPoseMaxRotation;
+    }
+
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     const float lossInvN = static_cast<float>(
         255.0 / (static_cast<double>(target.coverageUnits) * 3.0));
@@ -1592,6 +2037,8 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
     adam_step_count = nextAdamStep;
     if (refinePhotometricGains)
         cameraLogGainStepCounts[cameraIndex] = nextPhotometricStep;
+    if (poseStepEnabled)
+        cameraPoseStepCounts[cameraIndex] = nextPoseStep;
     try {
         r = msplat_train_step(
             numPoints, means, scales, 1.0f,
@@ -1606,12 +2053,15 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
             adam_ss, adam_bc2s,
             adam_beta1, adam_beta2, adam_eps,
             photometric,
+            pose,
             collectDensificationStats,
             visCounts, xysGradNorm, max2DSize, invMaxDim);
     } catch (...) {
         adam_step_count = previousAdamStep;
         if (refinePhotometricGains)
             cameraLogGainStepCounts[cameraIndex] = previousPhotometricStep;
+        if (poseStepEnabled)
+            cameraPoseStepCounts[cameraIndex] = previousPoseStep;
         throw;
     }
 

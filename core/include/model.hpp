@@ -22,7 +22,9 @@ struct Model{
         const float* bgColor = nullptr,
         int stopDensifyAt = -1,
         int maxGaussians = -1,
-        bool refinePhotometricGains = false);
+        bool refinePhotometricGains = false,
+        bool refineCameraPoses = false,
+        int poseAnchorCameraIndex = -1);
 
   ~Model(){ releaseOptimizers(); }
 
@@ -109,7 +111,15 @@ struct Model{
   MTensor cameraLogGainExpAvg;
   MTensor cameraLogGainExpAvgSq;
   std::vector<uint32_t> cameraLogGainStepCounts;
+  // Optional geometric camera refinement. Rows are indexed by the canonical
+  // dataset camera index. Each delta is [camera-space translation, axis-angle]
+  // and left-multiplies the immutable renderer view matrix during training.
+  MTensor cameraPoseDeltas;
+  MTensor cameraPoseExpAvg;
+  MTensor cameraPoseExpAvgSq;
+  std::vector<uint32_t> cameraPoseStepCounts;
   std::vector<std::string> cameraFrameIds;
+  std::vector<float> cameraBasePoses;
 
   int numCameras;
   int datasetCameraCount;
@@ -131,6 +141,8 @@ struct Model{
   /// Hard population and backing-buffer limit. -1 means unlimited.
   int maxGaussians;
   bool refinePhotometricGains;
+  bool refineCameraPoses;
+  int poseAnchorCameraIndex;
   bool keepCrs;
 
   float scale;

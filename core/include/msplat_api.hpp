@@ -37,6 +37,9 @@ struct Config {
     // exposure-like and their zero-mean residual is channel balance; source
     // pixels remain sRGB encoded, so this is not a physical exposure model.
     bool refinePhotometricGains = false;
+    // Learn small regularized camera-space SE(3) corrections after warm-up.
+    // Imported poses and canonical render/evaluation/export remain unchanged.
+    bool refineCameraPoses = false;
     float splitScreenSize = 0.05f;
     bool keepCrs = false;
     float downscaleFactor = 1.0f; // Legacy field retained for ABI compatibility; unused.

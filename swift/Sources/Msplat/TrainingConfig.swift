@@ -22,6 +22,9 @@ public struct TrainingConfig: Sendable {
     /// The source images are sRGB encoded, so this is a photometric correction,
     /// not a physical linear-light exposure model. Canonical renders are unchanged.
     public var refinePhotometricGains: Bool = false
+    /// Learn small, regularized camera-space pose corrections after warm-up.
+    /// Imported geometry and canonical render, evaluation, and export stay unchanged.
+    public var refineCameraPoses: Bool = false
     /// Legacy ABI field. Use `DatasetOptions.downscaleFactor`; this value does
     /// not affect training resolution.
     public var downscaleFactor: Float = 1.0
@@ -114,6 +117,9 @@ public struct TrainingConfig: Sendable {
         var options = msplat_default_refinement_options_v8()
         if refinePhotometricGains {
             options.flags |= UInt32(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS)
+        }
+        if refineCameraPoses {
+            options.flags |= UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS)
         }
         return options
     }

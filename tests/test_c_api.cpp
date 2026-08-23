@@ -17,7 +17,11 @@
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
-static_assert(MSPLAT_ABI_VERSION == 8u);
+static_assert(MSPLAT_ABI_VERSION == 9u);
+static_assert(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS == (1u << 0));
+static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS == (1u << 1));
+static_assert((MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS &
+               MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) == 0u);
 static_assert(sizeof(MsplatConfig) == 76);
 static_assert(alignof(MsplatConfig) == 4);
 static_assert(offsetof(MsplatConfig, keepCrs) == 56);
@@ -1039,6 +1043,16 @@ int main() {
               &refinementOptions, sizeof(refinementOptions), &error) ==
           MSPLAT_STATUS_OK);
     refinementOptions.flags = MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS;
+    CHECK(msplat_refinement_options_validate_v8(
+              &refinementOptions, sizeof(refinementOptions), &error) ==
+          MSPLAT_STATUS_OK);
+    refinementOptions.flags = MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS;
+    CHECK(msplat_refinement_options_validate_v8(
+              &refinementOptions, sizeof(refinementOptions), &error) ==
+          MSPLAT_STATUS_OK);
+    refinementOptions.flags =
+        MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS |
+        MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS;
     CHECK(msplat_refinement_options_validate_v8(
               &refinementOptions, sizeof(refinementOptions), &error) ==
           MSPLAT_STATUS_OK);

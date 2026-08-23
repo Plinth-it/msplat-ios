@@ -211,7 +211,11 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.bgColor,
         config.stopDensifyAt,
         config.maxGaussians,
-        config.refinePhotometricGains
+        config.refinePhotometricGains,
+        config.refineCameraPoses,
+        config.refineCameraPoses && !impl->ds->trainIndices.empty()
+            ? static_cast<int>(impl->ds->trainIndices.front())
+            : -1
     );
 
     impl->camIndices.resize(impl->ds->trainIndices.size());
@@ -1029,7 +1033,8 @@ void validateTrainingLimits(const MsplatTrainingLimits& limits) {
 void validateRefinementOptionsV8(
     const MsplatRefinementOptionsV8& options) {
     constexpr uint32_t knownFlags =
-        MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS;
+        MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS |
+        MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS;
     require((options.flags & ~knownFlags) == 0u,
             "Refinement options contain unknown flags");
     for (uint32_t reserved : options.reserved)
@@ -1332,6 +1337,9 @@ MsplatStatus msplat_trainer_create_v8(
         cfg.refinePhotometricGains =
             (refinementOptions->flags &
              MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS) != 0u;
+        cfg.refineCameraPoses =
+            (refinementOptions->flags &
+             MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) != 0u;
         auto handle = std::make_unique<CApiTrainerHandle>();
         handle->dataset = std::move(dataset);
         handle->trainer = std::make_unique<msplat::Trainer>(*handle->dataset, cfg);

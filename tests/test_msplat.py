@@ -32,6 +32,7 @@ def test_training_config_defaults():
     assert cfg.warmup_length == 500
     assert cfg.max_gaussians == -1
     assert cfg.refine_photometric_gains is False
+    assert cfg.refine_camera_poses is False
 
 
 def test_training_config_custom():
@@ -42,11 +43,13 @@ def test_training_config_custom():
         sh_degree=1,
         ssim_weight=0.0,
         refine_photometric_gains=True,
+        refine_camera_poses=True,
     )
     assert cfg.iterations == 100
     assert cfg.sh_degree == 1
     assert cfg.ssim_weight == 0.0
     assert cfg.refine_photometric_gains is True
+    assert cfg.refine_camera_poses is True
 
 
 def test_training_config_mutable():

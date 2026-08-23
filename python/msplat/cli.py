@@ -73,6 +73,9 @@ def main():
         refine_photometric_gains: bool = False
         """Optimize bounded per-camera RGB gains during training"""
 
+        refine_camera_poses: bool = False
+        """Optimize small regularized per-camera pose corrections after warm-up"""
+
         save_every: int = -1
         """Save every N steps (-1 to disable)"""
 
@@ -103,6 +106,7 @@ def main():
         split_screen_size=args.split_screen_size,
         keep_crs=args.keep_crs,
         refine_photometric_gains=args.refine_photometric_gains,
+        refine_camera_poses=args.refine_camera_poses,
         downscale_factor=args.downscale_factor,
         output=args.output,
         save_every=args.save_every,

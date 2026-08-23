@@ -56,9 +56,9 @@ string(REGEX MATCHALL
     "clamp_ewa_position\\(p_view, tan_fovx, tan_fovy\\)"
     clamp_uses "${metal_source}")
 list(LENGTH clamp_uses clamp_use_count)
-if(NOT clamp_use_count EQUAL 4)
+if(NOT clamp_use_count EQUAL 5)
     message(FATAL_ERROR
-        "Expected two forward and two backward EWA clamp uses, found ${clamp_use_count}")
+        "Expected two forward and three backward EWA clamp uses, found ${clamp_use_count}")
 endif()
 
 foreach(axis IN ITEMS x y)
@@ -76,18 +76,18 @@ foreach(axis IN ITEMS x y)
         "-clamped\\.ratio_gradient\\.${axis} \\* ${focal}_rz2 \\* v_J\\[2\\]\\[${j_index}\\]"
         axis_cotangents "${metal_source}")
     list(LENGTH axis_cotangents axis_cotangent_count)
-    if(NOT axis_cotangent_count EQUAL 2)
+    if(NOT axis_cotangent_count EQUAL 3)
         message(FATAL_ERROR
-            "Expected both EWA ${axis} cotangents, found ${axis_cotangent_count}")
+            "Expected all three EWA ${axis} cotangents, found ${axis_cotangent_count}")
     endif()
 
     string(REGEX MATCHALL
         "\\(1\\.f \\+ clamped\\.ratio_gradient\\.${axis}\\) \\* ${focal} \\* p_view\\.${position} \\* rz3"
         depth_cotangents "${metal_source}")
     list(LENGTH depth_cotangents depth_cotangent_count)
-    if(NOT depth_cotangent_count EQUAL 2)
+    if(NOT depth_cotangent_count EQUAL 3)
         message(FATAL_ERROR
-            "Expected both EWA ${axis} depth cotangents, found ${depth_cotangent_count}")
+            "Expected all three EWA ${axis} depth cotangents, found ${depth_cotangent_count}")
     endif()
 endforeach()
 

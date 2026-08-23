@@ -156,6 +156,19 @@ struct MsplatPhotometricRefinementStep {
     float maxAbsLogGain = 0.0f;
 };
 
+struct MsplatPoseRefinementStep {
+    bool enabled = false;
+    uint32_t cameraIndex = 0;
+    MTensor* deltas = nullptr;       // [N,6]: camera-space translation, axis-angle
+    MTensor* expAvg = nullptr;
+    MTensor* expAvgSq = nullptr;
+    float adamStepSize = 0.0f;
+    float adamBiasCorrection2Sqrt = 1.0f;
+    float regularization = 0.0f;
+    float maxTranslation = 0.0f;
+    float maxRotation = 0.0f;
+};
+
 // Fused forward + backward + Adam, with optional densification grad stats.
 // Normalized data loss is available from the completed logical-step telemetry
 // snapshot. Optimizer-only regularization terms are intentionally excluded.
@@ -176,6 +189,7 @@ MTensor msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     const MsplatPhotometricRefinementStep& photometric,
+    const MsplatPoseRefinementStep& pose,
     bool collect_densification_stats,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
     float inv_max_dim

@@ -24,6 +24,7 @@ namespace {
 constexpr uint32_t checkpointMagic = 0x4C50534D;
 constexpr uint32_t checkpointVersionV1 = 1;
 constexpr uint32_t checkpointVersionV2 = 2;
+constexpr uint32_t checkpointVersionV3 = 3;
 
 template <typename T>
 void appendScalar(std::vector<uint8_t> &bytes, T value) {
@@ -41,7 +42,8 @@ uint64_t tensorBytes(const std::vector<int64_t> &shape) {
 
 void appendTensor(std::vector<uint8_t> &bytes,
                   const std::vector<int64_t> &shape,
-                  size_t *byteCountOffset = nullptr) {
+                  size_t *byteCountOffset = nullptr,
+                  size_t *dataOffset = nullptr) {
     appendScalar(bytes, static_cast<uint32_t>(shape.size()));
     for (int64_t dimension : shape)
         appendScalar(bytes, dimension);
@@ -49,6 +51,8 @@ void appendTensor(std::vector<uint8_t> &bytes,
         *byteCountOffset = bytes.size();
     const uint64_t payloadBytes = tensorBytes(shape);
     appendScalar(bytes, payloadBytes);
+    if (dataOffset)
+        *dataOffset = bytes.size();
     bytes.resize(bytes.size() + static_cast<size_t>(payloadBytes), 0);
 }
 
@@ -122,6 +126,74 @@ std::vector<uint8_t> validV2Checkpoint(
     return bytes;
 }
 
+struct V3CheckpointFixture {
+    std::vector<uint8_t> bytes;
+    size_t poseFlagOffset = 0;
+    size_t cameraCountOffset = 0;
+    size_t anchorIndexOffset = 0;
+    size_t firstPoseStepOffset = 0;
+    size_t basePosesByteCountOffset = 0;
+    size_t poseDeltaByteCountOffset = 0;
+    size_t firstMomentByteCountOffset = 0;
+    size_t secondMomentByteCountOffset = 0;
+};
+
+V3CheckpointFixture validV3Checkpoint(
+    bool photometricEnabled,
+    bool poseEnabled,
+    const std::array<std::string, 2> &poseFrameIds = {"frame-0", "frame-1"},
+    const std::array<std::string, 2> &photometricFrameIds = {"frame-0", "frame-1"}) {
+    size_t ignored = 0;
+    V3CheckpointFixture fixture;
+    fixture.bytes = validV2Checkpoint(
+        photometricEnabled, ignored, ignored, ignored, ignored,
+        photometricFrameIds);
+    std::memcpy(fixture.bytes.data() + sizeof(uint32_t),
+                &checkpointVersionV3, sizeof(checkpointVersionV3));
+
+    fixture.poseFlagOffset = fixture.bytes.size();
+    appendScalar(fixture.bytes, poseEnabled ? uint32_t{1} : uint32_t{0});
+    if (!poseEnabled)
+        return fixture;
+
+    fixture.cameraCountOffset = fixture.bytes.size();
+    appendScalar(fixture.bytes, uint32_t{2});
+    fixture.anchorIndexOffset = fixture.bytes.size();
+    appendScalar(fixture.bytes, uint32_t{0});
+    for (const std::string &frameId : poseFrameIds)
+        appendString(fixture.bytes, frameId);
+
+    // The anchored camera is never updated. The second camera's count remains
+    // below the global Adam step count stored in the v1-compatible prefix.
+    fixture.firstPoseStepOffset = fixture.bytes.size();
+    appendScalar(fixture.bytes, uint32_t{0});
+    appendScalar(fixture.bytes, uint32_t{10});
+
+    size_t basePoseDataOffset = 0;
+    appendTensor(fixture.bytes, {2, 16},
+                 &fixture.basePosesByteCountOffset, &basePoseDataOffset);
+    const std::array<float, 32> basePoses = {
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+        1, 0, 0, 1,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    };
+    std::memcpy(fixture.bytes.data() + basePoseDataOffset,
+                basePoses.data(), sizeof(basePoses));
+
+    appendTensor(fixture.bytes, {2, 6},
+                 &fixture.poseDeltaByteCountOffset);
+    appendTensor(fixture.bytes, {2, 6},
+                 &fixture.firstMomentByteCountOffset);
+    appendTensor(fixture.bytes, {2, 6},
+                 &fixture.secondMomentByteCountOffset);
+    return fixture;
+}
+
 void writeFile(const fs::path &path, const std::vector<uint8_t> &bytes) {
     std::ofstream stream(path, std::ios::binary | std::ios::trunc);
     if (!stream)
@@ -181,6 +253,13 @@ int main() {
     const fs::path truncatedPhotoPayloadPath =
         prefix.string() + "-photo-payload.msplat";
     const fs::path trailingV2Path = prefix.string() + "-trailing-v2.msplat";
+    const fs::path validV3DisabledPath = prefix.string() + "-valid-v3-disabled.msplat";
+    const fs::path validV3PosePath = prefix.string() + "-valid-v3-pose.msplat";
+    const fs::path validV3BothPath = prefix.string() + "-valid-v3-both.msplat";
+    const fs::path poseCorruptPath = prefix.string() + "-pose-corrupt.msplat";
+    const fs::path truncatedPosePayloadPath =
+        prefix.string() + "-pose-payload.msplat";
+    const fs::path trailingV3Path = prefix.string() + "-trailing-v3.msplat";
     const fs::path atomicDestination = prefix.string() + "-atomic.bin";
     const fs::path atomicSentinel = atomicDestination.string() + ".tmp";
     RemoveFiles cleanup{{validPath, truncatedPath, badByteCountPath,
@@ -190,6 +269,9 @@ int main() {
                          maxPhotoStepPath, inconsistentPhotoStepsPath,
                          badPhotoTensorPath, hugePhotoCountPath,
                          truncatedPhotoPayloadPath, trailingV2Path,
+                         validV3DisabledPath, validV3PosePath,
+                         validV3BothPath, poseCorruptPath,
+                         truncatedPosePayloadPath, trailingV3Path,
                          atomicDestination, atomicSentinel}};
 
     size_t firstTensorByteCountOffset = 0;
@@ -305,6 +387,131 @@ int main() {
     trailingV2.push_back(0);
     writeFile(trailingV2Path, trailingV2);
     CHECK(rejects(trailingV2Path, "trailing data"));
+
+    // Version 3 retains the complete v2 prefix and adds an independently
+    // optional pose-refinement payload. Exercise disabled, pose-only, and
+    // combined photometric+pose states so the prefix remains compatible.
+    const V3CheckpointFixture validV3Disabled =
+        validV3Checkpoint(false, false);
+    writeFile(validV3DisabledPath, validV3Disabled.bytes);
+    validateCheckpointFile(validV3DisabledPath.string());
+
+    const V3CheckpointFixture validV3Pose = validV3Checkpoint(false, true);
+    writeFile(validV3PosePath, validV3Pose.bytes);
+    validateCheckpointFile(validV3PosePath.string());
+
+    const V3CheckpointFixture validV3Both = validV3Checkpoint(true, true);
+    writeFile(validV3BothPath, validV3Both.bytes);
+    validateCheckpointFile(validV3BothPath.string());
+
+    std::vector<uint8_t> invalidPoseFlag = validV3Disabled.bytes;
+    std::memcpy(invalidPoseFlag.data() + validV3Disabled.poseFlagOffset,
+                &invalidFlag, sizeof(invalidFlag));
+    writeFile(poseCorruptPath, invalidPoseFlag);
+    CHECK(rejects(poseCorruptPath, "pose enabled flag"));
+
+    std::vector<uint8_t> zeroPoseCameraCount = validV3Pose.bytes;
+    const uint32_t zeroCount = 0;
+    std::memcpy(zeroPoseCameraCount.data() + validV3Pose.cameraCountOffset,
+                &zeroCount, sizeof(zeroCount));
+    writeFile(poseCorruptPath, zeroPoseCameraCount);
+    CHECK(rejects(poseCorruptPath, "pose camera count"));
+
+    std::vector<uint8_t> hugePoseCameraCount = validV3Pose.bytes;
+    const uint32_t tooManyCameras = 1'000'001;
+    std::memcpy(hugePoseCameraCount.data() + validV3Pose.cameraCountOffset,
+                &tooManyCameras, sizeof(tooManyCameras));
+    writeFile(poseCorruptPath, hugePoseCameraCount);
+    CHECK(rejects(poseCorruptPath, "pose camera count"));
+
+    std::vector<uint8_t> invalidAnchor = validV3Pose.bytes;
+    const uint32_t outOfRangeAnchor = 2;
+    std::memcpy(invalidAnchor.data() + validV3Pose.anchorIndexOffset,
+                &outOfRangeAnchor, sizeof(outOfRangeAnchor));
+    writeFile(poseCorruptPath, invalidAnchor);
+    CHECK(rejects(poseCorruptPath, "pose anchor index"));
+
+    const V3CheckpointFixture duplicatePoseId = validV3Checkpoint(
+        false, true, {"same", "same"});
+    writeFile(poseCorruptPath, duplicatePoseId.bytes);
+    CHECK(rejects(poseCorruptPath, "pose frame IDs are not unique"));
+
+    const V3CheckpointFixture emptyPoseId = validV3Checkpoint(
+        false, true, {"", "frame-1"});
+    writeFile(poseCorruptPath, emptyPoseId.bytes);
+    CHECK(rejects(poseCorruptPath, "pose frame ID length"));
+
+    const V3CheckpointFixture reorderedPoseIds = validV3Checkpoint(
+        true, true, {"frame-1", "frame-0"});
+    writeFile(poseCorruptPath, reorderedPoseIds.bytes);
+    CHECK(rejects(poseCorruptPath, "camera identities"));
+
+    std::vector<uint8_t> maxPoseStep = validV3Pose.bytes;
+    std::memcpy(maxPoseStep.data() + validV3Pose.firstPoseStepOffset +
+                    sizeof(uint32_t),
+                &maxPhotoCount, sizeof(maxPhotoCount));
+    writeFile(poseCorruptPath, maxPoseStep);
+    CHECK(rejects(poseCorruptPath, "pose step count"));
+
+    std::vector<uint8_t> inconsistentPoseSteps = validV3Pose.bytes;
+    std::memcpy(inconsistentPoseSteps.data() + validV3Pose.firstPoseStepOffset,
+                &tenVisits, sizeof(tenVisits));
+    std::memcpy(inconsistentPoseSteps.data() + validV3Pose.firstPoseStepOffset +
+                    sizeof(uint32_t),
+                &tenVisits, sizeof(tenVisits));
+    writeFile(poseCorruptPath, inconsistentPoseSteps);
+    CHECK(rejects(poseCorruptPath, "pose step counts"));
+
+    std::vector<uint8_t> updatedPoseAnchor = validV3Pose.bytes;
+    const uint32_t oneAnchorVisit = 1;
+    std::memcpy(updatedPoseAnchor.data() + validV3Pose.firstPoseStepOffset,
+                &oneAnchorVisit, sizeof(oneAnchorVisit));
+    writeFile(poseCorruptPath, updatedPoseAnchor);
+    CHECK(rejects(poseCorruptPath, "pose anchor step count"));
+
+    std::vector<uint8_t> badBasePoseShape = validV3Pose.bytes;
+    const int64_t badBasePoseWidth = 15;
+    std::memcpy(badBasePoseShape.data() +
+                    validV3Pose.basePosesByteCountOffset - sizeof(int64_t),
+                &badBasePoseWidth, sizeof(badBasePoseWidth));
+    writeFile(poseCorruptPath, badBasePoseShape);
+    CHECK(rejects(poseCorruptPath, "incompatible shape"));
+
+    std::vector<uint8_t> badPoseDeltaShape = validV3Pose.bytes;
+    const int64_t badPoseDeltaWidth = 7;
+    std::memcpy(badPoseDeltaShape.data() +
+                    validV3Pose.poseDeltaByteCountOffset - sizeof(int64_t),
+                &badPoseDeltaWidth, sizeof(badPoseDeltaWidth));
+    writeFile(poseCorruptPath, badPoseDeltaShape);
+    CHECK(rejects(poseCorruptPath, "incompatible shape"));
+
+    std::vector<uint8_t> badPoseMomentBytes = validV3Pose.bytes;
+    uint64_t poseMomentBytes = 0;
+    std::memcpy(&poseMomentBytes,
+                badPoseMomentBytes.data() +
+                    validV3Pose.secondMomentByteCountOffset,
+                sizeof(poseMomentBytes));
+    ++poseMomentBytes;
+    std::memcpy(badPoseMomentBytes.data() +
+                    validV3Pose.secondMomentByteCountOffset,
+                &poseMomentBytes, sizeof(poseMomentBytes));
+    writeFile(poseCorruptPath, badPoseMomentBytes);
+    CHECK(rejects(poseCorruptPath, "byte count"));
+
+    // Reject attacker-sized counts before reserving per-camera containers.
+    std::vector<uint8_t> truncatedPosePayload = validV3Disabled.bytes;
+    truncatedPosePayload.resize(validV3Disabled.poseFlagOffset);
+    appendScalar(truncatedPosePayload, uint32_t{1});
+    appendScalar(truncatedPosePayload, uint32_t{1'000'000});
+    appendScalar(truncatedPosePayload, uint32_t{0});
+    writeFile(truncatedPosePayloadPath, truncatedPosePayload);
+    CHECK(rejects(truncatedPosePayloadPath,
+                  "truncated pose checkpoint payload"));
+
+    std::vector<uint8_t> trailingV3 = validV3Pose.bytes;
+    trailingV3.push_back(0);
+    writeFile(trailingV3Path, trailingV3);
+    CHECK(rejects(trailingV3Path, "trailing data"));
 
     {
         std::ofstream sentinel(atomicSentinel, std::ios::binary | std::ios::trunc);

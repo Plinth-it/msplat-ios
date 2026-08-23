@@ -21,8 +21,11 @@ extern "C" {
 // ABI v7 adds CPU-only capture diagnostics over canonical observations.
 // ABI v8 adds versioned refinement options without changing MsplatConfig's
 // locked layout.
+// ABI v9 adds the camera-pose refinement capability bit to those unchanged
+// v8 options. The global bump lets new clients reject older binaries that
+// would interpret that bit as unknown.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 8u
+#define MSPLAT_ABI_VERSION 9u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -110,11 +113,15 @@ static inline MsplatTrainingLimits msplat_default_training_limits(void) {
     return limits;
 }
 
-/// Optional training refinements introduced in ABI v8. These flags are kept
-/// outside MsplatConfig so its established binary layout remains unchanged.
+/// Optional training refinements introduced in ABI v8 and extended in ABI v9.
+/// These flags are kept outside MsplatConfig so its established binary layout
+/// remains unchanged.
 /// Photometric RGB gains affect only the training objective; rendering and
 /// evaluation continue to use the canonical model colors.
 #define MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS (1u << 0)
+/// Learn bounded camera-space pose corrections only for training. Imported
+/// camera geometry and canonical render/evaluation/export remain unchanged.
+#define MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS     (1u << 1)
 
 typedef struct {
     uint32_t flags;
@@ -476,8 +483,9 @@ MsplatStatus msplat_trainer_create_v3(MsplatDataset ds,
                                       size_t limitsSize,
                                       MsplatTrainer* outTrainer,
                                       MsplatErrorInfo* error);
-// ABI v8 trainer creation. Refinement options are versioned separately from
-// MsplatConfig. Unknown flags and non-zero reserved fields are rejected.
+// ABI v8 trainer creation, extended by ABI v9's camera-pose flag. Refinement
+// options are versioned separately from MsplatConfig. Unknown flags and
+// non-zero reserved fields are rejected.
 MsplatStatus msplat_refinement_options_validate_v8(
     const MsplatRefinementOptionsV8* options, size_t optionsSize,
     MsplatErrorInfo* error);
