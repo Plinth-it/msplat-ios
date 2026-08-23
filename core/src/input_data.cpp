@@ -770,7 +770,9 @@ DatasetDescriptor datasetDescriptorFromX(
             return validated(loaders::loadColmap(path, colmapImagePath));
 
     // Polycam: keyframes/ directory or cameras.json
-    if (fs::exists(root / "keyframes" / "corrected_cameras") || fs::exists(root / "cameras.json"))
+    if (fs::exists(root / "keyframes" / "corrected_cameras") ||
+        fs::exists(root / "keyframes" / "cameras") ||
+        fs::exists(root / "cameras.json"))
         return validated(loaders::loadPolycam(path));
 
     throw std::runtime_error("Unrecognized dataset format in: " + path +

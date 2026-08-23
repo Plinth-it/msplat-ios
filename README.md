@@ -128,6 +128,10 @@ them, or preserve their encoded raster.
   Polycam adapters, preserving source frame/calibration identity, sparse-point
   IDs, reprojection errors, image observations, and adapter provenance; COLMAP
   track reciprocity is checked before the descriptor is materialized
+- Polycam raw exports read the documented row-major `t_00...t_23` ARKit
+  camera-to-world transform directly, preferring a complete corrected
+  camera/image pair per frame while falling back to that frame's raw pair when
+  optimization output is partial
 - XCFramework slices for `macos-arm64`, `ios-arm64` and
   `ios-arm64_x86_64-simulator`, each with its own metallib
 

@@ -63,6 +63,11 @@
   canonical dataset descriptor. It preserves stable frame/calibration IDs,
   COLMAP sparse-point IDs and reprojection errors, source provenance, and an
   explicit encoded or EXIF-normalized raster-coordinate policy.
+- Corrected Polycam raw-export pose import to read the documented row-major
+  `t_00...t_23` camera-to-world matrix without an extra axis flip. Each frame
+  now uses corrected data only when both its corrected camera and image exist,
+  otherwise falling back to its complete raw pair; incomplete pairs and
+  missing required intrinsics are rejected explicitly.
 - COLMAP image observations and sparse-point tracks are now retained as one
   canonical correspondence table. Text and binary imports reject inconsistent
   tracks, duplicate source IDs, truncated records, and unsafe source counts.

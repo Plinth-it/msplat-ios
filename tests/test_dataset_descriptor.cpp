@@ -267,8 +267,10 @@ bool checkPolycamLayout1Adapter() {
         std::ofstream camera(cameraDirectory / (id + ".json"));
         camera << "{\"width\":4,\"height\":3,\"fx\":2,\"fy\":2.5,"
                << "\"cx\":2,\"cy\":1.5,"
-               << "\"R_00\":1,\"R_11\":1,\"R_22\":1,"
-               << "\"t_20\":" << translation << "}";
+               << "\"t_00\":0,\"t_01\":0,\"t_02\":1,"
+               << "\"t_03\":" << translation << ","
+               << "\"t_10\":0,\"t_11\":1,\"t_12\":0,\"t_13\":2,"
+               << "\"t_20\":-1,\"t_21\":0,\"t_22\":0,\"t_23\":3}";
         return static_cast<bool>(camera);
     };
     if (!writeCamera("b", 1.0f) || !writeCamera("a", -1.0f)) return false;
@@ -279,6 +281,18 @@ bool checkPolycamLayout1Adapter() {
 
     const DatasetDescriptor descriptor =
         datasetDescriptorFromX(temporary.path.string());
+    const std::array<float, 16> expectedFirstPose = {
+        0.0f, 0.0f, 1.0f, -1.0f,
+        0.0f, 1.0f, 0.0f,  2.0f,
+       -1.0f, 0.0f, 0.0f,  3.0f,
+        0.0f, 0.0f, 0.0f,  1.0f,
+    };
+    const std::array<float, 16> expectedSecondPose = {
+        0.0f, 0.0f, 1.0f, 1.0f,
+        0.0f, 1.0f, 0.0f, 2.0f,
+       -1.0f, 0.0f, 0.0f, 3.0f,
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
     return descriptor.provenance.adapter == "polycam" &&
            descriptor.frames.size() == 2 &&
            descriptor.frames[0].id == "a" &&
@@ -289,7 +303,134 @@ bool checkPolycamLayout1Adapter() {
                (imageDirectory / "a.jpg").string() &&
            descriptor.frames[1].imagePath ==
                (imageDirectory / "b.png").string() &&
+           descriptor.frames[0].cameraToWorld == expectedFirstPose &&
+           descriptor.frames[1].cameraToWorld == expectedSecondPose &&
            descriptor.points.count() == 2;
+}
+
+bool checkPolycamRawLayoutFallback() {
+    TempDirectory temporary;
+    const fs::path cameraDirectory = temporary.path / "keyframes/cameras";
+    const fs::path imageDirectory = temporary.path / "keyframes/images";
+    fs::create_directories(cameraDirectory);
+    fs::create_directories(imageDirectory);
+    // A partial optimized frame must not hide its complete raw pair.
+    const fs::path correctedCameraDirectory =
+        temporary.path / "keyframes/corrected_cameras";
+    const fs::path correctedImageDirectory =
+        temporary.path / "keyframes/corrected_images";
+    fs::create_directories(correctedCameraDirectory);
+    fs::create_directories(correctedImageDirectory);
+
+    {
+        std::ofstream camera(cameraDirectory / "42.json");
+        camera << R"({"width":4,"height":3,"fx":2,"fy":2.5,
+"cx":2,"cy":1.5,
+"t_00":1,"t_01":0,"t_02":0,"t_03":4,
+"t_10":0,"t_11":1,"t_12":0,"t_13":5,
+"t_20":0,"t_21":0,"t_22":1,"t_23":6})";
+        if (!camera) return false;
+    }
+    {
+        std::ofstream camera(correctedCameraDirectory / "42.json");
+        camera << R"({"width":4,"height":3,"fx":2,"fy":2.5,
+"cx":2,"cy":1.5,
+"t_00":1,"t_01":0,"t_02":0,"t_03":40,
+"t_10":0,"t_11":1,"t_12":0,"t_13":50,
+"t_20":0,"t_21":0,"t_22":1,"t_23":60})";
+        if (!camera) return false;
+    }
+    std::ofstream(imageDirectory / "42.jpg").close();
+    if (!writePointPly(temporary.path / "keyframes/point_cloud.ply"))
+        return false;
+
+    const DatasetDescriptor descriptor =
+        datasetDescriptorFromX(temporary.path.string());
+    return descriptor.frames.size() == 1 &&
+           descriptor.frames[0].id == "42" &&
+           descriptor.frames[0].imagePath ==
+               (imageDirectory / "42.jpg").string() &&
+           descriptor.frames[0].cameraToWorld[3] == 4.0f &&
+           descriptor.frames[0].cameraToWorld[7] == 5.0f &&
+           descriptor.frames[0].cameraToWorld[11] == 6.0f;
+}
+
+bool checkPolycamLayout1MissingImageRejected() {
+    TempDirectory temporary;
+    const fs::path cameraDirectory =
+        temporary.path / "keyframes/corrected_cameras";
+    fs::create_directories(cameraDirectory);
+    {
+        std::ofstream camera(cameraDirectory / "orphan.json");
+        camera << R"({"width":4,"height":3,"fx":2,"fy":2.5,
+"cx":2,"cy":1.5,
+"t_00":1,"t_01":0,"t_02":0,"t_03":0,
+"t_10":0,"t_11":1,"t_12":0,"t_13":0,
+"t_20":0,"t_21":0,"t_22":1,"t_23":0})";
+        if (!camera) return false;
+    }
+
+    try {
+        (void)datasetDescriptorFromX(temporary.path.string());
+    } catch (const std::invalid_argument &error) {
+        return std::string(error.what()).find("camera/image pair") !=
+               std::string::npos;
+    }
+    return false;
+}
+
+bool checkPolycamLayout1MissingIntrinsicRejected() {
+    TempDirectory temporary;
+    const fs::path cameraDirectory =
+        temporary.path / "keyframes/corrected_cameras";
+    const fs::path imageDirectory =
+        temporary.path / "keyframes/corrected_images";
+    fs::create_directories(cameraDirectory);
+    fs::create_directories(imageDirectory);
+    {
+        std::ofstream camera(cameraDirectory / "missing.json");
+        camera << R"({"width":4,"height":3,"fx":2,"fy":2.5,
+"cy":1.5,
+"t_00":1,"t_01":0,"t_02":0,"t_03":0,
+"t_10":0,"t_11":1,"t_12":0,"t_13":0,
+"t_20":0,"t_21":0,"t_22":1,"t_23":0})";
+        if (!camera) return false;
+    }
+    std::ofstream(imageDirectory / "missing.jpg").close();
+
+    try {
+        (void)datasetDescriptorFromX(temporary.path.string());
+    } catch (const std::invalid_argument &error) {
+        return std::string(error.what()).find("numeric field cx") !=
+               std::string::npos;
+    }
+    return false;
+}
+
+bool checkPolycamLayout1MissingTransformRejected() {
+    TempDirectory temporary;
+    const fs::path cameraDirectory =
+        temporary.path / "keyframes/corrected_cameras";
+    const fs::path imageDirectory =
+        temporary.path / "keyframes/corrected_images";
+    fs::create_directories(cameraDirectory);
+    fs::create_directories(imageDirectory);
+    {
+        std::ofstream camera(cameraDirectory / "missing.json");
+        camera << R"({"width":4,"height":3,"fx":2,"fy":2.5,
+"t_00":1,"t_01":0,"t_02":0,"t_03":0,
+"t_10":0,"t_11":1,"t_12":0,"t_13":0,
+"t_20":0,"t_21":0,"t_22":1})";
+        if (!camera) return false;
+    }
+    std::ofstream(imageDirectory / "missing.jpg").close();
+
+    try {
+        (void)datasetDescriptorFromX(temporary.path.string());
+    } catch (const std::invalid_argument &error) {
+        return std::string(error.what()).find("t_23") != std::string::npos;
+    }
+    return false;
 }
 
 bool checkPolycamLayout2Adapter() {
@@ -298,7 +439,7 @@ bool checkPolycamLayout2Adapter() {
         std::ofstream cameras(temporary.path / "cameras.json");
         cameras << R"({"frames":[
   {"file_path":"images/z.png","width":4,"height":3,"fx":2,"fy":2.5,
-   "transform_matrix":[[1,0,0,1],[0,1,0,0],[0,0,1,0],[0,0,0,1]]},
+   "transform_matrix":[[0,0,1,1],[0,1,0,2],[-1,0,0,3],[0,0,0,1]]},
   {"file_path":"images/a.png","width":4,"height":3,"fx":2,"fy":2.5,
    "transform_matrix":[[1,0,0,-1],[0,1,0,0],[0,0,1,0],[0,0,0,1]]}
 ]})";
@@ -308,6 +449,12 @@ bool checkPolycamLayout2Adapter() {
 
     const DatasetDescriptor descriptor =
         datasetDescriptorFromX(temporary.path.string());
+    const std::array<float, 16> expectedFirstPose = {
+        0.0f, 0.0f, 1.0f, 1.0f,
+        0.0f, 1.0f, 0.0f, 2.0f,
+       -1.0f, 0.0f, 0.0f, 3.0f,
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
     return descriptor.provenance.adapter == "polycam" &&
            descriptor.frames.size() == 2 &&
            descriptor.frames[0].id == "images/z.png" &&
@@ -316,6 +463,7 @@ bool checkPolycamLayout2Adapter() {
            descriptor.frames[1].calibrationId == "images/a.png" &&
            descriptor.frames[0].imagePath ==
                (temporary.path / "images/z.png").string() &&
+           descriptor.frames[0].cameraToWorld == expectedFirstPose &&
            descriptor.points.count() == 2;
 }
 
@@ -356,6 +504,10 @@ int main() {
     CHECK(checkColmapBinaryAdapter());
     CHECK(checkNerfstudioAdapter());
     CHECK(checkPolycamLayout1Adapter());
+    CHECK(checkPolycamRawLayoutFallback());
+    CHECK(checkPolycamLayout1MissingImageRejected());
+    CHECK(checkPolycamLayout1MissingIntrinsicRejected());
+    CHECK(checkPolycamLayout1MissingTransformRejected());
     CHECK(checkPolycamLayout2Adapter());
     CHECK(checkPolycamMissingTransformRejected());
 

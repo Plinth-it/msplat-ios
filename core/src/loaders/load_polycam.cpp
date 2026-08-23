@@ -1,19 +1,80 @@
 #include "loaders.hpp"
+#include "dataset_errors.hpp"
 #include <nlohmann/json.hpp>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <limits>
+#include <optional>
 #include <utility>
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
 
-static std::string findImage(const fs::path &dir, const std::string &stem) {
+static std::optional<fs::path> findImage(
+    const fs::path &dir, const std::string &stem) {
     for (auto ext : {".png", ".jpg", ".jpeg", ".JPG"}) {
         auto p = dir / (stem + ext);
-        if (fs::exists(p)) return p.string();
+        if (fs::is_regular_file(p)) return p;
     }
-    return (dir / (stem + ".png")).string();
+    return std::nullopt;
+}
+
+static float requiredFloatValue(
+    const json &camera, const std::string &key, const fs::path &path) {
+    const auto value = camera.find(key);
+    if (value == camera.end() || !value->is_number()) {
+        throw msplat::InvalidDatasetError(
+            "Polycam camera " + path.string() +
+            " is missing numeric field " + key);
+    }
+
+    const double number = value->get<double>();
+    if (!std::isfinite(number) ||
+        number < -std::numeric_limits<float>::max() ||
+        number > std::numeric_limits<float>::max()) {
+        throw msplat::InvalidDatasetError(
+            "Polycam camera " + path.string() +
+            " has an invalid field " + key);
+    }
+    return static_cast<float>(number);
+}
+
+static int32_t requiredDimensionValue(
+    const json &camera, const std::string &key, const fs::path &path) {
+    const auto value = camera.find(key);
+    if (value == camera.end() ||
+        (!value->is_number_integer() && !value->is_number_unsigned())) {
+        throw msplat::InvalidDatasetError(
+            "Polycam camera " + path.string() +
+            " is missing integer field " + key);
+    }
+
+    int64_t number = 0;
+    try {
+        number = value->get<int64_t>();
+    } catch (const json::exception &) {
+        throw msplat::InvalidDatasetError(
+            "Polycam camera " + path.string() +
+            " has an invalid field " + key);
+    }
+    if (number <= 0 || number > std::numeric_limits<int32_t>::max()) {
+        throw msplat::InvalidDatasetError(
+            "Polycam camera " + path.string() +
+            " has an invalid field " + key);
+    }
+    return static_cast<int32_t>(number);
+}
+
+static void appendCameraIds(
+    const fs::path &directory, std::vector<std::string> &ids) {
+    if (!fs::is_directory(directory)) return;
+    for (const auto &entry : fs::directory_iterator(directory)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".json")
+            ids.push_back(entry.path().stem().string());
+    }
 }
 
 DatasetDescriptor loaders::loadPolycam(const std::string &projectRoot) {
@@ -21,49 +82,91 @@ DatasetDescriptor loaders::loadPolycam(const std::string &projectRoot) {
     data.provenance.adapter = "polycam";
     data.provenance.source = projectRoot;
     fs::path root(projectRoot);
-    fs::path keyframesDir = root / "keyframes" / "corrected_cameras";
-    fs::path imagesDir = root / "keyframes" / "corrected_images";
+    const fs::path correctedCamerasDir =
+        root / "keyframes" / "corrected_cameras";
+    const fs::path correctedImagesDir =
+        root / "keyframes" / "corrected_images";
+    const fs::path rawCamerasDir = root / "keyframes" / "cameras";
+    const fs::path rawImagesDir = root / "keyframes" / "images";
+    const bool hasFolderLayout =
+        fs::is_directory(correctedCamerasDir) ||
+        fs::is_directory(rawCamerasDir);
 
-    if (fs::exists(keyframesDir)) {
+    if (hasFolderLayout) {
         // Layout 1: individual camera JSONs
-        std::vector<fs::path> jsonFiles;
-        for (auto &entry : fs::directory_iterator(keyframesDir))
-            if (entry.path().extension() == ".json") jsonFiles.push_back(entry.path());
-        std::sort(jsonFiles.begin(), jsonFiles.end());
+        std::vector<std::string> frameIds;
+        appendCameraIds(rawCamerasDir, frameIds);
+        appendCameraIds(correctedCamerasDir, frameIds);
+        std::sort(frameIds.begin(), frameIds.end());
+        frameIds.erase(
+            std::unique(frameIds.begin(), frameIds.end()), frameIds.end());
+        if (frameIds.empty()) {
+            throw msplat::InvalidDatasetError(
+                "Polycam keyframes contain no camera JSON files");
+        }
 
-        for (auto &jp : jsonFiles) {
+        for (const std::string &frameId : frameIds) {
+            const fs::path correctedCamera =
+                correctedCamerasDir / (frameId + ".json");
+            const fs::path rawCamera = rawCamerasDir / (frameId + ".json");
+            const std::optional<fs::path> correctedImage =
+                findImage(correctedImagesDir, frameId);
+            const std::optional<fs::path> rawImage =
+                findImage(rawImagesDir, frameId);
+
+            fs::path cameraPath;
+            std::optional<fs::path> imagePath;
+            if (fs::is_regular_file(correctedCamera) && correctedImage) {
+                cameraPath = correctedCamera;
+                imagePath = correctedImage;
+            } else if (fs::is_regular_file(rawCamera) && rawImage) {
+                cameraPath = rawCamera;
+                imagePath = rawImage;
+            } else {
+                throw msplat::InvalidDatasetError(
+                    "Polycam frame '" + frameId +
+                    "' has no complete corrected or raw camera/image pair");
+            }
+
+            const fs::path &jp = cameraPath;
             std::ifstream f(jp);
             json j = json::parse(f);
 
             DatasetFrameDescriptor frame;
-            frame.id = jp.stem().string();
+            frame.id = frameId;
             frame.calibrationId = frame.id;
-            frame.calibration.width = j.value("width", 0);
-            frame.calibration.height = j.value("height", 0);
-            frame.calibration.fx = j.value("fx", 0.0f);
-            frame.calibration.fy = j.value("fy", 0.0f);
-            frame.calibration.cx = j.value("cx", (float)frame.calibration.width / 2.0f);
-            frame.calibration.cy = j.value("cy", (float)frame.calibration.height / 2.0f);
+            frame.calibration.width =
+                requiredDimensionValue(j, "width", jp);
+            frame.calibration.height =
+                requiredDimensionValue(j, "height", jp);
+            frame.calibration.fx = requiredFloatValue(j, "fx", jp);
+            frame.calibration.fy = requiredFloatValue(j, "fy", jp);
+            frame.calibration.cx = requiredFloatValue(j, "cx", jp);
+            frame.calibration.cy = requiredFloatValue(j, "cy", jp);
             frame.rasterOrientation = RasterOrientation::EncodedPixels;
 
-            float R[9], T[3];
-            for (int r = 0; r < 3; r++)
-                for (int c = 0; c < 3; c++)
-                    R[r*3+c] = j.value("R_" + std::to_string(r) + std::to_string(c), 0.0f);
-            T[0] = j.value("t_20", 0.0f);
-            T[1] = j.value("t_21", 0.0f);
-            T[2] = j.value("t_22", 0.0f);
+            // Polycam writes the upper three rows of its ARKit camera-to-world
+            // transform as t_00...t_23. ARKit and msplat both use a
+            // right-handed, Y-up camera with -Z forward, so no camera-axis
+            // flip or matrix inversion applies here.
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 4; ++column) {
+                    const std::string key =
+                        "t_" + std::to_string(row) +
+                        std::to_string(column);
+                    frame.cameraToWorld[row * 4 + column] =
+                        requiredFloatValue(j, key, jp);
+                }
+            }
+            frame.cameraToWorld[12] = 0.0f;
+            frame.cameraToWorld[13] = 0.0f;
+            frame.cameraToWorld[14] = 0.0f;
+            frame.cameraToWorld[15] = 1.0f;
 
-            // c2w with OpenGL Y/Z flip
-            frame.cameraToWorld[0]  =  R[0]; frame.cameraToWorld[1]  =  R[1]; frame.cameraToWorld[2]  =  R[2]; frame.cameraToWorld[3]  =  T[0];
-            frame.cameraToWorld[4]  = -R[3]; frame.cameraToWorld[5]  = -R[4]; frame.cameraToWorld[6]  = -R[5]; frame.cameraToWorld[7]  = -T[1];
-            frame.cameraToWorld[8]  = -R[6]; frame.cameraToWorld[9]  = -R[7]; frame.cameraToWorld[10] = -R[8]; frame.cameraToWorld[11] = -T[2];
-            frame.cameraToWorld[12] = 0;     frame.cameraToWorld[13] = 0;     frame.cameraToWorld[14] = 0;     frame.cameraToWorld[15] = 1;
-
-            frame.imagePath = findImage(imagesDir, frame.id);
+            frame.imagePath = imagePath->string();
             data.frames.push_back(std::move(frame));
         }
-    } else {
+    } else if (fs::exists(root / "cameras.json")) {
         // Layout 2: single cameras.json (dispatcher already confirmed it exists)
         std::ifstream f(root / "cameras.json");
         json j = json::parse(f);
@@ -99,6 +202,11 @@ DatasetDescriptor loaders::loadPolycam(const std::string &projectRoot) {
                 frame.imagePath = (root / frame.imagePath).string();
             data.frames.push_back(std::move(frame));
         }
+    } else {
+        throw msplat::InvalidDatasetError(
+            "Polycam dataset must contain paired corrected_cameras and "
+            "corrected_images directories, paired cameras and images "
+            "directories, or cameras.json");
     }
 
     // Point cloud
