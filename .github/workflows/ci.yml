@@ -135,3 +135,21 @@ jobs:
             -destination 'generic/platform=iOS Simulator' \
             CODE_SIGNING_ALLOWED=NO \
             build
+
+      - name: Test pose checkpoint resume on iOS Simulator
+        run: |
+          xcodebuild \
+            -project examples/ios/MsplatExample.xcodeproj \
+            -scheme MsplatExample \
+            -destination 'platform=iOS Simulator,name=iPhone 16 Pro,OS=latest' \
+            -only-testing:MsplatExampleTests/PoseCheckpointTests/testPoseCheckpointSaveLoadAndResume \
+            test
+
+      - name: Link iOS device test bundle
+        run: |
+          xcodebuild \
+            -project examples/ios/MsplatExample.xcodeproj \
+            -scheme MsplatExample \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            build-for-testing

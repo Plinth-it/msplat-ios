@@ -49,6 +49,8 @@ extract_section(metal_source "kernel void project_and_sh_forward_kernel("
     "kernel void project_and_sh_backward_kernel(" fused_forward)
 extract_section(metal_source "kernel void project_and_sh_backward_kernel("
     "// ===== Exact Tile Intersection Pipeline" fused_backward)
+extract_section(metal_source "inline void atomic_add_threadgroup_float("
+    "// Packed Adam hyperparameters" pose_group_atomic_add)
 
 # D * V0 convention and the camera center derived from the same refined view.
 require_contains("${pose_prepare}"
@@ -90,14 +92,25 @@ require_contains("${fused_backward}"
     "geometry-only SH policy")
 
 # Reduce once per threadgroup before touching the shared six-value gradient.
+require_contains("${pose_group_atomic_add}"
+    "as_type<uint>(as_type<float>(expected) + value)"
+    "threadgroup Float32 bit-pattern addition")
+require_contains("${pose_group_atomic_add}"
+    "atomic_compare_exchange_weak_explicit("
+    "threadgroup Float32 CAS")
 require_contains("${fused_backward}"
-    "threadgroup atomic_float pose_group_gradient[6];"
-    "threadgroup pose reduction")
+    "threadgroup atomic_uint pose_group_gradient[6];"
+    "threadgroup pose reduction storage")
+foreach(component RANGE 0 5)
+    require_contains("${fused_backward}"
+        "&pose_group_gradient[${component}],"
+        "threadgroup pose component ${component} accumulation")
+endforeach()
 require_contains("${fused_backward}"
-    "threadgroup_barrier(mem_flags::mem_threadgroup);"
-    "threadgroup reduction barrier")
+    "if (pose_enabled != 0) {\n        threadgroup_barrier(mem_flags::mem_threadgroup);\n        if (thread_index == 0)"
+    "post-accumulation threadgroup barrier")
 require_contains("${fused_backward}"
-    "&pose_gradient[component],\n                    atomic_load_explicit("
+    "&pose_gradient[component],\n                    as_type<float>(atomic_load_explicit("
     "single global reduction per component")
 
 # Adam applies a negative tangent step by left composition, then norm bounds.

@@ -2155,6 +2155,27 @@ inline void adam_update_element(
     eas = v;
 }
 
+// Metal supports Float32 atomics in device memory, but not in threadgroup
+// memory on every SDK we target. Accumulate the bit pattern through an
+// atomic_uint CAS loop so the per-threadgroup pose reduction remains local.
+inline void atomic_add_threadgroup_float(
+    threadgroup atomic_uint* destination,
+    float value
+) {
+    uint expected = atomic_load_explicit(destination, memory_order_relaxed);
+    while (true) {
+        const uint desired = as_type<uint>(as_type<float>(expected) + value);
+        if (atomic_compare_exchange_weak_explicit(
+                destination,
+                &expected,
+                desired,
+                memory_order_relaxed,
+                memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
 // Packed Adam hyperparameters for SH groups (passed via setBytes)
 struct SHAdamParams {
     float dc_step_size;
@@ -2202,12 +2223,12 @@ kernel void project_and_sh_backward_kernel(
     uint idx [[thread_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]
 ) {
-    threadgroup atomic_float pose_group_gradient[6];
+    threadgroup atomic_uint pose_group_gradient[6];
     if (pose_enabled != 0) {
         if (thread_index == 0) {
             for (uint component = 0; component < 6; ++component) {
                 atomic_store_explicit(
-                    &pose_group_gradient[component], 0.0f,
+                    &pose_group_gradient[component], 0u,
                     memory_order_relaxed);
             }
         }
@@ -2297,24 +2318,18 @@ kernel void project_and_sh_backward_kernel(
             cross(W[0], pose_v_view_rotation[0]) +
             cross(W[1], pose_v_view_rotation[1]) +
             cross(W[2], pose_v_view_rotation[2]);
-        atomic_fetch_add_explicit(
-            &pose_group_gradient[0], translation_gradient.x,
-            memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            &pose_group_gradient[1], translation_gradient.y,
-            memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            &pose_group_gradient[2], translation_gradient.z,
-            memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            &pose_group_gradient[3], rotation_gradient.x,
-            memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            &pose_group_gradient[4], rotation_gradient.y,
-            memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            &pose_group_gradient[5], rotation_gradient.z,
-            memory_order_relaxed);
+        atomic_add_threadgroup_float(
+            &pose_group_gradient[0], translation_gradient.x);
+        atomic_add_threadgroup_float(
+            &pose_group_gradient[1], translation_gradient.y);
+        atomic_add_threadgroup_float(
+            &pose_group_gradient[2], translation_gradient.z);
+        atomic_add_threadgroup_float(
+            &pose_group_gradient[3], rotation_gradient.x);
+        atomic_add_threadgroup_float(
+            &pose_group_gradient[4], rotation_gradient.y);
+        atomic_add_threadgroup_float(
+            &pose_group_gradient[5], rotation_gradient.z);
     } else {
         project_cov3d_ewa_vjp(
             local_cov3d,
@@ -2351,9 +2366,9 @@ kernel void project_and_sh_backward_kernel(
             for (uint component = 0; component < 6; ++component) {
                 atomic_fetch_add_explicit(
                     &pose_gradient[component],
-                    atomic_load_explicit(
+                    as_type<float>(atomic_load_explicit(
                         &pose_group_gradient[component],
-                        memory_order_relaxed),
+                        memory_order_relaxed)),
                     memory_order_relaxed);
             }
         }
