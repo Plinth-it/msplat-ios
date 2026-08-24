@@ -145,6 +145,8 @@ class Dataset {
 public:
     Dataset(const std::string& path, float downscaleFactor,
             bool evalMode, int testEvery);
+    Dataset(const std::string& path, float downscaleFactor,
+            bool evalMode, int testEvery, bool discoverTrainingMasks);
     Dataset(::DatasetDescriptor descriptor, float downscaleFactor,
             bool evalMode, int testEvery);
     ~Dataset();

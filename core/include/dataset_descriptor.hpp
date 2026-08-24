@@ -16,6 +16,11 @@ enum class RasterOrientation : uint8_t {
 enum class TrainingMaskChannel : uint8_t {
     Luminance = 0,
     Alpha = 1,
+    // Path-based adapters use Brush-compatible channel selection: alpha when
+    // the decoded mask carries alpha, otherwise its first color channel.
+    // This value is internal to canonical descriptors and is not accepted by
+    // the explicit ABI v6 frame-mask sidecar.
+    Automatic = 255,
 };
 
 struct TrainingMaskDescriptor {

@@ -159,7 +159,8 @@ public struct TrainingPlan: Sendable, Equatable {
     /// Hard Gaussian population limit enforced when the plan is used with
     /// ``MsplatSession``.
     public let maximumGaussianCount: Int
-    /// Whether image-cache and decode estimates include per-frame UInt8 masks.
+    /// Whether path-based plan sessions discover mask sidecars and whether
+    /// image-cache and decode estimates include per-frame UInt8 masks.
     public let includesTrainingMasks: Bool
     /// Source dimensions after `inputDecodeScale` is applied.
     public let decodedInputDimensions: TrainingImageDimensions
@@ -250,7 +251,8 @@ public struct TrainingPlan: Sendable, Equatable {
         return DatasetOptions(
             downscaleFactor: inputDecodeScale,
             evalMode: evalMode,
-            testEvery: testEvery
+            testEvery: testEvery,
+            discoverTrainingMasks: includesTrainingMasks
         )
     }
 

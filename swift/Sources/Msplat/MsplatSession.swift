@@ -13,15 +13,19 @@ public struct DatasetOptions: Sendable, Equatable {
     public var downscaleFactor: Float
     public var evalMode: Bool
     public var testEvery: Int32
+    /// Whether path-based dataset loaders discover optional mask sidecars.
+    public var discoverTrainingMasks: Bool
 
     public init(
         downscaleFactor: Float = 1.0,
         evalMode: Bool = false,
-        testEvery: Int32 = 8
+        testEvery: Int32 = 8,
+        discoverTrainingMasks: Bool = false
     ) {
         self.downscaleFactor = downscaleFactor
         self.evalMode = evalMode
         self.testEvery = testEvery
+        self.discoverTrainingMasks = discoverTrainingMasks
     }
 }
 
@@ -77,7 +81,10 @@ public final class MsplatSession {
     ) throws {
         try self.init(
             datasetURL: datasetURL,
-            options: plan.makeDatasetOptions(evalMode: evalMode, testEvery: testEvery),
+            options: plan.makeDatasetOptions(
+                evalMode: evalMode,
+                testEvery: testEvery
+            ),
             config: plan.makeTrainingConfig(startingFrom: baseConfig),
             maximumGaussianCount: plan.maximumGaussianCount
         )
@@ -433,11 +440,12 @@ public final class MsplatSession {
         ) {
             var dataset: MsplatDataset?
             var nativeError = MsplatErrorInfo()
-            let status = msplat_dataset_create_v2(
+            let status = msplat_dataset_create_v10(
                 path,
                 options.downscaleFactor,
                 options.evalMode,
                 options.testEvery,
+                options.discoverTrainingMasks,
                 &dataset,
                 &nativeError
             )

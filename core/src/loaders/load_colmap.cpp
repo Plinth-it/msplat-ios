@@ -1,12 +1,16 @@
 #include "loaders.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <limits>
+#include <map>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -69,6 +73,119 @@ struct ColmapTrackValidation {
     std::vector<std::vector<uint8_t>> markers;
     size_t totalObservationCount = 0;
 };
+
+using TrainingMaskIndex =
+    std::map<std::pair<std::string, std::string>, fs::path>;
+
+std::string lowercaseASCII(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), [](char byte) {
+        return static_cast<char>(std::tolower(static_cast<unsigned char>(byte)));
+    });
+    return value;
+}
+
+std::vector<std::string> normalizedPathComponents(const fs::path &path) {
+    std::string value = path.generic_string();
+    std::replace(value.begin(), value.end(), '\\', '/');
+
+    std::vector<std::string> components;
+    size_t start = 0;
+    while (start <= value.size()) {
+        const size_t end = value.find('/', start);
+        const std::string component = lowercaseASCII(value.substr(
+            start, end == std::string::npos ? std::string::npos : end - start));
+        if (!component.empty() && component != ".") {
+            if (component == "..") {
+                if (!components.empty()) components.pop_back();
+            } else {
+                components.push_back(component);
+            }
+        }
+        if (end == std::string::npos) break;
+        start = end + 1;
+    }
+    return components;
+}
+
+std::string joinPathComponents(const std::vector<std::string> &components,
+                               size_t start, size_t end) {
+    std::string result;
+    for (size_t index = start; index < end; ++index) {
+        if (!result.empty()) result += '/';
+        result += components[index];
+    }
+    return result;
+}
+
+bool pathLess(const fs::path &lhs, const fs::path &rhs) {
+    return lhs.generic_string() < rhs.generic_string();
+}
+
+void insertTrainingMask(TrainingMaskIndex &index, const fs::path &root,
+                        const fs::path &candidate) {
+    const std::vector<std::string> components = normalizedPathComponents(
+        candidate.lexically_relative(root));
+    const auto masks = std::find(components.begin(), components.end(), "masks");
+    if (masks == components.end() || std::next(masks) == components.end()) {
+        return;
+    }
+
+    const std::string stem = fs::path(components.back()).stem().string();
+    if (stem.empty()) return;
+    const size_t masksIndex = static_cast<size_t>(
+        std::distance(components.begin(), masks));
+    const std::string subdirectory = joinPathComponents(
+        components, masksIndex + 1, components.size() - 1);
+    const auto key = std::make_pair(subdirectory, stem);
+    const auto existing = index.find(key);
+    if (existing == index.end() || pathLess(candidate, existing->second)) {
+        index[key] = candidate;
+    }
+}
+
+TrainingMaskIndex indexTrainingMasks(const fs::path &root) {
+    TrainingMaskIndex result;
+    for (const fs::directory_entry &candidate :
+         fs::recursive_directory_iterator(root)) {
+        if (candidate.is_regular_file()) {
+            insertTrainingMask(result, root, candidate.path());
+        }
+    }
+    return result;
+}
+
+std::optional<fs::path> findTrainingMask(
+    const TrainingMaskIndex &index, const std::string &imageFilename) {
+    std::string portableFilename = imageFilename;
+    std::replace(portableFilename.begin(), portableFilename.end(), '\\', '/');
+    const fs::path imagePath(portableFilename);
+    const std::string searchName =
+        lowercaseASCII(imagePath.filename().string());
+    const std::string searchStem = lowercaseASCII(imagePath.stem().string());
+    if (searchName.empty() || searchStem.empty()) return std::nullopt;
+
+    const std::vector<std::string> searchStems = {
+        searchName,
+        searchStem,
+        searchStem + ".mask",
+    };
+    const std::vector<std::string> parentComponents =
+        normalizedPathComponents(imagePath.parent_path());
+
+    std::optional<fs::path> result;
+    for (size_t start = 0; start <= parentComponents.size(); ++start) {
+        const std::string subdirectory = joinPathComponents(
+            parentComponents, start, parentComponents.size());
+        for (const std::string &stem : searchStems) {
+            const auto candidate = index.find({subdirectory, stem});
+            if (candidate != index.end() &&
+                (!result || pathLess(candidate->second, *result))) {
+                result = candidate->second;
+            }
+        }
+    }
+    return result;
+}
 
 [[noreturn]] void malformed(const std::string &path, const std::string &detail) {
     throw std::runtime_error("Malformed COLMAP file " + path + ": " + detail);
@@ -902,6 +1019,12 @@ void appendObservationsAndFinishTrackValidation(
 
 DatasetDescriptor loaders::loadColmap(const std::string &projectRoot,
                                       const std::string &imageSourcePath) {
+    return loadColmap(projectRoot, imageSourcePath, false);
+}
+
+DatasetDescriptor loaders::loadColmap(const std::string &projectRoot,
+                                      const std::string &imageSourcePath,
+                                      bool discoverTrainingMasks) {
     const fs::path root(projectRoot);
     const auto hasModel = [](const fs::path &directory) {
         return fs::exists(directory / "cameras.bin") ||
@@ -921,6 +1044,8 @@ DatasetDescriptor loaders::loadColmap(const std::string &projectRoot,
     auto images = usesBinaryImages
         ? readImagesBinary((sparse / "images.bin").string())
         : readImagesText((sparse / "images.txt").string());
+    const TrainingMaskIndex trainingMasks = discoverTrainingMasks
+        ? indexTrainingMasks(root) : TrainingMaskIndex{};
 
     std::sort(images.begin(), images.end(), [](const ColmapImage &lhs,
                                                 const ColmapImage &rhs) {
@@ -947,8 +1072,23 @@ DatasetDescriptor loaders::loadColmap(const std::string &projectRoot,
         DatasetFrameDescriptor frame;
         frame.id = std::to_string(image.id);
         frame.calibrationId = std::to_string(image.cameraId);
-        frame.imagePath = (fs::path(imageDirectory) / image.filename).string();
+        const fs::path resolvedImagePath =
+            fs::path(imageDirectory) / image.filename;
+        frame.imagePath = resolvedImagePath.string();
         frame.rasterOrientation = RasterOrientation::EncodedPixels;
+        std::string maskLookupPath = image.filename;
+        const fs::path relativeImagePath =
+            resolvedImagePath.lexically_relative(root);
+        const auto firstRelativeComponent = relativeImagePath.begin();
+        if (firstRelativeComponent != relativeImagePath.end() &&
+            *firstRelativeComponent != fs::path("..")) {
+            maskLookupPath = relativeImagePath.generic_string();
+        }
+        if (const auto mask = findTrainingMask(
+                trainingMasks, maskLookupPath)) {
+            frame.trainingMask = TrainingMaskDescriptor{
+                mask->string(), TrainingMaskChannel::Automatic};
+        }
         frame.calibration.width = camera->second.width;
         frame.calibration.height = camera->second.height;
         frame.calibration.fx = camera->second.fx;

@@ -40,6 +40,12 @@
   The initial geometry-only gradient detaches the SH view-direction term.
   Imported poses and canonical render, evaluation, and export remain unchanged;
   checkpoint v3 preserves pose state and validates frame IDs and source poses.
+- Added ABI v10 opt-in training-mask discovery for path-based COLMAP datasets.
+  Regular files under a case-insensitive `masks` directory use Brush-compatible
+  stem, suffix-directory, and deterministic tie-breaking rules; partial mask
+  sets remain valid. Discovered masks read alpha when present and the first color
+  channel otherwise, while ABI v2 remains discovery-disabled and descriptor ABI
+  v6 remains limited to explicit luminance or alpha coverage.
 - Corrected the image-edge versus array-index conversion in Brown-Conrady
   rectification, including alpha=0 crop endpoints and paired mask sampling.
   The renderer now uses an exact homogeneous divide, propagates the missing

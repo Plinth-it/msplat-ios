@@ -791,6 +791,12 @@ InputData inputDataFromDescriptor(DatasetDescriptor descriptor) {
 
 DatasetDescriptor datasetDescriptorFromX(
     const std::string &path, const std::string &colmapImagePath) {
+    return datasetDescriptorFromX(path, colmapImagePath, false);
+}
+
+DatasetDescriptor datasetDescriptorFromX(
+    const std::string &path, const std::string &colmapImagePath,
+    bool discoverTrainingMasks) {
     fs::path root(path);
     auto validated = [](DatasetDescriptor descriptor) {
         validateDatasetDescriptor(descriptor);
@@ -804,7 +810,8 @@ DatasetDescriptor datasetDescriptorFromX(
     // COLMAP: cameras.bin or cameras.txt (direct or in sparse/0/)
     for (const auto &name : {"cameras.bin", "cameras.txt"})
         if (fs::exists(root / name) || fs::exists(root / "sparse" / "0" / name))
-            return validated(loaders::loadColmap(path, colmapImagePath));
+            return validated(loaders::loadColmap(
+                path, colmapImagePath, discoverTrainingMasks));
 
     // Polycam: keyframes/ directory or cameras.json
     if (fs::exists(root / "keyframes" / "corrected_cameras") ||
@@ -818,6 +825,13 @@ DatasetDescriptor datasetDescriptorFromX(
 
 InputData inputDataFromX(
     const std::string &path, const std::string &colmapImagePath) {
+    return inputDataFromX(path, colmapImagePath, false);
+}
+
+InputData inputDataFromX(
+    const std::string &path, const std::string &colmapImagePath,
+    bool discoverTrainingMasks) {
     return inputDataFromDescriptor(
-        datasetDescriptorFromX(path, colmapImagePath));
+        datasetDescriptorFromX(
+            path, colmapImagePath, discoverTrainingMasks));
 }

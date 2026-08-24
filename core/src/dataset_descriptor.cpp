@@ -120,6 +120,7 @@ void validateDatasetDescriptor(const DatasetDescriptor &descriptor) {
             switch (frame.trainingMask->channel) {
                 case TrainingMaskChannel::Luminance:
                 case TrainingMaskChannel::Alpha:
+                case TrainingMaskChannel::Automatic:
                     break;
                 default:
                     reject("frame '" + frame.id +

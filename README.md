@@ -141,6 +141,8 @@ poses.
   Swift and the native/Python CLIs; it is disabled by default
 - ABI v9 opt-in bounded camera-pose refinement, exposed by Swift and the
   native/Python CLIs; it is disabled by default and training-only
+- ABI v10 opt-in mask-sidecar discovery for path-based dataset loading; the
+  existing path entry point remains unmasked by default
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
@@ -175,6 +177,7 @@ import Msplat
 
 @MsplatRuntimeActor
 func train() throws {
+    let useTrainingMasks = true
     let plan = try TrainingPlan(
         // Maximum source dimensions, before input decoding.
         inputDimensions: TrainingImageDimensions(width: 4_032, height: 3_024),
@@ -191,7 +194,8 @@ func train() throws {
             ),
         ],
         targetSHDegree: 2,
-        maximumGaussianCount: 400_000
+        maximumGaussianCount: 400_000,
+        includesTrainingMasks: useTrainingMasks
     )
 
     print("Conservative peak: \(plan.estimatedPeakMemory / 1_048_576) MiB")
@@ -222,6 +226,21 @@ func train() throws {
 `MsplatSession` is the checked, throwing API and serializes the engine's
 process-global Metal state. The legacy `GaussianDataset` and `GaussianTrainer`
 types remain available for source compatibility.
+
+Path-based COLMAP loading can opt into mask discovery with
+`DatasetOptions.discoverTrainingMasks`; plan-based sessions use
+`TrainingPlan.includesTrainingMasks` for both discovery and their conservative
+memory estimate. Both default to off. The native loader indexes regular files
+below any case-insensitive `masks` path component. It matches an image such as
+`images/foo.jpeg` to sidecars with the same stem (`masks/foo.png`), its full
+name plus `.mask` (`masks/foo.jpeg.mask`), or a `.mask` stem
+(`masks/foo.mask.png`). Nested mask directories may match a suffix of the image
+directory, and frames without a match retain full coverage. An alpha-bearing
+sidecar uses alpha; other color images use their first/red channel. Mask value
+0 excludes a pixel from RGB loss and 255 gives it full coverage, with
+intermediate values providing soft coverage. Coverage masking does not train
+rendered alpha to match source transparency. Sidecars must currently match the
+source image dimensions; unlike Brush, MSplat does not resize mismatched masks.
 
 Plinth can also construct a Swift `DatasetDescriptor` from calibrated frame
 URLs, optional per-frame soft training masks, sparse points, and optional

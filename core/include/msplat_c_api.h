@@ -24,8 +24,10 @@ extern "C" {
 // ABI v9 adds the camera-pose refinement capability bit to those unchanged
 // v8 options. The global bump lets new clients reject older binaries that
 // would interpret that bit as unknown.
+// ABI v10 adds opt-in Brush-compatible training-mask discovery for path-based
+// COLMAP loading without changing any existing structure or symbol.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 9u
+#define MSPLAT_ABI_VERSION 10u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -394,6 +396,14 @@ MsplatStatus msplat_dataset_create_v2(const char* path, float downscaleFactor,
                                       bool evalMode, int testEvery,
                                       MsplatDataset* outDataset,
                                       MsplatErrorInfo* error);
+/// ABI v10 path creation. When enabled for a COLMAP dataset, regular files
+/// below a case-insensitive `masks` directory are matched to image names using
+/// Brush-compatible stem and nested-directory rules. Missing matches leave
+/// individual frames unmasked. ABI v2 retains its discovery-disabled behavior.
+MsplatStatus msplat_dataset_create_v10(
+    const char* path, float downscaleFactor, bool evalMode, int32_t testEvery,
+    bool discoverTrainingMasks, MsplatDataset* outDataset,
+    MsplatErrorInfo* error);
 MsplatStatus msplat_dataset_destroy_v2(MsplatDataset ds, MsplatErrorInfo* error);
 MsplatStatus msplat_dataset_num_train_v2(MsplatDataset ds, int* outCount,
                                          MsplatErrorInfo* error);

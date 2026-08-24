@@ -3,6 +3,10 @@
 #include "input_data.hpp"
 #include "loaders.hpp"
 
+#include <CoreGraphics/CoreGraphics.h>
+#include <ImageIO/ImageIO.h>
+
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -14,10 +18,11 @@
 #include <string>
 #include <type_traits>
 #include <unistd.h>
+#include <vector>
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
-static_assert(MSPLAT_ABI_VERSION == 9u);
+static_assert(MSPLAT_ABI_VERSION == 10u);
 static_assert(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS == (1u << 0));
 static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS == (1u << 1));
 static_assert((MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS &
@@ -178,6 +183,150 @@ static_assert(MSPLAT_DATASET_V5_MAX_POINTS == 100000000u);
 static_assert(MSPLAT_DATASET_V5_MAX_OBSERVATIONS == 100000000u);
 
 namespace {
+
+template <typename T>
+class CFHandle {
+public:
+    explicit CFHandle(T value = nullptr) : value_(value) {}
+    ~CFHandle() {
+        if (value_) CFRelease(value_);
+    }
+
+    CFHandle(const CFHandle&) = delete;
+    CFHandle& operator=(const CFHandle&) = delete;
+
+    T get() const { return value_; }
+    explicit operator bool() const { return value_ != nullptr; }
+
+private:
+    T value_;
+};
+
+struct TempDirectory {
+    std::filesystem::path path;
+
+    explicit TempDirectory(const char *prefix) {
+        std::string pattern =
+            (std::filesystem::temp_directory_path() /
+             (std::string(prefix) + "-XXXXXX")).string();
+        std::vector<char> writable(pattern.begin(), pattern.end());
+        writable.push_back('\0');
+        const char *created = mkdtemp(writable.data());
+        if (!created) throw std::runtime_error("Could not create temporary directory");
+        path = created;
+    }
+
+    ~TempDirectory() {
+        std::error_code ignored;
+        std::filesystem::remove_all(path, ignored);
+    }
+};
+
+bool writeTextFile(const std::filesystem::path &path,
+                   const std::string &contents) {
+    std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+    stream << contents;
+    return static_cast<bool>(stream);
+}
+
+bool writeRGBAFixture(const std::filesystem::path &path, int width, int height,
+                      const std::vector<uint8_t> &rgba, bool hasAlpha) {
+    if (width <= 0 || height <= 0 ||
+        rgba.size() != static_cast<size_t>(width) * height * 4) {
+        return false;
+    }
+
+    CFHandle<CGDataProviderRef> provider(CGDataProviderCreateWithData(
+        nullptr, rgba.data(), rgba.size(), nullptr));
+    CFHandle<CGColorSpaceRef> colorSpace(
+        CGColorSpaceCreateWithName(kCGColorSpaceSRGB));
+    if (!provider || !colorSpace) return false;
+
+    const CGBitmapInfo bitmapInfo = static_cast<CGBitmapInfo>(
+        kCGBitmapByteOrder32Big |
+        (hasAlpha ? kCGImageAlphaPremultipliedLast
+                  : kCGImageAlphaNoneSkipLast));
+    CFHandle<CGImageRef> image(CGImageCreate(
+        static_cast<size_t>(width), static_cast<size_t>(height), 8, 32,
+        static_cast<size_t>(width) * 4, colorSpace.get(), bitmapInfo,
+        provider.get(), nullptr, false, kCGRenderingIntentDefault));
+    if (!image) return false;
+
+    const std::string pathString = path.string();
+    CFHandle<CFURLRef> url(CFURLCreateFromFileSystemRepresentation(
+        nullptr, reinterpret_cast<const UInt8 *>(pathString.data()),
+        static_cast<CFIndex>(pathString.size()), false));
+    if (!url) return false;
+    CFHandle<CGImageDestinationRef> destination(
+        CGImageDestinationCreateWithURL(
+            url.get(), CFSTR("public.tiff"), 1, nullptr));
+    if (!destination) return false;
+    CGImageDestinationAddImage(destination.get(), image.get(), nullptr);
+    return CGImageDestinationFinalize(destination.get());
+}
+
+bool automaticMaskChannelMatchesBrush() {
+    TempDirectory temporary("msplat-c-api-auto-mask");
+    const std::filesystem::path colorPath = temporary.path / "color.tiff";
+    const std::filesystem::path alphaPath = temporary.path / "alpha.tiff";
+    if (!writeRGBAFixture(
+            colorPath, 2, 1,
+            {255, 0, 0, 255, 0, 255, 0, 255}, false) ||
+        !writeRGBAFixture(
+            alphaPath, 2, 1,
+            {0, 0, 0, 17, 0, 0, 0, 231}, true)) {
+        return false;
+    }
+
+    try {
+        const ImageSourceInfo colorInfo = inspectImageSource(colorPath.string());
+        const CoverageMask color = imreadCoverageMask(
+            colorPath.string(), colorInfo, 2, 1, false,
+            TrainingMaskChannel::Automatic);
+        const ImageSourceInfo alphaInfo = inspectImageSource(alphaPath.string());
+        const CoverageMask alpha = imreadCoverageMask(
+            alphaPath.string(), alphaInfo, 2, 1, false,
+            TrainingMaskChannel::Automatic);
+        return color.data == std::vector<uint8_t>({255, 0}) &&
+               alpha.data == std::vector<uint8_t>({17, 231});
+    } catch (...) {
+        return false;
+    }
+}
+
+struct PathDatasetFixture {
+    TempDirectory temporary{"msplat-c-api-path-mask"};
+
+    PathDatasetFixture() {
+        std::filesystem::create_directories(temporary.path / "images");
+        std::filesystem::create_directories(temporary.path / "masks");
+        if (!writeTextFile(
+                temporary.path / "cameras.txt",
+                "7 PINHOLE 2 1 2 2 1 0.5\n") ||
+            !writeTextFile(
+                temporary.path / "images.txt",
+                "100 1 0 0 0 0 0 0 7 frame.png\n\n") ||
+            !writeTextFile(
+                temporary.path / "points3D.txt",
+                "900 1 2 3 255 0 0 0.25\n")) {
+            throw std::runtime_error("Could not write path dataset fixture");
+        }
+
+        Image image;
+        image.width = 2;
+        image.height = 1;
+        image.data = {1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 0.0f};
+        imwriteRGB((temporary.path / "images" / "frame.png").string(), image);
+
+        Image mask;
+        mask.width = 2;
+        mask.height = 1;
+        mask.data = {1.0f, 1.0f, 1.0f, 0.0f, 0.0f, 0.0f};
+        imwriteRGB(
+            (temporary.path / "masks" / "frame.png").string(),
+            mask);
+    }
+};
 
 template <size_t N>
 MsplatStringViewV5 stringView(const char (&value)[N]) {
@@ -428,6 +577,7 @@ MsplatStatus createFromStackAndOverwriteInputs(MsplatDataset *outDataset,
 
 int main() {
     CHECK(msplat_abi_version() == MSPLAT_ABI_VERSION);
+    CHECK(automaticMaskChannelMatchesBrush());
 
     MsplatErrorInfo error{};
 
@@ -515,6 +665,9 @@ int main() {
     CHECK(rejectsFrameMasksAs(
         MSPLAT_STATUS_INVALID_ARGUMENT,
         [](auto &value) { value.masks[0].coverageChannel = 2; }));
+    CHECK(rejectsFrameMasksAs(
+        MSPLAT_STATUS_INVALID_ARGUMENT,
+        [](auto &value) { value.masks[0].coverageChannel = 255; }));
     CHECK(rejectsFrameMasksAs(
         MSPLAT_STATUS_INVALID_ARGUMENT,
         [](auto &value) { value.masks[0].maskPath.data = nullptr; }));
@@ -934,6 +1087,45 @@ int main() {
     CHECK(dataset == nullptr);
     CHECK(error.status == status);
     CHECK(error.message[0] != '\0');
+
+    dataset = reinterpret_cast<MsplatDataset>(1);
+    status = msplat_dataset_create_v10(
+        nullptr, 1.0f, false, 8, true, &dataset, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(dataset == nullptr);
+    CHECK(error.status == status);
+    CHECK(error.message[0] != '\0');
+
+    PathDatasetFixture pathDataset;
+    dataset = nullptr;
+    status = msplat_dataset_create_v2(
+        pathDataset.temporary.path.c_str(), 1.0f, false, 8,
+        &dataset, &error);
+    CHECK(status == MSPLAT_STATUS_OK);
+    CHECK(dataset != nullptr);
+    CHECK(msplat_dataset_destroy_v2(dataset, &error) == MSPLAT_STATUS_OK);
+
+    dataset = nullptr;
+    status = msplat_dataset_create_v10(
+        pathDataset.temporary.path.c_str(), 1.0f, false, 8, false,
+        &dataset, &error);
+    CHECK(status == MSPLAT_STATUS_OK);
+    CHECK(dataset != nullptr);
+    CHECK(msplat_dataset_destroy_v2(dataset, &error) == MSPLAT_STATUS_OK);
+
+    dataset = reinterpret_cast<MsplatDataset>(1);
+    status = msplat_dataset_create_v10(
+        pathDataset.temporary.path.c_str(), 1.0f, false, 8, true,
+        &dataset, &error);
+    CHECK(status == MSPLAT_STATUS_OK);
+    CHECK(dataset != nullptr);
+    CHECK(msplat_dataset_destroy_v2(dataset, &error) == MSPLAT_STATUS_OK);
+
+    status = msplat_dataset_create_v10(
+        pathDataset.temporary.path.c_str(), 1.0f, false, 8, false,
+        nullptr, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(error.status == status);
 
     int count = 99;
     status = msplat_dataset_num_train_v2(nullptr, &count, &error);

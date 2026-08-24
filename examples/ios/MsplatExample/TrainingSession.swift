@@ -69,6 +69,7 @@ final class TrainingSession: ObservableObject {
     /// thermal budget as much as a quality one.
     @Published var iterations = 2_000
     @Published var qualityProfile: QualityProfile = .preview
+    @Published var trainingMasksEnabled = false
 
     private var worker: Task<Void, Never>?
 
@@ -104,10 +105,16 @@ final class TrainingSession: ObservableObject {
 
         let steps = iterations
         let profile = qualityProfile
+        let useTrainingMasks = trainingMasksEnabled
 
         worker = Task { [weak self] in
             guard let self else { return }
-            await self.run(folder: folder, steps: steps, profile: profile)
+            await self.run(
+                folder: folder,
+                steps: steps,
+                profile: profile,
+                useTrainingMasks: useTrainingMasks
+            )
         }
     }
 
@@ -118,7 +125,8 @@ final class TrainingSession: ObservableObject {
     private func run(
         folder: DatasetFolder,
         steps: Int,
-        profile: QualityProfile
+        profile: QualityProfile,
+        useTrainingMasks: Bool
     ) async {
         var session: MsplatSession?
         var resultURL: URL?
@@ -139,7 +147,8 @@ final class TrainingSession: ObservableObject {
             let plan = try Self.makePlan(
                 sourceDimensions: sourceDimensions,
                 steps: steps,
-                profile: profile
+                profile: profile,
+                includesTrainingMasks: useTrainingMasks
             )
             plannedStages = plan.resolvedStages
             estimatedPeakMB = Self.megabytes(plan.estimatedPeakMemory)
@@ -257,10 +266,11 @@ final class TrainingSession: ObservableObject {
 
     // MARK: - Helpers
 
-    private nonisolated static func makePlan(
+    nonisolated static func makePlan(
         sourceDimensions: TrainingImageDimensions,
         steps: Int,
-        profile: QualityProfile
+        profile: QualityProfile,
+        includesTrainingMasks: Bool = false
     ) throws -> TrainingPlan {
         guard let iterationBudget = Int32(exactly: steps) else {
             throw MsplatError.invalidArgument("Iteration budget is outside the native range")
@@ -306,7 +316,8 @@ final class TrainingSession: ObservableObject {
             iterationBudget: iterationBudget,
             stages: stages,
             targetSHDegree: profile.shDegree,
-            maximumGaussianCount: profile.maximumGaussianCount
+            maximumGaussianCount: profile.maximumGaussianCount,
+            includesTrainingMasks: includesTrainingMasks
         )
     }
 

@@ -6,6 +6,8 @@ struct ContentView: View {
     @State private var folder: DatasetFolder?
     @State private var picking = false
     @State private var pickError: String?
+    @State private var trainingMaskCandidateCount: Int?
+    @State private var trainingMaskSelectionWasEdited = false
 
     var body: some View {
         NavigationStack {
@@ -21,6 +23,9 @@ struct ContentView: View {
                 case .success(let url):
                     if let picked = DatasetFolder(picked: url) {
                         folder = picked
+                        trainingMaskCandidateCount = nil
+                        trainingMaskSelectionWasEdited = false
+                        session.trainingMasksEnabled = false
                         pickError = nil
                     } else {
                         pickError = "No cameras.bin or cameras.txt in that folder, or in its sparse/0."
@@ -28,6 +33,10 @@ struct ContentView: View {
                 case .failure(let error):
                     pickError = error.localizedDescription
                 }
+            }
+            .task(id: folder?.id) {
+                guard let selectedFolder = folder else { return }
+                await scanTrainingMasks(in: selectedFolder)
             }
         }
     }
@@ -59,17 +68,55 @@ struct ContentView: View {
                     Text(profile.rawValue).tag(profile)
                 }
             }
+            Toggle("Use discovered masks", isOn: trainingMasksBinding)
+                .disabled(isBusy || folder == nil)
+            LabeledContent(
+                "Mask candidates",
+                value: trainingMaskCandidateCount?.formatted() ?? "Scanning…"
+            )
 
             Button(trainButtonTitle) {
                 if let folder { session.start(folder: folder) }
             }
-            .disabled(isBusy)
+            .disabled(
+                isBusy ||
+                (trainingMaskCandidateCount == nil && !trainingMaskSelectionWasEdited)
+            )
 
             if isBusy {
                 Button("Stop", role: .destructive) { session.cancel() }
             }
         } footer: {
-            Text("Preview targets a 1,600-pixel edge, SH1, and 250K Gaussians. Balanced targets 1,920 pixels, SH2, and 400K Gaussians when preflight memory permits.")
+            Text("Preview targets a 1,600-pixel edge, SH1, and 250K Gaussians. Balanced targets 1,920 pixels, SH2, and 400K Gaussians when preflight memory permits. Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Mask value 0 is ignored and 255 has full training coverage.")
+        }
+    }
+
+    private var trainingMasksBinding: Binding<Bool> {
+        Binding(
+            get: { session.trainingMasksEnabled },
+            set: { enabled in
+                trainingMaskSelectionWasEdited = true
+                session.trainingMasksEnabled = enabled
+            }
+        )
+    }
+
+    @MainActor
+    private func scanTrainingMasks(in selectedFolder: DatasetFolder) async {
+        let datasetURL = selectedFolder.url
+        let scan = Task.detached(priority: .utility) {
+            DatasetFolder.countTrainingMaskCandidates(at: datasetURL)
+        }
+        let count = await withTaskCancellationHandler {
+            await scan.value
+        } onCancel: {
+            scan.cancel()
+        }
+
+        guard !Task.isCancelled, folder === selectedFolder else { return }
+        trainingMaskCandidateCount = count
+        if count > 0 && !trainingMaskSelectionWasEdited {
+            session.trainingMasksEnabled = true
         }
     }
 

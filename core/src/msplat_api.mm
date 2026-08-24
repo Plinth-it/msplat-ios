@@ -100,9 +100,15 @@ void initializeDataset(Dataset::Impl& impl, InputData data,
 
 Dataset::Dataset(const std::string& path, float downscaleFactor,
                  bool evalMode, int testEvery)
+    : Dataset(path, downscaleFactor, evalMode, testEvery, false)
+{}
+
+Dataset::Dataset(const std::string& path, float downscaleFactor,
+                 bool evalMode, int testEvery, bool discoverTrainingMasks)
     : impl(std::make_unique<Impl>())
 {
-    initializeDataset(*impl, inputDataFromX(path), downscaleFactor,
+    initializeDataset(
+        *impl, inputDataFromX(path, "", discoverTrainingMasks), downscaleFactor,
                       evalMode, testEvery, path);
 }
 
@@ -684,6 +690,25 @@ std::shared_ptr<msplat::Dataset> createCheckedDataset(Factory&& factory) {
     }
 }
 
+MsplatStatus createDatasetFromPath(
+    const char* path, float downscaleFactor, bool evalMode, int testEvery,
+    bool discoverTrainingMasks, MsplatDataset* outDataset,
+    MsplatErrorInfo* error) {
+    if (outDataset) *outDataset = nullptr;
+    return guarded(error, MSPLAT_STATUS_INVALID_DATASET, [&] {
+        require(outDataset != nullptr, "outDataset must not be null");
+        requirePath(path);
+        validateDatasetCreationOptions(downscaleFactor, evalMode, testEvery);
+        auto handle = std::make_unique<CApiDatasetHandle>();
+        handle->dataset = createCheckedDataset([&] {
+            return std::make_shared<msplat::Dataset>(
+                std::string(path), downscaleFactor, evalMode, testEvery,
+                discoverTrainingMasks);
+        });
+        *outDataset = static_cast<MsplatDataset>(handle.release());
+    });
+}
+
 constexpr size_t kMaxDescriptorPointComponents =
     static_cast<size_t>(MSPLAT_DATASET_V5_MAX_POINTS) * 3;
 
@@ -1076,18 +1101,17 @@ MsplatStatus msplat_dataset_create_v2(const char* path, float downscaleFactor,
                                       bool evalMode, int testEvery,
                                       MsplatDataset* outDataset,
                                       MsplatErrorInfo* error) {
-    if (outDataset) *outDataset = nullptr;
-    return guarded(error, MSPLAT_STATUS_INVALID_DATASET, [&] {
-        require(outDataset != nullptr, "outDataset must not be null");
-        requirePath(path);
-        validateDatasetCreationOptions(downscaleFactor, evalMode, testEvery);
-        auto handle = std::make_unique<CApiDatasetHandle>();
-        handle->dataset = createCheckedDataset([&] {
-            return std::make_shared<msplat::Dataset>(
-                std::string(path), downscaleFactor, evalMode, testEvery);
-        });
-        *outDataset = static_cast<MsplatDataset>(handle.release());
-    });
+    return createDatasetFromPath(
+        path, downscaleFactor, evalMode, testEvery, false, outDataset, error);
+}
+
+MsplatStatus msplat_dataset_create_v10(
+    const char* path, float downscaleFactor, bool evalMode, int32_t testEvery,
+    bool discoverTrainingMasks, MsplatDataset* outDataset,
+    MsplatErrorInfo* error) {
+    return createDatasetFromPath(
+        path, downscaleFactor, evalMode, static_cast<int>(testEvery),
+        discoverTrainingMasks, outDataset, error);
 }
 
 MsplatStatus msplat_dataset_create_from_descriptor_v5(

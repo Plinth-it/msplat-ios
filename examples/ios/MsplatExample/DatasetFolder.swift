@@ -9,6 +9,7 @@ import Msplat
 /// step to last — that is the whole point of the byte-budgeted image cache —
 /// so the scope has to stay open for the entire session, not just the load.
 final class DatasetFolder {
+    let id = UUID()
     let url: URL
     private var scoped = false
 
@@ -44,6 +45,44 @@ final class DatasetFolder {
             }
         }
         return nil
+    }
+
+    /// Counts regular files below any case-insensitive `masks/` path component
+    /// without claiming that every file matches a COLMAP frame. The native
+    /// loader owns exact mask matching.
+    static func countTrainingMaskCandidates(at root: URL) -> Int {
+        let fileManager = FileManager.default
+        guard let enumerator = fileManager.enumerator(
+            at: root,
+            includingPropertiesForKeys: [.isRegularFileKey]
+        ) else {
+            return 0
+        }
+
+        var count = 0
+        let rootComponentCount = root.standardizedFileURL.pathComponents.count
+        for case let candidate as URL in enumerator {
+            if Task.isCancelled { return count }
+            let relativeComponents = candidate.standardizedFileURL.pathComponents
+                .dropFirst(rootComponentCount)
+                .dropLast()
+            guard relativeComponents.contains(where: {
+                $0.compare(
+                    "masks",
+                    options: [.caseInsensitive, .literal]
+                ) == .orderedSame
+            }) else {
+                continue
+            }
+
+            let values = try? candidate.resourceValues(
+                forKeys: [.isRegularFileKey]
+            )
+            if values?.isRegularFile == true {
+                count += 1
+            }
+        }
+        return count
     }
 
     /// A short description of what was found, for the picker row.

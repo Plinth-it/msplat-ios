@@ -194,7 +194,13 @@ struct InputData {
 // materialize the mutable camera/image runtime used by the current trainer.
 DatasetDescriptor datasetDescriptorFromX(
     const std::string &path, const std::string &colmapImagePath = "");
+DatasetDescriptor datasetDescriptorFromX(
+    const std::string &path, const std::string &colmapImagePath,
+    bool discoverTrainingMasks);
 InputData inputDataFromDescriptor(DatasetDescriptor descriptor);
 InputData inputDataFromX(const std::string &path, const std::string &colmapImagePath = "");
+InputData inputDataFromX(const std::string &path,
+                         const std::string &colmapImagePath,
+                         bool discoverTrainingMasks);
 
 #endif

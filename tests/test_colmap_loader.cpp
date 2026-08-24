@@ -65,6 +65,134 @@ bool writeTextModel(const fs::path &root, const std::string &cameras,
            writeText(root / "points3D.txt", points);
 }
 
+bool writeFileCreatingParents(const fs::path &path,
+                              const std::string &contents = "mask") {
+    std::error_code error;
+    fs::create_directories(path.parent_path(), error);
+    return !error && writeText(path, contents);
+}
+
+const DatasetFrameDescriptor *frameWithId(
+    const DatasetDescriptor &descriptor, const std::string &id) {
+    for (const DatasetFrameDescriptor &frame : descriptor.frames) {
+        if (frame.id == id) return &frame;
+    }
+    return nullptr;
+}
+
+bool maskEquals(const DatasetFrameDescriptor *frame, const fs::path &path) {
+    return frame && frame->trainingMask &&
+           frame->trainingMask->path == path.string() &&
+           frame->trainingMask->channel == TrainingMaskChannel::Automatic;
+}
+
+bool checkTrainingMaskDiscoveryIsOptInAndPartial() {
+    TempDirectory temporary;
+    const fs::path maskPath =
+        temporary.path / "assets" / "MaSkS" / "images" / "A.PnG";
+    std::error_code directoryError;
+    fs::create_directories(temporary.path / "images", directoryError);
+    if (!writeTextModel(temporary.path, kTextCameras, kTextImages, kTextPoints) ||
+        directoryError ||
+        !writeFileCreatingParents(maskPath)) {
+        return false;
+    }
+
+    try {
+        const DatasetDescriptor disabled =
+            loaders::loadColmap(temporary.path.string());
+        if (disabled.frames.size() != 2 ||
+            disabled.frames[0].trainingMask ||
+            disabled.frames[1].trainingMask) {
+            return false;
+        }
+
+        const DatasetDescriptor enabled = datasetDescriptorFromX(
+            temporary.path.string(), "", true);
+        validateDatasetDescriptor(enabled);
+        return maskEquals(frameWithId(enabled, "200"), maskPath) &&
+               frameWithId(enabled, "100") &&
+               !frameWithId(enabled, "100")->trainingMask;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool checkTrainingMaskFormatsAndDeterminism() {
+    TempDirectory temporary;
+    if (!writeTextModel(temporary.path, kTextCameras, kTextImages, kTextPoints)) {
+        return false;
+    }
+
+    const fs::path sameStemA = temporary.path / "masks" / "a.png";
+    const fs::path sameStemB = temporary.path / "masks" / "A.webp";
+    const fs::path fullFilename = temporary.path / "masks" / "z.jpg.mask";
+    const fs::path maskSuffix = temporary.path / "masks" / "z.mask.tiff";
+    if (!writeFileCreatingParents(sameStemA) ||
+        !writeFileCreatingParents(sameStemB) ||
+        !writeFileCreatingParents(fullFilename) ||
+        !writeFileCreatingParents(maskSuffix)) {
+        return false;
+    }
+
+    const fs::path expectedA = sameStemA.generic_string() <
+            sameStemB.generic_string() ? sameStemA : sameStemB;
+    const fs::path expectedZ = fullFilename.generic_string() <
+            maskSuffix.generic_string() ? fullFilename : maskSuffix;
+
+    try {
+        const DatasetDescriptor first = loaders::loadColmap(
+            temporary.path.string(), "", true);
+        const DatasetDescriptor second = loaders::loadColmap(
+            temporary.path.string(), "", true);
+        if (!maskEquals(frameWithId(first, "200"), expectedA) ||
+            !maskEquals(frameWithId(first, "100"), expectedZ) ||
+            !maskEquals(frameWithId(second, "200"), expectedA) ||
+            !maskEquals(frameWithId(second, "100"), expectedZ)) {
+            return false;
+        }
+
+        std::error_code error;
+        fs::remove(fullFilename, error);
+        if (error) return false;
+        const DatasetDescriptor suffixOnly = loaders::loadColmap(
+            temporary.path.string(), "", true);
+        return maskEquals(frameWithId(suffixOnly, "100"), maskSuffix);
+    } catch (...) {
+        return false;
+    }
+}
+
+bool checkTrainingMaskNestedSuffixMatching() {
+    TempDirectory temporary;
+    const std::string images =
+        "100 1 0 0 0 0 0 0 7 capture/nested/frame.JPG\n\n"
+        "200 1 0 0 0 0 0 0 7 unmatched/other.jpeg\n\n";
+    const std::string points = "900 1 2 3 255 0 0 0.25\n";
+    const fs::path nestedMask =
+        temporary.path / "masks" / "nested" / "FRAME.custom";
+    const fs::path directoryOnly =
+        temporary.path / "masks" / "unmatched" / "other.png";
+    if (!writeTextModel(temporary.path, kTextCameras, images, points) ||
+        !writeFileCreatingParents(nestedMask)) {
+        return false;
+    }
+    std::error_code error;
+    fs::create_directories(directoryOnly, error);
+    if (error) return false;
+
+    try {
+        const DatasetDescriptor descriptor = loaders::loadColmap(
+            temporary.path.string(), "", true);
+        validateDatasetDescriptor(descriptor);
+        return maskEquals(frameWithId(descriptor, "100"), nestedMask) &&
+               frameWithId(descriptor, "200") &&
+               !frameWithId(descriptor, "200")->trainingMask;
+    } catch (...) {
+        return false;
+    }
+}
+
 bool writePointPly(const fs::path &path) {
     return writeText(path,
         "ply\n"
@@ -577,6 +705,9 @@ bool checkBinaryOversizedDimensionsRejected() {
 int main() {
     CHECK(checkTextHappyPath());
     CHECK(checkBinaryHappyPath());
+    CHECK(checkTrainingMaskDiscoveryIsOptInAndPartial());
+    CHECK(checkTrainingMaskFormatsAndDeterminism());
+    CHECK(checkTrainingMaskNestedSuffixMatching());
     CHECK(checkTextSemanticRejections());
     CHECK(checkTextDuplicateIdRejections());
     CHECK(checkTextTruncationRejections());

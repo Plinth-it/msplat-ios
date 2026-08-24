@@ -7,6 +7,9 @@
 // Format-specific loaders
 namespace loaders {
     DatasetDescriptor loadColmap(const std::string &projectRoot, const std::string &imageSourcePath = "");
+    DatasetDescriptor loadColmap(const std::string &projectRoot,
+                                 const std::string &imageSourcePath,
+                                 bool discoverTrainingMasks);
     DatasetDescriptor loadNerfstudio(const std::string &projectRoot);
     DatasetDescriptor loadPolycam(const std::string &projectRoot);
 }

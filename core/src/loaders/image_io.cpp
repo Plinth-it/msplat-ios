@@ -293,7 +293,8 @@ CoverageMask imreadCoverageMask(
     int targetWidth, int targetHeight, bool applyExifOrientation,
     TrainingMaskChannel channel) {
     if (channel != TrainingMaskChannel::Luminance &&
-        channel != TrainingMaskChannel::Alpha) {
+        channel != TrainingMaskChannel::Alpha &&
+        channel != TrainingMaskChannel::Automatic) {
         throw std::invalid_argument("Unknown training mask channel");
     }
 
@@ -325,8 +326,9 @@ CoverageMask imreadCoverageMask(
                 "Training mask full-resolution decode changed dimensions: " +
                 path);
         }
-        if (channel == TrainingMaskChannel::Alpha &&
-            !hasAlphaChannel(CGImageGetAlphaInfo(thumbnail.get()))) {
+        const bool sourceHasAlpha =
+            hasAlphaChannel(CGImageGetAlphaInfo(thumbnail.get()));
+        if (channel == TrainingMaskChannel::Alpha && !sourceHasAlpha) {
             throw msplat::InvalidDatasetError(
                 "Training mask requests alpha coverage but the image has no "
                 "alpha channel: " + path);
@@ -366,8 +368,14 @@ CoverageMask imreadCoverageMask(
         // pixel, and it avoids a fifth source-sized allocation while the
         // decoded CGImage is resident.
         for (size_t i = 0; i < sourceMaskElements; ++i) {
-            if (channel == TrainingMaskChannel::Alpha) {
+            if (channel == TrainingMaskChannel::Alpha ||
+                (channel == TrainingMaskChannel::Automatic &&
+                 sourceHasAlpha)) {
                 rgba[i] = rgba[i * 4 + 3];
+                continue;
+            }
+            if (channel == TrainingMaskChannel::Automatic) {
+                rgba[i] = rgba[i * 4 + 0];
                 continue;
             }
             const float luminance =

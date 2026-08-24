@@ -24,7 +24,23 @@ into `MsplatExample` under Finder's Files tab, then pick it from
 `On My iPhone / MsplatExample`.
 
 A COLMAP folder is one holding `cameras.bin` or `cameras.txt`, either at its
-root or under `sparse/0`, alongside an `images` directory.
+root or under `sparse/0`, alongside an `images` directory. Optional training
+mask sidecars live below any case-insensitive `masks` path component.
+
+After a folder is selected, the app counts regular files below those
+directories on a background task and automatically enables **Use discovered
+masks** when that count is nonzero. The switch remains manually available
+during and after the advisory scan, and can disable discovery for a run. The displayed number is a
+candidate-file count, not a matched-frame count: the native COLMAP loader owns
+exact sidecar matching, and frames without a match train with full coverage.
+For an image such as `images/foo.jpeg`, supported names include
+`masks/foo.png`, `masks/foo.jpeg.mask`, and `masks/foo.mask.png`; matching is
+case-insensitive and supports nested directory suffixes. An alpha-bearing mask
+uses alpha, while other color masks use their first/red channel. Mask value 0
+is ignored, 255 has full training coverage, and intermediate values provide
+soft coverage. This masks RGB loss; it does not train splat opacity to
+reproduce image transparency. Sidecars must match their source-image
+dimensions; unlike Brush, MSplat does not resize mismatched masks.
 
 ## What it shows
 
@@ -40,9 +56,10 @@ metadata and builds one of two explicit plans:
 The plan screen shows each effective resolution stage, target SH degree,
 Gaussian ceiling, and a conservative code-derived peak-memory estimate. The
 estimate covers native model and training buffers, image-cache insertion,
-target-resolution app-owned decode buffers, and recommended headroom. The
-current formula reflects the split cache and removal of dead workspaces. The app
-refuses to start when that estimate exceeds a nonzero
+target-resolution app-owned decode buffers, and recommended headroom. When mask
+discovery is enabled, it also includes conservative source-mask decoding and
+paired CPU/GPU mask caches. The current formula reflects the split cache and
+removal of dead workspaces. The app refuses to start when that estimate exceeds a nonzero
 `os_proc_available_memory` value at preflight (the simulator reports zero and
 skips this comparison).
 
