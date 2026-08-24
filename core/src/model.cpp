@@ -1944,18 +1944,44 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
         throw std::invalid_argument("Training coverage denominator is invalid");
     }
     if (target.coverageMask) {
-        if (!target.coverageMask->defined() ||
-            !target.coverageMask->isGpu() ||
-            target.coverageMask->dtype() != DType::UInt8 ||
-            target.coverageMask->ndim() != 2 ||
-            target.coverageMask->size(0) != s.height ||
-            target.coverageMask->size(1) != s.width) {
+        const bool coverageIsPackedAlpha =
+            target.coverageMask == target.image;
+        const bool standaloneCoverageValid =
+            target.coverageMask->defined() &&
+            target.coverageMask->isGpu() &&
+            target.coverageMask->dtype() == DType::UInt8 &&
+            target.coverageMask->ndim() == 2 &&
+            target.coverageMask->size(0) == s.height &&
+            target.coverageMask->size(1) == s.width;
+        if ((!coverageIsPackedAlpha && !standaloneCoverageValid) ||
+            (coverageIsPackedAlpha &&
+             target.image->dtype() != DType::UInt8)) {
             throw std::invalid_argument(
-                "Training coverage mask must be a GPU uint8 tensor matching the camera");
+                "Training coverage must be packed RGBA alpha or a GPU uint8 "
+                "tensor matching the camera");
         }
     } else if (target.coverageUnits != fullCoverageUnits) {
         throw std::invalid_argument(
             "Unmasked training coverage denominator is inconsistent");
+    }
+    if (target.coverageRenderTiles) {
+        const int64_t expectedTileHeight =
+            (static_cast<int64_t>(s.height) + kTrainingTileSize - 1) /
+            kTrainingTileSize;
+        const int64_t expectedTileWidth =
+            (static_cast<int64_t>(s.width) + kTrainingTileSize - 1) /
+            kTrainingTileSize;
+        if (!target.coverageMask ||
+            !target.coverageRenderTiles->defined() ||
+            !target.coverageRenderTiles->isGpu() ||
+            target.coverageRenderTiles->dtype() != DType::UInt8 ||
+            target.coverageRenderTiles->ndim() != 2 ||
+            target.coverageRenderTiles->size(0) != expectedTileHeight ||
+            target.coverageRenderTiles->size(1) != expectedTileWidth) {
+            throw std::invalid_argument(
+                "Coverage render tiles must be a GPU uint8 tile map matching "
+                "the camera");
+        }
     }
     MTensor& gt = *target.image;
 
@@ -2052,6 +2078,10 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
 
     const bool transparentMask =
         transparentTrainingMasks && target.coverageMask != nullptr;
+    const MTensor *coverageRenderTiles =
+        target.coverageMask && !transparentMask
+            ? target.coverageRenderTiles
+            : nullptr;
     const uint64_t objectiveCoverageUnits = transparentMask
         ? fullCoverageUnits
         : target.coverageUnits;
@@ -2072,6 +2102,7 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
             s.height, s.width, s.tileBounds, 0.01f,
             s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
             opacities, backgroundColor, gt, target.coverageMask,
+            coverageRenderTiles,
             objectiveCoverageUnits, ssimWeight,
             lossInvN, transparentMask, transparentAlphaLossWeight,
             N_ADAM_GROUPS,

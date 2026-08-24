@@ -74,12 +74,16 @@
   targets. ImageIO decode, resolution pyramids, and Brown-Conrady correction
   remain byte-native; the SSIM/L1 kernels normalize RGB during their existing
   tile loads, while CPU evaluation accepts the same compact representation.
-  Decoded CPU pixels are released after upload, leaving one four-byte target
-  per pixel in the image cache (plus a separate one-byte mask when present).
+  Decoded CPU pixels are released after upload. Masked coverage is packed into
+  the existing alpha byte. Coverage-mode targets also cache one UInt8 activity
+  byte per 16x16 render tile, including the exact five-pixel SSIM halo, and use
+  it to prune exact intersections without changing projection, dense loss, or
+  transparent-mode execution.
 - Added opt-in depth-one CPU camera prefetch across the C/Swift, native CLI,
   and Python trainers (`MSPLAT_CAMERA_PREFETCH=1`). It prepares the exact next
-  shuffled camera and resolution while the current Metal step runs; GPU upload
-  and cache mutation remain serialized. The default path remains synchronous.
+  shuffled camera and resolution while the current Metal step runs, packing a
+  prepared mask into RGBA alpha before staging; GPU upload and cache mutation
+  remain serialized. The default path remains synchronous.
 - Corrected the image-edge versus array-index conversion in Brown-Conrady
   rectification, including alpha=0 crop endpoints and paired mask sampling.
   The renderer now uses an exact homogeneous divide, propagates the missing

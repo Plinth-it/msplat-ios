@@ -102,7 +102,7 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_888_707_620)
     }
 
-    func testMaskAwareMemoryEstimateIncludesCompactTargetAndDecodeStorage() throws {
+    func testMaskAwareMemoryEstimateUsesPackedTargetAndDecodeStorage() throws {
         let plan = try TrainingPlan(
             inputDimensions: TrainingImageDimensions(width: 1_920, height: 1_440),
             inputDecodeScale: 2,
@@ -128,7 +128,7 @@ final class TrainingPlanTests: XCTestCase {
             imageCacheBudgetBytes:
                 TrainingMemoryEstimate.defaultIOSImageCacheBudgetBytes
         )
-        XCTAssertEqual(estimate.largestImageCacheEntryBytes, 3_456_000)
+        XCTAssertEqual(estimate.largestImageCacheEntryBytes, 2_767_500)
         XCTAssertEqual(estimate.imageDecodeTransientBytes, 24_883_200)
         XCTAssertEqual(estimate.imageInsertionPeakBytes, 561_754_112)
         XCTAssertEqual(estimate.codeDerivedBytes, 2_051_979_464)
@@ -164,7 +164,7 @@ final class TrainingPlanTests: XCTestCase {
                 imageCacheBudgetBytes:
                     TrainingMemoryEstimate.defaultIOSImageCacheBudgetBytes
             ).largestImageCacheEntryBytes,
-            864_000
+            691_890
         )
     }
 

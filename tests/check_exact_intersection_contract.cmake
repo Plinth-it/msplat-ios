@@ -36,6 +36,19 @@ endforeach()
 require_contains("${metal_source}" "device atomic_uint* tile_counts"
     "atomic projection counts")
 require_contains("${metal_source}"
+    "inline bool training_render_tile_active("
+    "shared coverage render-tile predicate")
+string(REGEX MATCHALL
+    "training_render_tile_active" active_tile_checks "${metal_source}")
+list(LENGTH active_tile_checks active_tile_check_count)
+if(NOT active_tile_check_count EQUAL 3)
+    message(FATAL_ERROR
+        "Expected one active-tile helper and two gates, found ${active_tile_check_count}")
+endif()
+require_contains("${metal_source}"
+    "constant uchar* coverage_render_tiles   [[buffer(13)]]"
+    "scatter coverage render-tile binding")
+require_contains("${metal_source}"
     "device float* projected_opacities       [[buffer(12)]]"
     "per-Gaussian projected opacity output")
 require_contains("${metal_source}"
@@ -72,6 +85,15 @@ endif()
 require_contains("${host_source}"
     "ENC_BUF(enc, g_tcache.tile_scatter_counters, 15)"
     "projection count binding")
+require_contains("${host_source}"
+    "ENC_BUF(enc, coverageRenderTileBuffer, 24);\n        ENC_SCALAR(enc, coverageRenderTileStride, 25);"
+    "training projection coverage tile bindings")
+require_contains("${host_source}"
+    "ENC_BUF(enc, coverageRenderTileBuffer, 13);\n        ENC_SCALAR(enc, coverageRenderTileStride, 14);"
+    "training scatter coverage tile bindings")
+require_contains("${host_source}"
+    "const uint32_t coverageRenderTileStrideDisabled = 0u;"
+    "render pipeline disables coverage pruning")
 require_contains("${host_source}" "ENC_BUF(enc, projected_opacities, 12)"
     "projected opacity binding")
 require_contains("${host_source}"

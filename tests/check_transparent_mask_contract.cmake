@@ -60,7 +60,7 @@ require_not_contains("${chunked_backward}"
     "chunked pixels must not return before threadgroup barriers")
 
 foreach(section IN ITEMS h_forward fused_loss v_backward)
-    require_contains("${${section}}" "alpha_stride"
+    require_contains("${${section}}" "alpha_layout"
         "${section} transparent-mode gate")
     require_contains("${${section}}" "training_target_rgb("
         "${section} background-composited RGB target")
@@ -75,24 +75,30 @@ extract_section(host_source "auto encode_loss_fwd_bwd ="
 extract_section(host_source "auto encode_rast_bwd ="
     "// Packed optimizer hyperparameters" host_raster_backward)
 require_contains("${host_loss}"
-    "ENC_BUF(enc, loss_coverage_buffer, 7);\n        ENC_SCALAR(enc, alpha_stride, 8);\n        ENC_BUF(enc, background, 9);"
+    "ENC_BUF(enc, loss_coverage_buffer, 7);\n        ENC_SCALAR(enc, alpha_layout, 8);\n        ENC_BUF(enc, background, 9);"
     "horizontal loss bindings")
 require_contains("${host_loss}"
-    "ENC_SCALAR(enc, alpha_stride, 13);\n        ENC_BUF(enc, background, 14);\n        ENC_BUF(enc, final_Ts, 15);\n        ENC_SCALAR(enc, alpha_loss_weight, 16);"
+    "ENC_SCALAR(enc, alpha_layout, 13);\n        ENC_BUF(enc, background, 14);\n        ENC_BUF(enc, final_Ts, 15);\n        ENC_SCALAR(enc, alpha_loss_weight, 16);"
     "fused alpha-loss bindings")
 require_contains("${host_loss}"
-    "ENC_SCALAR(enc, alpha_stride, 12);\n        ENC_BUF(enc, background, 13);"
+    "ENC_SCALAR(enc, alpha_layout, 12);\n        ENC_BUF(enc, background, 13);"
     "loss backward target bindings")
 require_contains("${host_raster_backward}"
-    "ENC_BUF(enc, loss_coverage_buffer, 15);\n            ENC_SCALAR(enc, alpha_stride, 16);\n            ENC_SCALAR(enc, alpha_gradient_scale, 17);"
+    "ENC_BUF(enc, loss_coverage_buffer, 15);\n            ENC_SCALAR(enc, alpha_layout, 16);\n            ENC_SCALAR(enc, alpha_gradient_scale, 17);"
     "monolithic raster alpha bindings")
 require_contains("${host_raster_backward}"
-    "ENC_BUF(enc, loss_coverage_buffer, 20);\n            ENC_SCALAR(enc, alpha_stride, 21);\n            ENC_SCALAR(enc, alpha_gradient_scale, 22);"
+    "ENC_BUF(enc, loss_coverage_buffer, 20);\n            ENC_SCALAR(enc, alpha_layout, 21);\n            ENC_SCALAR(enc, alpha_gradient_scale, 22);"
     "chunked raster alpha bindings")
 
 require_contains("${model_source}"
     "transparentTrainingMasks && target.coverageMask != nullptr"
     "per-frame transparent activation")
+require_contains("${model_source}"
+    "target.coverageMask && !transparentMask\n            ? target.coverageRenderTiles\n            : nullptr;"
+    "transparent mode suppresses coverage render-tile pruning")
+require_contains("${host_source}"
+    "const bool useCoverageRenderTiles = coverage_mask &&\n        !transparent_mask && coverage_render_tiles;"
+    "Metal host enables render-tile pruning only for coverage mode")
 require_contains("${model_source}"
     "transparentMask\n        ? fullCoverageUnits\n        : target.coverageUnits"
     "full-frame transparent normalization")

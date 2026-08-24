@@ -273,7 +273,7 @@ void checkTerminalStep(bool collectStats, int degreesToUse) {
         kHeight, kWidth, std::make_tuple(2, 2, 1), 0.01f,
         shDegree, degreesToUse, cameraPosition,
         featuresDc, featuresRest, opacities, background,
-        target, nullptr, coverageUnits, 0.2f, lossInvN,
+        target, nullptr, nullptr, coverageUnits, 0.2f, lossInvN,
         false, 0.0f,
         kAdamGroups, params.data(), expAvg.data(), expAvgSq.data(),
         stepSizes, biasCorrection2Sqrts,

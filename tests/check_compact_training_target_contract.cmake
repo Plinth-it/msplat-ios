@@ -3,9 +3,11 @@ if(NOT DEFINED MSPLAT_SOURCE_DIR)
 endif()
 
 file(READ "${MSPLAT_SOURCE_DIR}/core/src/input_data.cpp" input_source)
+file(READ "${MSPLAT_SOURCE_DIR}/core/include/input_data.hpp" input_header)
 file(READ "${MSPLAT_SOURCE_DIR}/core/src/model.cpp" model_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/metal/msplat_metal.mm" host_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/metal/msplat_metal.metal" metal_source)
+file(READ "${MSPLAT_SOURCE_DIR}/swift/Sources/Msplat/TrainingPlan.swift" planner_source)
 
 function(require_contains contents needle label)
     string(FIND "${contents}" "${needle}" position)
@@ -37,7 +39,7 @@ function(extract_section source_name start_marker end_marker output_name)
 endfunction()
 
 extract_section(input_source "UploadedTrainingTarget uploadTrainingTarget("
-    "} // namespace\n\nCameraTrainingTarget Camera::getGPUTrainingTarget("
+    "} // namespace\n\nbool Camera::hasGPUTrainingTarget("
     target_upload)
 require_contains("${target_upload}"
     "{image.height, image.width, 4}, DType::UInt8"
@@ -45,16 +47,51 @@ require_contains("${target_upload}"
 require_contains("${target_upload}"
     "expectedImageBytes != image.data.size()"
     "Camera validates compact image storage before upload")
-require_contains("${target_upload}"
-    "pixelCount != mask->data.size()"
+require_contains("${input_source}"
+    "pixelCount != mask.data.size()"
     "Camera validates compact mask storage before upload")
 require_contains("${target_upload}"
     "static_cast<size_t>(expectedImageBytes)"
     "Camera copies the validated compact raster without float expansion")
+require_contains("${target_upload}"
+    "rgba[pixel * 4u + 3u] = mask->data[pixel]"
+    "Camera packs coverage into RGBA alpha")
+require_absent("${target_upload}" "gpu_empty(\n            {mask->height"
+    "Camera must not allocate a standalone GPU mask")
 extract_section(input_source "CameraTrainingTarget Camera::getGPUTrainingTarget("
     "MTensor& Camera::getGPUImage(" camera_upload)
 require_contains("${camera_upload}" "uploadTrainingTarget("
     "Camera publishes through the validated compact upload helper")
+require_contains("${camera_upload}"
+    "trainingMask ? &imageInserted.first->second : nullptr"
+    "Camera marks packed coverage by aliasing the image")
+require_contains("${input_header}" "MTensor *coverageMask = nullptr;"
+    "CameraTrainingTarget ABI fields remain intact")
+require_contains("${input_header}" "MTensor *coverageRenderTiles = nullptr;"
+    "CameraTrainingTarget appends optional render tiles")
+require_contains("${input_header}" "kTrainingSsimHalo = 5"
+    "CPU render-tile halo matches 11x11 SSIM")
+require_contains("${metal_source}" "#define SSIM_HALF_WIN 5"
+    "Metal SSIM radius matches the CPU render-tile halo")
+require_contains("${input_source}" "buildCoverageRenderTileMap("
+    "Camera builds conservative coverage render tiles")
+require_contains("${input_source}"
+    "gpuTrainingMaskSourceByDownscale.emplace("
+    "resident targets retain their mask source identity")
+require_contains("${input_source}"
+    "decodedTrainingMaskSource = trainingMask;"
+    "decoded coverage retains its mask source identity")
+require_contains("${input_source}"
+    "!decodedTrainingMaskMatches(*this)"
+    "coverage lookup rejects a stale decoded mask source")
+require_contains("${input_source}"
+    "camera.hasGPUTrainingTarget(downscaleFactor)"
+    "prefetch residency requires a complete source-matched target")
+require_contains("${planner_source}" "[4, pixelCount]"
+    "planner budgets four bytes for masked and unmasked targets")
+require_contains("${planner_source}"
+    "includesTrainingMasks ? tileCount : 0"
+    "planner budgets one byte per masked render tile")
 require_contains("${input_source}" "cam.releaseCpuImageMemory();"
     "decoded CPU pixels are released after compact publication")
 
@@ -67,6 +104,16 @@ require_contains("${host_source}"
 require_contains("${host_source}"
     "const uint32_t target_pixel_stride_bytes = targetIsRGBA8\n        ? 4u\n        : 3u * static_cast<uint32_t>(sizeof(float));"
     "host derives the compact target byte stride")
+require_contains("${host_source}"
+    "const bool coverageIsPackedAlpha = coverage_mask == &gt;"
+    "Metal entry point recognizes packed alpha")
+require_contains("${host_source}"
+    "std::array<uint32_t, 2>{4u, 3u}"
+    "Metal host exposes packed mask stride and offset")
+
+require_contains("${metal_source}"
+    "training_mask[pixel * layout.x + layout.y]"
+    "Metal kernels address interleaved packed coverage")
 
 extract_section(metal_source "inline float training_target_rgb("
     "// Forward pass 1: horizontal convolution" target_helper)

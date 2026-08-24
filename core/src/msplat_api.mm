@@ -347,8 +347,13 @@ EvalMetrics Trainer::evaluate() {
         MTensor maskCpu;
         const MTensor* coverageMask = nullptr;
         if (target.coverageMask) {
-            maskCpu = target.coverageMask->cpu();
-            coverageMask = &maskCpu;
+            if (target.coverageMask == target.image) {
+                // Preserve the packed-alpha marker across the GPU-to-CPU copy.
+                coverageMask = &gtCpu;
+            } else {
+                maskCpu = target.coverageMask->cpu();
+                coverageMask = &maskCpu;
+            }
         }
 
         sumPsnr += psnr(

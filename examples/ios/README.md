@@ -66,10 +66,11 @@ initial Gaussian count, Gaussian ceiling, and a conservative code-derived
 peak-memory estimate. The
 estimate covers native model and training buffers, image-cache insertion,
 target-resolution app-owned decode buffers, and recommended headroom. When mask
-discovery is enabled, it also includes conservative source-mask decoding and
-the retained GPU mask. Training targets remain compact UInt8 RGBA buffers and
-decoded CPU pixels are released after upload. The current formula reflects the
-split cache and removal of dead workspaces. The app refuses to start when that
+discovery is enabled, it also includes conservative source-mask decoding.
+Training targets remain compact UInt8 RGBA buffers, with coverage packed into
+alpha, plus one activity byte per 16x16 tile for masked coverage targets; decoded
+CPU pixels are released after upload. The current formula reflects that compact
+cache and removal of dead workspaces. The app refuses to start when that
 estimate exceeds a nonzero `os_proc_available_memory` value at preflight (the
 simulator reports zero and skips this comparison).
 

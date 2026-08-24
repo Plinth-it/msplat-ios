@@ -96,7 +96,7 @@ struct ContentView: View {
                 Button("Stop", role: .destructive) { session.cancel() }
             }
         } footer: {
-            Text("Preview targets a 1,600-pixel edge, SH1, and a 250K Gaussian ceiling. Balanced targets 1,920 pixels, SH2, and a 400K ceiling when preflight memory permits. Either ceiling rises only enough to preserve a larger initial sparse model, and the memory estimate is recomputed. Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Transparent treats the mask as target alpha and suppresses exterior floaters. Coverage only uses mask values to weight RGB loss.")
+            Text("Preview targets a 1,600-pixel edge, SH1, and a 250K Gaussian ceiling. Balanced targets 1,920 pixels, SH2, and a 400K ceiling when preflight memory permits. Either ceiling rises only enough to preserve a larger initial sparse model, and the memory estimate is recomputed. Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Coverage only weights RGB loss and can skip off-mask tile work for throughput. Transparent supervises the full frame to suppress exterior floaters and is not expected to be faster.")
         }
     }
 
@@ -184,6 +184,7 @@ struct ContentView: View {
                         : session.splatCount.formatted()
                 )
                 LabeledContent("CPU submit", value: duration(session.cpuSubmitMs))
+                LabeledContent("Image prepare", value: duration(session.imagePrepareMs))
                 LabeledContent("GPU execute", value: duration(session.gpuExecutionMs))
                 LabeledContent("End to end", value: duration(session.endToEndMs))
                 LabeledContent("Loss", value: session.loss.map {

@@ -1672,6 +1672,10 @@ static void render_pipeline(
         ENC_BUF(enc, colors, 21); ENC_BUF(enc, aabb, 22);
         const uint32_t poseDisabled = 0u;
         ENC_SCALAR(enc, poseDisabled, 23);
+        // Render has no coverage objective; a zero stride disables pruning.
+        ENC_BUF(enc, g_tcache.tile_scatter_counters, 24);
+        const uint32_t coverageRenderTileStrideDisabled = 0u;
+        ENC_SCALAR(enc, coverageRenderTileStrideDisabled, 25);
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -1743,6 +1747,9 @@ static void render_pipeline(
         ENC_BUF(enc, g_tcache.overflow_flag, 10);
         ENC_BUF(enc, opacities, 11);
         ENC_BUF(enc, projected_opacities, 12);
+        ENC_BUF(enc, g_tcache.tile_scatter_counters, 13);
+        const uint32_t coverageRenderTileStrideDisabled = 0u;
+        ENC_SCALAR(enc, coverageRenderTileStrideDisabled, 14);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(scatterTpg, 1, 1)];
 
@@ -1933,6 +1940,7 @@ MTensor msplat_train_step(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
     MTensor &gt, const MTensor* coverage_mask,
+    const MTensor* coverage_render_tiles,
     uint64_t loss_coverage_units, float ssim_weight,
     float loss_inv_n, bool transparent_mask,
     float alpha_loss_weight,
@@ -1994,14 +2002,18 @@ MTensor msplat_train_step(
         throw std::invalid_argument(
             "Training alpha loss weight must be finite and non-negative");
     }
+    const bool coverageIsPackedAlpha = coverage_mask == &gt;
     if (coverage_mask) {
-        if (!coverage_mask->defined() || !coverage_mask->isGpu() ||
-            coverage_mask->dtype() != DType::UInt8 ||
-            coverage_mask->ndim() != 2 ||
-            coverage_mask->size(0) != static_cast<int64_t>(img_height) ||
-            coverage_mask->size(1) != static_cast<int64_t>(img_width)) {
+        const bool standaloneCoverageValid =
+            coverage_mask->defined() && coverage_mask->isGpu() &&
+            coverage_mask->dtype() == DType::UInt8 &&
+            coverage_mask->ndim() == 2 &&
+            coverage_mask->size(0) == static_cast<int64_t>(img_height) &&
+            coverage_mask->size(1) == static_cast<int64_t>(img_width);
+        if ((!coverageIsPackedAlpha && !standaloneCoverageValid) ||
+            (coverageIsPackedAlpha && !targetIsRGBA8)) {
             throw std::invalid_argument(
-                "Training coverage mask must be a GPU uint8 image");
+                "Training coverage must be packed RGBA alpha or a GPU uint8 image");
         }
     } else if (loss_coverage_units != fullCoverageUnits) {
         throw std::invalid_argument(
@@ -2015,11 +2027,47 @@ MTensor msplat_train_step(
         throw std::invalid_argument(
             "Transparent training must use the full-frame loss denominator");
     }
+    if (coverage_render_tiles) {
+        const int64_t expectedTileHeight =
+            (static_cast<int64_t>(img_height) + BLOCK_Y - 1) / BLOCK_Y;
+        const int64_t expectedTileWidth =
+            (static_cast<int64_t>(img_width) + BLOCK_X - 1) / BLOCK_X;
+        if (tile_bounds_x != expectedTileWidth ||
+            tile_bounds_y != expectedTileHeight ||
+            !coverage_mask || !coverage_render_tiles->defined() ||
+            !coverage_render_tiles->isGpu() ||
+            coverage_render_tiles->dtype() != DType::UInt8 ||
+            coverage_render_tiles->ndim() != 2 ||
+            coverage_render_tiles->size(0) != expectedTileHeight ||
+            coverage_render_tiles->size(1) != expectedTileWidth) {
+            throw std::invalid_argument(
+                "Coverage render tiles must be a GPU uint8 tile map matching "
+                "the training image");
+        }
+    }
     const MTensor& loss_coverage_buffer = coverage_mask ? *coverage_mask : gt;
-    const uint32_t coverage_stride =
-        coverage_mask && !transparent_mask ? img_width : 0u;
-    const uint32_t alpha_stride =
-        coverage_mask && transparent_mask ? img_width : 0u;
+    // uint2(x, y) is byte stride per pixel plus byte offset within the pixel.
+    // Camera cache targets use RGBA alpha (4,3); legacy standalone masks use
+    // one byte per pixel (1,0). A zero stride disables that objective.
+    const std::array<uint32_t, 2> mask_layout = coverageIsPackedAlpha
+        ? std::array<uint32_t, 2>{4u, 3u}
+        : std::array<uint32_t, 2>{1u, 0u};
+    const std::array<uint32_t, 2> coverage_layout =
+        coverage_mask && !transparent_mask
+            ? mask_layout
+            : std::array<uint32_t, 2>{0u, 0u};
+    const std::array<uint32_t, 2> alpha_layout =
+        coverage_mask && transparent_mask
+            ? mask_layout
+            : std::array<uint32_t, 2>{0u, 0u};
+    const bool useCoverageRenderTiles = coverage_mask &&
+        !transparent_mask && coverage_render_tiles;
+    const MTensor &coverageRenderTileBuffer = useCoverageRenderTiles
+        ? *coverage_render_tiles
+        : loss_coverage_buffer;
+    const uint32_t coverageRenderTileStride = useCoverageRenderTiles
+        ? static_cast<uint32_t>(tile_bounds_x)
+        : 0u;
     const float alpha_gradient_scale = transparent_mask
         ? alpha_loss_weight / static_cast<float>(pixelCount)
         : 0.0f;
@@ -2252,6 +2300,8 @@ MTensor msplat_train_step(
         ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, features_rest, 20);
         ENC_BUF(enc, colors, 21); ENC_BUF(enc, aabb, 22);
         ENC_SCALAR(enc, poseEnabled, 23);
+        ENC_BUF(enc, coverageRenderTileBuffer, 24);
+        ENC_SCALAR(enc, coverageRenderTileStride, 25);
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -2361,6 +2411,8 @@ MTensor msplat_train_step(
         ENC_BUF(enc, overflow_flag, 10);
         ENC_BUF(enc, opacities, 11);
         ENC_BUF(enc, projected_opacities, 12);
+        ENC_BUF(enc, coverageRenderTileBuffer, 13);
+        ENC_SCALAR(enc, coverageRenderTileStride, 14);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(scatterTpg, 1, 1)];
 
@@ -2447,7 +2499,7 @@ MTensor msplat_train_step(
         ENC_SCALAR(enc, cameraGainOffset, 5);
         ENC_SCALAR(enc, photometricEnabled, 6);
         ENC_BUF(enc, loss_coverage_buffer, 7);
-        ENC_SCALAR(enc, alpha_stride, 8);
+        ENC_SCALAR(enc, alpha_layout, 8);
         ENC_BUF(enc, background, 9);
         ENC_SCALAR(enc, target_pixel_stride_bytes, 10);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
@@ -2460,11 +2512,11 @@ MTensor msplat_train_step(
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, ssim_deriv_h_buf, 6); ENC_BUF(enc, loss_sum, 7);
         ENC_BUF(enc, loss_coverage_buffer, 8);
-        ENC_SCALAR(enc, coverage_stride, 9);
+        ENC_SCALAR(enc, coverage_layout, 9);
         ENC_BUF(enc, photometricLogGains, 10);
         ENC_SCALAR(enc, cameraGainOffset, 11);
         ENC_SCALAR(enc, photometricEnabled, 12);
-        ENC_SCALAR(enc, alpha_stride, 13);
+        ENC_SCALAR(enc, alpha_layout, 13);
         ENC_BUF(enc, background, 14);
         ENC_BUF(enc, final_Ts, 15);
         ENC_SCALAR(enc, alpha_loss_weight, 16);
@@ -2478,12 +2530,12 @@ MTensor msplat_train_step(
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
         ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
         ENC_BUF(enc, loss_coverage_buffer, 6);
-        ENC_SCALAR(enc, coverage_stride, 7);
+        ENC_SCALAR(enc, coverage_layout, 7);
         ENC_BUF(enc, photometricLogGains, 8);
         ENC_SCALAR(enc, cameraGainOffset, 9);
         ENC_BUF(enc, photometric_gradient, 10);
         ENC_SCALAR(enc, photometricEnabled, 11);
-        ENC_SCALAR(enc, alpha_stride, 12);
+        ENC_SCALAR(enc, alpha_layout, 12);
         ENC_BUF(enc, background, 13);
         ENC_SCALAR(enc, target_pixel_stride_bytes, 14);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
@@ -2524,7 +2576,7 @@ MTensor msplat_train_step(
             ENC_BUF(enc, v_xy, 11); ENC_BUF(enc, v_conic, 12);
             ENC_BUF(enc, v_colors_rast, 13); ENC_BUF(enc, v_opacity, 14);
             ENC_BUF(enc, loss_coverage_buffer, 15);
-            ENC_SCALAR(enc, alpha_stride, 16);
+            ENC_SCALAR(enc, alpha_layout, 16);
             ENC_SCALAR(enc, alpha_gradient_scale, 17);
             [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         } else {
@@ -2559,7 +2611,7 @@ MTensor msplat_train_step(
             ENC_BUF(enc, v_colors_rast, 16); ENC_BUF(enc, v_opacity, 17);
             ENC_SCALAR(enc, BWD_CHUNK_SIZE, 18); ENC_SCALAR(enc, bwd_K_max, 19);
             ENC_BUF(enc, loss_coverage_buffer, 20);
-            ENC_SCALAR(enc, alpha_stride, 21);
+            ENC_SCALAR(enc, alpha_layout, 21);
             ENC_SCALAR(enc, alpha_gradient_scale, 22);
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, bwd_K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         }
