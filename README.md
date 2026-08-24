@@ -47,11 +47,12 @@ canonical, caller-owned dataset directly through a checked deep-copy boundary.
   alpha byte for soft coverage. Coverage mode additionally caches one activity
   byte per 16x16 render tile, expanded by the five-pixel SSIM halo, so exact
   intersection packing omits inactive tiles and leaves their raster bins empty.
-  Transparent mode retains the full-frame path. Setting exactly
-  `MSPLAT_CAMERA_PREFETCH=1` opts each trainer entry point into preparing one
-  detached CPU target for the next shuffled camera and resolution while the
-  current Metal step runs. GPU upload and LRU mutation remain on the serialized
-  training thread, and prefetch remains off by default.
+  Transparent mode retains the full-frame path. Swift sessions can opt in with
+  `DatasetOptions.prefetchTrainingTargets`; native clients can use ABI v13 or
+  set exactly `MSPLAT_CAMERA_PREFETCH=1`. One detached CPU target for the next
+  shuffled camera and resolution is prepared while the current Metal step runs.
+  GPU upload and LRU mutation remain on the serialized training thread, and
+  library prefetch remains off by default.
 - `maxGaussians` bounds the active population and its backing buffers. When a
   densification step has more eligible candidates than remaining capacity, the
   highest normalized-gradient candidates are retained; pruning still runs at
@@ -162,6 +163,8 @@ poses.
   the locked `MsplatConfig` layout or any earlier entry point.
 - ABI v12 detailed count-barrier and tile-distribution telemetry through a new
   query structure; the ABI v4 telemetry layout and entry point remain unchanged.
+- ABI v13 instance-scoped training-target prefetch, exposed through Swift
+  `DatasetOptions`; the environment opt-in remains available to native clients.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,

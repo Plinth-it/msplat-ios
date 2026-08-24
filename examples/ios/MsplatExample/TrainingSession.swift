@@ -192,7 +192,8 @@ final class TrainingSession: ObservableObject {
             let activeSession = try await MsplatSession(
                 datasetURL: folder.url,
                 trainingPlan: plan,
-                baseConfig: baseConfig
+                baseConfig: baseConfig,
+                prefetchTrainingTargets: true
             )
             session = activeSession
             try Task.checkCancellation()

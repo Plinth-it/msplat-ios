@@ -59,6 +59,17 @@
 - Added ABI v12 completed-step telemetry for image preparation, exact-count GPU
   duration and wall wait, post-count encoding, arena growth, and tile-density
   buckets. The ABI v4 telemetry structure and query remain byte-for-byte stable.
+- Added ABI v13 instance-scoped training-target prefetch enablement. Swift
+  exposes it through `DatasetOptions.prefetchTrainingTargets`, and the iOS
+  sample enables it for both masked and unmasked runs so their timing comparison
+  remains fair. The existing environment opt-in remains available to native
+  clients. The first shuffled target is scheduled when the trainer is created;
+  later targets overlap the preceding Metal step while upload and LRU mutation
+  stay serialized.
+- Added an exact binary-grayscale PNG mask path for discovered Brush-style
+  masks. Eligible 8-bit black/white masks decode into one source byte per pixel
+  before the existing area filter; soft, profiled, alpha, and color masks retain
+  the established RGBA/sRGB fallback and byte-for-byte target semantics.
 - Removed the unused depth cotangent from RGB training, computed projected
   opacity once per visible Gaussian, and recovered backward Gaussian IDs directly
   from sorted keys. Exact-intersection storage drops from 56 to 52 bytes per
@@ -79,11 +90,6 @@
   byte per 16x16 render tile, including the exact five-pixel SSIM halo, and use
   it to prune exact intersections without changing projection, dense loss, or
   transparent-mode execution.
-- Added opt-in depth-one CPU camera prefetch across the C/Swift, native CLI,
-  and Python trainers (`MSPLAT_CAMERA_PREFETCH=1`). It prepares the exact next
-  shuffled camera and resolution while the current Metal step runs, packing a
-  prepared mask into RGBA alpha before staging; GPU upload and cache mutation
-  remain serialized. The default path remains synchronous.
 - Corrected the image-edge versus array-index conversion in Brown-Conrady
   rectification, including alpha=0 crop endpoints and paired mask sampling.
   The renderer now uses an exact homogeneous divide, propagates the missing

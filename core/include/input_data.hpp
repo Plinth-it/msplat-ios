@@ -170,7 +170,8 @@ class CameraImageCache {
 public:
     /// MSPLAT_IMAGE_CACHE_MB overrides it; otherwise 512MB on iOS, 2GB elsewhere.
     static size_t defaultBudgetBytes();
-    /// Experimental depth-one CPU prefetch is opt-in with the exact value
+    /// Environment fallback for clients that do not explicitly enable the
+    /// instance-scoped depth-one prefetcher. Requires the exact value
     /// MSPLAT_CAMERA_PREFETCH=1.
     static bool defaultPrefetchEnabled() noexcept;
 
@@ -217,6 +218,10 @@ public:
     uint64_t hitCount() const { return _hitCount; }
     uint64_t missCount() const { return _missCount; }
     bool prefetchEnabled() const { return _prefetchEnabled; }
+    /// Idempotently enables the existing depth-one worker for this cache.
+    /// Configure it before training starts; cache operations are not otherwise
+    /// designed for concurrent control-plane mutation.
+    void enablePrefetch() noexcept { _prefetchEnabled = true; }
     uint64_t prefetchScheduledCount() const { return _prefetchScheduledCount; }
     uint64_t prefetchUsedCount() const { return _prefetchUsedCount; }
     uint64_t prefetchWaitCount() const { return _prefetchWaitCount; }

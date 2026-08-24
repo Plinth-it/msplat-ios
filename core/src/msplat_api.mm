@@ -126,6 +126,9 @@ Dataset& Dataset::operator=(Dataset&&) noexcept = default;
 
 int Dataset::numTrain() const { return (int)impl->trainIndices.size(); }
 int Dataset::numTest() const { return (int)impl->testIndices.size(); }
+void Dataset::enableTrainingTargetPrefetch() noexcept {
+    impl->images.enablePrefetch();
+}
 void Dataset::cameraPose(int index, float camToWorld[16]) const {
     if (index >= 0 && index < (int)impl->trainIndices.size())
         memcpy(camToWorld, impl->data.cameras[impl->trainIndices[index]].camToWorld,
@@ -243,6 +246,13 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
     impl->camIndices.resize(impl->ds->trainIndices.size());
     std::iota(impl->camIndices.begin(), impl->camIndices.end(), 0);
     impl->shuffleCameras();
+    if (impl->ds->images.prefetchEnabled() && !impl->camIndices.empty()) {
+        const size_t firstCamera = impl->currentCamera();
+        impl->ds->images.prefetchTrainingTarget(
+            impl->ds->data.cameras,
+            impl->ds->trainIndices[firstCamera],
+            impl->model->getDownscaleFactor(1));
+    }
 }
 
 Trainer::~Trainer() {
@@ -488,12 +498,23 @@ void Trainer::saveCheckpoint(const std::string& path) {
 
 int Trainer::loadCheckpoint(const std::string& path) {
     std::lock_guard lock(g_trainerTransactionMutex);
-    const int loadedStep = impl->model->loadCheckpoint(path);
+    // A constructor-prefetched step-one target cannot be reused after the
+    // checkpoint changes both the logical step and camera sequence.
     impl->ds->images.discardPrefetch();
+    const int loadedStep = impl->model->loadCheckpoint(path);
     impl->currentStep = loadedStep;
     msplat_training_telemetry_reset(impl->telemetry);
     // Re-shuffle cameras for resumed training
     impl->shuffleCameras();
+    if (impl->ds->images.prefetchEnabled() &&
+        loadedStep < impl->config.iterations &&
+        !impl->camIndices.empty()) {
+        const size_t firstCamera = impl->currentCamera();
+        impl->ds->images.prefetchTrainingTarget(
+            impl->ds->data.cameras,
+            impl->ds->trainIndices[firstCamera],
+            impl->model->getDownscaleFactor(loadedStep + 1));
+    }
     return impl->currentStep;
 }
 
@@ -1178,6 +1199,17 @@ MsplatStatus msplat_dataset_create_v10(
     return createDatasetFromPath(
         path, downscaleFactor, evalMode, static_cast<int>(testEvery),
         discoverTrainingMasks, outDataset, error);
+}
+
+MsplatStatus msplat_dataset_enable_training_target_prefetch_v13(
+    MsplatDataset ds, MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(ds != nullptr, "Dataset handle must not be null");
+        CApiDatasetHandle& handle = datasetHandle(ds);
+        require(handle.dataset.use_count() == 1,
+                "Training target prefetch must be enabled before trainer creation");
+        handle.dataset->enableTrainingTargetPrefetch();
+    });
 }
 
 MsplatStatus msplat_dataset_create_from_descriptor_v5(

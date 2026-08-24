@@ -30,8 +30,9 @@ extern "C" {
 // MsplatConfig or the existing coverage-mask behavior.
 // ABI v12 adds detailed count-barrier and tile-distribution telemetry through
 // a new query structure without changing the ABI v4 telemetry layout.
+// ABI v13 adds instance-scoped, opt-in depth-one training-target prefetch.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 12u
+#define MSPLAT_ABI_VERSION 13u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -479,6 +480,11 @@ MsplatStatus msplat_dataset_create_v10(
     const char* path, float downscaleFactor, bool evalMode, int32_t testEvery,
     bool discoverTrainingMasks, MsplatDataset* outDataset,
     MsplatErrorInfo* error);
+/// ABI v13 instance-scoped prefetch opt-in. This is idempotent and must be
+/// called before a trainer is created from the dataset. The environment-based
+/// default remains supported for existing clients.
+MsplatStatus msplat_dataset_enable_training_target_prefetch_v13(
+    MsplatDataset ds, MsplatErrorInfo* error);
 MsplatStatus msplat_dataset_destroy_v2(MsplatDataset ds, MsplatErrorInfo* error);
 MsplatStatus msplat_dataset_num_train_v2(MsplatDataset ds, int* outCount,
                                          MsplatErrorInfo* error);

@@ -179,6 +179,9 @@ public:
     int numTrain() const;
     int numTest() const;
     void cameraPose(int index, float camToWorld[16]) const;
+    /// Enables depth-one target preparation for trainers subsequently created
+    /// from this dataset. Call before constructing a Trainer.
+    void enableTrainingTargetPrefetch() noexcept;
 
     // Opaque handle for Trainer
     void* _handle() const;

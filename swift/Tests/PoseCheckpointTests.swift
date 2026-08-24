@@ -39,6 +39,7 @@ private func runPoseCheckpointRegression() throws {
     do {
         let session = try MsplatSession(
             dataset: descriptor,
+            options: DatasetOptions(prefetchTrainingTargets: true),
             config: config,
             maximumGaussianCount: 5
         )
@@ -57,6 +58,7 @@ private func runPoseCheckpointRegression() throws {
     do {
         let session = try MsplatSession(
             dataset: descriptor,
+            options: DatasetOptions(prefetchTrainingTargets: true),
             config: config,
             maximumGaussianCount: 5
         )

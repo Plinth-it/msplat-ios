@@ -16,15 +16,18 @@ final class TrainingPlanTests: XCTestCase {
         )
 
         XCTAssertFalse(try plan.makeDatasetOptions().discoverTrainingMasks)
+        XCTAssertFalse(try plan.makeDatasetOptions().prefetchTrainingTargets)
         let options = try plan.makeDatasetOptions(
             evalMode: true,
-            testEvery: 10
+            testEvery: 10,
+            prefetchTrainingTargets: true
         )
         XCTAssertEqual(options, DatasetOptions(
             downscaleFactor: 2,
             evalMode: true,
             testEvery: 10,
-            discoverTrainingMasks: false
+            discoverTrainingMasks: false,
+            prefetchTrainingTargets: true
         ))
 
         let config = try plan.makeTrainingConfig()
@@ -124,6 +127,7 @@ final class TrainingPlanTests: XCTestCase {
 
         XCTAssertTrue(plan.includesTrainingMasks)
         XCTAssertTrue(try plan.makeDatasetOptions().discoverTrainingMasks)
+        XCTAssertFalse(try plan.makeDatasetOptions().prefetchTrainingTargets)
         let estimate = try plan.memoryEstimate(
             imageCacheBudgetBytes:
                 TrainingMemoryEstimate.defaultIOSImageCacheBudgetBytes

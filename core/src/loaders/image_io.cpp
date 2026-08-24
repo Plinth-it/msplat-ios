@@ -3,6 +3,7 @@
 #include <cmath>
 #include <algorithm>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <utility>
 
@@ -224,6 +225,80 @@ CFHandle<CGImageRef> createThumbnail(
     return thumbnail;
 }
 
+std::optional<CoverageMask> tryDecodeBinaryGrayscalePNG(
+    CGImageSourceRef source, CGImageRef image, int width, int height,
+    bool applyExifOrientation, TrainingMaskChannel channel) {
+    // Discovered Brush-style masks use Automatic. Keep this path deliberately
+    // narrow so explicit luminance/alpha and profiled soft masks retain the
+    // established sRGB conversion below.
+    if (channel != TrainingMaskChannel::Automatic || applyExifOrientation) {
+        return std::nullopt;
+    }
+
+    CFStringRef sourceType = CGImageSourceGetType(source);
+    CGColorSpaceRef sourceColorSpace = CGImageGetColorSpace(image);
+    CFStringRef sourceColorSpaceName = sourceColorSpace
+        ? CGColorSpaceGetName(sourceColorSpace) : nullptr;
+    if (!sourceType || !CFEqual(sourceType, CFSTR("public.png")) ||
+        !sourceColorSpace ||
+        CGColorSpaceGetModel(sourceColorSpace) !=
+            kCGColorSpaceModelMonochrome ||
+        !sourceColorSpaceName ||
+        !CFEqual(sourceColorSpaceName, kCGColorSpaceGenericGrayGamma2_2) ||
+        CGImageGetBitsPerComponent(image) != 8 ||
+        CGImageGetBitsPerPixel(image) != 8 ||
+        CGImageGetAlphaInfo(image) != kCGImageAlphaNone ||
+        CGImageGetDecode(image) != nullptr) {
+        return std::nullopt;
+    }
+
+    const size_t elements = checkedElementCount(
+        width, height, 1, sizeof(uint8_t), "Decoded training mask");
+    CGDataProviderRef provider = CGImageGetDataProvider(image);
+    if (!provider) return std::nullopt;
+    CFHandle<CFDataRef> providerData(CGDataProviderCopyData(provider));
+    if (!providerData) return std::nullopt;
+
+    const size_t rowBytes = CGImageGetBytesPerRow(image);
+    const size_t imageHeight = static_cast<size_t>(height);
+    const size_t imageWidth = static_cast<size_t>(width);
+    if (rowBytes < imageWidth ||
+        (imageHeight > 1 &&
+         rowBytes > (std::numeric_limits<size_t>::max() - imageWidth) /
+             (imageHeight - 1))) {
+        return std::nullopt;
+    }
+    const size_t requiredBytes =
+        (imageHeight - 1) * rowBytes + imageWidth;
+    const CFIndex providerLength = CFDataGetLength(providerData.get());
+    if (providerLength < 0 ||
+        static_cast<uint64_t>(providerLength) < requiredBytes) {
+        return std::nullopt;
+    }
+    const UInt8 *providerBytes = CFDataGetBytePtr(providerData.get());
+    if (!providerBytes) return std::nullopt;
+
+    CoverageMask mask;
+    mask.width = width;
+    mask.height = height;
+    mask.data.resize(elements);
+    for (size_t row = 0; row < imageHeight; ++row) {
+        std::copy_n(
+            providerBytes + row * rowBytes, imageWidth,
+            mask.data.data() + row * imageWidth);
+    }
+
+    // Black and white samples in ImageIO's unprofiled generic-gray space are
+    // invariant under the established sRGB-R Automatic path. Any soft or
+    // profiled source falls back rather than changing alpha by even one byte.
+    if (!std::all_of(mask.data.begin(), mask.data.end(), [](uint8_t value) {
+            return value == 0 || value == 255;
+        })) {
+        return std::nullopt;
+    }
+    return mask;
+}
+
 } // namespace
 
 ImageSourceInfo inspectImageSource(const std::string &path) {
@@ -322,9 +397,6 @@ CoverageMask imreadCoverageMask(
         ? expectedSourceInfo.orientedWidth : expectedSourceInfo.rawWidth;
     const int sourceHeight = applyExifOrientation
         ? expectedSourceInfo.orientedHeight : expectedSourceInfo.rawHeight;
-    const size_t rgbaElements = checkedElementCount(
-        sourceWidth, sourceHeight, 4, sizeof(uint8_t),
-        "Decoded training mask");
     const size_t sourceMaskElements = checkedElementCount(
         sourceWidth, sourceHeight, 1, sizeof(uint8_t),
         "Decoded training mask");
@@ -332,79 +404,90 @@ CoverageMask imreadCoverageMask(
         targetWidth, targetHeight, 1, sizeof(uint8_t),
         "Decoded training mask target");
 
+    auto source = openImageSource(path);
+    auto thumbnail = createThumbnail(
+        source.get(), path, expectedSourceInfo, sourceWidth, sourceHeight,
+        applyExifOrientation);
+    if (CGImageGetWidth(thumbnail.get()) !=
+            static_cast<size_t>(sourceWidth) ||
+        CGImageGetHeight(thumbnail.get()) !=
+            static_cast<size_t>(sourceHeight)) {
+        throw msplat::DatasetIOError(
+            "Training mask full-resolution decode changed dimensions: " +
+            path);
+    }
+    const bool sourceHasAlpha =
+        hasAlphaChannel(CGImageGetAlphaInfo(thumbnail.get()));
+    if (channel == TrainingMaskChannel::Alpha && !sourceHasAlpha) {
+        throw msplat::InvalidDatasetError(
+            "Training mask requests alpha coverage but the image has no "
+            "alpha channel: " + path);
+    }
+
+    if (!sourceHasAlpha) {
+        if (auto binaryMask = tryDecodeBinaryGrayscalePNG(
+                source.get(), thumbnail.get(), sourceWidth, sourceHeight,
+                applyExifOrientation, channel)) {
+            if (sourceWidth == targetWidth && sourceHeight == targetHeight) {
+                return std::move(*binaryMask);
+            }
+            return resizeCoverageArea(*binaryMask, targetWidth, targetHeight);
+        }
+    }
+
+    const size_t rgbaElements = checkedElementCount(
+        sourceWidth, sourceHeight, 4, sizeof(uint8_t),
+        "Decoded training mask");
     std::vector<uint8_t> rgba(rgbaElements);
-    {
-        auto source = openImageSource(path);
-        auto thumbnail = createThumbnail(
-            source.get(), path, expectedSourceInfo, sourceWidth, sourceHeight,
-            applyExifOrientation);
-        if (CGImageGetWidth(thumbnail.get()) !=
-                static_cast<size_t>(sourceWidth) ||
-            CGImageGetHeight(thumbnail.get()) !=
-                static_cast<size_t>(sourceHeight)) {
-            throw msplat::DatasetIOError(
-                "Training mask full-resolution decode changed dimensions: " +
-                path);
-        }
-        const bool sourceHasAlpha =
-            hasAlphaChannel(CGImageGetAlphaInfo(thumbnail.get()));
-        if (channel == TrainingMaskChannel::Alpha && !sourceHasAlpha) {
-            throw msplat::InvalidDatasetError(
-                "Training mask requests alpha coverage but the image has no "
-                "alpha channel: " + path);
-        }
+    CFHandle<CGColorSpaceRef> colorSpace(
+        CGColorSpaceCreateWithName(kCGColorSpaceSRGB));
+    if (!colorSpace) {
+        throw msplat::DatasetIOError(
+            "Failed to create training mask color space: " + path);
+    }
 
-        CFHandle<CGColorSpaceRef> colorSpace(
-            CGColorSpaceCreateWithName(kCGColorSpaceSRGB));
-        if (!colorSpace) {
-            throw msplat::DatasetIOError(
-                "Failed to create training mask color space: " + path);
-        }
+    // A premultiplied destination makes luminance coverage naturally
+    // include source alpha instead of treating transparent RGB as visible.
+    const CGBitmapInfo bitmapInfo = static_cast<CGBitmapInfo>(
+        kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
+    const size_t rowBytes = static_cast<size_t>(sourceWidth) * 4;
+    CFHandle<CGContextRef> context(CGBitmapContextCreate(
+        rgba.data(), static_cast<size_t>(sourceWidth),
+        static_cast<size_t>(sourceHeight), 8, rowBytes, colorSpace.get(),
+        bitmapInfo));
+    if (!context) {
+        throw msplat::DatasetIOError(
+            "Failed to allocate training mask decode context: " + path);
+    }
 
-        // A premultiplied destination makes luminance coverage naturally
-        // include source alpha instead of treating transparent RGB as visible.
-        const CGBitmapInfo bitmapInfo = static_cast<CGBitmapInfo>(
-            kCGImageAlphaPremultipliedLast | kCGBitmapByteOrder32Big);
-        const size_t rowBytes = static_cast<size_t>(sourceWidth) * 4;
-        CFHandle<CGContextRef> context(CGBitmapContextCreate(
-            rgba.data(), static_cast<size_t>(sourceWidth),
-            static_cast<size_t>(sourceHeight), 8, rowBytes, colorSpace.get(),
-            bitmapInfo));
-        if (!context) {
-            throw msplat::DatasetIOError(
-                "Failed to allocate training mask decode context: " + path);
-        }
+    CGContextSetBlendMode(context.get(), kCGBlendModeCopy);
+    CGContextSetInterpolationQuality(context.get(), kCGInterpolationNone);
+    CGContextDrawImage(
+        context.get(),
+        CGRectMake(0, 0, static_cast<CGFloat>(sourceWidth),
+                   static_cast<CGFloat>(sourceHeight)),
+        thumbnail.get());
 
-        CGContextSetBlendMode(context.get(), kCGBlendModeCopy);
-        CGContextSetInterpolationQuality(context.get(), kCGInterpolationNone);
-        CGContextDrawImage(
-            context.get(),
-            CGRectMake(0, 0, static_cast<CGFloat>(sourceWidth),
-                       static_cast<CGFloat>(sourceHeight)),
-            thumbnail.get());
-
-        // Compact coverage into the start of the RGBA buffer. This is safe
-        // in-place because each destination byte precedes every unread source
-        // pixel, and it avoids a fifth source-sized allocation while the
-        // decoded CGImage is resident.
-        for (size_t i = 0; i < sourceMaskElements; ++i) {
-            if (channel == TrainingMaskChannel::Alpha ||
-                (channel == TrainingMaskChannel::Automatic &&
-                 sourceHasAlpha)) {
-                rgba[i] = rgba[i * 4 + 3];
-                continue;
-            }
-            if (channel == TrainingMaskChannel::Automatic) {
-                rgba[i] = rgba[i * 4 + 0];
-                continue;
-            }
-            const float luminance =
-                0.2126f * rgba[i * 4 + 0] +
-                0.7152f * rgba[i * 4 + 1] +
-                0.0722f * rgba[i * 4 + 2];
-            rgba[i] = static_cast<uint8_t>(
-                std::clamp(std::lround(luminance), 0L, 255L));
+    // Compact coverage into the start of the RGBA buffer. This is safe
+    // in-place because each destination byte precedes every unread source
+    // pixel, and it avoids a fifth source-sized allocation while the decoded
+    // CGImage is resident.
+    for (size_t i = 0; i < sourceMaskElements; ++i) {
+        if (channel == TrainingMaskChannel::Alpha ||
+            (channel == TrainingMaskChannel::Automatic && sourceHasAlpha)) {
+            rgba[i] = rgba[i * 4 + 3];
+            continue;
         }
+        if (channel == TrainingMaskChannel::Automatic) {
+            rgba[i] = rgba[i * 4 + 0];
+            continue;
+        }
+        const float luminance =
+            0.2126f * rgba[i * 4 + 0] +
+            0.7152f * rgba[i * 4 + 1] +
+            0.0722f * rgba[i * 4 + 2];
+        rgba[i] = static_cast<uint8_t>(
+            std::clamp(std::lround(luminance), 0L, 255L));
     }
 
     CoverageMask mask;

@@ -137,6 +137,88 @@ void writeTIFF(const fs::path &path, int width, int height,
     CHECK(CGImageDestinationFinalize(destination.get()));
 }
 
+void writeGrayscalePNG(const fs::path &path, int width, int height,
+                       const std::vector<uint8_t> &gray) {
+    CHECK(width > 0 && height > 0);
+    CHECK(gray.size() == static_cast<size_t>(width) * height);
+
+    CFHandle<CGDataProviderRef> provider(CGDataProviderCreateWithData(
+        nullptr, gray.data(), gray.size(), nullptr));
+    CHECK(provider);
+    CFHandle<CGColorSpaceRef> colorSpace(CGColorSpaceCreateDeviceGray());
+    CHECK(colorSpace);
+    CFHandle<CGImageRef> image(CGImageCreate(
+        static_cast<size_t>(width), static_cast<size_t>(height), 8, 8,
+        static_cast<size_t>(width), colorSpace.get(), kCGImageAlphaNone,
+        provider.get(), nullptr, false, kCGRenderingIntentDefault));
+    CHECK(image);
+
+    const std::string pathString = path.string();
+    CFHandle<CFURLRef> url(CFURLCreateFromFileSystemRepresentation(
+        nullptr, reinterpret_cast<const UInt8 *>(pathString.data()),
+        static_cast<CFIndex>(pathString.size()), false));
+    CHECK(url);
+    CFHandle<CGImageDestinationRef> destination(
+        CGImageDestinationCreateWithURL(
+            url.get(), CFSTR("public.png"), 1, nullptr));
+    CHECK(destination);
+    CGImageDestinationAddImage(destination.get(), image.get(), nullptr);
+    CHECK(CGImageDestinationFinalize(destination.get()));
+}
+
+void checkBinaryGrayscalePNGFastPathCandidate(
+    const fs::path &path, int width, int height) {
+    const std::string pathString = path.string();
+    CFHandle<CFURLRef> url(CFURLCreateFromFileSystemRepresentation(
+        nullptr, reinterpret_cast<const UInt8 *>(pathString.data()),
+        static_cast<CFIndex>(pathString.size()), false));
+    CHECK(url);
+    CFHandle<CGImageSourceRef> source(
+        CGImageSourceCreateWithURL(url.get(), nullptr));
+    CHECK(source);
+    CFStringRef sourceType = CGImageSourceGetType(source.get());
+    CHECK(sourceType != nullptr);
+    CHECK(CFEqual(sourceType, CFSTR("public.png")));
+
+    const int64_t maximumPixelSize = std::max(width, height);
+    CFHandle<CFNumberRef> maximumPixelSizeNumber(CFNumberCreate(
+        nullptr, kCFNumberSInt64Type, &maximumPixelSize));
+    CHECK(maximumPixelSizeNumber);
+    const void *keys[] = {
+        kCGImageSourceCreateThumbnailFromImageAlways,
+        kCGImageSourceCreateThumbnailWithTransform,
+        kCGImageSourceThumbnailMaxPixelSize,
+        kCGImageSourceShouldCacheImmediately,
+    };
+    const void *values[] = {
+        kCFBooleanTrue,
+        kCFBooleanFalse,
+        maximumPixelSizeNumber.get(),
+        kCFBooleanTrue,
+    };
+    CFHandle<CFDictionaryRef> options(CFDictionaryCreate(
+        nullptr, keys, values, 4,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks));
+    CHECK(options);
+    CFHandle<CGImageRef> thumbnail(CGImageSourceCreateThumbnailAtIndex(
+        source.get(), 0, options.get()));
+    CHECK(thumbnail);
+    CHECK(CGImageGetWidth(thumbnail.get()) == static_cast<size_t>(width));
+    CHECK(CGImageGetHeight(thumbnail.get()) == static_cast<size_t>(height));
+
+    CGColorSpaceRef colorSpace = CGImageGetColorSpace(thumbnail.get());
+    CHECK(colorSpace != nullptr);
+    CHECK(CGColorSpaceGetModel(colorSpace) == kCGColorSpaceModelMonochrome);
+    CFStringRef colorSpaceName = CGColorSpaceGetName(colorSpace);
+    CHECK(colorSpaceName != nullptr);
+    CHECK(CFEqual(colorSpaceName, kCGColorSpaceGenericGrayGamma2_2));
+    CHECK(CGImageGetBitsPerComponent(thumbnail.get()) == 8);
+    CHECK(CGImageGetBitsPerPixel(thumbnail.get()) == 8);
+    CHECK(CGImageGetAlphaInfo(thumbnail.get()) == kCGImageAlphaNone);
+    CHECK(CGImageGetDecode(thumbnail.get()) == nullptr);
+}
+
 RGB8 pixel8(const Image &image, int x, int y) {
     CHECK(x >= 0 && x < image.width);
     CHECK(y >= 0 && y < image.height);
@@ -632,6 +714,68 @@ void checkCoverageMaskDecodeAndResize(const TempDirectory &temporary) {
                 TrainingMaskChannel::Alpha);
         },
         "no alpha channel");
+}
+
+void checkBinaryGrayscalePNGMaskDecode(const TempDirectory &temporary) {
+    constexpr int width = 7;
+    constexpr int height = 5;
+    const std::vector<uint8_t> binary = {
+        0,   0,   255, 255, 255, 0,   0,
+        0,   255, 255, 255, 0,   0,   255,
+        255, 255, 0,   0,   0,   255, 255,
+        255, 0,   0,   255, 255, 255, 0,
+        0,   0,   255, 0,   255, 0,   255,
+    };
+    const fs::path binaryPath = temporary.path / "binary-gray-mask.png";
+    writeGrayscalePNG(binaryPath, width, height, binary);
+    checkBinaryGrayscalePNGFastPathCandidate(binaryPath, width, height);
+    const ImageSourceInfo binaryInfo = inspectImageSource(binaryPath.string());
+
+    const CoverageMask full = imreadCoverageMask(
+        binaryPath.string(), binaryInfo, width, height, false,
+        TrainingMaskChannel::Automatic);
+    CHECK(full.width == width);
+    CHECK(full.height == height);
+    CHECK(full.data == binary);
+
+    // Requesting orientation normalization deliberately bypasses the fast
+    // path. Orientation 1 should remain byte-identical through the fallback.
+    const CoverageMask transformed = imreadCoverageMask(
+        binaryPath.string(), binaryInfo, width, height, true,
+        TrainingMaskChannel::Automatic);
+    CHECK(transformed.data == binary);
+
+    CoverageMask sourceMask;
+    sourceMask.width = width;
+    sourceMask.height = height;
+    sourceMask.data = binary;
+    const CoverageMask expected = resizeCoverageArea(sourceMask, 4, 3);
+    const CoverageMask scaled = imreadCoverageMask(
+        binaryPath.string(), binaryInfo, 4, 3, false,
+        TrainingMaskChannel::Automatic);
+    CHECK(scaled.width == 4);
+    CHECK(scaled.height == 3);
+    CHECK(scaled.data == expected.data);
+    CHECK(buildCoverageRenderTileMap(scaled).data ==
+          buildCoverageRenderTileMap(expected).data);
+
+    // Explicit luminance deliberately takes the established RGBA fallback.
+    const CoverageMask luminance = imreadCoverageMask(
+        binaryPath.string(), binaryInfo, 4, 3, false,
+        TrainingMaskChannel::Luminance);
+    CHECK(luminance.data == scaled.data);
+
+    const std::vector<uint8_t> soft = {0, 1, 64, 127, 128, 254, 255};
+    const fs::path softPath = temporary.path / "soft-gray-mask.png";
+    writeGrayscalePNG(softPath, 7, 1, soft);
+    const ImageSourceInfo softInfo = inspectImageSource(softPath.string());
+    const CoverageMask automaticSoft = imreadCoverageMask(
+        softPath.string(), softInfo, 7, 1, false,
+        TrainingMaskChannel::Automatic);
+    const CoverageMask luminanceSoft = imreadCoverageMask(
+        softPath.string(), softInfo, 7, 1, false,
+        TrainingMaskChannel::Luminance);
+    CHECK(automaticSoft.data == luminanceSoft.data);
 }
 
 void checkCoverageMaskOrientation(const TempDirectory &temporary) {
@@ -1197,6 +1341,10 @@ void checkPrefetchEnvironmentOptIn() {
         CHECK(defaulted.prefetchEnabled());
         CameraImageCache explicitlyDisabled(1.0f, 1'024, false);
         CHECK(!explicitlyDisabled.prefetchEnabled());
+        explicitlyDisabled.enablePrefetch();
+        CHECK(explicitlyDisabled.prefetchEnabled());
+        explicitlyDisabled.enablePrefetch();
+        CHECK(explicitlyDisabled.prefetchEnabled());
     }
 
     const char *restoredValue = std::getenv("MSPLAT_CAMERA_PREFETCH");
@@ -1798,6 +1946,9 @@ int main() {
         });
         checkStage("coverage mask decode and resize", [&] {
             checkCoverageMaskDecodeAndResize(temporary);
+        });
+        checkStage("binary grayscale PNG mask decode", [&] {
+            checkBinaryGrayscalePNGMaskDecode(temporary);
         });
         checkStage("coverage render-tile halo", [&] {
             checkCoverageRenderTileMap();

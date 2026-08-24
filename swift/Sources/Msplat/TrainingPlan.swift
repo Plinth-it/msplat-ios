@@ -243,7 +243,8 @@ public struct TrainingPlan: Sendable, Equatable {
     /// Produces dataset options controlled by this plan.
     public func makeDatasetOptions(
         evalMode: Bool = false,
-        testEvery: Int32 = 8
+        testEvery: Int32 = 8,
+        prefetchTrainingTargets: Bool = false
     ) throws -> DatasetOptions {
         guard testEvery > 0 else {
             throw MsplatError.invalidArgument("testEvery must be greater than zero")
@@ -252,7 +253,8 @@ public struct TrainingPlan: Sendable, Equatable {
             downscaleFactor: inputDecodeScale,
             evalMode: evalMode,
             testEvery: testEvery,
-            discoverTrainingMasks: includesTrainingMasks
+            discoverTrainingMasks: includesTrainingMasks,
+            prefetchTrainingTargets: prefetchTrainingTargets
         )
     }
 
