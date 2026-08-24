@@ -1855,7 +1855,8 @@ MTensor msplat_train_step(
     MTensor &opacities, MTensor &background,
     MTensor &gt, const MTensor* coverage_mask,
     uint64_t loss_coverage_units, float ssim_weight,
-    float loss_inv_n,
+    float loss_inv_n, bool transparent_mask,
+    float alpha_loss_weight,
     int num_adam_groups,
     MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
     float adam_step_sizes[], float adam_bc2_sqrts[],
@@ -1890,6 +1891,10 @@ MTensor msplat_train_step(
         !std::isfinite(loss_inv_n) || loss_inv_n <= 0.0f) {
         throw std::invalid_argument("Training loss normalization is invalid");
     }
+    if (!std::isfinite(alpha_loss_weight) || alpha_loss_weight < 0.0f) {
+        throw std::invalid_argument(
+            "Training alpha loss weight must be finite and non-negative");
+    }
     if (coverage_mask) {
         if (!coverage_mask->defined() || !coverage_mask->isGpu() ||
             coverage_mask->dtype() != DType::UInt8 ||
@@ -1903,8 +1908,22 @@ MTensor msplat_train_step(
         throw std::invalid_argument(
             "Unmasked training coverage denominator is inconsistent");
     }
+    if (transparent_mask && !coverage_mask) {
+        throw std::invalid_argument(
+            "Transparent training requires a per-frame mask");
+    }
+    if (transparent_mask && loss_coverage_units != fullCoverageUnits) {
+        throw std::invalid_argument(
+            "Transparent training must use the full-frame loss denominator");
+    }
     const MTensor& loss_coverage_buffer = coverage_mask ? *coverage_mask : gt;
-    const uint32_t coverage_stride = coverage_mask ? img_width : 0u;
+    const uint32_t coverage_stride =
+        coverage_mask && !transparent_mask ? img_width : 0u;
+    const uint32_t alpha_stride =
+        coverage_mask && transparent_mask ? img_width : 0u;
+    const float alpha_gradient_scale = transparent_mask
+        ? alpha_loss_weight / static_cast<float>(pixelCount)
+        : 0.0f;
 
     auto validatePhotometricTensor = [](const MTensor* tensor,
                                         const char* name) {
@@ -2295,6 +2314,9 @@ MTensor msplat_train_step(
         ENC_BUF(enc, photometricLogGains, 4);
         ENC_SCALAR(enc, cameraGainOffset, 5);
         ENC_SCALAR(enc, photometricEnabled, 6);
+        ENC_BUF(enc, loss_coverage_buffer, 7);
+        ENC_SCALAR(enc, alpha_stride, 8);
+        ENC_BUF(enc, background, 9);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 2: Fused V fwd + H bwd
@@ -2309,6 +2331,10 @@ MTensor msplat_train_step(
         ENC_BUF(enc, photometricLogGains, 10);
         ENC_SCALAR(enc, cameraGainOffset, 11);
         ENC_SCALAR(enc, photometricEnabled, 12);
+        ENC_SCALAR(enc, alpha_stride, 13);
+        ENC_BUF(enc, background, 14);
+        ENC_BUF(enc, final_Ts, 15);
+        ENC_SCALAR(enc, alpha_loss_weight, 16);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 3: V bwd
@@ -2323,6 +2349,8 @@ MTensor msplat_train_step(
         ENC_SCALAR(enc, cameraGainOffset, 9);
         ENC_BUF(enc, photometric_gradient, 10);
         ENC_SCALAR(enc, photometricEnabled, 11);
+        ENC_SCALAR(enc, alpha_stride, 12);
+        ENC_BUF(enc, background, 13);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
 
         if (photometric.enabled) {
@@ -2359,6 +2387,9 @@ MTensor msplat_train_step(
             ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, rendered_gradient, 10);
             ENC_BUF(enc, v_xy, 11); ENC_BUF(enc, v_conic, 12);
             ENC_BUF(enc, v_colors_rast, 13); ENC_BUF(enc, v_opacity, 14);
+            ENC_BUF(enc, loss_coverage_buffer, 15);
+            ENC_SCALAR(enc, alpha_stride, 16);
+            ENC_SCALAR(enc, alpha_gradient_scale, 17);
             [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         } else {
             // Chunked backward
@@ -2390,6 +2421,9 @@ MTensor msplat_train_step(
             ENC_BUF(enc, v_xy, 14); ENC_BUF(enc, v_conic, 15);
             ENC_BUF(enc, v_colors_rast, 16); ENC_BUF(enc, v_opacity, 17);
             ENC_SCALAR(enc, BWD_CHUNK_SIZE, 18); ENC_SCALAR(enc, bwd_K_max, 19);
+            ENC_BUF(enc, loss_coverage_buffer, 20);
+            ENC_SCALAR(enc, alpha_stride, 21);
+            ENC_SCALAR(enc, alpha_gradient_scale, 22);
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, bwd_K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         }
     };

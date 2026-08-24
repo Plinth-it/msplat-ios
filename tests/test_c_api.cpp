@@ -22,7 +22,7 @@
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
-static_assert(MSPLAT_ABI_VERSION == 10u);
+static_assert(MSPLAT_ABI_VERSION == 11u);
 static_assert(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS == (1u << 0));
 static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS == (1u << 1));
 static_assert((MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS &
@@ -39,6 +39,14 @@ static_assert(sizeof(MsplatRefinementOptionsV8) == 16);
 static_assert(alignof(MsplatRefinementOptionsV8) == 4);
 static_assert(offsetof(MsplatRefinementOptionsV8, flags) == 0);
 static_assert(offsetof(MsplatRefinementOptionsV8, reserved) == 4);
+static_assert(std::is_standard_layout<MsplatTrainingMaskOptionsV11>::value);
+static_assert(sizeof(MsplatTrainingMaskOptionsV11) == 16);
+static_assert(alignof(MsplatTrainingMaskOptionsV11) == 4);
+static_assert(offsetof(MsplatTrainingMaskOptionsV11, mode) == 0);
+static_assert(offsetof(MsplatTrainingMaskOptionsV11, alphaLossWeight) == 4);
+static_assert(offsetof(MsplatTrainingMaskOptionsV11, reserved) == 8);
+static_assert(MSPLAT_TRAINING_MASK_MODE_COVERAGE == 0);
+static_assert(MSPLAT_TRAINING_MASK_MODE_TRANSPARENT == 1);
 static_assert(sizeof(MsplatSubmittedTrainingStep) == 32);
 static_assert(alignof(MsplatSubmittedTrainingStep) == 4);
 static_assert(sizeof(MsplatCompletedTrainingStep) == 64);
@@ -1265,6 +1273,43 @@ int main() {
               nullptr, sizeof(refinementOptions), &error) ==
           MSPLAT_STATUS_INVALID_ARGUMENT);
 
+    MsplatTrainingMaskOptionsV11 maskOptions =
+        msplat_default_training_mask_options_v11();
+    CHECK(maskOptions.mode == MSPLAT_TRAINING_MASK_MODE_COVERAGE);
+    CHECK(maskOptions.alphaLossWeight == 0.1f);
+    CHECK(maskOptions.reserved[0] == 0u);
+    CHECK(maskOptions.reserved[1] == 0u);
+    CHECK(msplat_training_mask_options_validate_v11(
+              &maskOptions, sizeof(maskOptions), &error) == MSPLAT_STATUS_OK);
+    maskOptions.mode = MSPLAT_TRAINING_MASK_MODE_TRANSPARENT;
+    CHECK(msplat_training_mask_options_validate_v11(
+              &maskOptions, sizeof(maskOptions), &error) == MSPLAT_STATUS_OK);
+    maskOptions.mode = 2u;
+    CHECK(msplat_training_mask_options_validate_v11(
+              &maskOptions, sizeof(maskOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    maskOptions = msplat_default_training_mask_options_v11();
+    maskOptions.alphaLossWeight = -0.1f;
+    CHECK(msplat_training_mask_options_validate_v11(
+              &maskOptions, sizeof(maskOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    maskOptions.alphaLossWeight = std::numeric_limits<float>::quiet_NaN();
+    CHECK(msplat_training_mask_options_validate_v11(
+              &maskOptions, sizeof(maskOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    maskOptions = msplat_default_training_mask_options_v11();
+    maskOptions.reserved[0] = 1u;
+    CHECK(msplat_training_mask_options_validate_v11(
+              &maskOptions, sizeof(maskOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    maskOptions = msplat_default_training_mask_options_v11();
+    CHECK(msplat_training_mask_options_validate_v11(
+              &maskOptions, sizeof(maskOptions) - 1, &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(msplat_training_mask_options_validate_v11(
+              nullptr, sizeof(maskOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+
     MsplatTrainer trainer = reinterpret_cast<MsplatTrainer>(1);
     config = msplat_default_config();
     limits = msplat_default_training_limits();
@@ -1277,6 +1322,14 @@ int main() {
     CHECK(msplat_trainer_create_v8(
               nullptr, &config, sizeof(config), &limits, sizeof(limits),
               &refinementOptions, sizeof(refinementOptions), &trainer,
+              &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(trainer == nullptr);
+    trainer = reinterpret_cast<MsplatTrainer>(1);
+    maskOptions = msplat_default_training_mask_options_v11();
+    CHECK(msplat_trainer_create_v11(
+              nullptr, &config, sizeof(config), &limits, sizeof(limits),
+              &refinementOptions, sizeof(refinementOptions),
+              &maskOptions, sizeof(maskOptions), &trainer,
               &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
     CHECK(trainer == nullptr);
 

@@ -1,5 +1,14 @@
 import MsplatCore
 
+/// How a per-frame training mask participates in the objective.
+public enum TrainingMaskMode: UInt32, CaseIterable, Sendable {
+    /// Mask values weight RGB loss; masked-out pixels provide no supervision.
+    case coverage = 0
+    /// Mask values are target alpha; RGB is composited over the background and
+    /// rendered alpha is supervised across the complete frame.
+    case transparent = 1
+}
+
 /// Configuration for Gaussian splatting training.
 public struct TrainingConfig: Sendable {
     public var iterations: Int32 = 30_000
@@ -25,6 +34,12 @@ public struct TrainingConfig: Sendable {
     /// Learn small, regularized camera-space pose corrections after warm-up.
     /// Imported geometry and canonical render, evaluation, and export stay unchanged.
     public var refineCameraPoses: Bool = false
+    /// Treatment for frames that have a training mask. Frames without a mask
+    /// remain ordinary opaque RGB targets in either mode. Transparent mode
+    /// cannot be combined with `refinePhotometricGains`.
+    public var trainingMaskMode: TrainingMaskMode = .coverage
+    /// Weight of the full-frame L1 alpha term used by transparent mask mode.
+    public var transparentAlphaLossWeight: Float = 0.1
     /// Legacy ABI field. Use `DatasetOptions.downscaleFactor`; this value does
     /// not affect training resolution.
     public var downscaleFactor: Float = 1.0
@@ -82,6 +97,17 @@ public struct TrainingConfig: Sendable {
         guard splitScreenSize.isFinite, splitScreenSize >= 0 else {
             throw MsplatError.invalidArgument("splitScreenSize must be finite and non-negative")
         }
+        guard transparentAlphaLossWeight.isFinite,
+              transparentAlphaLossWeight >= 0 else {
+            throw MsplatError.invalidArgument(
+                "transparentAlphaLossWeight must be finite and non-negative"
+            )
+        }
+        guard trainingMaskMode != .transparent || !refinePhotometricGains else {
+            throw MsplatError.invalidArgument(
+                "Transparent training masks cannot be combined with photometric gain refinement"
+            )
+        }
         guard downscaleFactor.isFinite, (1...32).contains(downscaleFactor) else {
             throw MsplatError.invalidArgument("downscaleFactor must be finite and in 1...32")
         }
@@ -121,6 +147,13 @@ public struct TrainingConfig: Sendable {
         if refineCameraPoses {
             options.flags |= UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS)
         }
+        return options
+    }
+
+    func toTrainingMaskOptionsV11() -> MsplatTrainingMaskOptionsV11 {
+        var options = msplat_default_training_mask_options_v11()
+        options.mode = trainingMaskMode.rawValue
+        options.alphaLossWeight = transparentAlphaLossWeight
         return options
     }
 }

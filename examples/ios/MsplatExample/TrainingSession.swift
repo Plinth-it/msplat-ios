@@ -71,6 +71,7 @@ final class TrainingSession: ObservableObject {
     @Published var iterations = 2_000
     @Published var qualityProfile: QualityProfile = .preview
     @Published var trainingMasksEnabled = false
+    @Published var trainingMaskMode: TrainingMaskMode = .transparent
 
     private var worker: Task<Void, Never>?
 
@@ -108,6 +109,7 @@ final class TrainingSession: ObservableObject {
         let steps = iterations
         let profile = qualityProfile
         let useTrainingMasks = trainingMasksEnabled
+        let selectedTrainingMaskMode = trainingMaskMode
 
         worker = Task { [weak self] in
             guard let self else { return }
@@ -115,7 +117,8 @@ final class TrainingSession: ObservableObject {
                 folder: folder,
                 steps: steps,
                 profile: profile,
-                useTrainingMasks: useTrainingMasks
+                useTrainingMasks: useTrainingMasks,
+                trainingMaskMode: selectedTrainingMaskMode
             )
         }
     }
@@ -128,7 +131,8 @@ final class TrainingSession: ObservableObject {
         folder: DatasetFolder,
         steps: Int,
         profile: QualityProfile,
-        useTrainingMasks: Bool
+        useTrainingMasks: Bool,
+        trainingMaskMode: TrainingMaskMode
     ) async {
         var session: MsplatSession?
         var resultURL: URL?
@@ -181,9 +185,12 @@ final class TrainingSession: ObservableObject {
             phase = .loading
             try Task.checkCancellation()
 
+            var baseConfig = TrainingConfig()
+            baseConfig.trainingMaskMode = trainingMaskMode
             let activeSession = try await MsplatSession(
                 datasetURL: folder.url,
-                trainingPlan: plan
+                trainingPlan: plan,
+                baseConfig: baseConfig
             )
             session = activeSession
             try Task.checkCancellation()

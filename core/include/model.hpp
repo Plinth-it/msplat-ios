@@ -24,7 +24,9 @@ struct Model{
         int maxGaussians = -1,
         bool refinePhotometricGains = false,
         bool refineCameraPoses = false,
-        int poseAnchorCameraIndex = -1);
+        int poseAnchorCameraIndex = -1,
+        bool transparentTrainingMasks = false,
+        float transparentAlphaLossWeight = 0.1f);
 
   ~Model(){ releaseOptimizers(); }
 
@@ -143,6 +145,8 @@ struct Model{
   bool refinePhotometricGains;
   bool refineCameraPoses;
   int poseAnchorCameraIndex;
+  bool transparentTrainingMasks;
+  float transparentAlphaLossWeight;
   bool keepCrs;
 
   float scale;

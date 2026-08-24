@@ -221,7 +221,9 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.refineCameraPoses,
         config.refineCameraPoses && !impl->ds->trainIndices.empty()
             ? static_cast<int>(impl->ds->trainIndices.front())
-            : -1
+            : -1,
+        config.trainingMaskMode == TrainingMaskMode::Transparent,
+        config.transparentAlphaLossWeight
     );
 
     impl->camIndices.resize(impl->ds->trainIndices.size());
@@ -1067,6 +1069,19 @@ void validateRefinementOptionsV8(
                 "Refinement options reserved fields must be zero");
 }
 
+void validateTrainingMaskOptionsV11(
+    const MsplatTrainingMaskOptionsV11& options) {
+    require(options.mode == MSPLAT_TRAINING_MASK_MODE_COVERAGE ||
+                options.mode == MSPLAT_TRAINING_MASK_MODE_TRANSPARENT,
+            "Training mask mode is not recognized");
+    require(std::isfinite(options.alphaLossWeight) &&
+                options.alphaLossWeight >= 0.0f,
+            "Training mask alpha loss weight must be finite and non-negative");
+    for (uint32_t reserved : options.reserved)
+        require(reserved == 0u,
+                "Training mask options reserved fields must be zero");
+}
+
 msplat::Config configFromC(const MsplatConfig& c) {
     msplat::Config cfg;
     cfg.iterations = c.iterations;
@@ -1337,6 +1352,35 @@ MsplatStatus msplat_trainer_create_v8(
     size_t refinementOptionsSize,
     MsplatTrainer* outTrainer,
     MsplatErrorInfo* error) {
+    const MsplatTrainingMaskOptionsV11 maskOptions =
+        msplat_default_training_mask_options_v11();
+    return msplat_trainer_create_v11(
+        ds, config, configSize, limits, limitsSize,
+        refinementOptions, refinementOptionsSize,
+        &maskOptions, sizeof(maskOptions), outTrainer, error);
+}
+
+MsplatStatus msplat_training_mask_options_validate_v11(
+    const MsplatTrainingMaskOptionsV11* options, size_t optionsSize,
+    MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INVALID_ARGUMENT, [&] {
+        require(options != nullptr, "Training mask options must not be null");
+        require(optionsSize == sizeof(MsplatTrainingMaskOptionsV11),
+                "Training mask options size does not match this msplat ABI");
+        validateTrainingMaskOptionsV11(*options);
+    });
+}
+
+MsplatStatus msplat_trainer_create_v11(
+    MsplatDataset ds,
+    const MsplatConfig* config, size_t configSize,
+    const MsplatTrainingLimits* limits, size_t limitsSize,
+    const MsplatRefinementOptionsV8* refinementOptions,
+    size_t refinementOptionsSize,
+    const MsplatTrainingMaskOptionsV11* maskOptions,
+    size_t maskOptionsSize,
+    MsplatTrainer* outTrainer,
+    MsplatErrorInfo* error) {
     if (outTrainer) *outTrainer = nullptr;
     return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
         require(ds != nullptr, "Dataset handle must not be null");
@@ -1350,10 +1394,20 @@ MsplatStatus msplat_trainer_create_v8(
                 "Refinement options must not be null");
         require(refinementOptionsSize == sizeof(MsplatRefinementOptionsV8),
                 "Refinement options size does not match this msplat ABI");
+        require(maskOptions != nullptr,
+                "Training mask options must not be null");
+        require(maskOptionsSize == sizeof(MsplatTrainingMaskOptionsV11),
+                "Training mask options size does not match this msplat ABI");
         require(outTrainer != nullptr, "outTrainer must not be null");
         validateConfig(*config);
         validateTrainingLimits(*limits);
         validateRefinementOptionsV8(*refinementOptions);
+        validateTrainingMaskOptionsV11(*maskOptions);
+        require(!(maskOptions->mode ==
+                      MSPLAT_TRAINING_MASK_MODE_TRANSPARENT &&
+                  (refinementOptions->flags &
+                   MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS) != 0u),
+                "Transparent training masks cannot be combined with photometric gain refinement");
         auto dataset = datasetHandle(ds).dataset;
         require(dataset->numTrain() > 0, "Dataset has no training cameras");
         auto cfg = configFromC(*config);
@@ -1364,6 +1418,11 @@ MsplatStatus msplat_trainer_create_v8(
         cfg.refineCameraPoses =
             (refinementOptions->flags &
              MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) != 0u;
+        cfg.trainingMaskMode =
+            maskOptions->mode == MSPLAT_TRAINING_MASK_MODE_TRANSPARENT
+                ? msplat::TrainingMaskMode::Transparent
+                : msplat::TrainingMaskMode::Coverage;
+        cfg.transparentAlphaLossWeight = maskOptions->alphaLossWeight;
         auto handle = std::make_unique<CApiTrainerHandle>();
         handle->dataset = std::move(dataset);
         handle->trainer = std::make_unique<msplat::Trainer>(*handle->dataset, cfg);

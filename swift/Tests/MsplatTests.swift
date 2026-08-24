@@ -13,8 +13,28 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(config.ssimWeight, 0.2, accuracy: 0.001)
         XCTAssertFalse(config.refinePhotometricGains)
         XCTAssertFalse(config.refineCameraPoses)
+        XCTAssertEqual(config.trainingMaskMode, .coverage)
+        XCTAssertEqual(config.transparentAlphaLossWeight, 0.1, accuracy: 0.001)
         XCTAssertEqual(config.toRefinementOptionsV8().flags, 0)
+        XCTAssertEqual(
+            config.toTrainingMaskOptionsV11().mode,
+            MSPLAT_TRAINING_MASK_MODE_COVERAGE.rawValue
+        )
         XCTAssertNoThrow(try config.validate())
+    }
+
+    func testTransparentMaskModeMapsToVersionedNativeOptions() {
+        var config = TrainingConfig()
+        config.trainingMaskMode = .transparent
+        config.transparentAlphaLossWeight = 0.25
+
+        let options = config.toTrainingMaskOptionsV11()
+        XCTAssertEqual(
+            options.mode,
+            MSPLAT_TRAINING_MASK_MODE_TRANSPARENT.rawValue
+        )
+        XCTAssertEqual(options.alphaLossWeight, 0.25, accuracy: 0.001)
+        XCTAssertEqual(MemoryLayout<MsplatTrainingMaskOptionsV11>.size, 16)
     }
 
     func testPhotometricRefinementMapsToVersionedNativeOptions() {
@@ -81,6 +101,19 @@ final class MsplatTests: XCTestCase {
 
         config = TrainingConfig()
         config.bgColor = (0, .infinity, 0)
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.transparentAlphaLossWeight = -.infinity
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.transparentAlphaLossWeight = -0.1
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.trainingMaskMode = .transparent
+        config.refinePhotometricGains = true
         invalidConfigs.append(config)
 
         for invalidConfig in invalidConfigs {

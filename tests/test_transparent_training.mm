@@ -1,0 +1,274 @@
+#include "bindings.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <tuple>
+#include <vector>
+
+namespace {
+
+[[noreturn]] void fail(const char *expression, int line) {
+    throw std::runtime_error(
+        "line " + std::to_string(line) + ": " + expression);
+}
+
+#define CHECK(condition) \
+    do { if (!(condition)) fail(#condition, __LINE__); } while (false)
+
+constexpr int kWidth = 32;
+constexpr int kHeight = 32;
+constexpr int kAdamGroups = 6;
+
+struct StepResult {
+    float opacity = 0.0f;
+    float opacityFirstMoment = 0.0f;
+    float lastOpacity = 0.0f;
+    float lastOpacityFirstMoment = 0.0f;
+    float minimumOpacity = 0.0f;
+    float maximumOpacity = 0.0f;
+    int positiveOpacityMomentCount = 0;
+    int nonfiniteOpacityCount = 0;
+    int nonfiniteOpacityMomentCount = 0;
+    int radius = 0;
+};
+
+MTensor gpuFloats(std::initializer_list<int64_t> shape,
+                  std::initializer_list<float> values) {
+    MTensor tensor = gpu_empty(std::vector<int64_t>(shape), DType::Float32);
+    CHECK(static_cast<size_t>(tensor.numel()) == values.size());
+    std::copy(values.begin(), values.end(), tensor.data<float>());
+    return tensor;
+}
+
+MTensor gpuFloats(std::initializer_list<int64_t> shape,
+                  const std::vector<float>& values) {
+    MTensor tensor = gpu_empty(std::vector<int64_t>(shape), DType::Float32);
+    CHECK(static_cast<size_t>(tensor.numel()) == values.size());
+    std::copy(values.begin(), values.end(), tensor.data<float>());
+    return tensor;
+}
+
+StepResult runStep(bool transparent, float alphaLossWeight,
+                   int gaussianCount = 1,
+                   float initialAlpha = 0.1f) {
+    CHECK(gaussianCount > 0);
+    std::vector<float> meanValues(static_cast<size_t>(gaussianCount) * 3);
+    std::vector<float> scaleValues(static_cast<size_t>(gaussianCount) * 3);
+    std::vector<float> quatValues(static_cast<size_t>(gaussianCount) * 4);
+    std::vector<float> dcValues(static_cast<size_t>(gaussianCount) * 3);
+    std::vector<float> opacityValues(static_cast<size_t>(gaussianCount));
+
+    const float logScale = std::log(0.03f);
+    constexpr float shC0 = 0.28209479177387814f;
+    const float blackDc = -0.5f / shC0;
+    const float initialOpacity = std::log(initialAlpha / (1.0f - initialAlpha));
+    for (int index = 0; index < gaussianCount; ++index) {
+        const size_t meanOffset = static_cast<size_t>(index) * 3;
+        meanValues[meanOffset + 0] = 0.25f;
+        meanValues[meanOffset + 1] = -0.25f;
+        meanValues[meanOffset + 2] = -1.0f;
+        scaleValues[meanOffset + 0] = logScale;
+        scaleValues[meanOffset + 1] = logScale;
+        scaleValues[meanOffset + 2] = logScale;
+        dcValues[meanOffset + 0] = blackDc;
+        dcValues[meanOffset + 1] = blackDc;
+        dcValues[meanOffset + 2] = blackDc;
+        quatValues[static_cast<size_t>(index) * 4] = 1.0f;
+        opacityValues[static_cast<size_t>(index)] = initialOpacity;
+    }
+
+    MTensor means = gpuFloats({gaussianCount, 3}, meanValues);
+    MTensor scales = gpuFloats({gaussianCount, 3}, scaleValues);
+    MTensor quats = gpuFloats({gaussianCount, 4}, quatValues);
+
+    // Identity camera-to-world becomes diag(1,-1,-1,1) in the renderer's
+    // OpenGL camera convention. P*V below projects the Gaussian to (23.5,23.5).
+    MTensor viewmat = gpuFloats({4, 4}, {
+        1, 0, 0, 0,
+        0, -1, 0, 0,
+        0, 0, -1, 0,
+        0, 0, 0, 1,
+    });
+    constexpr float nearPlane = 0.001f;
+    constexpr float farPlane = 1000.0f;
+    const float depthScale = (farPlane + nearPlane) / (farPlane - nearPlane);
+    const float depthOffset = -farPlane * nearPlane / (farPlane - nearPlane);
+    MTensor projmat = gpuFloats({4, 4}, {
+        2, 0, 0, 0,
+        0, -2, 0, 0,
+        0, 0, -depthScale, depthOffset,
+        0, 0, -1, 0,
+    });
+
+    MTensor featuresDc = gpuFloats({gaussianCount, 3}, dcValues);
+    MTensor featuresRest = gpu_zeros(
+        {gaussianCount, 0, 3}, DType::Float32);
+    MTensor opacities = gpuFloats({gaussianCount, 1}, opacityValues);
+    MTensor background = gpu_zeros({3}, DType::Float32);
+    MTensor gt = gpu_zeros({kHeight, kWidth, 3}, DType::Float32);
+    MTensor mask = gpu_zeros({kHeight, kWidth}, DType::UInt8);
+    for (int y = 0; y < 4; ++y) {
+        for (int x = 0; x < 4; ++x)
+            mask.data<uint8_t>()[y * kWidth + x] = 255;
+    }
+
+    std::array<MTensor, kAdamGroups> params = {
+        means, scales, quats, featuresDc, featuresRest, opacities,
+    };
+    std::array<MTensor, kAdamGroups> expAvg;
+    std::array<MTensor, kAdamGroups> expAvgSq;
+    for (int group = 0; group < kAdamGroups; ++group) {
+        expAvg[group] = gpu_zeros(params[group].shape(), DType::Float32);
+        expAvgSq[group] = gpu_zeros(params[group].shape(), DType::Float32);
+    }
+    float stepSizes[kAdamGroups] = {};
+    stepSizes[5] = 0.5f;
+    float biasCorrection2Sqrts[kAdamGroups];
+    std::fill_n(biasCorrection2Sqrts, kAdamGroups, std::sqrt(0.001f));
+
+    MTensor logRgbGains = gpu_zeros({1, 3}, DType::Float32);
+    MsplatPhotometricRefinementStep photometric;
+    photometric.logRgbGains = &logRgbGains;
+    MTensor poseDeltas = gpu_zeros({1, 6}, DType::Float32);
+    MsplatPoseRefinementStep pose;
+    pose.deltas = &poseDeltas;
+
+    MTensor visibility = gpu_zeros({gaussianCount}, DType::Float32);
+    MTensor xyGradientNorm = gpu_zeros({gaussianCount}, DType::Float32);
+    MTensor max2DSize = gpu_zeros({gaussianCount}, DType::Float32);
+    float cameraPosition[3] = {0, 0, 0};
+    const uint64_t coverageUnits = transparent
+        ? static_cast<uint64_t>(kWidth) * kHeight * 255u
+        : 4u * 4u * 255u;
+    const float lossInvN = static_cast<float>(
+        255.0 / (static_cast<double>(coverageUnits) * 3.0));
+
+    MTensor radii = msplat_train_step(
+        gaussianCount, means, scales, 1.0f,
+        quats, viewmat, projmat,
+        32.0f, 32.0f, 16.0f, 16.0f,
+        kHeight, kWidth, std::make_tuple(2, 2, 1), 0.01f,
+        0, 0, cameraPosition,
+        featuresDc, featuresRest, opacities, background,
+        gt, &mask, coverageUnits, 0.0f, lossInvN,
+        transparent, alphaLossWeight,
+        kAdamGroups, params.data(), expAvg.data(), expAvgSq.data(),
+        stepSizes, biasCorrection2Sqrts,
+        0.9f, 0.999f, 1.0e-8f,
+        photometric, pose, false,
+        visibility, xyGradientNorm, max2DSize, 1.0f / kWidth);
+    msplat_gpu_sync();
+
+    StepResult result;
+    result.opacity = opacities.data<float>()[0];
+    result.opacityFirstMoment = expAvg[5].data<float>()[0];
+    result.lastOpacity = opacities.data<float>()[gaussianCount - 1];
+    result.lastOpacityFirstMoment =
+        expAvg[5].data<float>()[gaussianCount - 1];
+    result.minimumOpacity = result.opacity;
+    result.maximumOpacity = result.opacity;
+    for (int index = 0; index < gaussianCount; ++index) {
+        const float opacity = opacities.data<float>()[index];
+        const float moment = expAvg[5].data<float>()[index];
+        if (!std::isfinite(opacity)) ++result.nonfiniteOpacityCount;
+        if (!std::isfinite(moment)) ++result.nonfiniteOpacityMomentCount;
+        result.minimumOpacity = std::min(result.minimumOpacity, opacity);
+        result.maximumOpacity = std::max(result.maximumOpacity, opacity);
+        if (moment > 0.0f)
+            ++result.positiveOpacityMomentCount;
+    }
+    result.radius = radii.data<int32_t>()[0];
+    return result;
+}
+
+void checkTransparentAlphaSupervision() {
+    const float initialOpacity = std::log(0.1f / 0.9f);
+
+    const StepResult coverage = runStep(false, 0.1f);
+    CHECK(coverage.radius > 0);
+    CHECK(coverage.opacity == initialOpacity);
+    CHECK(coverage.opacityFirstMoment == 0.0f);
+
+    const StepResult disabledAlpha = runStep(true, 0.0f);
+    CHECK(disabledAlpha.radius > 0);
+    CHECK(disabledAlpha.opacity == initialOpacity);
+    CHECK(disabledAlpha.opacityFirstMoment == 0.0f);
+
+    const StepResult transparent = runStep(true, 0.1f);
+    CHECK(transparent.radius > 0);
+    CHECK(transparent.opacity < initialOpacity);
+    CHECK(transparent.opacityFirstMoment > 0.0f);
+}
+
+void checkChunkedTransparentAlphaSupervision() {
+    // More than 512 identical tile intersections forces both chunked raster
+    // passes. Keep per-Gaussian opacity just above the 1/255 raster cutoff and
+    // aggregate transmittance high enough that every chunk contributes.
+    constexpr int gaussianCount = 513;
+    constexpr float initialAlpha = 0.005f;
+    const float initialOpacity =
+        std::log(initialAlpha / (1.0f - initialAlpha));
+
+    const StepResult transparent =
+        runStep(true, 0.1f, gaussianCount, initialAlpha);
+    if (!(transparent.opacity < initialOpacity &&
+          transparent.lastOpacity < initialOpacity &&
+          transparent.opacityFirstMoment > 0.0f &&
+          transparent.lastOpacityFirstMoment > 0.0f &&
+          transparent.positiveOpacityMomentCount == gaussianCount &&
+          transparent.nonfiniteOpacityCount == 0 &&
+          transparent.nonfiniteOpacityMomentCount == 0)) {
+        std::cerr << "chunked initial=" << initialOpacity
+                  << " first=" << transparent.opacity
+                  << " last=" << transparent.lastOpacity
+                  << " firstMoment=" << transparent.opacityFirstMoment
+                  << " lastMoment=" << transparent.lastOpacityFirstMoment
+                  << " min=" << transparent.minimumOpacity
+                  << " max=" << transparent.maximumOpacity
+                  << " positiveMoments="
+                  << transparent.positiveOpacityMomentCount
+                  << " nonfiniteOpacity="
+                  << transparent.nonfiniteOpacityCount
+                  << " nonfiniteMoments="
+                  << transparent.nonfiniteOpacityMomentCount
+                  << '\n';
+    }
+    CHECK(transparent.radius > 0);
+    CHECK(transparent.opacity < initialOpacity);
+    CHECK(transparent.lastOpacity < initialOpacity);
+    CHECK(transparent.opacityFirstMoment > 0.0f);
+    CHECK(transparent.lastOpacityFirstMoment > 0.0f);
+    CHECK(transparent.positiveOpacityMomentCount == gaussianCount);
+    CHECK(transparent.nonfiniteOpacityCount == 0);
+    CHECK(transparent.nonfiniteOpacityMomentCount == 0);
+}
+
+}  // namespace
+
+int main(int argc, char **argv) {
+    @autoreleasepool {
+        try {
+            if (argc != 2)
+                throw std::invalid_argument("Expected the metallib path");
+            msplat_set_metallib_path_checked(argv[1]);
+            checkTransparentAlphaSupervision();
+            checkChunkedTransparentAlphaSupervision();
+            cleanup_msplat_metal();
+            return 0;
+        } catch (const std::exception &error) {
+            if (std::string(error.what()) ==
+                "msplat: no Metal device is available") {
+                std::cerr << "SKIP: " << error.what() << '\n';
+                return 77;
+            }
+            std::cerr << error.what() << '\n';
+            cleanup_msplat_metal();
+            return 1;
+        }
+    }
+}

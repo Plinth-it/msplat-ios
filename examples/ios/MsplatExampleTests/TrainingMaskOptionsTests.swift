@@ -99,6 +99,13 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertGreaterThan(masked.estimatedPeakMemory, unmasked.estimatedPeakMemory)
     }
 
+    @MainActor
+    func testDiscoveredMasksDefaultToTransparentTreatment() {
+        let session = TrainingSession()
+
+        XCTAssertEqual(session.trainingMaskMode, .transparent)
+    }
+
     func testBinarySparsePointCountTakesPriorityOverText() throws {
         let directory = try XCTUnwrap(temporaryDirectory)
         try writeBinaryPointHeader(count: 2, to: directory)

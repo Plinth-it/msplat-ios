@@ -1,3 +1,4 @@
+import Msplat
 import SwiftUI
 import UniformTypeIdentifiers
 
@@ -26,6 +27,7 @@ struct ContentView: View {
                         trainingMaskCandidateCount = nil
                         trainingMaskSelectionWasEdited = false
                         session.trainingMasksEnabled = false
+                        session.trainingMaskMode = .transparent
                         pickError = nil
                     } else {
                         pickError = "Choose a COLMAP-only folder with cameras.bin or cameras.txt at its root or in sparse/0."
@@ -70,6 +72,13 @@ struct ContentView: View {
             }
             Toggle("Use discovered masks", isOn: trainingMasksBinding)
                 .disabled(isBusy || folder == nil)
+            if session.trainingMasksEnabled {
+                Picker("Mask treatment", selection: $session.trainingMaskMode) {
+                    Text("Transparent").tag(TrainingMaskMode.transparent)
+                    Text("Coverage only").tag(TrainingMaskMode.coverage)
+                }
+                .disabled(isBusy)
+            }
             LabeledContent(
                 "Mask candidates",
                 value: trainingMaskCandidateCount?.formatted() ?? "Scanning…"
@@ -87,7 +96,7 @@ struct ContentView: View {
                 Button("Stop", role: .destructive) { session.cancel() }
             }
         } footer: {
-            Text("Preview targets a 1,600-pixel edge, SH1, and a 250K Gaussian ceiling. Balanced targets 1,920 pixels, SH2, and a 400K ceiling when preflight memory permits. Either ceiling rises only enough to preserve a larger initial sparse model, and the memory estimate is recomputed. Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Mask value 0 is ignored and 255 has full training coverage.")
+            Text("Preview targets a 1,600-pixel edge, SH1, and a 250K Gaussian ceiling. Balanced targets 1,920 pixels, SH2, and a 400K ceiling when preflight memory permits. Either ceiling rises only enough to preserve a larger initial sparse model, and the memory estimate is recomputed. Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Transparent treats the mask as target alpha and suppresses exterior floaters. Coverage only uses mask values to weight RGB loss.")
         }
     }
 

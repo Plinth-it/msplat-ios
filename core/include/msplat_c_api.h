@@ -26,8 +26,10 @@ extern "C" {
 // would interpret that bit as unknown.
 // ABI v10 adds opt-in Brush-compatible training-mask discovery for path-based
 // COLMAP loading without changing any existing structure or symbol.
+// ABI v11 adds versioned training-mask treatment options without changing
+// MsplatConfig or the existing coverage-mask behavior.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 10u
+#define MSPLAT_ABI_VERSION 11u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -137,6 +139,31 @@ msplat_default_refinement_options_v8(void) {
     options.reserved[0] = 0u;
     options.reserved[1] = 0u;
     options.reserved[2] = 0u;
+    return options;
+}
+
+/// How a decoded per-frame training mask participates in the objective.
+/// Coverage mode preserves the ABI v6 behavior: mask values weight RGB loss.
+/// Transparent mode treats the mask as target alpha, composites source RGB
+/// over the configured background, and adds a full-frame alpha loss.
+typedef enum {
+    MSPLAT_TRAINING_MASK_MODE_COVERAGE = 0,
+    MSPLAT_TRAINING_MASK_MODE_TRANSPARENT = 1
+} MsplatTrainingMaskModeV11;
+
+typedef struct {
+    uint32_t mode;
+    float alphaLossWeight;
+    uint32_t reserved[2];
+} MsplatTrainingMaskOptionsV11;
+
+static inline MsplatTrainingMaskOptionsV11
+msplat_default_training_mask_options_v11(void) {
+    MsplatTrainingMaskOptionsV11 options;
+    options.mode = MSPLAT_TRAINING_MASK_MODE_COVERAGE;
+    options.alphaLossWeight = 0.1f;
+    options.reserved[0] = 0u;
+    options.reserved[1] = 0u;
     return options;
 }
 
@@ -505,6 +532,23 @@ MsplatStatus msplat_trainer_create_v8(
     const MsplatTrainingLimits* limits, size_t limitsSize,
     const MsplatRefinementOptionsV8* refinementOptions,
     size_t refinementOptionsSize,
+    MsplatTrainer* outTrainer,
+    MsplatErrorInfo* error);
+// ABI v11 trainer creation. Mask treatment is versioned separately from the
+// locked MsplatConfig layout. Unknown modes, non-finite/negative weights, and
+// non-zero reserved fields are rejected. Frames without a mask retain opaque
+// RGB training even when transparent mode is selected.
+MsplatStatus msplat_training_mask_options_validate_v11(
+    const MsplatTrainingMaskOptionsV11* options, size_t optionsSize,
+    MsplatErrorInfo* error);
+MsplatStatus msplat_trainer_create_v11(
+    MsplatDataset ds,
+    const MsplatConfig* config, size_t configSize,
+    const MsplatTrainingLimits* limits, size_t limitsSize,
+    const MsplatRefinementOptionsV8* refinementOptions,
+    size_t refinementOptionsSize,
+    const MsplatTrainingMaskOptionsV11* maskOptions,
+    size_t maskOptionsSize,
     MsplatTrainer* outTrainer,
     MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_destroy_v2(MsplatTrainer t, MsplatErrorInfo* error);

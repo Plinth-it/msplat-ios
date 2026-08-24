@@ -215,6 +215,8 @@ final class TrainingPlanTests: XCTestCase {
         base.ssimWeight = 0.35
         base.refineEvery = 50
         base.stopDensifyAt = 900
+        base.trainingMaskMode = .transparent
+        base.transparentAlphaLossWeight = 0.25
         base.downscaleFactor = 8
 
         let plan = try TrainingPlan(
@@ -232,6 +234,8 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(config.ssimWeight, 0.35)
         XCTAssertEqual(config.refineEvery, 50)
         XCTAssertEqual(config.stopDensifyAt, 900)
+        XCTAssertEqual(config.trainingMaskMode, .transparent)
+        XCTAssertEqual(config.transparentAlphaLossWeight, 0.25)
         XCTAssertEqual(config.downscaleFactor, 1)
     }
 

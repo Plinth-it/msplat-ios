@@ -143,6 +143,9 @@ poses.
   native/Python CLIs; it is disabled by default and training-only
 - ABI v10 opt-in mask-sidecar discovery for path-based dataset loading; the
   existing path entry point remains unmasked by default
+- ABI v11 versioned training-mask treatment options. Coverage remains the
+  default; transparent mode adds full-frame alpha supervision without changing
+  the locked `MsplatConfig` layout or any earlier entry point.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
@@ -202,6 +205,7 @@ func train() throws {
 
     var baseConfig = TrainingConfig()
     baseConfig.stopDensifyAt = 750
+    baseConfig.trainingMaskMode = .transparent
 
     let session = try MsplatSession(
         datasetURL: URL(fileURLWithPath: "path/to/colmap/"),
@@ -236,11 +240,20 @@ below any case-insensitive `masks` path component. It matches an image such as
 name plus `.mask` (`masks/foo.jpeg.mask`), or a `.mask` stem
 (`masks/foo.mask.png`). Nested mask directories may match a suffix of the image
 directory, and frames without a match retain full coverage. An alpha-bearing
-sidecar uses alpha; other color images use their first/red channel. Mask value
-0 excludes a pixel from RGB loss and 255 gives it full coverage, with
-intermediate values providing soft coverage. Coverage masking does not train
-rendered alpha to match source transparency. Sidecars must currently match the
-source image dimensions; unlike Brush, MSplat does not resize mismatched masks.
+sidecar uses alpha; other color images use their first/red channel. In the
+default `TrainingMaskMode.coverage`, mask value 0 excludes a pixel from RGB loss
+and 255 gives it full coverage, with intermediate values providing soft
+coverage. `TrainingMaskMode.transparent` instead treats those values as target
+alpha. It composites source RGB over `TrainingConfig.bgColor`, supervises RGB
+over the full frame, and adds `transparentAlphaLossWeight` times full-frame L1
+loss between the mask and rendered alpha (`1 - transmittance`); the default
+weight is 0.1. This directly penalizes exterior opacity while preserving soft
+silhouette edges. The fixed configured background is used for deterministic,
+race-free asynchronous training. Transparent mask treatment cannot currently be
+combined with per-camera photometric gain refinement because those gains would
+also act on the synthetic background. Frames without a matched mask remain
+ordinary opaque RGB targets. Sidecars must currently match the source image dimensions;
+unlike Brush, MSplat does not resize mismatched masks.
 
 Plinth can also construct a Swift `DatasetDescriptor` from calibrated frame
 URLs, optional per-frame soft training masks, sparse points, and optional
@@ -248,9 +261,10 @@ observations, then pass it to
 `MsplatSession(dataset:securityScopedResourceURLs:options:config:)`. The native
 ABI v5/v6 path copies every descriptor and mask-sidecar buffer synchronously.
 Luminance masks use premultiplied Rec. 709 coverage; alpha masks require an
-alpha channel. Both remain soft UInt8 coverage through resize and
-undistortion, must match the image in its selected encoded or EXIF-normalized
-raster frame, and normalize training loss over covered RGB units. Callers
+alpha channel. Both remain soft UInt8 masks through resize and undistortion and
+must match the image in its selected encoded or EXIF-normalized raster frame.
+Coverage mode normalizes over covered RGB units; transparent mode uses the
+full-frame RGB and alpha objective described above. Callers
 should provide the selected folder or bookmark roots whose security scopes
 cover every lazily decoded image and mask URL; the session releases those
 scopes after its native trainer and dataset are destroyed. Set

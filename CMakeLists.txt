@@ -222,6 +222,14 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         set_tests_properties(msplat_densification_classification PROPERTIES
             SKIP_RETURN_CODE 77)
+        add_executable(msplat_transparent_training_tests
+            tests/test_transparent_training.mm)
+        target_link_libraries(msplat_transparent_training_tests PRIVATE msplat_core)
+        add_test(NAME msplat_transparent_training
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_transparent_training PROPERTIES
+            SKIP_RETURN_CODE 77)
         add_test(NAME msplat_exact_intersection_contract
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
@@ -230,6 +238,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
                 -P ${CMAKE_SOURCE_DIR}/tests/check_ssim_storage_contract.cmake)
+        add_test(NAME msplat_transparent_mask_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_transparent_mask_contract.cmake)
         add_test(NAME msplat_projection_contract
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}

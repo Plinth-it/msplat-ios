@@ -46,8 +46,8 @@ require_contains("${host_source}"
     "const MTensor& loss_coverage_buffer = coverage_mask ? *coverage_mask : gt;"
     "allocation-free unmasked coverage buffer")
 require_contains("${host_source}"
-    "const uint32_t coverage_stride = coverage_mask ? img_width : 0u;"
-    "zero-stride unmasked coverage contract")
+    "const uint32_t coverage_stride =\n        coverage_mask && !transparent_mask ? img_width : 0u;"
+    "zero-stride unmasked or transparent coverage contract")
 require_contains("${host_source}"
     "ENC_BUF(enc, loss_coverage_buffer, 8);"
     "fused forward coverage binding")

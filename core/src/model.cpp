@@ -123,7 +123,9 @@ Model::Model(const InputData &inputData, int numCameras,
     int maxGaussians,
     bool refinePhotometricGains,
     bool refineCameraPoses,
-    int poseAnchorCameraIndex)
+    int poseAnchorCameraIndex,
+    bool transparentTrainingMasks,
+    float transparentAlphaLossWeight)
     : numCameras(numCameras),
       datasetCameraCount(0),
       numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
@@ -135,12 +137,24 @@ Model::Model(const InputData &inputData, int numCameras,
       maxSteps(maxSteps), maxGaussians(maxGaussians),
       refinePhotometricGains(refinePhotometricGains),
       refineCameraPoses(refineCameraPoses),
-      poseAnchorCameraIndex(poseAnchorCameraIndex), keepCrs(keepCrs) {
+      poseAnchorCameraIndex(poseAnchorCameraIndex),
+      transparentTrainingMasks(transparentTrainingMasks),
+      transparentAlphaLossWeight(transparentAlphaLossWeight),
+      keepCrs(keepCrs) {
 
     if (inputData.points.count <= 0)
         throw std::invalid_argument("Dataset must contain sparse points");
     if (maxGaussians != -1 && maxGaussians <= 0)
         throw std::invalid_argument("maxGaussians must be -1 or greater than zero");
+    if (!std::isfinite(transparentAlphaLossWeight) ||
+        transparentAlphaLossWeight < 0.0f) {
+        throw std::invalid_argument(
+            "transparentAlphaLossWeight must be finite and non-negative");
+    }
+    if (transparentTrainingMasks && refinePhotometricGains) {
+        throw std::invalid_argument(
+            "Transparent training masks cannot be combined with photometric gain refinement");
+    }
     if (inputData.points.count > std::numeric_limits<int>::max())
         throw std::invalid_argument("Dataset contains too many sparse points");
     if (maxGaussians > 0 && inputData.points.count > maxGaussians)
@@ -2029,9 +2043,14 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
         pose.maxRotation = kPoseMaxRotation;
     }
 
+    const bool transparentMask =
+        transparentTrainingMasks && target.coverageMask != nullptr;
+    const uint64_t objectiveCoverageUnits = transparentMask
+        ? fullCoverageUnits
+        : target.coverageUnits;
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
     const float lossInvN = static_cast<float>(
-        255.0 / (static_cast<double>(target.coverageUnits) * 3.0));
+        255.0 / (static_cast<double>(objectiveCoverageUnits) * 3.0));
 
     MTensor r;
     adam_step_count = nextAdamStep;
@@ -2046,8 +2065,8 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
             s.height, s.width, s.tileBounds, 0.01f,
             s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
             opacities, backgroundColor, gt, target.coverageMask,
-            target.coverageUnits, ssimWeight,
-            lossInvN,
+            objectiveCoverageUnits, ssimWeight,
+            lossInvN, transparentMask, transparentAlphaLossWeight,
             N_ADAM_GROUPS,
             adam_p, adam_ea, adam_eas,
             adam_ss, adam_bc2s,

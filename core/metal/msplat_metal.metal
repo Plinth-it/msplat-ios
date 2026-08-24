@@ -1034,6 +1034,9 @@ kernel void rasterize_backward_kernel(
     device atomic_float* v_conic, // float3
     device atomic_float* v_rgb, // float3
     device atomic_float* v_opacity,
+    constant uchar* training_mask, // (H, W), ignored when stride is zero
+    constant uint& alpha_stride,
+    constant float& alpha_gradient_scale,
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -1056,6 +1059,15 @@ kernel void rasterize_backward_kernel(
     // this is the T AFTER the last gaussian in this pixel
     float T_final = final_Ts[pix_id];
     float T = T_final;
+    float v_alpha_pixel = 0.0f;
+    if (inside && alpha_stride != 0) {
+        const float target_alpha =
+            float(training_mask[i * alpha_stride + j]) / 255.0f;
+        const float rendered_alpha = 1.0f - T_final;
+        v_alpha_pixel = alpha_gradient_scale * (
+            rendered_alpha > target_alpha ? 1.0f :
+            (rendered_alpha < target_alpha ? -1.0f : 0.0f));
+    }
     // the contribution from gaussians behind the current one
     float3 buffer = {0.f, 0.f, 0.f};
     // index of last gaussian to contribute to this pixel
@@ -1182,6 +1194,7 @@ kernel void rasterize_backward_kernel(
                 const float3 rgb = max(b_rgb + 0.5f, 0.f);
                 // contribution from this pixel + background
                 v_alpha += dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
+                v_alpha += v_alpha_pixel * T_final * ra;
                 // update the running sum
                 buffer = fma(rgb, fac, buffer);
 
@@ -3441,6 +3454,9 @@ kernel void rasterize_backward_chunked_kernel(
     device atomic_float* v_opacity,
     constant uint& chunk_size,
     constant uint& K_max,
+    constant uchar* training_mask, // (H, W), ignored when stride is zero
+    constant uint& alpha_stride,
+    constant float& alpha_gradient_scale,
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3473,6 +3489,15 @@ kernel void rasterize_backward_chunked_kernel(
     float3 buffer = aC_k;
 
     float T_final = final_Ts[pix_id];
+    float v_alpha_pixel = 0.0f;
+    if (inside && alpha_stride != 0) {
+        const float target_alpha =
+            float(training_mask[i * alpha_stride + j]) / 255.0f;
+        const float rendered_alpha = 1.0f - T_final;
+        v_alpha_pixel = alpha_gradient_scale * (
+            rendered_alpha > target_alpha ? 1.0f :
+            (rendered_alpha < target_alpha ? -1.0f : 0.0f));
+    }
     const float3 bg = {background[0], background[1], background[2]};
     const float3 T_final_bg = T_final * bg;
     const float3 v_out = read_packed_float3(v_output, pix_id);
@@ -3484,11 +3509,12 @@ kernel void rasterize_backward_chunked_kernel(
     int chunk_start = full_range.x + (int)(k * chunk_size);
     int chunk_end = min(full_range.x + (int)((k + 1) * chunk_size), full_range.y);
 
-    if (chunk_start >= chunk_end || bin_final < chunk_start) {
-        return; // empty chunk or no contributors
-    }
-
-    const int num_batches = (chunk_end - chunk_start + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
+    // Do not return individual pixels before the threadgroup barriers below.
+    // Pixels without contributors remain present for cooperative batch loads;
+    // bin_final and inside gate their arithmetic in the inner loop.
+    const int chunk_count = max(0, chunk_end - chunk_start);
+    const int num_batches =
+        (chunk_count + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
 
     threadgroup int32_t id_batch[RAST_BLOCK_SIZE];
     threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
@@ -3577,6 +3603,7 @@ kernel void rasterize_backward_chunked_kernel(
 
                 const float3 rgb = max(b_rgb + 0.5f, 0.f);
                 v_alpha += dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
+                v_alpha += v_alpha_pixel * T_final * ra;
                 buffer = fma(rgb, fac, buffer);
 
                 const float v_sigma = -alpha * v_alpha;
@@ -3635,6 +3662,20 @@ inline float photometric_gain(
         PHOTOMETRIC_MAX_ABS_LOG_GAIN));
 }
 
+inline float training_target_rgb(
+    constant float* gt,
+    constant uchar* training_mask,
+    uint alpha_stride,
+    constant float* background,
+    uint pixel,
+    uint channel) {
+    const float source = gt[pixel * 3 + channel];
+    if (alpha_stride == 0) return source;
+    const float target_alpha = float(training_mask[pixel]) / 255.0f;
+    return fma(source - background[channel], target_alpha,
+               background[channel]);
+}
+
 // Forward pass 1: horizontal convolution of rendered and gt.
 // For each pixel, computes 5 horizontal partial sums per channel:
 //   h_mu_x, h_mu_y, h_sq_x, h_sq_y, h_cross_xy
@@ -3647,6 +3688,9 @@ kernel void ssim_h_fwd_kernel(
     constant float* log_rgb_gains,  // (cameraCount, 3)
     constant uint& camera_gain_offset,
     constant uint& photometric_enabled,
+    constant uchar* training_mask,  // (H, W), ignored when stride is zero
+    constant uint& alpha_stride,
+    constant float* background,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3681,8 +3725,10 @@ kernel void ssim_h_fwd_kernel(
             int gx = base_gx + (int)sx;
             float gv = 0.0f, rv = 0.0f;
             if (gx >= 0 && gx < (int)W && gy >= 0 && gy < (int)H) {
-                uint idx = (gy * W + gx) * 3 + c;
-                gv = gt[idx];
+                uint pixel = gy * W + gx;
+                uint idx = pixel * 3 + c;
+                gv = training_target_rgb(
+                    gt, training_mask, alpha_stride, background, pixel, c);
                 rv = rendered[idx] * tg_gain[c];
             }
             tg_gt[c][sy][sx] = gv;
@@ -3841,6 +3887,10 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constant float* log_rgb_gains, // (cameraCount, 3)
     constant uint& camera_gain_offset,
     constant uint& photometric_enabled,
+    constant uint& alpha_stride,
+    constant float* background,
+    constant float* final_Ts,
+    constant float& alpha_loss_weight,
     uint2 gid [[thread_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]],
     uint2 tg_size [[threads_per_threadgroup]]
@@ -3852,6 +3902,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constexpr uint TILE_DIM = SSIM_TG + 2 * SSIM_HALF_WIN;
     constexpr uint TILE_PIXELS = TILE_DIM * TILE_DIM;
     float ssim_sum = 0.0f, l1_sum = 0.0f, coverage_sum = 0.0f;
+    float alpha_loss_sum = 0.0f;
     threadgroup float tg_gain[3];
 
     if (tr < 3) {
@@ -3912,10 +3963,20 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             if (dx >= SSIM_HALF_WIN && dx < SSIM_HALF_WIN + SSIM_TG) {
                 if (valid_center) {
                     ssim_sum += coverage * (A * B) / (Cd * D);
+                    const uint center_pixel = uint(gpy) * W + uint(gpx);
+                    const float target = training_target_rgb(
+                        gt, coverage_mask, alpha_stride, background,
+                        center_pixel, c);
                     l1_sum += coverage *
-                        fabs(gt[(gpy*W+gpx)*3+c] -
+                        fabs(target -
                              rendered[(gpy*W+gpx)*3+c] * gain);
                     coverage_sum += coverage;
+                    if (c == 0 && alpha_stride != 0) {
+                        const float target_alpha = float(coverage_mask[
+                            uint(gpy) * alpha_stride + uint(gpx)]) / 255.0f;
+                        alpha_loss_sum += alpha_loss_weight * fabs(
+                            (1.0f - final_Ts[center_pixel]) - target_alpha);
+                    }
                 }
             }
         }
@@ -3938,7 +3999,8 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     // Invalid centers already contribute zero coverage above.
     float pixel_loss =
         ssim_weight * (coverage_sum - ssim_sum) / 3.0f +
-        (1.0f - ssim_weight) * l1_sum / 3.0f;
+        (1.0f - ssim_weight) * l1_sum / 3.0f +
+        alpha_loss_sum;
     threadgroup float tg_sum[256];
     tg_sum[tr] = pixel_loss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4051,6 +4113,8 @@ kernel void ssim_v_bwd_kernel(
     constant uint& camera_gain_offset,
     device atomic_float* log_gain_gradient, // (3)
     constant uint& photometric_enabled,
+    constant uint& alpha_stride,
+    constant float* background,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -4112,7 +4176,9 @@ kernel void ssim_v_bwd_kernel(
             uint pixel_channel = (py * W + px) * 3 + c;
             const float raw_rend_val = rendered_gradient[pixel_channel];
             const float rend_val = raw_rend_val * gain;
-            float gt_val = gt[(py * W + px) * 3 + c];
+            float gt_val = training_target_rgb(
+                gt, coverage_mask, alpha_stride, background,
+                py * W + px, c);
 
             float v_ssim = conv_f1 + rend_val * conv_f2 + gt_val * conv_f3;
             const float coverage = coverage_stride == 0

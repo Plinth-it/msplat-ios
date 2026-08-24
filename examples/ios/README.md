@@ -37,10 +37,14 @@ For an image such as `images/foo.jpeg`, supported names include
 `masks/foo.png`, `masks/foo.jpeg.mask`, and `masks/foo.mask.png`; matching is
 case-insensitive and supports nested directory suffixes. An alpha-bearing mask
 uses alpha, while other color masks use their first/red channel. Mask value 0
-is ignored, 255 has full training coverage, and intermediate values provide
-soft coverage. This masks RGB loss; it does not train splat opacity to
-reproduce image transparency. Sidecars must match their source-image
-dimensions; unlike Brush, MSplat does not resize mismatched masks.
+is transparent, 255 is opaque, and intermediate values preserve soft edges.
+The app selects **Transparent** treatment by default: it composites source RGB
+over the configured background and trains rendered alpha across the full frame,
+which suppresses exterior floaters. **Coverage only** retains the earlier
+behavior where mask values merely weight RGB loss and masked-out pixels provide
+no opacity supervision. Frames without a matched mask remain opaque RGB targets
+in either mode. Sidecars must match their source-image dimensions; unlike Brush,
+MSplat does not resize mismatched masks.
 
 ## What it shows
 

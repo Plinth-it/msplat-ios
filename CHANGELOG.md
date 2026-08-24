@@ -46,6 +46,16 @@
   sets remain valid. Discovered masks read alpha when present and the first color
   channel otherwise, while ABI v2 remains discovery-disabled and descriptor ABI
   v6 remains limited to explicit luminance or alpha coverage.
+- Added ABI v11 versioned training-mask treatment options while preserving the
+  locked `MsplatConfig` layout and coverage defaults for every earlier entry
+  point. Transparent mode composites masked RGB over the configured background,
+  normalizes RGB over the full frame, and adds a full-frame L1 objective on
+  rendered alpha (`1 - transmittance`). Swift exposes the mode and alpha weight,
+  and the sample defaults discovered masks to transparent treatment while
+  retaining coverage-only selection. Transparent treatment rejects photometric
+  gain refinement so synthetic-background pixels cannot dominate those gains.
+  Chunked raster backward now keeps every pixel alive through cooperative
+  threadgroup barriers, so dense tiles propagate gradients through all chunks.
 - Corrected the image-edge versus array-index conversion in Brown-Conrady
   rectification, including alpha=0 crop endpoints and paired mask sampling.
   The renderer now uses an exact homogeneous divide, propagates the missing

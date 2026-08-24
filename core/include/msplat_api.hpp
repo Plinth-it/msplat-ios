@@ -16,6 +16,11 @@ namespace msplat {
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
+enum class TrainingMaskMode : uint32_t {
+    Coverage = 0,
+    Transparent = 1,
+};
+
 struct Config {
     int iterations = 30000;
     int shDegree = 3;
@@ -40,6 +45,9 @@ struct Config {
     // Learn small regularized camera-space SE(3) corrections after warm-up.
     // Imported poses and canonical render/evaluation/export remain unchanged.
     bool refineCameraPoses = false;
+    // Transparent mode applies only to frames that actually carry a mask.
+    TrainingMaskMode trainingMaskMode = TrainingMaskMode::Coverage;
+    float transparentAlphaLossWeight = 0.1f;
     float splitScreenSize = 0.05f;
     bool keepCrs = false;
     float downscaleFactor = 1.0f; // Legacy field retained for ABI compatibility; unused.
