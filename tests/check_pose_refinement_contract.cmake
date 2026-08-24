@@ -62,6 +62,9 @@ require_contains("${pose_prepare}"
 require_contains("${pose_prepare}"
     "-(transpose(rotation) * view_translation);"
     "refined camera center")
+require_contains("${pose_prepare}"
+    "refined_cam_pos[3] = 0.0f;"
+    "refined camera-center float3 ABI padding")
 
 # The disabled path must retain the established projection and VJP arithmetic.
 require_contains("${fused_forward}"
@@ -147,12 +150,27 @@ require_contains("${host_prepare}"
 require_contains("${host_prepare}"
     "[enc memoryBarrierWithScope:MTLBarrierScopeBuffers];"
     "pose preparation barrier")
+require_contains("${host_source}"
+    "pose_cam_pos = mtensor_empty(dev, {4}, DType::Float32);"
+    "refined camera-center 16-byte allocation")
+require_contains("${host_source}"
+    "Metal constant float3 arguments require 16 bytes"
+    "host camera-center ABI assertion")
 
 extract_section(host_source "static void render_pipeline("
     "MTensor msplat_render(" canonical_render_pipeline)
 require_contains("${canonical_render_pipeline}"
+    "std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f}"
+    "render camera-center 16-byte argument")
+require_contains("${canonical_render_pipeline}"
     "const uint32_t poseDisabled = 0u;\n        ENC_SCALAR(enc, poseDisabled, 23);"
     "canonical render pose-disabled binding")
+
+extract_section(host_source "MTensor msplat_train_step("
+    "// ========================== FORWARD ENCODE LAMBDAS" training_setup)
+require_contains("${training_setup}"
+    "std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f}"
+    "training camera-center 16-byte argument")
 
 extract_section(host_source "auto encode_proj_sh_bwd_adam ="
     "// ========================== DISPATCH" host_backward)

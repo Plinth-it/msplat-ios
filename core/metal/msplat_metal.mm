@@ -65,6 +65,8 @@ static constexpr size_t kTrainingReadbackBytes =
 static constexpr NSUInteger kTrainingReadbackLossOffset = sizeof(uint32_t);
 static constexpr NSUInteger kTrainingReadbackIntersectionOffset =
     2 * sizeof(uint32_t);
+static_assert(sizeof(std::array<float, 4>) == 16,
+              "Metal constant float3 arguments require 16 bytes");
 
 double elapsedMilliseconds(TelemetryClock::time_point start,
                            TelemetryClock::time_point end) {
@@ -1404,7 +1406,9 @@ struct FusedTensorCache {
         pose_viewmat.reset(); pose_cam_pos.reset(); pose_gradient.reset();
         try {
             pose_viewmat = mtensor_empty(dev, {4, 4}, DType::Float32);
-            pose_cam_pos = mtensor_empty(dev, {3}, DType::Float32);
+            // Metal constant float3 arguments occupy 16 bytes. Keep the
+            // camera-center buffer padded to the shader ABI width.
+            pose_cam_pos = mtensor_empty(dev, {4}, DType::Float32);
             pose_gradient = mtensor_empty(dev, {6}, DType::Float32);
         } catch (...) {
             pose_viewmat.reset(); pose_cam_pos.reset(); pose_gradient.reset();
@@ -1568,7 +1572,10 @@ static void render_pipeline(
         (uint32_t)tile_bounds_x, (uint32_t)tile_bounds_y,
         (uint32_t)std::get<2>(tile_bounds), 0xDEAD
     });
-    auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
+    // Metal constant float3 arguments occupy 16 bytes, despite carrying only
+    // three values.
+    auto cam_pos_arr = std::make_shared<std::array<float, 4>>(
+        std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
     uint32_t num_points_u32 = (uint32_t)num_points;
     auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
     auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
@@ -2082,7 +2089,10 @@ MTensor msplat_train_step(
         (uint32_t)tile_bounds_x, (uint32_t)tile_bounds_y,
         (uint32_t)std::get<2>(tile_bounds), 0xDEAD
     });
-    auto cam_pos_arr = std::make_shared<std::array<float, 3>>(std::array<float, 3>{cam_pos[0], cam_pos[1], cam_pos[2]});
+    // Metal constant float3 arguments occupy 16 bytes, despite carrying only
+    // three values.
+    auto cam_pos_arr = std::make_shared<std::array<float, 4>>(
+        std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
     uint32_t num_points_u32 = (uint32_t)num_points;
     auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
     auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});

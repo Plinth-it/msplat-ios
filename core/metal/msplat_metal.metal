@@ -1949,6 +1949,8 @@ kernel void prepare_camera_pose_kernel(
     refined_cam_pos[0] = camera_position.x;
     refined_cam_pos[1] = camera_position.y;
     refined_cam_pos[2] = camera_position.z;
+    // constant float3 kernel arguments use a 16-byte buffer ABI.
+    refined_cam_pos[3] = 0.0f;
 }
 
 struct PoseAdamParams {
