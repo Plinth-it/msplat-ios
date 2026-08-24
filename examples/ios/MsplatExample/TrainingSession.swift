@@ -63,6 +63,7 @@ final class TrainingSession: ObservableObject {
     @Published private(set) var plannedStages: [ResolvedTrainingResolutionStage] = []
     @Published private(set) var estimatedPeakMB = 0
     @Published private(set) var plannedSHDegree = 0
+    @Published private(set) var plannedInitialGaussians = 0
     @Published private(set) var plannedMaximumGaussians = 0
 
     /// Total steps. Kept modest by default: on a phone this is a battery and
@@ -101,6 +102,7 @@ final class TrainingSession: ObservableObject {
         plannedStages = []
         estimatedPeakMB = 0
         plannedSHDegree = 0
+        plannedInitialGaussians = 0
         plannedMaximumGaussians = 0
 
         let steps = iterations
@@ -136,16 +138,24 @@ final class TrainingSession: ObservableObject {
 
         do {
             let datasetURL = folder.url
-            let dimensionScan = Task.detached(priority: .userInitiated) {
-                try DatasetFolder.maximumSourceDimensions(at: datasetURL)
+            let datasetScan = Task.detached(priority: .userInitiated) {
+                let dimensions = try DatasetFolder.maximumSourceDimensions(
+                    at: datasetURL
+                )
+                let initialGaussianCount = try DatasetFolder.initialSparsePointCount(
+                    at: datasetURL
+                )
+                return (dimensions, initialGaussianCount)
             }
-            let sourceDimensions = try await withTaskCancellationHandler {
-                try await dimensionScan.value
-            } onCancel: {
-                dimensionScan.cancel()
-            }
+            let (sourceDimensions, initialGaussianCount) =
+                try await withTaskCancellationHandler {
+                    try await datasetScan.value
+                } onCancel: {
+                    datasetScan.cancel()
+                }
             let plan = try Self.makePlan(
                 sourceDimensions: sourceDimensions,
+                initialGaussianCount: initialGaussianCount,
                 steps: steps,
                 profile: profile,
                 includesTrainingMasks: useTrainingMasks
@@ -153,6 +163,7 @@ final class TrainingSession: ObservableObject {
             plannedStages = plan.resolvedStages
             estimatedPeakMB = Self.megabytes(plan.estimatedPeakMemory)
             plannedSHDegree = Int(plan.targetSHDegree)
+            plannedInitialGaussians = initialGaussianCount
             plannedMaximumGaussians = plan.maximumGaussianCount
             availableMB = Self.availableMB()
 
@@ -161,7 +172,9 @@ final class TrainingSession: ObservableObject {
                 throw MsplatError.outOfMemory(
                     "The \(profile.rawValue) plan estimates \(estimatedPeakMB) MB, " +
                     "but iOS currently reports \(availableMB) MB available. " +
-                    "Choose a smaller plan or close other apps."
+                    (profile == .balanced
+                        ? "Choose Preview, turn off masks, or close other apps."
+                        : "Turn off masks, use a sparser COLMAP model, or close other apps.")
                 )
             }
 
@@ -268,10 +281,16 @@ final class TrainingSession: ObservableObject {
 
     nonisolated static func makePlan(
         sourceDimensions: TrainingImageDimensions,
+        initialGaussianCount: Int,
         steps: Int,
         profile: QualityProfile,
         includesTrainingMasks: Bool = false
     ) throws -> TrainingPlan {
+        guard initialGaussianCount > 0 else {
+            throw MsplatError.invalidDataset(
+                "The COLMAP model must contain at least one sparse point."
+            )
+        }
         guard let iterationBudget = Int32(exactly: steps) else {
             throw MsplatError.invalidArgument("Iteration budget is outside the native range")
         }
@@ -316,7 +335,10 @@ final class TrainingSession: ObservableObject {
             iterationBudget: iterationBudget,
             stages: stages,
             targetSHDegree: profile.shDegree,
-            maximumGaussianCount: profile.maximumGaussianCount,
+            maximumGaussianCount: max(
+                profile.maximumGaussianCount,
+                initialGaussianCount
+            ),
             includesTrainingMasks: includesTrainingMasks
         )
     }

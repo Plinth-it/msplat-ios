@@ -28,7 +28,7 @@ struct ContentView: View {
                         session.trainingMasksEnabled = false
                         pickError = nil
                     } else {
-                        pickError = "No cameras.bin or cameras.txt in that folder, or in its sparse/0."
+                        pickError = "Choose a COLMAP-only folder with cameras.bin or cameras.txt at its root or in sparse/0."
                     }
                 case .failure(let error):
                     pickError = error.localizedDescription
@@ -87,7 +87,7 @@ struct ContentView: View {
                 Button("Stop", role: .destructive) { session.cancel() }
             }
         } footer: {
-            Text("Preview targets a 1,600-pixel edge, SH1, and 250K Gaussians. Balanced targets 1,920 pixels, SH2, and 400K Gaussians when preflight memory permits. Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Mask value 0 is ignored and 255 has full training coverage.")
+            Text("Preview targets a 1,600-pixel edge, SH1, and a 250K Gaussian ceiling. Balanced targets 1,920 pixels, SH2, and a 400K ceiling when preflight memory permits. Either ceiling rises only enough to preserve a larger initial sparse model, and the memory estimate is recomputed. Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Mask value 0 is ignored and 255 has full training coverage.")
         }
     }
 
@@ -130,6 +130,10 @@ struct ContentView: View {
                     )
                 }
                 LabeledContent("Final SH degree", value: "\(session.plannedSHDegree)")
+                LabeledContent(
+                    "Initial Gaussians",
+                    value: session.plannedInitialGaussians.formatted()
+                )
                 LabeledContent(
                     "Gaussian limit",
                     value: session.plannedMaximumGaussians.formatted()

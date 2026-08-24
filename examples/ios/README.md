@@ -48,13 +48,18 @@ Before loading the dataset, the app reads image dimensions from ImageIO
 metadata and builds one of two explicit plans:
 
 - Preview targets a 1,600-pixel longest edge, SH degree 1, one resolution
-  stage, and a hard limit of 250,000 Gaussians.
+  stage, and a 250,000-Gaussian ceiling.
 - Balanced targets a 1,920-pixel longest edge, trains its first half at an
   additional 2x downscale before moving to the final resolution, reaches SH
-  degree 2, and limits the population to 400,000 Gaussians.
+  degree 2, and has a 400,000-Gaussian ceiling.
+
+For either profile, when the selected COLMAP model starts with more sparse
+points, the ceiling rises only enough to preserve the input population and the
+memory estimate is recomputed before training.
 
 The plan screen shows each effective resolution stage, target SH degree,
-Gaussian ceiling, and a conservative code-derived peak-memory estimate. The
+initial Gaussian count, Gaussian ceiling, and a conservative code-derived
+peak-memory estimate. The
 estimate covers native model and training buffers, image-cache insertion,
 target-resolution app-owned decode buffers, and recommended headroom. When mask
 discovery is enabled, it also includes conservative source-mask decoding and

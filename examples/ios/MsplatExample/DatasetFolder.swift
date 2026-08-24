@@ -9,6 +9,10 @@ import Msplat
 /// step to last — that is the whole point of the byte-budgeted image cache —
 /// so the scope has to stay open for the entire session, not just the load.
 final class DatasetFolder {
+    private static let pointReadChunkSize = 64 * 1_024
+    private static let maximumPointTextLineBytes = 16 * 1_024 * 1_024
+    private static let minimumBinaryPointRecordBytes = 51
+
     let id = UUID()
     let url: URL
     private var scoped = false
@@ -19,7 +23,8 @@ final class DatasetFolder {
     init?(picked url: URL) {
         self.url = url
         scoped = url.startAccessingSecurityScopedResource()
-        guard Self.modelDirectory(under: url) != nil else {
+        guard !Self.containsHigherPriorityDataset(at: url),
+              Self.modelDirectory(under: url) != nil else {
             release()
             return nil
         }
@@ -45,6 +50,219 @@ final class DatasetFolder {
             }
         }
         return nil
+    }
+
+    private static func containsHigherPriorityDataset(at root: URL) -> Bool {
+        FileManager.default.fileExists(
+            atPath: root.appending(path: "transforms.json").path
+        )
+    }
+
+    /// Reads only the sparse-model metadata needed to choose a safe Gaussian
+    /// ceiling. Full point and track validation remains in the native loader.
+    static func initialSparsePointCount(at root: URL) throws -> Int {
+        try Task.checkCancellation()
+        guard !containsHigherPriorityDataset(at: root) else {
+            throw MsplatError.invalidDataset(
+                "This sample expects a COLMAP-only folder without a root transforms.json."
+            )
+        }
+        guard let model = modelDirectory(under: root) else {
+            throw MsplatError.invalidDataset(
+                "No COLMAP camera model was found in the selected folder."
+            )
+        }
+
+        let fileManager = FileManager.default
+        let binary = model.appending(path: "points3D.bin")
+        if fileManager.fileExists(atPath: binary.path) {
+            return try binarySparsePointCount(at: binary)
+        }
+
+        let text = model.appending(path: "points3D.txt")
+        if fileManager.fileExists(atPath: text.path) {
+            return try textSparsePointCount(at: text)
+        }
+
+        let ply = model.appending(path: "points3D.ply")
+        if fileManager.fileExists(atPath: ply.path) {
+            return try plySparsePointCount(at: ply)
+        }
+
+        throw MsplatError.invalidDataset(
+            "No points3D.bin, points3D.txt, or points3D.ply was found in the COLMAP model."
+        )
+    }
+
+    private static func binarySparsePointCount(at url: URL) throws -> Int {
+        let values = try url.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey])
+        guard values.isRegularFile == true,
+              let fileSize = values.fileSize,
+              fileSize >= MemoryLayout<UInt64>.size else {
+            throw MsplatError.invalidDataset(
+                "The COLMAP points3D.bin header is incomplete."
+            )
+        }
+
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+        let header = try handle.read(upToCount: MemoryLayout<UInt64>.size) ?? Data()
+        guard header.count == MemoryLayout<UInt64>.size else {
+            throw MsplatError.invalidDataset(
+                "The COLMAP points3D.bin header is incomplete."
+            )
+        }
+
+        let count = header.enumerated().reduce(UInt64(0)) { value, byte in
+            value | (UInt64(byte.element) << UInt64(byte.offset * 8))
+        }
+        let availableRecordBytes = fileSize - MemoryLayout<UInt64>.size
+        guard count <= UInt64(availableRecordBytes / minimumBinaryPointRecordBytes) else {
+            throw MsplatError.invalidDataset(
+                "The COLMAP points3D.bin point count exceeds its file size."
+            )
+        }
+        return try validatedSparsePointCount(count)
+    }
+
+    private static func textSparsePointCount(at url: URL) throws -> Int {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var count = UInt64(0)
+        var lineLength = 0
+        var lineIsData = false
+        var lineWasClassified = false
+
+        func finishLine() throws {
+            if lineIsData {
+                count += 1
+                guard count <= UInt64(Int32.max) else {
+                    throw MsplatError.invalidDataset(
+                        "The COLMAP sparse-point count exceeds the supported range."
+                    )
+                }
+            }
+            lineLength = 0
+            lineIsData = false
+            lineWasClassified = false
+        }
+
+        while true {
+            try Task.checkCancellation()
+            let chunk = try handle.read(upToCount: pointReadChunkSize) ?? Data()
+            if chunk.isEmpty { break }
+
+            for byte in chunk {
+                if byte == 0x0A {
+                    try finishLine()
+                    continue
+                }
+
+                lineLength += 1
+                guard lineLength <= maximumPointTextLineBytes else {
+                    throw MsplatError.invalidDataset(
+                        "A COLMAP points3D.txt line exceeds the supported length."
+                    )
+                }
+                if !lineWasClassified,
+                   byte != 0x20,
+                   byte != 0x09,
+                   byte != 0x0D {
+                    lineWasClassified = true
+                    lineIsData = byte != 0x23
+                }
+            }
+        }
+
+        if lineLength > 0 {
+            try finishLine()
+        }
+        return try validatedSparsePointCount(count)
+    }
+
+    private static func plySparsePointCount(at url: URL) throws -> Int {
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        var line = Data()
+        var isFirstLine = true
+        var foundHeaderEnd = false
+        var pointCount: UInt64?
+
+        func processLine() throws -> Bool {
+            let value = String(decoding: line, as: UTF8.self)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if isFirstLine {
+                isFirstLine = false
+                guard value == "ply" else {
+                    throw MsplatError.invalidDataset("points3D.ply is not a PLY file.")
+                }
+            }
+
+            let fields = value.split(whereSeparator: { $0.isWhitespace })
+            if fields.count == 3,
+               fields[0] == "element",
+               fields[1] == "vertex" {
+                guard let parsed = UInt64(fields[2]) else {
+                    throw MsplatError.invalidDataset(
+                        "points3D.ply has an invalid vertex count."
+                    )
+                }
+                pointCount = parsed
+            }
+            if value == "end_header" {
+                foundHeaderEnd = true
+                return true
+            }
+            return false
+        }
+
+        var finished = false
+        while !finished {
+            try Task.checkCancellation()
+            let chunk = try handle.read(upToCount: pointReadChunkSize) ?? Data()
+            if chunk.isEmpty { break }
+
+            for byte in chunk {
+                if byte == 0x0A {
+                    finished = try processLine()
+                    line.removeAll(keepingCapacity: true)
+                    if finished { break }
+                } else {
+                    line.append(byte)
+                    guard line.count <= maximumPointTextLineBytes else {
+                        throw MsplatError.invalidDataset(
+                            "A points3D.ply header line exceeds the supported length."
+                        )
+                    }
+                }
+            }
+        }
+
+        if !finished, !line.isEmpty {
+            _ = try processLine()
+        }
+        guard foundHeaderEnd, let pointCount else {
+            throw MsplatError.invalidDataset(
+                "points3D.ply has an incomplete header or no vertex count."
+            )
+        }
+        return try validatedSparsePointCount(pointCount)
+    }
+
+    private static func validatedSparsePointCount(_ count: UInt64) throws -> Int {
+        guard count > 0 else {
+            throw MsplatError.invalidDataset(
+                "The COLMAP model contains no sparse points."
+            )
+        }
+        guard count <= UInt64(Int32.max) else {
+            throw MsplatError.invalidDataset(
+                "The COLMAP sparse-point count exceeds the supported range."
+            )
+        }
+        return Int(count)
     }
 
     /// Counts regular files below any case-insensitive `masks/` path component
