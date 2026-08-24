@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include "dataset_descriptor.hpp"
 #include "metal_tensor.hpp"
 
@@ -144,10 +145,18 @@ class CameraImageCache {
 public:
     /// MSPLAT_IMAGE_CACHE_MB overrides it; otherwise 512MB on iOS, 2GB elsewhere.
     static size_t defaultBudgetBytes();
+    /// Experimental depth-one CPU prefetch is opt-in with the exact value
+    /// MSPLAT_CAMERA_PREFETCH=1.
+    static bool defaultPrefetchEnabled() noexcept;
 
-    CameraImageCache() = default;
-    CameraImageCache(float downscaleFactor, size_t budgetBytes)
-        : _downscaleFactor(downscaleFactor), _budgetBytes(budgetBytes) {}
+    CameraImageCache();
+    CameraImageCache(float downscaleFactor, size_t budgetBytes,
+                     bool prefetchEnabled = defaultPrefetchEnabled());
+    ~CameraImageCache();
+    CameraImageCache(CameraImageCache&&) noexcept;
+    CameraImageCache& operator=(CameraImageCache&&) noexcept;
+    CameraImageCache(const CameraImageCache&) = delete;
+    CameraImageCache& operator=(const CameraImageCache&) = delete;
 
     /// Decodes cameras[index] if it is not resident and returns its GPU image at
     /// `downscaleFactor`, evicting other cameras to stay under budget. The
@@ -158,6 +167,17 @@ public:
     /// requires every tensor needed by the target to already be resident.
     CameraTrainingTarget gpuTrainingTarget(
         std::vector<Camera> &cameras, size_t index, int downscaleFactor);
+
+    /// Best-effort CPU preparation for one exact future target. The worker
+    /// never references or mutates `cameras`; a matching foreground target
+    /// request performs the Metal upload and cache publication.
+    void prefetchTrainingTarget(
+        const std::vector<Camera> &cameras, size_t index,
+        int downscaleFactor) noexcept;
+
+    /// Waits for and discards any staged target. Decode failures are suppressed
+    /// because they only become user-visible when the matching target is used.
+    void discardPrefetch() noexcept;
 
     /// Establishes and accounts for corrected camera geometry without an
     /// upload. It decodes only when that geometry has not yet been established
@@ -171,9 +191,15 @@ public:
     size_t budgetBytes() const { return _budgetBytes; }
     uint64_t hitCount() const { return _hitCount; }
     uint64_t missCount() const { return _missCount; }
+    bool prefetchEnabled() const { return _prefetchEnabled; }
+    uint64_t prefetchScheduledCount() const { return _prefetchScheduledCount; }
+    uint64_t prefetchUsedCount() const { return _prefetchUsedCount; }
+    uint64_t prefetchWaitCount() const { return _prefetchWaitCount; }
+    uint64_t prefetchDiscardedCount() const { return _prefetchDiscardedCount; }
 
 private:
     void evict(std::vector<Camera> &cameras, size_t protectedIndex);
+    struct PrefetchTask;
 
     struct Entry {
         uint64_t lastUse = 0;
@@ -188,6 +214,12 @@ private:
     uint64_t _clock = 0;
     uint64_t _hitCount = 0;
     uint64_t _missCount = 0;
+    bool _prefetchEnabled = false;
+    std::unique_ptr<PrefetchTask> _prefetch;
+    uint64_t _prefetchScheduledCount = 0;
+    uint64_t _prefetchUsedCount = 0;
+    uint64_t _prefetchWaitCount = 0;
+    uint64_t _prefetchDiscardedCount = 0;
 };
 
 struct InputData {

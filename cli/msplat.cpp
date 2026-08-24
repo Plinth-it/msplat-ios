@@ -179,6 +179,14 @@ int main(int argc, char *argv[]) {
             model.afterTrain(step);
             msplat_commit();
 
+            if (images.prefetchEnabled() &&
+                step < static_cast<size_t>(numIters)) {
+                const size_t nextCamIdx = camsIter.peek();
+                images.prefetchTrainingTarget(
+                    inputData.cameras, cams[nextCamIdx],
+                    model.getDownscaleFactor(static_cast<int>(step + 1)));
+            }
+
             msplat::reportMemory((int)step, (int)model.means.size(0),
                                  model.estimatedGpuBytes(),
                                  images.cachedBytes(), images.budgetBytes());

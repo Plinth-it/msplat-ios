@@ -154,14 +154,25 @@ public:
         shuffle_cameras();
     }
 
+    ~GaussianTrainer() {
+        if (dataset_ptr)
+            dataset_ptr->images.discardPrefetch();
+    }
+
     void shuffle_cameras() {
         std::shuffle(cam_indices.begin(), cam_indices.end(), rng);
         cam_iter_pos = 0;
     }
 
-    size_t next_camera() {
+    size_t peek_camera() {
         if (cam_iter_pos >= cam_indices.size()) shuffle_cameras();
-        return cam_indices[cam_iter_pos++];
+        return cam_indices[cam_iter_pos];
+    }
+
+    size_t next_camera() {
+        const size_t camera = peek_camera();
+        ++cam_iter_pos;
+        return camera;
     }
 
     TrainingStats step() {
@@ -169,10 +180,9 @@ public:
             throw std::overflow_error("Training iteration cannot be incremented further");
         current_step++;
         size_t cam_idx = next_camera();
-        Camera &cam = dataset_ptr->train_camera(cam_idx);
-
         int ds = model->getDownscaleFactor(current_step);
         MTensor &gt = dataset_ptr->train_image(cam_idx, ds);
+        Camera &cam = dataset_ptr->train_camera(cam_idx);
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
@@ -181,6 +191,15 @@ public:
         model->schedulersStep(current_step);
         model->afterTrain(current_step);
         msplat_commit();
+
+        if (dataset_ptr->images.prefetchEnabled() &&
+            current_step < config.iterations) {
+            const size_t nextCamIdx = peek_camera();
+            dataset_ptr->images.prefetchTrainingTarget(
+                dataset_ptr->data.cameras,
+                dataset_ptr->train_cams[nextCamIdx],
+                model->getDownscaleFactor(current_step + 1));
+        }
 
         msplat::reportMemory(current_step, (int)model->means.size(0),
                              model->estimatedGpuBytes(),
@@ -304,7 +323,9 @@ public:
     }
 
     void load_checkpoint(const std::string &path) {
-        current_step = model->loadCheckpoint(path);
+        const int loadedStep = model->loadCheckpoint(path);
+        dataset_ptr->images.discardPrefetch();
+        current_step = loadedStep;
     }
 
     int splat_count() const {

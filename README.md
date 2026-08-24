@@ -43,7 +43,11 @@ canonical, caller-owned dataset directly through a checked deep-copy boundary.
   A byte-budgeted LRU now retains one tightly packed UInt8 RGBA GPU target per
   resident camera, releases decoded CPU pixels after upload, and reloads only
   on an eviction or resolution-stage transition. Loss kernels convert the RGB
-  bytes to float during their existing tile loads.
+  bytes to float during their existing tile loads. Setting exactly
+  `MSPLAT_CAMERA_PREFETCH=1` opts each trainer entry point into preparing one
+  detached CPU target for the next shuffled camera and resolution while the
+  current Metal step runs. GPU upload and LRU mutation remain on the serialized
+  training thread, and prefetch remains off by default.
 - `maxGaussians` bounds the active population and its backing buffers. When a
   densification step has more eligible candidates than remaining capacity, the
   highest normalized-gradient candidates are retained; pruning still runs at
@@ -312,6 +316,9 @@ reports image preparation, exact-count GPU and wall-wait time, post-count CPU
 encoding, intersection-arena growth, the exact intersection count, maximum
 tile population, and trivial/small/medium/large tile counts. This makes the
 per-step count barrier measurable without enabling the heavier stage profiler.
+With camera prefetch enabled, decode work overlapped with the preceding Metal
+step is outside the next step's `imagePrepareMs`; any remaining wait plus target
+installation and GPU upload is still included.
 `memoryMetrics()` separates model, render-transient, training-transient,
 telemetry-readback, and image-cache bytes from process `phys_footprint` and iOS
 available memory. The buffer categories are logical allocations, not a claim
@@ -332,6 +339,7 @@ Output: `.ply`, `.splat`, `.spz`.
 | Variable | Effect |
 |---|---|
 | `MSPLAT_IMAGE_CACHE_MB` | Image cache budget. Default 512 on iOS, 2048 elsewhere. |
+| `MSPLAT_CAMERA_PREFETCH` | Set exactly `1` to predecode one upcoming training camera. Default off. |
 | `MSPLAT_MEM_LOG_EVERY` | Memory breakdown every N steps. |
 | `MSPLAT_ISECT_LOG` | Intersection count against capacity at each sample. |
 

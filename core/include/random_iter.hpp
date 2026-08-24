@@ -18,6 +18,13 @@ public:
         return val;
     }
 
+    /// Returns the next value without advancing or changing the RNG state.
+    /// `next()` eagerly reshuffles at an epoch boundary, so `pos_` always
+    /// identifies the exact value that a later call will consume.
+    const T& peek() const {
+        return items_[pos_];
+    }
+
 private:
     void shuffle() {
         std::shuffle(items_.begin(), items_.end(), rng_);

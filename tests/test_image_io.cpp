@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -13,8 +14,10 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -315,6 +318,46 @@ struct TempDirectory {
         fs::remove_all(path, ignored);
     }
 };
+
+class ScopedEnvironmentVariable {
+public:
+    explicit ScopedEnvironmentVariable(std::string name)
+        : name_(std::move(name)) {
+        if (const char *value = std::getenv(name_.c_str()))
+            originalValue_ = value;
+    }
+
+    ~ScopedEnvironmentVariable() {
+        if (originalValue_) {
+            (void)setenv(name_.c_str(), originalValue_->c_str(), 1);
+        } else {
+            (void)unsetenv(name_.c_str());
+        }
+    }
+
+    void set(const char *value) {
+        const int result = value
+            ? setenv(name_.c_str(), value, 1)
+            : unsetenv(name_.c_str());
+        if (result != 0)
+            throw std::runtime_error("could not update environment variable");
+    }
+
+private:
+    std::string name_;
+    std::optional<std::string> originalValue_;
+};
+
+template <typename Predicate>
+void waitUntil(Predicate predicate, const std::string &description) {
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            fail("asynchronous condition", __LINE__, description);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+}
 
 void checkPNGWriteReadRoundTrip(const TempDirectory &temporary) {
     Image source;
@@ -1000,6 +1043,290 @@ void checkBadInputs(const TempDirectory &temporary) {
         {});
 }
 
+std::vector<uint8_t> repeatingGridRGBA(int width, int height) {
+    std::vector<RGB8> colors(static_cast<size_t>(width) * height);
+    for (size_t index = 0; index < colors.size(); ++index)
+        colors[index] = gridColors[index % gridColors.size()];
+    return rgbaGrid(width, height, colors);
+}
+
+Camera prefetchTestCamera(
+    const fs::path &imagePath, int width, int height,
+    std::optional<TrainingMaskDescriptor> trainingMask = std::nullopt) {
+    Camera camera;
+    camera.filePath = imagePath.string();
+    camera.width = width;
+    camera.height = height;
+    camera.fx = static_cast<float>(width);
+    camera.fy = static_cast<float>(height);
+    camera.cx = static_cast<float>(width) * 0.5f;
+    camera.cy = static_cast<float>(height) * 0.5f;
+    camera.trainingMask = std::move(trainingMask);
+    return camera;
+}
+
+struct TrainingTargetSnapshot {
+    std::vector<int64_t> imageShape;
+    std::vector<uint8_t> imageBytes;
+    std::optional<std::vector<int64_t>> maskShape;
+    std::optional<std::vector<uint8_t>> maskBytes;
+    uint64_t coverageUnits = 0;
+
+    size_t byteCount() const {
+        return imageBytes.size() + (maskBytes ? maskBytes->size() : 0);
+    }
+};
+
+TrainingTargetSnapshot snapshotTarget(const CameraTrainingTarget &target) {
+    CHECK(target.image != nullptr);
+    CHECK(target.image->dtype() == DType::UInt8);
+
+    TrainingTargetSnapshot result;
+    result.imageShape = target.image->shape();
+    const uint8_t *imageBytes = target.image->data<uint8_t>();
+    result.imageBytes.assign(
+        imageBytes, imageBytes + target.image->nbytes());
+    if (target.coverageMask) {
+        CHECK(target.coverageMask->dtype() == DType::UInt8);
+        result.maskShape = target.coverageMask->shape();
+        const uint8_t *maskBytes = target.coverageMask->data<uint8_t>();
+        result.maskBytes.emplace(
+            maskBytes, maskBytes + target.coverageMask->nbytes());
+    }
+    result.coverageUnits = target.coverageUnits;
+    return result;
+}
+
+void checkSameTarget(const TrainingTargetSnapshot &expected,
+                     const TrainingTargetSnapshot &actual) {
+    CHECK(actual.imageShape == expected.imageShape);
+    CHECK(actual.imageBytes == expected.imageBytes);
+    CHECK(actual.maskShape == expected.maskShape);
+    CHECK(actual.maskBytes == expected.maskBytes);
+    CHECK(actual.coverageUnits == expected.coverageUnits);
+}
+
+void checkPrefetchEnvironmentOptIn() {
+    const char *originalValue = std::getenv("MSPLAT_CAMERA_PREFETCH");
+    const std::optional<std::string> original = originalValue
+        ? std::optional<std::string>(originalValue)
+        : std::nullopt;
+
+    {
+        ScopedEnvironmentVariable environment("MSPLAT_CAMERA_PREFETCH");
+        environment.set(nullptr);
+        CHECK(!CameraImageCache::defaultPrefetchEnabled());
+
+        for (const char *disabled : {
+                 "", "0", "01", "true", "TRUE", " 1", "1 ", "2",
+             }) {
+            environment.set(disabled);
+            CHECK(!CameraImageCache::defaultPrefetchEnabled());
+        }
+
+        environment.set("1");
+        CHECK(CameraImageCache::defaultPrefetchEnabled());
+        CameraImageCache defaulted(1.0f, 1'024);
+        CHECK(defaulted.prefetchEnabled());
+        CameraImageCache explicitlyDisabled(1.0f, 1'024, false);
+        CHECK(!explicitlyDisabled.prefetchEnabled());
+    }
+
+    const char *restoredValue = std::getenv("MSPLAT_CAMERA_PREFETCH");
+    if (original) {
+        CHECK(restoredValue != nullptr);
+        CHECK(*original == restoredValue);
+    } else {
+        CHECK(restoredValue == nullptr);
+    }
+}
+
+void checkUnmaskedPrefetchParity(const TempDirectory &temporary) {
+    constexpr int width = 6;
+    constexpr int height = 4;
+    constexpr int stageDownscale = 2;
+    const fs::path imagePath = temporary.path / "prefetch-unmasked.tiff";
+    writeTIFF(
+        imagePath, width, height, repeatingGridRGBA(width, height), 1);
+
+    std::vector<Camera> synchronousCameras;
+    synchronousCameras.push_back(
+        prefetchTestCamera(imagePath, width, height));
+    CameraImageCache synchronousCache(1.0f, 1'024 * 1'024, false);
+    const TrainingTargetSnapshot expected = snapshotTarget(
+        synchronousCache.gpuTrainingTarget(
+            synchronousCameras, 0, stageDownscale));
+    CHECK(expected.maskBytes == std::nullopt);
+
+    std::vector<Camera> cameras;
+    cameras.push_back(prefetchTestCamera(imagePath, width, height));
+    CameraImageCache cache(1.0f, 1'024 * 1'024, true);
+    cache.prefetchTrainingTarget(cameras, 0, stageDownscale);
+    CHECK(cache.prefetchScheduledCount() == 1);
+    CHECK(cache.prefetchUsedCount() == 0);
+    CHECK(cache.prefetchDiscardedCount() == 0);
+
+    waitUntil(
+        [&] { return cache.cachedCpuBytes() == expected.byteCount(); },
+        "unmasked camera prefetch did not finish");
+
+    // The worker owns only its source snapshot and staging Camera. The live
+    // camera is untouched until foreground upload and publication.
+    const Camera &live = cameras[0];
+    CHECK(!live.declared.captured);
+    CHECK(live.width == width);
+    CHECK(live.height == height);
+    CHECK(live.fx == static_cast<float>(width));
+    CHECK(live.fy == static_cast<float>(height));
+    CHECK(live.loadedImageDownscaleFactor == 0.0f);
+    CHECK(live.image.empty());
+    CHECK(live.coverageMask.empty());
+    CHECK(live.imagePyramids.empty());
+    CHECK(live.coverageMaskPyramids.empty());
+    CHECK(live.mtensorImageCache.empty());
+    CHECK(live.mtensorCoverageMaskCache.empty());
+    CHECK(live.coverageUnitsByDownscale.empty());
+    CHECK(live.cachedImageBytes() == 0);
+
+    const TrainingTargetSnapshot actual = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 0, stageDownscale));
+    checkSameTarget(expected, actual);
+    CHECK(cache.prefetchScheduledCount() == 1);
+    CHECK(cache.prefetchUsedCount() == 1);
+    CHECK(cache.prefetchDiscardedCount() == 0);
+    CHECK(cache.missCount() == 1);
+    CHECK(cache.hitCount() == 0);
+    CHECK(cache.cachedCpuBytes() == 0);
+    CHECK(cache.cachedGpuBytes() == expected.byteCount());
+}
+
+void checkMaskedPrefetchParity(const TempDirectory &temporary) {
+    constexpr int width = 6;
+    constexpr int height = 4;
+    constexpr int stageDownscale = 2;
+    const fs::path imagePath = temporary.path / "prefetch-masked-rgb.tiff";
+    const fs::path maskPath = temporary.path / "prefetch-masked-mask.tiff";
+    writeTIFF(
+        imagePath, width, height, repeatingGridRGBA(width, height), 1);
+
+    std::vector<uint8_t> maskRGBA(
+        static_cast<size_t>(width) * height * 4, 0);
+    for (size_t pixel = 0; pixel < maskRGBA.size() / 4; ++pixel)
+        maskRGBA[pixel * 4 + 3] = static_cast<uint8_t>(32 + pixel * 7);
+    writeTIFF(maskPath, width, height, maskRGBA, 1);
+    const TrainingMaskDescriptor mask{
+        maskPath.string(), TrainingMaskChannel::Alpha};
+
+    std::vector<Camera> synchronousCameras;
+    synchronousCameras.push_back(
+        prefetchTestCamera(imagePath, width, height, mask));
+    CameraImageCache synchronousCache(1.0f, 1'024 * 1'024, false);
+    const TrainingTargetSnapshot expected = snapshotTarget(
+        synchronousCache.gpuTrainingTarget(
+            synchronousCameras, 0, stageDownscale));
+    CHECK(expected.maskBytes.has_value());
+
+    std::vector<Camera> cameras;
+    cameras.push_back(prefetchTestCamera(imagePath, width, height, mask));
+    CameraImageCache cache(1.0f, 1'024 * 1'024, true);
+    cache.prefetchTrainingTarget(cameras, 0, stageDownscale);
+    waitUntil(
+        [&] { return cache.cachedCpuBytes() == expected.byteCount(); },
+        "masked camera prefetch did not finish");
+
+    const TrainingTargetSnapshot actual = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 0, stageDownscale));
+    checkSameTarget(expected, actual);
+    CHECK(cache.prefetchScheduledCount() == 1);
+    CHECK(cache.prefetchUsedCount() == 1);
+    CHECK(cache.prefetchDiscardedCount() == 0);
+    CHECK(cache.missCount() == 1);
+    CHECK(cache.cachedCpuBytes() == 0);
+    CHECK(cache.cachedGpuBytes() == expected.byteCount());
+}
+
+void checkNonmatchingTargetPreservesPrefetch(
+    const TempDirectory &temporary) {
+    constexpr int width = 6;
+    constexpr int height = 4;
+    const fs::path prefetchedPath =
+        temporary.path / "prefetch-preserved.tiff";
+    const fs::path foregroundPath =
+        temporary.path / "prefetch-foreground.tiff";
+    writeTIFF(
+        prefetchedPath, width, height,
+        repeatingGridRGBA(width, height), 1);
+    writeTIFF(
+        foregroundPath, width, height,
+        solidRGBA(width, height, {19, 73, 211}), 1);
+
+    std::vector<Camera> cameras;
+    cameras.push_back(prefetchTestCamera(prefetchedPath, width, height));
+    cameras.push_back(prefetchTestCamera(foregroundPath, width, height));
+    CameraImageCache cache(1.0f, 1'024 * 1'024, true);
+
+    const size_t stagedBytes = static_cast<size_t>(width) * height * 4;
+    cache.prefetchTrainingTarget(cameras, 0, 1);
+    waitUntil(
+        [&] { return cache.cachedCpuBytes() == stagedBytes; },
+        "preserved camera prefetch did not finish");
+
+    const TrainingTargetSnapshot foreground = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 1, 1));
+    CHECK(!foreground.imageBytes.empty());
+    CHECK(cache.prefetchScheduledCount() == 1);
+    CHECK(cache.prefetchUsedCount() == 0);
+    CHECK(cache.prefetchDiscardedCount() == 0);
+    CHECK(cache.cachedCpuBytes() == stagedBytes);
+
+    const TrainingTargetSnapshot prefetched = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 0, 1));
+    CHECK(!prefetched.imageBytes.empty());
+    CHECK(cache.prefetchScheduledCount() == 1);
+    CHECK(cache.prefetchUsedCount() == 1);
+    CHECK(cache.prefetchDiscardedCount() == 0);
+    CHECK(cache.missCount() == 2);
+    CHECK(cache.cachedCpuBytes() == 0);
+}
+
+void checkFailedPrefetchDiscard(const TempDirectory &temporary) {
+    constexpr int width = 6;
+    constexpr int height = 4;
+    const fs::path validPath = temporary.path / "prefetch-after-failure.tiff";
+    writeTIFF(validPath, width, height,
+              repeatingGridRGBA(width, height), 1);
+
+    std::vector<Camera> cameras;
+    cameras.push_back(prefetchTestCamera(
+        temporary.path / "missing-prefetch.tiff", width, height));
+    cameras.push_back(prefetchTestCamera(validPath, width, height));
+    CameraImageCache cache(1.0f, 1'024 * 1'024, true);
+
+    cache.prefetchTrainingTarget(cameras, 0, 1);
+    CHECK(cache.prefetchScheduledCount() == 1);
+    // This joins the worker and suppresses its missing-file exception.
+    cache.discardPrefetch();
+    CHECK(cache.prefetchDiscardedCount() == 1);
+    CHECK(cache.prefetchUsedCount() == 0);
+    CHECK(cache.cachedCpuBytes() == 0);
+    cache.discardPrefetch();
+    CHECK(cache.prefetchDiscardedCount() == 1);
+
+    // A discarded failure leaves the depth-one slot reusable.
+    const size_t stagedBytes = static_cast<size_t>(width) * height * 4;
+    cache.prefetchTrainingTarget(cameras, 1, 1);
+    waitUntil(
+        [&] { return cache.cachedCpuBytes() == stagedBytes; },
+        "camera prefetch slot was not reusable after discard");
+    const TrainingTargetSnapshot target = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 1, 1));
+    CHECK(!target.imageBytes.empty());
+    CHECK(cache.prefetchScheduledCount() == 2);
+    CHECK(cache.prefetchUsedCount() == 1);
+    CHECK(cache.prefetchDiscardedCount() == 1);
+    CHECK(cache.cachedCpuBytes() == 0);
+}
+
 void checkImageCacheAccountingCategories() {
     Camera camera;
     camera.image.data.resize(2 * 3 * 4);
@@ -1325,6 +1652,9 @@ int main() {
         checkStage("bad inputs", [&] {
             checkBadInputs(temporary);
         });
+        checkStage("camera prefetch environment opt-in", [&] {
+            checkPrefetchEnvironmentOptIn();
+        });
         checkStage("image cache accounting categories", [&] {
             checkImageCacheAccountingCategories();
         });
@@ -1336,6 +1666,18 @@ int main() {
         });
         checkStage("masked cache hit and eviction", [&] {
             checkMaskedCacheHitAndEviction(temporary);
+        });
+        checkStage("unmasked camera prefetch parity", [&] {
+            checkUnmaskedPrefetchParity(temporary);
+        });
+        checkStage("masked camera prefetch parity", [&] {
+            checkMaskedPrefetchParity(temporary);
+        });
+        checkStage("nonmatching target preserves camera prefetch", [&] {
+            checkNonmatchingTargetPreservesPrefetch(temporary);
+        });
+        checkStage("failed camera prefetch discard", [&] {
+            checkFailedPrefetchDiscard(temporary);
         });
         checkStage("camera pose cache contract", [&] {
             checkCameraPoseCacheContract();

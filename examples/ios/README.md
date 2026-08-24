@@ -73,6 +73,11 @@ split cache and removal of dead workspaces. The app refuses to start when that
 estimate exceeds a nonzero `os_proc_available_memory` value at preflight (the
 simulator reports zero and skips this comparison).
 
+Depth-one CPU camera prefetch remains off by default. For device A/B testing,
+set exactly `MSPLAT_CAMERA_PREFETCH=1` in the Xcode Run scheme environment. It
+prepares the next training target while the current Metal step runs; compiling
+a new build alone does not enable it.
+
 This check is a planning aid, not a jetsam guarantee. Metal driver state,
 framework allocations, other process memory, and changing system pressure are
 not fully modeled. The model term intentionally covers the pre-cutoff peak;

@@ -194,6 +194,20 @@ struct Trainer::Impl {
     void advanceCamera() {
         ++camIterPos;
     }
+
+    size_t cameraAfterCurrent() const {
+        const size_t nextPosition = camIterPos + 1;
+        if (nextPosition < camIndices.size())
+            return camIndices[nextPosition];
+
+        // Match the next epoch without advancing the live RNG or camera
+        // sequence. The eventual currentCamera() call performs this same
+        // shuffle after the committed step advances the cursor.
+        std::vector<size_t> nextIndices = camIndices;
+        std::mt19937 nextRng = rng;
+        std::shuffle(nextIndices.begin(), nextIndices.end(), nextRng);
+        return nextIndices.front();
+    }
 };
 
 Trainer::Trainer(Dataset& dataset, const Config& config)
@@ -233,6 +247,8 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
 
 Trainer::~Trainer() {
     std::lock_guard lock(g_trainerTransactionMutex);
+    if (impl && impl->ds)
+        impl->ds->images.discardPrefetch();
     impl.reset();
 }
 
@@ -246,13 +262,12 @@ Stats Trainer::step() {
     double cpuSubmitMs = 0.0;
     try {
         size_t camIdx = impl->currentCamera();
-        Camera& cam = impl->ds->trainCamera(camIdx);
-
         int ds = impl->model->getDownscaleFactor(nextStep);
         CameraTrainingTarget target =
             impl->ds->trainingTargetForTrainCamera(camIdx, ds);
         if (!target.image)
             throw std::runtime_error("Training target has no RGB image");
+        Camera& cam = impl->ds->trainCamera(camIdx);
 
         msplat_training_step_mark_cpu_start(logicalStep);
         impl->model->fullIteration(
@@ -273,6 +288,15 @@ Stats Trainer::step() {
             nextStep / impl->config.shDegreeInterval,
             impl->config.shDegree);
         cpuSubmitMs = msplat_training_step_submit(logicalStep, descriptor);
+
+        if (impl->ds->images.prefetchEnabled() &&
+            nextStep < impl->config.iterations) {
+            const size_t nextCamIdx = impl->cameraAfterCurrent();
+            impl->ds->images.prefetchTrainingTarget(
+                impl->ds->data.cameras,
+                impl->ds->trainIndices[nextCamIdx],
+                impl->model->getDownscaleFactor(nextStep + 1));
+        }
     } catch (...) {
         msplat_training_step_abort(logicalStep);
         throw;
@@ -459,7 +483,9 @@ void Trainer::saveCheckpoint(const std::string& path) {
 
 int Trainer::loadCheckpoint(const std::string& path) {
     std::lock_guard lock(g_trainerTransactionMutex);
-    impl->currentStep = impl->model->loadCheckpoint(path);
+    const int loadedStep = impl->model->loadCheckpoint(path);
+    impl->ds->images.discardPrefetch();
+    impl->currentStep = loadedStep;
     msplat_training_telemetry_reset(impl->telemetry);
     // Re-shuffle cameras for resumed training
     impl->shuffleCameras();

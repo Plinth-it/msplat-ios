@@ -36,20 +36,25 @@ function(extract_section source_name start_marker end_marker output_name)
     set(${output_name} "${section_contents}" PARENT_SCOPE)
 endfunction()
 
-extract_section(input_source "CameraTrainingTarget Camera::getGPUTrainingTarget("
-    "MTensor& Camera::getGPUImage(" camera_upload)
-require_contains("${camera_upload}"
-    "{img.height, img.width, 4}, DType::UInt8"
+extract_section(input_source "UploadedTrainingTarget uploadTrainingTarget("
+    "} // namespace\n\nCameraTrainingTarget Camera::getGPUTrainingTarget("
+    target_upload)
+require_contains("${target_upload}"
+    "{image.height, image.width, 4}, DType::UInt8"
     "Camera uploads tightly packed uint8 RGBA")
-require_contains("${camera_upload}"
-    "expectedImageBytes != img.data.size()"
+require_contains("${target_upload}"
+    "expectedImageBytes != image.data.size()"
     "Camera validates compact image storage before upload")
-require_contains("${camera_upload}"
+require_contains("${target_upload}"
     "pixelCount != mask->data.size()"
     "Camera validates compact mask storage before upload")
-require_contains("${camera_upload}"
+require_contains("${target_upload}"
     "static_cast<size_t>(expectedImageBytes)"
     "Camera copies the validated compact raster without float expansion")
+extract_section(input_source "CameraTrainingTarget Camera::getGPUTrainingTarget("
+    "MTensor& Camera::getGPUImage(" camera_upload)
+require_contains("${camera_upload}" "uploadTrainingTarget("
+    "Camera publishes through the validated compact upload helper")
 require_contains("${input_source}" "cam.releaseCpuImageMemory();"
     "decoded CPU pixels are released after compact publication")
 
