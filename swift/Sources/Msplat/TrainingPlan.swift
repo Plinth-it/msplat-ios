@@ -609,24 +609,13 @@ public struct TrainingPlan: Sendable, Equatable {
                 ], component: "training cache")
             }
 
-            let imageCacheEntryBytes: Int64
-            if stage.downscaleFactor == 1 {
-                imageCacheEntryBytes = try checkedProduct(
-                    [includesTrainingMasks ? 26 : 24, decodedPixelCount],
-                    component: "full-resolution image cache entry"
-                )
-            } else {
-                imageCacheEntryBytes = try checkedSum([
-                    try checkedProduct(
-                        [includesTrainingMasks ? 13 : 12, decodedPixelCount],
-                        component: "decoded image cache entry"
-                    ),
-                    try checkedProduct(
-                        [includesTrainingMasks ? 26 : 24, pixelCount],
-                        component: "stage image cache entry"
-                    ),
-                ], component: "image cache entry")
-            }
+            // The native cache releases decoded and pyramid pixels after a
+            // successful upload. Its retained stage target is one shared
+            // UInt8 RGBA buffer plus, when present, one UInt8 coverage mask.
+            let imageCacheEntryBytes = try checkedProduct(
+                [includesTrainingMasks ? 5 : 4, pixelCount],
+                component: "compact stage image cache entry"
+            )
 
             peakTrainingCacheBytes = max(peakTrainingCacheBytes, trainingCacheBytes)
             largestImageCacheEntryBytes = max(
@@ -644,21 +633,21 @@ public struct TrainingPlan: Sendable, Equatable {
             ))
         }
 
-        // RGB uses a decoded-input thumbnail. Masks decode at source resolution
-        // before exact area reduction because ImageIO does not promise a
-        // coverage-preserving thumbnail filter. The mask implementation
-        // releases its CG objects before copying the compact source coverage,
-        // so its largest explicit/decode-backed phase is 12P + 8S.
+        // RGB remains compact RGBA8 throughout decode and calibrated image
+        // transforms. Masks decode at source resolution before exact area
+        // reduction because ImageIO does not promise a coverage-preserving
+        // thumbnail filter. During that phase the retained target is 4P and
+        // the source mask's explicit/decode-backed storage is 8S.
         let targetResolutionDecodeBytes = try checkedProduct(
-            [includesTrainingMasks ? 41 : 36, decodedPixelCount],
+            [includesTrainingMasks ? 29 : 24, decodedPixelCount],
             component: "target-resolution image decode transient"
         )
         let imageDecodeTransientBytes: Int64
         if includesTrainingMasks {
             let sourceMaskDecodeBytes = try checkedSum([
                 try checkedProduct(
-                    [12, decodedPixelCount],
-                    component: "decoded RGB retained during mask decode"
+                    [4, decodedPixelCount],
+                    component: "decoded RGBA8 retained during mask decode"
                 ),
                 try checkedProduct(
                     [8, sourcePixelCount],

@@ -70,6 +70,12 @@
   one statistics dispatch. Geometry and opacity preserve full-population
   zero-gradient moment decay; SH retains its visibility/degree gates and now
   includes degree-four backward updates.
+- Replaced retained Float32 RGB training images with tightly packed UInt8 RGBA
+  targets. ImageIO decode, resolution pyramids, and Brown-Conrady correction
+  remain byte-native; the SSIM/L1 kernels normalize RGB during their existing
+  tile loads, while CPU evaluation accepts the same compact representation.
+  Decoded CPU pixels are released after upload, leaving one four-byte target
+  per pixel in the image cache (plus a separate one-byte mask when present).
 - Corrected the image-edge versus array-index conversion in Brown-Conrady
   rectification, including alpha=0 crop endpoints and paired mask sampling.
   The renderer now uses an exact homogeneous divide, propagates the missing

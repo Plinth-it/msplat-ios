@@ -62,6 +62,78 @@ int main() {
         ssim_eval(rendered, gt, &fractionalMask, fractionalUnits),
         unmaskedSsim));
 
+    // Evaluation renders remain float32 RGB, while cached training targets are
+    // compact uint8 RGBA. A byte-equivalent float target must produce the same
+    // metrics, and the padding alpha byte must never participate.
+    MTensor mixedRendered = makeImage(height, width);
+    MTensor floatTarget = makeImage(height, width);
+    MTensor rgbaTarget({height, width, 4}, DType::UInt8);
+    MTensor differentAlphaTarget({height, width, 4}, DType::UInt8);
+    MTensor mixedMask({height, width}, DType::UInt8);
+    uint64_t mixedCoverageUnits = 0;
+    for (int64_t pixel = 0; pixel < height * width; ++pixel) {
+        for (int channel = 0; channel < 3; ++channel) {
+            const uint8_t targetByte = static_cast<uint8_t>(
+                (pixel * 53 + channel * 79 + 17) % 256);
+            floatTarget.data<float>()[pixel * 3 + channel] =
+                targetByte / 255.0f;
+            rgbaTarget.data<uint8_t>()[pixel * 4 + channel] = targetByte;
+            differentAlphaTarget.data<uint8_t>()[pixel * 4 + channel] =
+                targetByte;
+            mixedRendered.data<float>()[pixel * 3 + channel] =
+                static_cast<float>(
+                    (pixel * 29 + channel * 41 + 11) % 251) / 250.0f;
+        }
+        rgbaTarget.data<uint8_t>()[pixel * 4 + 3] =
+            static_cast<uint8_t>((pixel * 7) % 256);
+        differentAlphaTarget.data<uint8_t>()[pixel * 4 + 3] =
+            static_cast<uint8_t>(255 - (pixel * 13) % 256);
+        const uint8_t coverage = static_cast<uint8_t>((pixel * 37) % 256);
+        mixedMask.data<uint8_t>()[pixel] = coverage;
+        mixedCoverageUnits += coverage;
+    }
+
+    const float floatPsnr = psnr(mixedRendered, floatTarget);
+    const float floatL1 = l1_loss(mixedRendered, floatTarget);
+    const float floatSsim = ssim_eval(mixedRendered, floatTarget);
+    CHECK(nearlyEqual(psnr(mixedRendered, rgbaTarget), floatPsnr));
+    CHECK(nearlyEqual(l1_loss(mixedRendered, rgbaTarget), floatL1));
+    CHECK(nearlyEqual(ssim_eval(mixedRendered, rgbaTarget), floatSsim));
+    CHECK(nearlyEqual(
+        psnr(mixedRendered, differentAlphaTarget), floatPsnr));
+    CHECK(nearlyEqual(
+        l1_loss(mixedRendered, differentAlphaTarget), floatL1));
+    CHECK(nearlyEqual(
+        ssim_eval(mixedRendered, differentAlphaTarget), floatSsim));
+
+    const float maskedFloatPsnr = psnr(
+        mixedRendered, floatTarget, &mixedMask, mixedCoverageUnits);
+    const float maskedFloatL1 = l1_loss(
+        mixedRendered, floatTarget, &mixedMask, mixedCoverageUnits);
+    const float maskedFloatSsim = ssim_eval(
+        mixedRendered, floatTarget, &mixedMask, mixedCoverageUnits);
+    CHECK(nearlyEqual(
+        psnr(mixedRendered, rgbaTarget, &mixedMask, mixedCoverageUnits),
+        maskedFloatPsnr));
+    CHECK(nearlyEqual(
+        l1_loss(mixedRendered, rgbaTarget, &mixedMask, mixedCoverageUnits),
+        maskedFloatL1));
+    CHECK(nearlyEqual(
+        ssim_eval(mixedRendered, rgbaTarget, &mixedMask, mixedCoverageUnits),
+        maskedFloatSsim));
+    CHECK(nearlyEqual(
+        psnr(mixedRendered, differentAlphaTarget,
+             &mixedMask, mixedCoverageUnits),
+        maskedFloatPsnr));
+    CHECK(nearlyEqual(
+        l1_loss(mixedRendered, differentAlphaTarget,
+                &mixedMask, mixedCoverageUnits),
+        maskedFloatL1));
+    CHECK(nearlyEqual(
+        ssim_eval(mixedRendered, differentAlphaTarget,
+                  &mixedMask, mixedCoverageUnits),
+        maskedFloatSsim));
+
     MTensor twoPixelRendered = makeImage(1, 2);
     MTensor twoPixelGt = makeImage(1, 2);
     for (int channel = 0; channel < 3; ++channel) {

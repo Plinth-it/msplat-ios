@@ -1969,6 +1969,21 @@ MTensor msplat_train_step(
         pixelCount > std::numeric_limits<uint64_t>::max() / 255u) {
         throw std::invalid_argument("Training image dimensions are invalid");
     }
+    const bool targetShapeMatches = gt.defined() && gt.isGpu() &&
+        gt.ndim() == 3 &&
+        gt.size(0) == static_cast<int64_t>(img_height) &&
+        gt.size(1) == static_cast<int64_t>(img_width);
+    const bool targetIsRGBA8 = targetShapeMatches &&
+        gt.dtype() == DType::UInt8 && gt.size(2) == 4;
+    const bool targetIsFloatRGB = targetShapeMatches &&
+        gt.dtype() == DType::Float32 && gt.size(2) == 3;
+    if (!targetIsRGBA8 && !targetIsFloatRGB) {
+        throw std::invalid_argument(
+            "Training target must be a GPU uint8 RGBA or float32 RGB image");
+    }
+    const uint32_t target_pixel_stride_bytes = targetIsRGBA8
+        ? 4u
+        : 3u * static_cast<uint32_t>(sizeof(float));
     const uint64_t fullCoverageUnits = pixelCount * 255u;
     if (loss_coverage_units == 0 ||
         loss_coverage_units > fullCoverageUnits ||
@@ -2434,6 +2449,7 @@ MTensor msplat_train_step(
         ENC_BUF(enc, loss_coverage_buffer, 7);
         ENC_SCALAR(enc, alpha_stride, 8);
         ENC_BUF(enc, background, 9);
+        ENC_SCALAR(enc, target_pixel_stride_bytes, 10);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 2: Fused V fwd + H bwd
@@ -2452,6 +2468,7 @@ MTensor msplat_train_step(
         ENC_BUF(enc, background, 14);
         ENC_BUF(enc, final_Ts, 15);
         ENC_SCALAR(enc, alpha_loss_weight, 16);
+        ENC_SCALAR(enc, target_pixel_stride_bytes, 17);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         // Pass 3: V bwd
@@ -2468,6 +2485,7 @@ MTensor msplat_train_step(
         ENC_SCALAR(enc, photometricEnabled, 11);
         ENC_SCALAR(enc, alpha_stride, 12);
         ENC_BUF(enc, background, 13);
+        ENC_SCALAR(enc, target_pixel_stride_bytes, 14);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
 
         if (photometric.enabled) {

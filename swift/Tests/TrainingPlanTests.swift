@@ -87,22 +87,22 @@ final class TrainingPlanTests: XCTestCase {
             [866_055_848, 926_222_408]
         )
         XCTAssertEqual(estimate.peakTrainingCacheBytes, 926_222_408)
-        XCTAssertEqual(estimate.largestImageCacheEntryBytes, 16_588_800)
-        XCTAssertEqual(estimate.imageDecodeTransientBytes, 24_883_200)
-        XCTAssertEqual(estimate.imageInsertionPeakBytes, 561_754_112)
-        XCTAssertEqual(estimate.codeDerivedBytes, 2_051_979_464)
-        XCTAssertEqual(estimate.recommendedHeadroomBytes, 410_395_893)
-        XCTAssertEqual(estimate.estimatedPeakMemory, 2_462_375_357)
+        XCTAssertEqual(estimate.largestImageCacheEntryBytes, 2_764_800)
+        XCTAssertEqual(estimate.imageDecodeTransientBytes, 16_588_800)
+        XCTAssertEqual(estimate.imageInsertionPeakBytes, 553_459_712)
+        XCTAssertEqual(estimate.codeDerivedBytes, 2_043_685_064)
+        XCTAssertEqual(estimate.recommendedHeadroomBytes, 408_737_013)
+        XCTAssertEqual(estimate.estimatedPeakMemory, 2_452_422_077)
         let customEstimate = try plan.memoryEstimate(
             imageCacheBudgetBytes: 64 * 1_024 * 1_024
         )
-        XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 91_992_064)
-        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_582_217_416)
-        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 316_443_484)
-        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_898_660_900)
+        XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 83_697_664)
+        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_573_923_016)
+        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 314_784_604)
+        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_888_707_620)
     }
 
-    func testMaskAwareMemoryEstimateIncludesUInt8CacheAndDecodeStorage() throws {
+    func testMaskAwareMemoryEstimateIncludesCompactTargetAndDecodeStorage() throws {
         let plan = try TrainingPlan(
             inputDimensions: TrainingImageDimensions(width: 1_920, height: 1_440),
             inputDecodeScale: 2,
@@ -128,22 +128,22 @@ final class TrainingPlanTests: XCTestCase {
             imageCacheBudgetBytes:
                 TrainingMemoryEstimate.defaultIOSImageCacheBudgetBytes
         )
-        XCTAssertEqual(estimate.largestImageCacheEntryBytes, 17_971_200)
-        XCTAssertEqual(estimate.imageDecodeTransientBytes, 30_412_800)
-        XCTAssertEqual(estimate.imageInsertionPeakBytes, 567_283_712)
-        XCTAssertEqual(estimate.codeDerivedBytes, 2_057_509_064)
-        XCTAssertEqual(estimate.recommendedHeadroomBytes, 411_501_813)
-        XCTAssertEqual(estimate.estimatedPeakMemory, 2_469_010_877)
+        XCTAssertEqual(estimate.largestImageCacheEntryBytes, 3_456_000)
+        XCTAssertEqual(estimate.imageDecodeTransientBytes, 24_883_200)
+        XCTAssertEqual(estimate.imageInsertionPeakBytes, 561_754_112)
+        XCTAssertEqual(estimate.codeDerivedBytes, 2_051_979_464)
+        XCTAssertEqual(estimate.recommendedHeadroomBytes, 410_395_893)
+        XCTAssertEqual(estimate.estimatedPeakMemory, 2_462_375_357)
 
         let customEstimate = try plan.memoryEstimate(
             imageCacheBudgetBytes: 64 * 1_024 * 1_024
         )
-        XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 97_521_664)
-        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_587_747_016)
-        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_905_296_420)
+        XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 91_992_064)
+        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_582_217_416)
+        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_898_660_900)
     }
 
-    func testMaskAwareCoarseOnlyCacheEstimateIncludesBothResolutions() throws {
+    func testMaskAwareCoarseOnlyCacheEstimateUsesCompactStageTarget() throws {
         let plan = try TrainingPlan(
             inputDimensions: TrainingImageDimensions(width: 1_920, height: 1_440),
             inputDecodeScale: 2,
@@ -164,7 +164,7 @@ final class TrainingPlanTests: XCTestCase {
                 imageCacheBudgetBytes:
                     TrainingMemoryEstimate.defaultIOSImageCacheBudgetBytes
             ).largestImageCacheEntryBytes,
-            13_478_400
+            864_000
         )
     }
 

@@ -110,7 +110,18 @@ StepResult runStep(bool transparent, float alphaLossWeight,
         {gaussianCount, 0, 3}, DType::Float32);
     MTensor opacities = gpuFloats({gaussianCount, 1}, opacityValues);
     MTensor background = gpu_zeros({3}, DType::Float32);
-    MTensor gt = gpu_zeros({kHeight, kWidth, 3}, DType::Float32);
+    MTensor gt = gpu_empty({kHeight, kWidth, 4}, DType::UInt8);
+    auto *targetBytes = gt.data<uint8_t>();
+    for (int pixel = 0; pixel < kWidth * kHeight; ++pixel) {
+        const int offset = pixel * 4;
+        // Deliberately asymmetric RGB exercises byte normalization in every
+        // loss pass. Alpha is neither opaque nor derived from the mask: compact
+        // training targets must ignore it and use the separate mask instead.
+        targetBytes[offset + 0] = 23;
+        targetBytes[offset + 1] = 91;
+        targetBytes[offset + 2] = 207;
+        targetBytes[offset + 3] = 37;
+    }
     MTensor mask = gpu_zeros({kHeight, kWidth}, DType::UInt8);
     for (int y = 0; y < 4; ++y) {
         for (int x = 0; x < 4; ++x)
@@ -155,7 +166,7 @@ StepResult runStep(bool transparent, float alphaLossWeight,
         kHeight, kWidth, std::make_tuple(2, 2, 1), 0.01f,
         0, 0, cameraPosition,
         featuresDc, featuresRest, opacities, background,
-        gt, &mask, coverageUnits, 0.0f, lossInvN,
+        gt, &mask, coverageUnits, 0.2f, lossInvN,
         transparent, alphaLossWeight,
         kAdamGroups, params.data(), expAvg.data(), expAvgSq.data(),
         stepSizes, biasCorrection2Sqrts,

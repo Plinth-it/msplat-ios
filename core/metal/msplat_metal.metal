@@ -3705,9 +3705,17 @@ inline float training_target_rgb(
     constant uchar* training_mask,
     uint alpha_stride,
     constant float* background,
+    uint target_pixel_stride_bytes,
     uint pixel,
     uint channel) {
-    const float source = gt[pixel * 3 + channel];
+    float source = 0.0f;
+    if (target_pixel_stride_bytes == 4) {
+        constant uchar* bytes =
+            reinterpret_cast<constant uchar*>(gt);
+        source = float(bytes[pixel * 4 + channel]) * (1.0f / 255.0f);
+    } else {
+        source = gt[pixel * 3 + channel];
+    }
     if (alpha_stride == 0) return source;
     const float target_alpha = float(training_mask[pixel]) / 255.0f;
     return fma(source - background[channel], target_alpha,
@@ -3720,7 +3728,7 @@ inline float training_target_rgb(
 // Output: ssim_h_buf (H, W, 15) — 5 values × 3 channels
 kernel void ssim_h_fwd_kernel(
     constant float* rendered,       // (H, W, 3) HWC
-    constant float* gt,             // (H, W, 3) HWC
+    constant float* gt,             // UInt8 RGBA or Float32 RGB, selected by stride
     constant uint2& img_size,       // (W, H)
     device float* ssim_h_buf,       // (H, W, 15)
     constant float* log_rgb_gains,  // (cameraCount, 3)
@@ -3729,6 +3737,7 @@ kernel void ssim_h_fwd_kernel(
     constant uchar* training_mask,  // (H, W), ignored when stride is zero
     constant uint& alpha_stride,
     constant float* background,
+    constant uint& target_pixel_stride_bytes,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3766,7 +3775,8 @@ kernel void ssim_h_fwd_kernel(
                 uint pixel = gy * W + gx;
                 uint idx = pixel * 3 + c;
                 gv = training_target_rgb(
-                    gt, training_mask, alpha_stride, background, pixel, c);
+                    gt, training_mask, alpha_stride, background,
+                    target_pixel_stride_bytes, pixel, c);
                 rv = rendered[idx] * tg_gain[c];
             }
             tg_gt[c][sy][sx] = gv;
@@ -3915,7 +3925,8 @@ kernel void ssim_v_fwd_kernel(
 // computes loss + derivative fields, then H convs derivatives to a compact
 // 3-float-per-channel output buffer.
 kernel void ssim_fused_v_fwd_h_bwd_kernel(
-    constant float* rendered, constant float* gt,
+    constant float* rendered,
+    constant float* gt,             // UInt8 RGBA or Float32 RGB, selected by stride
     constant float* ssim_h_buf, constant uint2& img_size,
     constant float& ssim_weight, constant float& inv_n,
     device float* deriv_h_buf, // (H, W, 9): 3 values × 3 channels
@@ -3929,6 +3940,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constant float* background,
     constant float* final_Ts,
     constant float& alpha_loss_weight,
+    constant uint& target_pixel_stride_bytes,
     uint2 gid [[thread_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]],
     uint2 tg_size [[threads_per_threadgroup]]
@@ -4004,7 +4016,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                     const uint center_pixel = uint(gpy) * W + uint(gpx);
                     const float target = training_target_rgb(
                         gt, coverage_mask, alpha_stride, background,
-                        center_pixel, c);
+                        target_pixel_stride_bytes, center_pixel, c);
                     l1_sum += coverage *
                         fabs(target -
                              rendered[(gpy*W+gpx)*3+c] * gain);
@@ -4140,7 +4152,7 @@ kernel void ssim_h_bwd_kernel(
 // overwritten in place with its gradient; each thread touches only its pixel.
 kernel void ssim_v_bwd_kernel(
     device float* rendered_gradient,// (H, W, 3), rendered in / gradient out
-    constant float* gt,             // (H, W, 3)
+    constant float* gt,             // UInt8 RGBA or Float32 RGB, selected by stride
     constant float* deriv_h_buf,    // (H, W, 9): 3 values × 3 channels
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
@@ -4153,6 +4165,7 @@ kernel void ssim_v_bwd_kernel(
     constant uint& photometric_enabled,
     constant uint& alpha_stride,
     constant float* background,
+    constant uint& target_pixel_stride_bytes,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -4216,7 +4229,7 @@ kernel void ssim_v_bwd_kernel(
             const float rend_val = raw_rend_val * gain;
             float gt_val = training_target_rgb(
                 gt, coverage_mask, alpha_stride, background,
-                py * W + px, c);
+                target_pixel_stride_bytes, py * W + px, c);
 
             float v_ssim = conv_f1 + rend_val * conv_f2 + gt_val * conv_f3;
             const float coverage = coverage_stride == 0

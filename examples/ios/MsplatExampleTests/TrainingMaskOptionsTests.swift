@@ -193,7 +193,7 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(plan.maximumGaussianCount, 313_214)
         XCTAssertEqual(plan.resolvedStages.first?.dimensions.width, 1_200)
         XCTAssertEqual(plan.resolvedStages.first?.dimensions.height, 1_600)
-        XCTAssertEqual(iOSMemory.estimatedPeakMemory, 2_458_298_991)
+        XCTAssertEqual(iOSMemory.estimatedPeakMemory, 2_340_264_941)
         XCTAssertLessThan(
             iOSMemory.estimatedPeakMemory,
             3_351 * 1_024 * 1_024

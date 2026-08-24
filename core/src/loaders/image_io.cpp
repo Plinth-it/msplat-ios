@@ -231,13 +231,11 @@ ImageSourceInfo inspectImageSource(const std::string &path) {
     return sourceInfo(source.get(), path);
 }
 
-Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceInfo,
-                int targetWidth, int targetHeight,
-                bool applyExifOrientation) {
+RGBA8Image imreadRGBA8(
+    const std::string &path, const ImageSourceInfo &expectedSourceInfo,
+    int targetWidth, int targetHeight, bool applyExifOrientation) {
     const size_t rgbaElements = checkedElementCount(
         targetWidth, targetHeight, 4, sizeof(uint8_t), "Decoded image");
-    const size_t rgbElements = checkedElementCount(
-        targetWidth, targetHeight, 3, sizeof(float), "Decoded image");
     auto source = openImageSource(path);
     auto thumbnail = createThumbnail(
         source.get(), path, expectedSourceInfo, targetWidth, targetHeight,
@@ -275,15 +273,37 @@ Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceIn
                    static_cast<CGFloat>(targetHeight)),
         thumbnail.get());
 
+    // The skipped channel is not part of the source-image semantics. Make it
+    // deterministic so the compact buffer is a valid opaque RGBA8 raster for
+    // tests, diagnostics, and any future texture-backed upload.
+    const size_t pixelCount = rgbaElements / 4;
+    for (size_t pixel = 0; pixel < pixelCount; ++pixel)
+        rgba[pixel * 4 + 3] = 255;
+
+    RGBA8Image image;
+    image.width = targetWidth;
+    image.height = targetHeight;
+    image.data = std::move(rgba);
+    return image;
+}
+
+Image imreadRGB(const std::string &path, const ImageSourceInfo &expectedSourceInfo,
+                int targetWidth, int targetHeight,
+                bool applyExifOrientation) {
+    const RGBA8Image rgba = imreadRGBA8(
+        path, expectedSourceInfo, targetWidth, targetHeight,
+        applyExifOrientation);
+    const size_t rgbElements = checkedElementCount(
+        targetWidth, targetHeight, 3, sizeof(float), "Decoded image");
     Image image;
     image.width = targetWidth;
     image.height = targetHeight;
     image.data.resize(rgbElements);
     const size_t pixelCount = rgbElements / 3;
     for (size_t i = 0; i < pixelCount; ++i) {
-        image.data[i * 3 + 0] = rgba[i * 4 + 0] / 255.0f;
-        image.data[i * 3 + 1] = rgba[i * 4 + 1] / 255.0f;
-        image.data[i * 3 + 2] = rgba[i * 4 + 2] / 255.0f;
+        image.data[i * 3 + 0] = rgba.data[i * 4 + 0] / 255.0f;
+        image.data[i * 3 + 1] = rgba.data[i * 4 + 1] / 255.0f;
+        image.data[i * 3 + 2] = rgba.data[i * 4 + 2] / 255.0f;
     }
     return image;
 }
@@ -527,6 +547,68 @@ Image resizeArea(const Image &src, int dstW, int dstH) {
     return dst;
 }
 
+RGBA8Image resizeRGBA8Area(const RGBA8Image &src, int dstW, int dstH) {
+    const size_t sourceElements = checkedElementCount(
+        src.width, src.height, 4, sizeof(uint8_t), "Source RGBA8 image");
+    if (src.data.size() != sourceElements) {
+        throw std::invalid_argument(
+            "Source RGBA8 image storage does not match its dimensions");
+    }
+    const size_t destinationElements = checkedElementCount(
+        dstW, dstH, 4, sizeof(uint8_t), "Resized RGBA8 image");
+
+    RGBA8Image dst;
+    dst.width = dstW;
+    dst.height = dstH;
+    dst.data.resize(destinationElements, 255);
+
+    const double scaleX = static_cast<double>(src.width) / dstW;
+    const double scaleY = static_cast<double>(src.height) / dstH;
+    for (int dy = 0; dy < dstH; ++dy) {
+        const double srcY0 = dy * scaleY;
+        const double srcY1 = (dy + 1) * scaleY;
+        for (int dx = 0; dx < dstW; ++dx) {
+            const double srcX0 = dx * scaleX;
+            const double srcX1 = (dx + 1) * scaleX;
+            double sum[3] = {};
+            double totalArea = 0.0;
+
+            const int iy0 = static_cast<int>(srcY0);
+            const int iy1 = std::min(
+                static_cast<int>(std::ceil(srcY1)), src.height);
+            const int ix0 = static_cast<int>(srcX0);
+            const int ix1 = std::min(
+                static_cast<int>(std::ceil(srcX1)), src.width);
+            for (int iy = iy0; iy < iy1; ++iy) {
+                const double wy =
+                    std::min(static_cast<double>(iy + 1), srcY1) -
+                    std::max(static_cast<double>(iy), srcY0);
+                for (int ix = ix0; ix < ix1; ++ix) {
+                    const double wx =
+                        std::min(static_cast<double>(ix + 1), srcX1) -
+                        std::max(static_cast<double>(ix), srcX0);
+                    const double area = wx * wy;
+                    const size_t sourceIndex =
+                        (static_cast<size_t>(iy) * src.width + ix) * 4;
+                    for (int channel = 0; channel < 3; ++channel)
+                        sum[channel] += src.data[sourceIndex + channel] * area;
+                    totalArea += area;
+                }
+            }
+
+            const size_t destinationIndex =
+                (static_cast<size_t>(dy) * dstW + dx) * 4;
+            const double inverseArea = 1.0 / totalArea;
+            for (int channel = 0; channel < 3; ++channel) {
+                dst.data[destinationIndex + channel] =
+                    static_cast<uint8_t>(std::clamp(
+                        std::lround(sum[channel] * inverseArea), 0L, 255L));
+            }
+        }
+    }
+    return dst;
+}
+
 // ── Undistortion (Brown-Conrady model) ───────────────────────────────────────
 
 CoverageMask resizeCoverageArea(const CoverageMask &src, int dstW, int dstH) {
@@ -701,6 +783,75 @@ static int cropBoundary(float edgeCoordinate, int dimension) {
     return static_cast<int>(boundary);
 }
 
+struct UndistortCrop {
+    int x = 0;
+    int y = 0;
+    int width = 0;
+    int height = 0;
+};
+
+static UndistortCrop calculateUndistortCrop(
+    int width, int height, float fx, float fy, float cx, float cy,
+    float k1, float k2, float p1, float p2, float k3) {
+    // Calibration coordinates describe the half-open raster [0, width) x
+    // [0, height), not array indices [0, width - 1]. Transform all four
+    // raster edges and keep their inner rectangle for an alpha=0 crop.
+    float topMax = -1e9f;
+    float bottomMin = 1e9f;
+    float leftMax = -1e9f;
+    float rightMin = 1e9f;
+    constexpr int boundarySampleCount = 200;
+    for (int i = 0; i < boundarySampleCount; ++i) {
+        const float t = static_cast<float>(i) /
+                        static_cast<float>(boundarySampleCount - 1);
+        const float edgeX = t * static_cast<float>(width);
+        const float edgeY = t * static_cast<float>(height);
+
+        float xu = 0.0f;
+        float yu = 0.0f;
+        float xd = (edgeX - cx) / fx;
+        float yd = (0.0f - cy) / fy;
+        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        requireValidUndistortedPoint(
+            xd, yd, xu, yu, k1, k2, p1, p2, k3);
+        topMax = std::max(topMax, yu * fy + cy);
+
+        xd = (edgeX - cx) / fx;
+        yd = (static_cast<float>(height) - cy) / fy;
+        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        requireValidUndistortedPoint(
+            xd, yd, xu, yu, k1, k2, p1, p2, k3);
+        bottomMin = std::min(bottomMin, yu * fy + cy);
+
+        xd = (0.0f - cx) / fx;
+        yd = (edgeY - cy) / fy;
+        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        requireValidUndistortedPoint(
+            xd, yd, xu, yu, k1, k2, p1, p2, k3);
+        leftMax = std::max(leftMax, xu * fx + cx);
+
+        xd = (static_cast<float>(width) - cx) / fx;
+        yd = (edgeY - cy) / fy;
+        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
+        requireValidUndistortedPoint(
+            xd, yd, xu, yu, k1, k2, p1, p2, k3);
+        rightMin = std::min(rightMin, xu * fx + cx);
+    }
+
+    UndistortCrop crop;
+    crop.x = cropBoundary(leftMax, width);
+    crop.y = cropBoundary(topMax, height);
+    const int right = cropBoundary(rightMin, width);
+    const int bottom = cropBoundary(bottomMin, height);
+    crop.width = right - crop.x;
+    crop.height = bottom - crop.y;
+    if (crop.width <= 0 || crop.height <= 0) {
+        throw msplat::InvalidDatasetError(
+            "Distortion model leaves no valid image region");
+    }
+    return crop;
+}
+
 // Bilinear sample from float32 image, returns pixel value at (x, y)
 static void bilinearSample(const Image &img, float x, float y, float out[3]) {
     int x0 = (int)std::floor(x);
@@ -727,6 +878,36 @@ static void bilinearSample(const Image &img, float x, float y, float out[3]) {
         float bottom = p01[c] * (1.0f - fx) + p11[c] * fx;
         out[c] = top * (1.0f - fy) + bottom * fy;
     }
+}
+
+static void bilinearSample(
+    const RGBA8Image &img, float x, float y, uint8_t out[4]) {
+    int x0 = static_cast<int>(std::floor(x));
+    int y0 = static_cast<int>(std::floor(y));
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+    x0 = std::clamp(x0, 0, img.width - 1);
+    x1 = std::clamp(x1, 0, img.width - 1);
+    y0 = std::clamp(y0, 0, img.height - 1);
+    y1 = std::clamp(y1, 0, img.height - 1);
+
+    const float fractionX = x - std::floor(x);
+    const float fractionY = y - std::floor(y);
+    const auto sample = [&](int sampleX, int sampleY, int channel) {
+        return static_cast<float>(img.data[
+            (static_cast<size_t>(sampleY) * img.width + sampleX) * 4 +
+            channel]);
+    };
+    for (int channel = 0; channel < 3; ++channel) {
+        const float top = sample(x0, y0, channel) * (1.0f - fractionX) +
+            sample(x1, y0, channel) * fractionX;
+        const float bottom = sample(x0, y1, channel) * (1.0f - fractionX) +
+            sample(x1, y1, channel) * fractionX;
+        out[channel] = static_cast<uint8_t>(std::clamp(
+            std::lround(top * (1.0f - fractionY) + bottom * fractionY),
+            0L, 255L));
+    }
+    out[3] = 255;
 }
 
 static uint8_t bilinearSampleCoverage(
@@ -770,83 +951,29 @@ UndistortResult undistortImage(const Image &src,
     }
     const int w = src.width;
     const int h = src.height;
-
-    // Calibration coordinates describe the half-open raster [0, width) x
-    // [0, height), not array indices [0, width - 1]. Transform all four raster
-    // edges and keep their inner rectangle for an alpha=0 crop.
-    float topMax = -1e9f;
-    float bottomMin = 1e9f;
-    float leftMax = -1e9f;
-    float rightMin = 1e9f;
-    constexpr int boundarySampleCount = 200;
-    for (int i = 0; i < boundarySampleCount; ++i) {
-        const float t = static_cast<float>(i) /
-                        static_cast<float>(boundarySampleCount - 1);
-        const float edgeX = t * static_cast<float>(w);
-        const float edgeY = t * static_cast<float>(h);
-
-        float xu = 0.0f;
-        float yu = 0.0f;
-        float xd = (edgeX - cx) / fx;
-        float yd = (0.0f - cy) / fy;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
-        requireValidUndistortedPoint(
-            xd, yd, xu, yu, k1, k2, p1, p2, k3);
-        topMax = std::max(topMax, yu * fy + cy);
-
-        xd = (edgeX - cx) / fx;
-        yd = (static_cast<float>(h) - cy) / fy;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
-        requireValidUndistortedPoint(
-            xd, yd, xu, yu, k1, k2, p1, p2, k3);
-        bottomMin = std::min(bottomMin, yu * fy + cy);
-
-        xd = (0.0f - cx) / fx;
-        yd = (edgeY - cy) / fy;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
-        requireValidUndistortedPoint(
-            xd, yd, xu, yu, k1, k2, p1, p2, k3);
-        leftMax = std::max(leftMax, xu * fx + cx);
-
-        xd = (static_cast<float>(w) - cx) / fx;
-        yd = (edgeY - cy) / fy;
-        undistortPoint(xd, yd, k1, k2, p1, p2, k3, xu, yu);
-        requireValidUndistortedPoint(
-            xd, yd, xu, yu, k1, k2, p1, p2, k3);
-        rightMin = std::min(rightMin, xu * fx + cx);
-    }
-
-    const int roiX = cropBoundary(leftMax, w);
-    const int roiY = cropBoundary(topMax, h);
-    const int roiRight = cropBoundary(rightMin, w);
-    const int roiBottom = cropBoundary(bottomMin, h);
-    const int roiW = roiRight - roiX;
-    const int roiH = roiBottom - roiY;
-    if (roiW <= 0 || roiH <= 0) {
-        throw msplat::InvalidDatasetError(
-            "Distortion model leaves no valid image region");
-    }
+    const UndistortCrop crop = calculateUndistortCrop(
+        w, h, fx, fy, cx, cy, k1, k2, p1, p2, k3);
 
     // Write the crop directly so undistortion does not allocate another
     // full-sized float image while the decoded source is resident.
     Image cropped;
-    cropped.width = roiW;
-    cropped.height = roiH;
+    cropped.width = crop.width;
+    cropped.height = crop.height;
     cropped.data.resize(checkedElementCount(
-        roiW, roiH, 3, sizeof(float), "Undistorted image"));
-    for (int y = 0; y < roiH; ++y) {
-        for (int x = 0; x < roiW; ++x) {
+        crop.width, crop.height, 3, sizeof(float), "Undistorted image"));
+    for (int y = 0; y < crop.height; ++y) {
+        for (int x = 0; x < crop.width; ++x) {
             float sourceX = 0.0f;
             float sourceY = 0.0f;
             distortedSampleCoordinate(
-                x + roiX, y + roiY, w, h,
+                x + crop.x, y + crop.y, w, h,
                 fx, fy, cx, cy, k1, k2, p1, p2, k3,
                 sourceX, sourceY);
 
             float pixel[3];
             bilinearSample(src, sourceX, sourceY, pixel);
             float *out = &cropped.data[
-                (static_cast<size_t>(y) * roiW + x) * 3];
+                (static_cast<size_t>(y) * crop.width + x) * 3];
             out[0] = pixel[0];
             out[1] = pixel[1];
             out[2] = pixel[2];
@@ -857,10 +984,57 @@ UndistortResult undistortImage(const Image &src,
     result.image = std::move(cropped);
     result.fx = fx;
     result.fy = fy;
-    result.cx = cx - roiX;
-    result.cy = cy - roiY;
-    result.width = roiW;
-    result.height = roiH;
+    result.cx = cx - crop.x;
+    result.cy = cy - crop.y;
+    result.width = crop.width;
+    result.height = crop.height;
+    return result;
+}
+
+UndistortRGBA8Result undistortRGBA8Image(const RGBA8Image &src,
+    float fx, float fy, float cx, float cy,
+    float k1, float k2, float p1, float p2, float k3) {
+    const size_t sourceElements = checkedElementCount(
+        src.width, src.height, 4, sizeof(uint8_t),
+        "RGBA8 image to undistort");
+    if (src.data.size() != sourceElements) {
+        throw std::invalid_argument(
+            "RGBA8 image storage does not match its dimensions");
+    }
+    const UndistortCrop crop = calculateUndistortCrop(
+        src.width, src.height, fx, fy, cx, cy,
+        k1, k2, p1, p2, k3);
+
+    RGBA8Image cropped;
+    cropped.width = crop.width;
+    cropped.height = crop.height;
+    cropped.data.resize(checkedElementCount(
+        crop.width, crop.height, 4, sizeof(uint8_t),
+        "Undistorted RGBA8 image"));
+    for (int y = 0; y < crop.height; ++y) {
+        for (int x = 0; x < crop.width; ++x) {
+            float sourceX = 0.0f;
+            float sourceY = 0.0f;
+            distortedSampleCoordinate(
+                x + crop.x, y + crop.y, src.width, src.height,
+                fx, fy, cx, cy, k1, k2, p1, p2, k3,
+                sourceX, sourceY);
+            uint8_t pixel[4];
+            bilinearSample(src, sourceX, sourceY, pixel);
+            uint8_t *out = &cropped.data[
+                (static_cast<size_t>(y) * crop.width + x) * 4];
+            std::copy_n(pixel, 4, out);
+        }
+    }
+
+    UndistortRGBA8Result result;
+    result.image = std::move(cropped);
+    result.fx = fx;
+    result.fy = fy;
+    result.cx = cx - crop.x;
+    result.cy = cy - crop.y;
+    result.width = crop.width;
+    result.height = crop.height;
     return result;
 }
 
@@ -907,6 +1081,60 @@ UndistortTrainingTargetResult undistortImageAndCoverageMask(
     }
 
     UndistortTrainingTargetResult result;
+    result.image = std::move(imageResult.image);
+    result.coverageMask = std::move(croppedMask);
+    result.fx = imageResult.fx;
+    result.fy = imageResult.fy;
+    result.cx = imageResult.cx;
+    result.cy = imageResult.cy;
+    result.width = imageResult.width;
+    result.height = imageResult.height;
+    return result;
+}
+
+UndistortRGBA8TrainingTargetResult undistortRGBA8ImageAndCoverageMask(
+    const RGBA8Image &image, const CoverageMask &coverageMask,
+    float fx, float fy, float cx, float cy,
+    float k1, float k2, float p1, float p2, float k3) {
+    const size_t maskElements = checkedElementCount(
+        coverageMask.width, coverageMask.height, 1, sizeof(uint8_t),
+        "Training mask to undistort");
+    if (coverageMask.data.size() != maskElements) {
+        throw std::invalid_argument(
+            "Training mask storage does not match its dimensions");
+    }
+    if (coverageMask.width != image.width ||
+        coverageMask.height != image.height) {
+        throw std::invalid_argument(
+            "Training mask dimensions do not match the image");
+    }
+
+    UndistortRGBA8Result imageResult = undistortRGBA8Image(
+        image, fx, fy, cx, cy, k1, k2, p1, p2, k3);
+    const int cropX = static_cast<int>(std::lround(cx - imageResult.cx));
+    const int cropY = static_cast<int>(std::lround(cy - imageResult.cy));
+
+    CoverageMask croppedMask;
+    croppedMask.width = imageResult.width;
+    croppedMask.height = imageResult.height;
+    croppedMask.data.resize(checkedElementCount(
+        croppedMask.width, croppedMask.height, 1, sizeof(uint8_t),
+        "Undistorted training mask"));
+    for (int y = 0; y < croppedMask.height; ++y) {
+        for (int x = 0; x < croppedMask.width; ++x) {
+            float sourceX = 0.0f;
+            float sourceY = 0.0f;
+            distortedSampleCoordinate(
+                x + cropX, y + cropY,
+                coverageMask.width, coverageMask.height,
+                fx, fy, cx, cy, k1, k2, p1, p2, k3,
+                sourceX, sourceY);
+            croppedMask.data[static_cast<size_t>(y) * croppedMask.width + x] =
+                bilinearSampleCoverage(coverageMask, sourceX, sourceY);
+        }
+    }
+
+    UndistortRGBA8TrainingTargetResult result;
     result.image = std::move(imageResult.image);
     result.coverageMask = std::move(croppedMask);
     result.fx = imageResult.fx;

@@ -20,6 +20,18 @@ struct Image {
     const float* ptr() const { return data.data(); }
 };
 
+/// Compact training raster. Bytes are tightly packed RGBA in the same
+/// sRGB-encoded numerical space used by the loss. Loader-produced alpha is 255;
+/// the loss ignores it because training transparency uses a separate mask.
+struct RGBA8Image {
+    std::vector<uint8_t> data;  // width * height * 4 bytes, RGBA
+    int width = 0, height = 0;
+
+    bool empty() const { return data.empty(); }
+    uint8_t* ptr() { return data.data(); }
+    const uint8_t* ptr() const { return data.data(); }
+};
+
 struct CoverageMask {
     std::vector<uint8_t> data;  // width * height bytes, soft coverage [0,255]
     int width = 0, height = 0;
@@ -46,9 +58,9 @@ struct Camera {
     RasterOrientation rasterOrientation = RasterOrientation::EncodedPixels;
     std::optional<TrainingMaskDescriptor> trainingMask;
 
-    Image image;
+    RGBA8Image image;
     CoverageMask coverageMask;
-    std::unordered_map<int, Image> imagePyramids;
+    std::unordered_map<int, RGBA8Image> imagePyramids;
     std::unordered_map<int, CoverageMask> coverageMaskPyramids;
     std::unordered_map<int, MTensor> mtensorImageCache;
     std::unordered_map<int, MTensor> mtensorCoverageMaskCache;
@@ -76,7 +88,7 @@ struct Camera {
     DeclaredIntrinsics declared;
 
     void loadImage(float downscaleFactor);
-    const Image& getImage(int downscaleFactor);
+    const RGBA8Image& getImage(int downscaleFactor);
     const CoverageMask& getCoverageMask(int downscaleFactor);
     uint64_t getCoverageUnits(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
@@ -88,6 +100,9 @@ struct Camera {
     bool projectionCacheMatchesPose() const noexcept;
     void recordProjectionCachePose() noexcept;
     void invalidateProjectionCache();
+    /// Releases decoded/pyramid pixels after their compact GPU target has
+    /// been published, while retaining corrected geometry and GPU caches.
+    void releaseCpuImageMemory();
     void releaseImageMemory();
     size_t cachedCpuImageBytes() const;
     size_t cachedGpuImageBytes() const;
@@ -116,8 +131,9 @@ struct DatasetMetadata {
     DatasetProvenance provenance;
 };
 
-/// Holds decoded training images under a byte budget, evicting the
-/// least-recently-used camera when the budget is exceeded.
+/// Holds compact GPU training targets under a byte budget, evicting the
+/// least-recently-used camera when the budget is exceeded. Decode and pyramid
+/// pixels are released after a target is uploaded.
 ///
 /// Every entry point used to decode all images up front and then copy the
 /// camera array, so a dataset occupied twice its decoded size before the first
@@ -143,11 +159,10 @@ public:
     CameraTrainingTarget gpuTrainingTarget(
         std::vector<Camera> &cameras, size_t index, int downscaleFactor);
 
-    /// Decodes cameras[index] if it is not resident, and accounts for it, but
-    /// uploads nothing. Render paths need this: the correction from the
-    /// dataset's declared image size to the file's real one happens during the
-    /// decode, so a camera that has never been loaded renders at the wrong
-    /// scale.
+    /// Establishes and accounts for corrected camera geometry without an
+    /// upload. It decodes only when that geometry has not yet been established
+    /// at the cache's input scale; a prior compact-target upload can satisfy
+    /// render paths without recreating released CPU pixels.
     Camera& ensureLoaded(std::vector<Camera> &cameras, size_t index);
 
     size_t cachedBytes() const;

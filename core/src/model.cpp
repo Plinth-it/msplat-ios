@@ -1918,12 +1918,19 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
     lastHeight = s.height; lastWidth = s.width;
     int numPoints = means.size(0);
 
-    if (!target.image || !target.image->defined() || !target.image->isGpu() ||
-        target.image->dtype() != DType::Float32 ||
-        target.image->ndim() != 3 || target.image->size(0) != s.height ||
-        target.image->size(1) != s.width || target.image->size(2) != 3) {
+    const bool targetBaseValid = target.image && target.image->defined() &&
+        target.image->isGpu() && target.image->ndim() == 3 &&
+        target.image->size(0) == s.height &&
+        target.image->size(1) == s.width;
+    const bool targetFormatValid = targetBaseValid && (
+        (target.image->dtype() == DType::UInt8 &&
+         target.image->size(2) == 4) ||
+        (target.image->dtype() == DType::Float32 &&
+         target.image->size(2) == 3));
+    if (!targetFormatValid) {
         throw std::invalid_argument(
-            "Training image must be a GPU float32 tensor matching the camera");
+            "Training image must be a GPU uint8 RGBA or float32 RGB tensor "
+            "matching the camera");
     }
     const uint64_t pixelCount = static_cast<uint64_t>(s.height) *
         static_cast<uint64_t>(s.width);

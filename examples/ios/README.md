@@ -67,10 +67,11 @@ peak-memory estimate. The
 estimate covers native model and training buffers, image-cache insertion,
 target-resolution app-owned decode buffers, and recommended headroom. When mask
 discovery is enabled, it also includes conservative source-mask decoding and
-paired CPU/GPU mask caches. The current formula reflects the split cache and
-removal of dead workspaces. The app refuses to start when that estimate exceeds a nonzero
-`os_proc_available_memory` value at preflight (the simulator reports zero and
-skips this comparison).
+the retained GPU mask. Training targets remain compact UInt8 RGBA buffers and
+decoded CPU pixels are released after upload. The current formula reflects the
+split cache and removal of dead workspaces. The app refuses to start when that
+estimate exceeds a nonzero `os_proc_available_memory` value at preflight (the
+simulator reports zero and skips this comparison).
 
 This check is a planning aid, not a jetsam guarantee. Metal driver state,
 framework allocations, other process memory, and changing system pressure are

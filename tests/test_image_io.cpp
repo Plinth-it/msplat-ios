@@ -4,6 +4,7 @@
 #include <CoreGraphics/CoreGraphics.h>
 #include <ImageIO/ImageIO.h>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstdint>
@@ -147,6 +148,24 @@ RGB8 pixel8(const Image &image, int x, int y) {
     };
 }
 
+RGB8 pixel8(const RGBA8Image &image, int x, int y) {
+    CHECK(x >= 0 && x < image.width);
+    CHECK(y >= 0 && y < image.height);
+    const size_t index = (static_cast<size_t>(y) * image.width + x) * 4;
+    return {
+        image.data[index + 0],
+        image.data[index + 1],
+        image.data[index + 2],
+    };
+}
+
+uint8_t alpha8(const RGBA8Image &image, int x, int y) {
+    CHECK(x >= 0 && x < image.width);
+    CHECK(y >= 0 && y < image.height);
+    return image.data[
+        (static_cast<size_t>(y) * image.width + x) * 4 + 3];
+}
+
 bool near(RGB8 lhs, RGB8 rhs, int tolerance = 2) {
     return std::abs(static_cast<int>(lhs.red) - rhs.red) <= tolerance &&
            std::abs(static_cast<int>(lhs.green) - rhs.green) <= tolerance &&
@@ -164,6 +183,59 @@ void checkPixel(const Image &image, int x, int y, RGB8 expected) {
              std::to_string(actual.red) + "," +
              std::to_string(actual.green) + "," +
              std::to_string(actual.blue));
+    }
+}
+
+void checkPixel(const RGBA8Image &image, int x, int y, RGB8 expected,
+                int tolerance = 2) {
+    const RGB8 actual = pixel8(image, x, y);
+    if (!near(actual, expected, tolerance)) {
+        fail("RGBA8 pixel color", __LINE__,
+             "at " + std::to_string(x) + "," + std::to_string(y) +
+             " expected " + std::to_string(expected.red) + "," +
+             std::to_string(expected.green) + "," +
+             std::to_string(expected.blue) + " got " +
+             std::to_string(actual.red) + "," +
+             std::to_string(actual.green) + "," +
+             std::to_string(actual.blue));
+    }
+}
+
+RGBA8Image compactImage(const Image &source) {
+    RGBA8Image compact;
+    compact.width = source.width;
+    compact.height = source.height;
+    compact.data.resize(
+        static_cast<size_t>(source.width) * source.height * 4, 255);
+    for (size_t pixel = 0;
+         pixel < static_cast<size_t>(source.width) * source.height;
+         ++pixel) {
+        for (int channel = 0; channel < 3; ++channel) {
+            compact.data[pixel * 4 + channel] = static_cast<uint8_t>(
+                std::clamp(
+                    std::lround(source.data[pixel * 3 + channel] * 255.0f),
+                    0L, 255L));
+        }
+    }
+    return compact;
+}
+
+void checkCompactParity(const Image &expected, const RGBA8Image &actual,
+                        int tolerance = 1) {
+    CHECK(actual.width == expected.width);
+    CHECK(actual.height == expected.height);
+    CHECK(actual.data.size() ==
+          static_cast<size_t>(actual.width) * actual.height * 4);
+    for (size_t pixel = 0;
+         pixel < static_cast<size_t>(actual.width) * actual.height;
+         ++pixel) {
+        for (int channel = 0; channel < 3; ++channel) {
+            const int expectedByte = static_cast<int>(std::lround(
+                expected.data[pixel * 3 + channel] * 255.0f));
+            const int actualByte = actual.data[pixel * 4 + channel];
+            CHECK(std::abs(expectedByte - actualByte) <= tolerance);
+        }
+        CHECK(actual.data[pixel * 4 + 3] == 255);
     }
 }
 
@@ -296,6 +368,41 @@ void checkIndependentPPMRowOrder(const TempDirectory &temporary) {
     CHECK(decoded.height == 2);
     for (int index = 0; index < 6; ++index) {
         checkPixel(decoded, index % 3, index / 3, gridColors[index]);
+    }
+}
+
+void checkCompactRGBA8Decode(const TempDirectory &temporary) {
+    const fs::path path = temporary.path / "compact-rgba8.ppm";
+    std::array<uint8_t, gridColors.size() * 3> rgb{};
+    for (size_t index = 0; index < gridColors.size(); ++index) {
+        rgb[index * 3 + 0] = gridColors[index].red;
+        rgb[index * 3 + 1] = gridColors[index].green;
+        rgb[index * 3 + 2] = gridColors[index].blue;
+    }
+    {
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        stream << "P6\n3 2\n255\n";
+        stream.write(reinterpret_cast<const char *>(rgb.data()),
+                     static_cast<std::streamsize>(rgb.size()));
+        CHECK(static_cast<bool>(stream));
+    }
+
+    const ImageSourceInfo info = inspectImageSource(path.string());
+    const RGBA8Image compact = imreadRGBA8(
+        path.string(), info, 3, 2, false);
+    const Image floats = imreadRGB(path.string(), info, 3, 2, false);
+    CHECK(compact.width == 3);
+    CHECK(compact.height == 2);
+    CHECK(compact.data.size() == gridColors.size() * 4);
+    for (size_t index = 0; index < gridColors.size(); ++index) {
+        const int x = static_cast<int>(index % 3);
+        const int y = static_cast<int>(index / 3);
+        checkPixel(compact, x, y, gridColors[index], 0);
+        CHECK(alpha8(compact, x, y) == 255);
+        const RGB8 floatPixel = pixel8(floats, x, y);
+        CHECK(floatPixel.red == compact.data[index * 4 + 0]);
+        CHECK(floatPixel.green == compact.data[index * 4 + 1]);
+        CHECK(floatPixel.blue == compact.data[index * 4 + 2]);
     }
 }
 
@@ -564,6 +671,29 @@ Image coordinateImage(int width, int height) {
     return image;
 }
 
+void checkCompactResizeAndUndistortionParity() {
+    const Image source = coordinateImage(9, 9);
+    const RGBA8Image compact = compactImage(source);
+
+    const Image resized = resizeArea(source, 4, 3);
+    const RGBA8Image compactResized = resizeRGBA8Area(compact, 4, 3);
+    checkCompactParity(resized, compactResized);
+
+    const auto undistorted = undistortImage(
+        source, 10.0f, 10.0f, 4.5f, 4.5f,
+        0.04f, -0.005f, 0.002f, -0.003f, 0.0f);
+    const auto compactUndistorted = undistortRGBA8Image(
+        compact, 10.0f, 10.0f, 4.5f, 4.5f,
+        0.04f, -0.005f, 0.002f, -0.003f, 0.0f);
+    CHECK(compactUndistorted.width == undistorted.width);
+    CHECK(compactUndistorted.height == undistorted.height);
+    CHECK(compactUndistorted.fx == undistorted.fx);
+    CHECK(compactUndistorted.fy == undistorted.fy);
+    CHECK(compactUndistorted.cx == undistorted.cx);
+    CHECK(compactUndistorted.cy == undistorted.cy);
+    checkCompactParity(undistorted.image, compactUndistorted.image);
+}
+
 CoverageMask coordinateMask(int width, int height) {
     CoverageMask mask;
     mask.width = width;
@@ -669,10 +799,21 @@ void checkJointUndistortion() {
     const auto result = undistortImageAndCoverageMask(
         image, mask, 10.0f, 10.0f, 6.0f, 4.0f,
         0.08f, -0.01f, 0.002f, -0.003f, 0.0f);
+    const auto compactResult = undistortRGBA8ImageAndCoverageMask(
+        compactImage(image), mask, 10.0f, 10.0f, 6.0f, 4.0f,
+        0.08f, -0.01f, 0.002f, -0.003f, 0.0f);
     CHECK(result.image.width == result.width);
     CHECK(result.image.height == result.height);
     CHECK(result.coverageMask.width == result.width);
     CHECK(result.coverageMask.height == result.height);
+    CHECK(compactResult.width == result.width);
+    CHECK(compactResult.height == result.height);
+    CHECK(compactResult.fx == result.fx);
+    CHECK(compactResult.fy == result.fy);
+    CHECK(compactResult.cx == result.cx);
+    CHECK(compactResult.cy == result.cy);
+    CHECK(compactResult.coverageMask.data == result.coverageMask.data);
+    checkCompactParity(result.image, compactResult.image);
     for (size_t pixel = 0; pixel < result.coverageMask.data.size(); ++pixel) {
         const int imageByte = static_cast<int>(std::lround(
             result.image.data[pixel * 3] * 255.0f));
@@ -861,23 +1002,22 @@ void checkBadInputs(const TempDirectory &temporary) {
 
 void checkImageCacheAccountingCategories() {
     Camera camera;
-    camera.image.data.resize(2 * 3 * 3);
+    camera.image.data.resize(2 * 3 * 4);
     camera.coverageMask.data.resize(2 * 3);
-    Image pyramid;
-    pyramid.data.resize(1 * 2 * 3);
+    RGBA8Image pyramid;
+    pyramid.data.resize(1 * 2 * 4);
     camera.imagePyramids.emplace(2, std::move(pyramid));
     CoverageMask maskPyramid;
     maskPyramid.data.resize(1 * 2);
     camera.coverageMaskPyramids.emplace(2, std::move(maskPyramid));
     camera.mtensorImageCache.emplace(
-        2, MTensor({1, 2, 3}, DType::Float32));
+        2, MTensor({1, 2, 4}, DType::UInt8));
     camera.mtensorCoverageMaskCache.emplace(
         2, MTensor({1, 2}, DType::UInt8));
 
     const size_t expectedCpuBytes =
-        (2 * 3 * 3 + 1 * 2 * 3) * sizeof(float) + 2 * 3 + 1 * 2;
-    const size_t expectedGpuBytes =
-        1 * 2 * 3 * sizeof(float) + 1 * 2;
+        2 * 3 * 4 + 1 * 2 * 4 + 2 * 3 + 1 * 2;
+    const size_t expectedGpuBytes = 1 * 2 * 4 + 1 * 2;
     CHECK(camera.cachedCpuImageBytes() == expectedCpuBytes);
     CHECK(camera.cachedGpuImageBytes() == expectedGpuBytes);
     CHECK(camera.cachedImageBytes() == expectedCpuBytes + expectedGpuBytes);
@@ -889,6 +1029,107 @@ void checkImageCacheAccountingCategories() {
     CHECK(emptyCache.missCount() == 0);
 }
 
+void checkCompactGPUTrainingTargetUpload(const TempDirectory &temporary) {
+    const fs::path path = temporary.path / "compact-target-upload.ppm";
+    std::array<uint8_t, gridColors.size() * 3> rgb{};
+    for (size_t index = 0; index < gridColors.size(); ++index) {
+        rgb[index * 3 + 0] = gridColors[index].red;
+        rgb[index * 3 + 1] = gridColors[index].green;
+        rgb[index * 3 + 2] = gridColors[index].blue;
+    }
+    {
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        stream << "P6\n3 2\n255\n";
+        stream.write(reinterpret_cast<const char *>(rgb.data()),
+                     static_cast<std::streamsize>(rgb.size()));
+        CHECK(static_cast<bool>(stream));
+    }
+
+    const ImageSourceInfo info = inspectImageSource(path.string());
+    const RGBA8Image expected = imreadRGBA8(
+        path.string(), info, 3, 2, false);
+
+    Camera camera;
+    camera.filePath = path.string();
+    camera.width = 3;
+    camera.height = 2;
+    std::vector<Camera> cameras;
+    cameras.push_back(std::move(camera));
+    CameraImageCache cache(1.0f, 1'024);
+
+    const CameraTrainingTarget first =
+        cache.gpuTrainingTarget(cameras, 0, 1);
+    CHECK(first.image != nullptr);
+    CHECK(first.coverageMask == nullptr);
+    CHECK(first.coverageUnits == 3u * 2u * 255u);
+    CHECK(first.image->isGpu());
+    CHECK(first.image->dtype() == DType::UInt8);
+    CHECK(first.image->shape() == std::vector<int64_t>({2, 3, 4}));
+    CHECK(first.image->nbytes() == expected.data.size());
+    CHECK(std::equal(
+        expected.data.begin(), expected.data.end(),
+        first.image->data<uint8_t>()));
+    CHECK(cameras[0].image.empty());
+    CHECK(cameras[0].imagePyramids.empty());
+    CHECK(cache.cachedCpuBytes() == 0);
+    CHECK(cache.cachedGpuBytes() == expected.data.size());
+    CHECK(cache.hitCount() == 0);
+    CHECK(cache.missCount() == 1);
+
+    // A resident compact target must not touch the source file again.
+    CHECK(fs::remove(path));
+    const CameraTrainingTarget second =
+        cache.gpuTrainingTarget(cameras, 0, 1);
+    CHECK(second.image == first.image);
+    CHECK(std::equal(
+        expected.data.begin(), expected.data.end(),
+        second.image->data<uint8_t>()));
+    CHECK(cache.cachedCpuBytes() == 0);
+    CHECK(cache.cachedGpuBytes() == expected.data.size());
+    CHECK(cache.hitCount() == 1);
+    CHECK(cache.missCount() == 1);
+}
+
+void checkCompactTrainingTargetStorageValidation() {
+    auto makeCamera = [](size_t imageBytes) {
+        Camera camera;
+        camera.filePath = "manual-rgba8";
+        camera.width = 2;
+        camera.height = 2;
+        camera.image.width = 2;
+        camera.image.height = 2;
+        camera.image.data.resize(imageBytes, 64);
+        return camera;
+    };
+
+    for (const size_t imageBytes : {size_t{15}, size_t{17}}) {
+        Camera camera = makeCamera(imageBytes);
+        checkThrows<msplat::InvalidDatasetError>(
+            [&] { (void)camera.getGPUTrainingTarget(1); },
+            "Training image storage does not match its dimensions");
+        CHECK(camera.mtensorImageCache.empty());
+        CHECK(camera.mtensorCoverageMaskCache.empty());
+    }
+
+    for (const size_t maskBytes : {size_t{3}, size_t{5}}) {
+        Camera camera = makeCamera(16);
+        camera.trainingMask = TrainingMaskDescriptor{
+            "manual-mask", TrainingMaskChannel::Luminance};
+        camera.coverageMask.width = 2;
+        camera.coverageMask.height = 2;
+        camera.coverageMask.data.resize(maskBytes, 255);
+        // Exercise the upload boundary directly: a manually populated
+        // denominator bypasses getCoverageUnits' normal storage validation.
+        camera.coverageUnitsByDownscale.emplace(1, 4u * 255u);
+
+        checkThrows<msplat::InvalidDatasetError>(
+            [&] { (void)camera.getGPUTrainingTarget(1); },
+            "Training mask storage does not match its dimensions");
+        CHECK(camera.mtensorImageCache.empty());
+        CHECK(camera.mtensorCoverageMaskCache.empty());
+    }
+}
+
 void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
     Camera resident;
     resident.filePath = "unused-on-resident-hit";
@@ -896,13 +1137,15 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
         "unused-mask-on-resident-hit", TrainingMaskChannel::Luminance};
     resident.image.width = 3;
     resident.image.height = 2;
-    resident.image.data.resize(3 * 2 * 3, 0.25f);
+    resident.image.data.resize(3 * 2 * 4, 64);
+    for (size_t pixel = 0; pixel < 3 * 2; ++pixel)
+        resident.image.data[pixel * 4 + 3] = 255;
     resident.coverageMask.width = 3;
     resident.coverageMask.height = 2;
     resident.coverageMask.data = {1, 2, 3, 4, 5, 6};
     resident.loadedImageDownscaleFactor = 1.0f;
     resident.mtensorImageCache.emplace(
-        1, MTensor({2, 3, 3}, DType::Float32));
+        1, MTensor({2, 3, 4}, DType::UInt8));
     resident.mtensorCoverageMaskCache.emplace(
         1, MTensor({2, 3}, DType::UInt8));
 
@@ -912,6 +1155,8 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
     const CameraTrainingTarget target =
         residentCache.gpuTrainingTarget(residentCameras, 0, 1);
     CHECK(target.image != nullptr);
+    CHECK(target.image->dtype() == DType::UInt8);
+    CHECK(target.image->shape() == std::vector<int64_t>({2, 3, 4}));
     CHECK(target.coverageMask != nullptr);
     CHECK(target.coverageMask->dtype() == DType::UInt8);
     CHECK(target.coverageMask->shape() == std::vector<int64_t>({2, 3}));
@@ -921,6 +1166,9 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
     CHECK(residentCache.missCount() == 0);
     CHECK(residentCache.cachedBytes() ==
           residentCameras[0].cachedImageBytes());
+    CHECK(residentCameras[0].image.empty());
+    CHECK(residentCameras[0].coverageMask.empty());
+    CHECK(residentCache.cachedCpuBytes() == 0);
 
     const fs::path imagePath = temporary.path / "cache-rgb.tiff";
     const fs::path maskPath = temporary.path / "cache-mask.tiff";
@@ -936,8 +1184,7 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
         camera.height = 4;
     }
 
-    constexpr size_t oneCameraBytes =
-        4 * 4 * 3 * sizeof(float) + 4 * 4;
+    constexpr size_t oneCameraBytes = 4 * 4 * 4 + 4 * 4;
     CameraImageCache evictionCache(1.0f, oneCameraBytes);
     (void)evictionCache.ensureLoaded(cameras, 0);
     CHECK(!cameras[0].image.empty());
@@ -956,7 +1203,9 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
         "unused-zero-mask", TrainingMaskChannel::Luminance};
     zeroAtCoarse.image.width = 4;
     zeroAtCoarse.image.height = 4;
-    zeroAtCoarse.image.data.resize(4 * 4 * 3, 0.5f);
+    zeroAtCoarse.image.data.resize(4 * 4 * 4, 128);
+    for (size_t pixel = 0; pixel < 4 * 4; ++pixel)
+        zeroAtCoarse.image.data[pixel * 4 + 3] = 255;
     zeroAtCoarse.coverageMask.width = 4;
     zeroAtCoarse.coverageMask.height = 4;
     zeroAtCoarse.coverageMask.data.resize(4 * 4, 0);
@@ -1028,6 +1277,9 @@ int main() {
         checkStage("independent PPM row order", [&] {
             checkIndependentPPMRowOrder(temporary);
         });
+        checkStage("compact RGBA8 decode", [&] {
+            checkCompactRGBA8Decode(temporary);
+        });
         checkStage("PNG write/read round trip", [&] {
             checkPNGWriteReadRoundTrip(temporary);
         });
@@ -1048,6 +1300,9 @@ int main() {
         });
         checkStage("identity undistortion", [&] {
             checkIdentityUndistortion();
+        });
+        checkStage("compact resize and undistortion parity", [&] {
+            checkCompactResizeAndUndistortionParity();
         });
         checkStage("undistortion raster edges", [&] {
             checkUndistortionRasterEdges();
@@ -1072,6 +1327,12 @@ int main() {
         });
         checkStage("image cache accounting categories", [&] {
             checkImageCacheAccountingCategories();
+        });
+        checkStage("compact GPU training-target upload", [&] {
+            checkCompactGPUTrainingTargetUpload(temporary);
+        });
+        checkStage("compact training-target storage validation", [&] {
+            checkCompactTrainingTargetStorageValidation();
         });
         checkStage("masked cache hit and eviction", [&] {
             checkMaskedCacheHitAndEviction(temporary);

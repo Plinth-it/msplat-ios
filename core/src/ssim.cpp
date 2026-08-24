@@ -16,19 +16,37 @@ struct MetricInput {
     int64_t pixels;
     const uint8_t* coverage;
     uint64_t coverageUnits;
+    bool targetIsRGBA8;
 };
+
+float targetChannel(const MTensor& target, const MetricInput& input,
+                    int64_t pixel, int channel) {
+    if (input.targetIsRGBA8) {
+        return target.data<uint8_t>()[pixel * 4 + channel] /
+            255.0f;
+    }
+    return target.data<float>()[pixel * 3 + channel];
+}
 
 MetricInput validateMetricInput(const MTensor& rendered, const MTensor& gt,
                                 const MTensor* coverageMask,
                                 uint64_t suppliedCoverageUnits) {
     if (!rendered.defined() || !gt.defined())
         throw std::invalid_argument("Metric images must be defined");
-    if (rendered.dtype() != DType::Float32 || gt.dtype() != DType::Float32)
-        throw std::invalid_argument("Metric images must use float32");
-    if (rendered.shape() != gt.shape() || rendered.ndim() != 3 ||
+    if (rendered.dtype() != DType::Float32 || rendered.ndim() != 3 ||
         rendered.size(2) != 3) {
         throw std::invalid_argument(
-            "Metric images must have matching (height, width, 3) shapes");
+            "Rendered metric image must use float32 RGB");
+    }
+    const bool targetShapeMatches = gt.ndim() == 3 &&
+        gt.size(0) == rendered.size(0) && gt.size(1) == rendered.size(1);
+    const bool targetIsRGBA8 = targetShapeMatches &&
+        gt.dtype() == DType::UInt8 && gt.size(2) == 4;
+    const bool targetIsFloatRGB = targetShapeMatches &&
+        gt.dtype() == DType::Float32 && gt.size(2) == 3;
+    if (!targetIsRGBA8 && !targetIsFloatRGB) {
+        throw std::invalid_argument(
+            "Metric target must be matching float32 RGB or uint8 RGBA");
     }
 
     const int64_t height64 = rendered.size(0);
@@ -47,7 +65,7 @@ MetricInput validateMetricInput(const MTensor& rendered, const MTensor& gt,
 
     MetricInput input{
         static_cast<int>(height64), static_cast<int>(width64), 3, pixels,
-        nullptr, static_cast<uint64_t>(pixels) * 255u};
+        nullptr, static_cast<uint64_t>(pixels) * 255u, targetIsRGBA8};
     if (!coverageMask) {
         if (suppliedCoverageUnits != 0 &&
             suppliedCoverageUnits != input.coverageUnits) {
@@ -86,27 +104,23 @@ float psnr(const MTensor& rendered, const MTensor& gt,
     const MetricInput input = validateMetricInput(
         rendered, gt, coverageMask, coverageUnits);
     const float* renderedData = rendered.data<float>();
-    const float* gtData = gt.data<float>();
 
     double mse = 0.0;
-    if (!input.coverage) {
-        const int64_t elements = rendered.numel();
-        for (int64_t index = 0; index < elements; ++index) {
-            const double difference = renderedData[index] - gtData[index];
-            mse += difference * difference;
+    for (int64_t pixel = 0; pixel < input.pixels; ++pixel) {
+        const double coverage = input.coverage
+            ? input.coverage[pixel]
+            : 1.0;
+        for (int channel = 0; channel < input.channels; ++channel) {
+            const int64_t index = pixel * input.channels + channel;
+            const double difference = renderedData[index] -
+                targetChannel(gt, input, pixel, channel);
+            mse += coverage * difference * difference;
         }
-        mse /= static_cast<double>(elements);
-    } else {
-        for (int64_t pixel = 0; pixel < input.pixels; ++pixel) {
-            const double coverage = input.coverage[pixel];
-            for (int channel = 0; channel < input.channels; ++channel) {
-                const int64_t index = pixel * input.channels + channel;
-                const double difference = renderedData[index] - gtData[index];
-                mse += coverage * difference * difference;
-            }
-        }
-        mse /= static_cast<double>(input.coverageUnits) * input.channels;
     }
+    const double denominator = input.coverage
+        ? static_cast<double>(input.coverageUnits) * input.channels
+        : static_cast<double>(input.pixels) * input.channels;
+    mse /= denominator;
     return 10.0f * std::log10(1.0 / mse);
 }
 
@@ -115,26 +129,23 @@ float l1_loss(const MTensor& rendered, const MTensor& gt,
     const MetricInput input = validateMetricInput(
         rendered, gt, coverageMask, coverageUnits);
     const float* renderedData = rendered.data<float>();
-    const float* gtData = gt.data<float>();
 
     double sum = 0.0;
-    if (!input.coverage) {
-        const int64_t elements = rendered.numel();
-        for (int64_t index = 0; index < elements; ++index)
-            sum += std::abs(renderedData[index] - gtData[index]);
-        return static_cast<float>(sum / static_cast<double>(elements));
-    }
-
     for (int64_t pixel = 0; pixel < input.pixels; ++pixel) {
-        const double coverage = input.coverage[pixel];
+        const double coverage = input.coverage
+            ? input.coverage[pixel]
+            : 1.0;
         for (int channel = 0; channel < input.channels; ++channel) {
             const int64_t index = pixel * input.channels + channel;
             sum += coverage *
-                std::abs(renderedData[index] - gtData[index]);
+                std::abs(renderedData[index] -
+                         targetChannel(gt, input, pixel, channel));
         }
     }
-    return static_cast<float>(
-        sum / (static_cast<double>(input.coverageUnits) * input.channels));
+    const double denominator = input.coverage
+        ? static_cast<double>(input.coverageUnits) * input.channels
+        : static_cast<double>(input.pixels) * input.channels;
+    return static_cast<float>(sum / denominator);
 }
 
 std::vector<float> createSSIMWindow(int windowSize, float sigma) {
@@ -218,7 +229,6 @@ float ssim_eval(const MTensor& rendered, const MTensor& gt,
     for (int i = 0; i < windowSize; i++) kernel[i] /= ksum;
 
     const float* r = rendered.data<float>();
-    const float* g = gt.data<float>();
 
     // Scratch buffers
     std::vector<float> r_ch(HW), g_ch(HW), rr(HW), gg(HW), rg(HW);
@@ -234,7 +244,7 @@ float ssim_eval(const MTensor& rendered, const MTensor& gt,
         // Extract channel (HWC → planar)
         for (int i = 0; i < HW; i++) {
             r_ch[i] = r[i * C + c];
-            g_ch[i] = g[i * C + c];
+            g_ch[i] = targetChannel(gt, input, i, c);
             rr[i] = r_ch[i] * r_ch[i];
             gg[i] = g_ch[i] * g_ch[i];
             rg[i] = r_ch[i] * g_ch[i];

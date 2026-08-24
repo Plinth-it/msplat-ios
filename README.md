@@ -39,8 +39,11 @@ canonical, caller-owned dataset directly through a checked deep-copy boundary.
   and the final pass overwrites rendered RGB with its gradient. This removes
   36 bytes per pixel from the training cache (23.73 MiB at 960×720) without
   reducing numerical precision.
-- Training images were all decoded up front. A byte-budgeted LRU holds what fits
-  and reloads the rest.
+- Training images were all decoded up front as CPU and GPU Float32 RGB copies.
+  A byte-budgeted LRU now retains one tightly packed UInt8 RGBA GPU target per
+  resident camera, releases decoded CPU pixels after upload, and reloads only
+  on an eviction or resolution-stage transition. Loss kernels convert the RGB
+  bytes to float during their existing tile loads.
 - `maxGaussians` bounds the active population and its backing buffers. When a
   densification step has more eligible candidates than remaining capacity, the
   highest normalized-gradient candidates are retained; pruning still runs at
@@ -97,6 +100,9 @@ coordinates with EXIF reorientation disabled. Its adapter therefore validates
 EXIF orientation but deliberately preserves the raw pixel frame; applying a
 display transform without updating intrinsics and poses would corrupt the
 calibration. ImageIO converts decoded thumbnails into an explicit sRGB canvas.
+Training retains those encoded numerical values as RGBA8 and normalizes them
+manually; it does not use an sRGB texture conversion that would change the loss
+space.
 The canonical dataset descriptor records that pixel-frame choice explicitly;
 existing file adapters use encoded pixels, while calibration-aware native
 adapters can opt into tested EXIF-normalized materialization. Low-level decode
@@ -151,7 +157,8 @@ poses.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
-  explicit sRGB conversion, and raw-coordinate EXIF handling for COLMAP
+  explicit sRGB conversion, compact RGBA8 training storage, and raw-coordinate
+  EXIF handling for COLMAP
 - A validated canonical descriptor shared by the COLMAP, Nerfstudio, and
   Polycam adapters, preserving source frame/calibration identity, sparse-point
   IDs, reprojection errors, image observations, and adapter provenance; COLMAP
@@ -384,6 +391,10 @@ Backward:
   sh_opacity_backward_adam   register SH VJP + SH/opacity Adam update
   project_backward_adam      register geometry VJP + Adam + densify stats
 ```
+
+The loss target entering `ssim_h_fwd` is a tightly packed UInt8 RGBA buffer;
+only RGB is sampled and converted with `byte / 255`. Training-mask coverage and
+transparent alpha supervision remain in the separate UInt8 mask.
 
 Upstream's [README](https://github.com/rayanht/msplat) covers the design behind
 this and carries M4 Max benchmarks against gsplat. This fork has not re-run
