@@ -1021,7 +1021,7 @@ inline float warpSum(float val, const int warp_size, const uint lane) {
 kernel void rasterize_backward_kernel(
     constant uint3& tile_bounds,
     constant uint2& img_size,
-    constant int32_t* gaussian_ids_sorted,
+    constant uint64_t* sorted_keys,
     constant int* tile_bins, // int2
     constant float* packed_xy_opac, // float3: (x, y, sigmoid(opacity))
     constant float* packed_conic,   // float3
@@ -1119,7 +1119,7 @@ kernel void rasterize_backward_kernel(
         int batch_size = min(RAST_BLOCK_SIZE, batch_end + 1 - range.x);
         const int idx = batch_end - tr;
         if (idx >= range.x) {
-            id_batch[tr] = gaussian_ids_sorted[idx];
+            id_batch[tr] = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
             // Sequential reads from packed sorted-order buffers
             xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
             conic_batch[tr] = read_packed_float3(packed_conic, idx);
@@ -1755,7 +1755,6 @@ kernel void project_gaussians_backward_kernel(
     constant int* radii,
     constant float* conics, // float3
     constant float* v_xy, // float2
-    constant float* v_depth,
     constant float* v_conic, // float3
     device float* v_cov2d, // float3
     device float* v_cov3d,
@@ -1774,15 +1773,6 @@ kernel void project_gaussians_backward_kernel(
     write_packed_float3(
         v_mean3d, idx, 
         project_pix_vjp(projmat, p_world, img_size, read_packed_float2(v_xy, idx))
-    );
-
-    // get z gradient contribution to mean3d gradient
-    // z = viemwat[8] * mean3d.x + viewmat[9] * mean3d.y + viewmat[10] *
-    // mean3d.z + viewmat[11]
-    float v_z = v_depth[idx];
-    write_packed_float3(
-        v_mean3d, idx, 
-        read_packed_float3(v_mean3d, idx) + float3(viewmat[8], viewmat[9], viewmat[10]) * v_z
     );
 
     // get v_cov2d
@@ -2216,7 +2206,6 @@ kernel void project_and_sh_backward_kernel(
     constant int* radii,
     constant float* conics,
     constant float* v_xy,
-    constant float* v_depth,
     constant float* v_conic,
     device float* v_mean3d,
     device float* v_scale,
@@ -2264,7 +2253,6 @@ kernel void project_and_sh_backward_kernel(
     if (pose_enabled != 0) {
         pose_v_p_view = project_view_pix_vjp(
             p_view, fx, fy, read_packed_float2(v_xy, idx));
-        pose_v_p_view.z += v_depth[idx];
     } else {
         // Preserve the canonical projection VJP arithmetic exactly when pose
         // refinement is disabled.
@@ -2272,11 +2260,6 @@ kernel void project_and_sh_backward_kernel(
             v_mean3d, idx,
             project_pix_vjp(
                 projmat, p_world, img_size, read_packed_float2(v_xy, idx))
-        );
-        write_packed_float3(
-            v_mean3d, idx,
-            read_packed_float3(v_mean3d, idx) +
-                float3(viewmat[8], viewmat[9], viewmat[10]) * v_depth[idx]
         );
     }
 
@@ -2488,10 +2471,13 @@ kernel void scatter_to_exact_bins_kernel(
     device uint64_t* keys_out               [[buffer(8)]],
     constant uint& capacity                 [[buffer(9)]],
     device atomic_uint* overflow_flag       [[buffer(10)]],
+    constant float* opacities               [[buffer(11)]],
+    device float* projected_opacities       [[buffer(12)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= num_points || radii[idx] <= 0) return;
 
+    projected_opacities[idx] = 1.f / (1.f + exp(-opacities[idx]));
     const float2 center = read_packed_float2(xys, idx);
     uint2 tile_min, tile_max;
     get_tile_bbox(
@@ -2702,29 +2688,27 @@ kernel void radix_sort_per_tile_kernel(
     }
 }
 
-// Extract Gaussian IDs from the sorted depth keys and pack the fields consumed
-// by both forward and backward rasterization. `exact_count` is the checked final
-// CPU prefix, not the allocated arena capacity.
+// Pack the fields consumed by forward and backward rasterization. Backward
+// extracts Gaussian IDs directly from the sorted keys. `exact_count` is the
+// checked final CPU prefix, not the allocated arena capacity.
 kernel void pack_sorted_gaussians_kernel(
     constant uint64_t* sorted_keys    [[buffer(0)]],
     constant float* xys               [[buffer(1)]],
     constant float* conics            [[buffer(2)]],
     constant float* colors            [[buffer(3)]],
-    constant float* opacities         [[buffer(4)]],
-    device int32_t* gaussian_ids      [[buffer(5)]],
-    device float* packed_xy_opac      [[buffer(6)]],
-    device float* packed_conic        [[buffer(7)]],
-    device float* packed_rgb          [[buffer(8)]],
-    constant uint& exact_count        [[buffer(9)]],
+    constant float* projected_opacities [[buffer(4)]],
+    device float* packed_xy_opac      [[buffer(5)]],
+    device float* packed_conic        [[buffer(6)]],
+    device float* packed_rgb          [[buffer(7)]],
+    constant uint& exact_count        [[buffer(8)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= exact_count) return;
     const int32_t gaussian_id = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
-    gaussian_ids[idx] = gaussian_id;
     const float2 xy = read_packed_float2(xys, gaussian_id);
-    const float opacity = 1.f / (1.f + exp(-opacities[gaussian_id]));
     write_packed_float3(
-        packed_xy_opac, idx, float3(xy.x, xy.y, opacity));
+        packed_xy_opac, idx,
+        float3(xy.x, xy.y, projected_opacities[gaussian_id]));
     write_packed_float3(
         packed_conic, idx, read_packed_float3(conics, gaussian_id));
     write_packed_float3(
@@ -3438,7 +3422,7 @@ kernel void compute_chunk_prefix_suffix_kernel(
 kernel void rasterize_backward_chunked_kernel(
     constant uint3& tile_bounds,
     constant uint2& img_size,
-    constant int32_t* gaussian_ids_sorted,
+    constant uint64_t* sorted_keys,
     constant int* tile_bins,
     constant float* packed_xy_opac,
     constant float* packed_conic,
@@ -3546,7 +3530,7 @@ kernel void rasterize_backward_chunked_kernel(
         int batch_size = min(RAST_BLOCK_SIZE, batch_end + 1 - chunk_start);
         const int idx = batch_end - tr;
         if (idx >= chunk_start) {
-            id_batch[tr] = gaussian_ids_sorted[idx];
+            id_batch[tr] = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
             xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
             conic_batch[tr] = read_packed_float3(packed_conic, idx);
             rgbs_batch[tr] = read_packed_float3(packed_rgb, idx);

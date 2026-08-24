@@ -22,7 +22,7 @@
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
-static_assert(MSPLAT_ABI_VERSION == 11u);
+static_assert(MSPLAT_ABI_VERSION == 12u);
 static_assert(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS == (1u << 0));
 static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS == (1u << 1));
 static_assert((MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS &
@@ -57,6 +57,21 @@ static_assert(offsetof(MsplatTrainingMetrics, submitted) == 8);
 static_assert(offsetof(MsplatTrainingMetrics, completed) == 40);
 static_assert(offsetof(MsplatTrainingMetrics, overflowedCompletedSteps) == 104);
 static_assert(offsetof(MsplatTrainingMetrics, lastFailedIteration) == 132);
+static_assert(std::is_standard_layout<MsplatCompletedTrainingStepV12>::value);
+static_assert(sizeof(MsplatCompletedTrainingStepV12) == 112);
+static_assert(alignof(MsplatCompletedTrainingStepV12) == 8);
+static_assert(offsetof(MsplatCompletedTrainingStepV12, imagePrepareMs) == 64);
+static_assert(offsetof(MsplatCompletedTrainingStepV12, countGpuMs) == 68);
+static_assert(offsetof(MsplatCompletedTrainingStepV12, maximumTileCount) == 84);
+static_assert(offsetof(MsplatCompletedTrainingStepV12, largeTileCount) == 104);
+static_assert(offsetof(MsplatCompletedTrainingStepV12, reservedV12) == 108);
+static_assert(std::is_standard_layout<MsplatTrainingMetricsV12>::value);
+static_assert(sizeof(MsplatTrainingMetricsV12) == 184);
+static_assert(alignof(MsplatTrainingMetricsV12) == 8);
+static_assert(offsetof(MsplatTrainingMetricsV12, submitted) == 8);
+static_assert(offsetof(MsplatTrainingMetricsV12, completed) == 40);
+static_assert(offsetof(MsplatTrainingMetricsV12, overflowedCompletedSteps) == 152);
+static_assert(offsetof(MsplatTrainingMetricsV12, lastFailedIteration) == 180);
 static_assert(sizeof(MsplatTrainingMemoryMetrics) == 96);
 static_assert(alignof(MsplatTrainingMemoryMetrics) == 8);
 static_assert(offsetof(MsplatTrainingMemoryMetrics, trainerModelBufferBytes) == 8);
@@ -1170,6 +1185,31 @@ int main() {
                       sizeof(trainingMetrics)) == 0);
     status = msplat_trainer_metrics_v4(
         nullptr, nullptr, sizeof(trainingMetrics), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+
+    MsplatTrainingMetricsV12 trainingMetricsV12;
+    std::memset(&trainingMetricsV12, 0x5a, sizeof(trainingMetricsV12));
+    status = msplat_trainer_metrics_v12(
+        nullptr, &trainingMetricsV12, sizeof(trainingMetricsV12), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    MsplatTrainingMetricsV12 zeroTrainingMetricsV12{};
+    CHECK(std::memcmp(&trainingMetricsV12, &zeroTrainingMetricsV12,
+                      sizeof(trainingMetricsV12)) == 0);
+
+    std::memset(&trainingMetricsV12, 0x5a, sizeof(trainingMetricsV12));
+    MsplatTrainingMetricsV12 unchangedTrainingMetricsV12 = trainingMetricsV12;
+    status = msplat_trainer_metrics_v12(
+        nullptr, &trainingMetricsV12, sizeof(trainingMetricsV12) - 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&trainingMetricsV12, &unchangedTrainingMetricsV12,
+                      sizeof(trainingMetricsV12)) == 0);
+    status = msplat_trainer_metrics_v12(
+        nullptr, &trainingMetricsV12, sizeof(trainingMetricsV12) + 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&trainingMetricsV12, &unchangedTrainingMetricsV12,
+                      sizeof(trainingMetricsV12)) == 0);
+    status = msplat_trainer_metrics_v12(
+        nullptr, nullptr, sizeof(trainingMetricsV12), &error);
     CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
 
     MsplatTrainingMemoryMetrics memoryMetrics;

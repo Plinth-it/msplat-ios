@@ -35,6 +35,12 @@ endforeach()
 
 require_contains("${metal_source}" "device atomic_uint* tile_counts"
     "atomic projection counts")
+require_contains("${metal_source}"
+    "device float* projected_opacities       [[buffer(12)]]"
+    "per-Gaussian projected opacity output")
+require_contains("${metal_source}"
+    "projected_opacities[idx] = 1.f / (1.f + exp(-opacities[idx]));"
+    "one sigmoid evaluation per visible Gaussian")
 require_contains("${metal_source}" "EXACT_BITONIC_FAST_PATH 2048"
     "exact-range bitonic fast path")
 require_contains("${metal_source}" "for (uint pass = 0; pass < 8; ++pass)"
@@ -45,9 +51,32 @@ require_contains("${metal_source}" "(uint64_t)end_i > (uint64_t)capacity"
     "radix arena bounds check")
 require_contains("${metal_source}" "constant uint& exact_count"
     "packing uses the exact live count")
+require_contains("${metal_source}"
+    "float3(xy.x, xy.y, projected_opacities[gaussian_id])"
+    "packing reuses projected opacity")
+string(REGEX MATCHALL
+    "constant uint64_t\\* sorted_keys" backward_key_inputs "${metal_source}")
+list(LENGTH backward_key_inputs backward_key_input_count)
+if(NOT backward_key_input_count EQUAL 3)
+    message(FATAL_ERROR
+        "Expected sorted-key inputs for packing and both backward paths, found ${backward_key_input_count}")
+endif()
+string(REGEX MATCHALL
+    "id_batch\\[tr\\] = \\(int32_t\\)\\(sorted_keys\\[idx\\] & 0xFFFFFFFFu\\)"
+    backward_id_extracts "${metal_source}")
+list(LENGTH backward_id_extracts backward_id_extract_count)
+if(NOT backward_id_extract_count EQUAL 2)
+    message(FATAL_ERROR
+        "Expected two backward Gaussian-ID key extracts, found ${backward_id_extract_count}")
+endif()
 require_contains("${host_source}"
     "ENC_BUF(enc, g_tcache.tile_scatter_counters, 15)"
     "projection count binding")
+require_contains("${host_source}" "ENC_BUF(enc, projected_opacities, 12)"
+    "projected opacity binding")
+require_contains("${host_source}"
+    "ENC_BUF(enc, g_tcache.intersection_keys_a, 2);"
+    "backward sorted-key binding")
 require_contains("${host_source}" "ENC_SCALAR(enc, capacity_u32, 5)"
     "radix capacity binding")
 require_contains("${host_source}"
@@ -65,3 +94,11 @@ foreach(legacy_token IN ITEMS
     require_absent("${metal_source}" "${legacy_token}" "${legacy_token} in Metal")
     require_absent("${host_source}" "${legacy_token}" "${legacy_token} in host")
 endforeach()
+
+require_absent("${host_source}" "MTensor gaussian_ids;"
+    "redundant Gaussian-ID arena")
+require_absent("${host_source}" "ENC_BUF(enc, gaussian_ids"
+    "redundant Gaussian-ID binding")
+require_absent("${metal_source}"
+    "const float opacity = 1.f / (1.f + exp(-opacities[gaussian_id]));"
+    "per-intersection opacity sigmoid")

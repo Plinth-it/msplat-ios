@@ -56,6 +56,13 @@
   gain refinement so synthetic-background pixels cannot dominate those gains.
   Chunked raster backward now keeps every pixel alive through cooperative
   threadgroup barriers, so dense tiles propagate gradients through all chunks.
+- Added ABI v12 completed-step telemetry for image preparation, exact-count GPU
+  duration and wall wait, post-count encoding, arena growth, and tile-density
+  buckets. The ABI v4 telemetry structure and query remain byte-for-byte stable.
+- Removed the unused depth cotangent from RGB training, computed projected
+  opacity once per visible Gaussian, and recovered backward Gaussian IDs directly
+  from sorted keys. Exact-intersection storage drops from 56 to 52 bytes per
+  entry without changing raster output or the training objective.
 - Corrected the image-edge versus array-index conversion in Brown-Conrady
   rectification, including alpha=0 crop endpoints and paired mask sampling.
   The renderer now uses an exact homogeneous divide, propagates the missing
@@ -68,7 +75,7 @@
   grows compact arenas, and exact-range bitonic/radix sorting preserves every
   intersection. Allocation, native-index, and the explicit 65,536-per-tile
   work-limit failures now abort before rasterization or Adam; the planner models
-  the 56-byte exact arena without treating its estimate as a correctness cap.
+  the 52-byte exact arena without treating its estimate as a correctness cap.
 - Enforced the Gaussian ceiling during initialization, densification, PLY
   import, and checkpoint restore. Capacity-constrained densification keeps the
   highest normalized-gradient candidates, and `--max-gaussians` exposes the

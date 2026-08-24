@@ -11,6 +11,8 @@ int main() {
         nullptr, nullptr, 0);
     CHECK(noTiles.totalCount == 0);
     CHECK(noTiles.maximumTileCount == 0);
+    CHECK(noTiles.activeTileCount == 0);
+    CHECK(noTiles.trivialTileCount == 0);
 
     const uint32_t zeroCount[] = {0};
     int32_t zeroOffset[] = {-1};
@@ -18,6 +20,8 @@ int main() {
         zeroCount, zeroOffset, 1);
     CHECK(zero.totalCount == 0);
     CHECK(zero.maximumTileCount == 0);
+    CHECK(zero.activeTileCount == 0);
+    CHECK(zero.trivialTileCount == 1);
     CHECK(zeroOffset[0] == 0);
 
     const uint32_t counts[] = {0, 3, 1, 0, 4};
@@ -26,6 +30,11 @@ int main() {
     CHECK(layout.totalCount == 8);
     CHECK(layout.maximumTileCount == 4);
     CHECK(layout.maximumTileIndex == 4);
+    CHECK(layout.activeTileCount == 3);
+    CHECK(layout.trivialTileCount == 3);
+    CHECK(layout.smallTileCount == 2);
+    CHECK(layout.mediumTileCount == 0);
+    CHECK(layout.largeTileCount == 0);
     CHECK(offsets[0] == 0);
     CHECK(offsets[1] == 3);
     CHECK(offsets[2] == 4);
@@ -38,6 +47,8 @@ int main() {
         emptyCounts, emptyOffsets, 2);
     CHECK(empty.totalCount == 0);
     CHECK(empty.maximumTileCount == 0);
+    CHECK(empty.activeTileCount == 0);
+    CHECK(empty.trivialTileCount == 2);
     CHECK(emptyOffsets[0] == 0);
     CHECK(emptyOffsets[1] == 0);
 
@@ -49,6 +60,17 @@ int main() {
     CHECK(denseSingleTile.maximumTileCount == 4'097);
     CHECK(denseSingleTileOffset[0] == 4'097);
     msplat::validateTileIntersectionWorkLimit(denseSingleTile);
+    CHECK(denseSingleTile.largeTileCount == 1);
+
+    const uint32_t bucketBoundaryCounts[] = {1, 2, 32, 33, 2'048, 2'049};
+    int32_t bucketBoundaryOffsets[6] = {};
+    const auto bucketBoundaries = msplat::buildTileIntersectionLayout(
+        bucketBoundaryCounts, bucketBoundaryOffsets, 6);
+    CHECK(bucketBoundaries.activeTileCount == 6);
+    CHECK(bucketBoundaries.trivialTileCount == 1);
+    CHECK(bucketBoundaries.smallTileCount == 2);
+    CHECK(bucketBoundaries.mediumTileCount == 2);
+    CHECK(bucketBoundaries.largeTileCount == 1);
 
     const msplat::TileIntersectionLayout workLimitBoundary{
         65'536, 65'536, 0};
@@ -115,7 +137,7 @@ int main() {
     }
     CHECK(arenaOverflowRejected);
 
-    CHECK(msplat::kExactIntersectionBytesPerEntry == 56);
+    CHECK(msplat::kExactIntersectionBytesPerEntry == 52);
     CHECK(msplat::kExactTileMetadataBytes == 16);
     CHECK(msplat::tileRasterChunkCount(1, 0) == 1);
     CHECK(msplat::tileRasterChunkCount(1, 1) == 1);

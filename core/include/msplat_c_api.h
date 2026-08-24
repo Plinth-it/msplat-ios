@@ -28,8 +28,10 @@ extern "C" {
 // COLMAP loading without changing any existing structure or symbol.
 // ABI v11 adds versioned training-mask treatment options without changing
 // MsplatConfig or the existing coverage-mask behavior.
+// ABI v12 adds detailed count-barrier and tile-distribution telemetry through
+// a new query structure without changing the ABI v4 telemetry layout.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 11u
+#define MSPLAT_ABI_VERSION 12u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -175,13 +177,15 @@ typedef struct {
     float msPerStep; // CPU encode + command submission time; not completed GPU time.
 } MsplatStats;
 
-// Flags for MsplatTrainingMetrics.flags.
+// Flags shared by the v4 and v12 training-metrics snapshots. The count-GPU
+// timing flag is emitted only by the v12 query.
 #define MSPLAT_TRAINING_METRICS_HAS_SUBMITTED_STEP (1u << 0)
 #define MSPLAT_TRAINING_METRICS_HAS_COMPLETED_STEP (1u << 1)
 #define MSPLAT_TRAINING_METRICS_GPU_TIME_VALID     (1u << 2)
 #define MSPLAT_TRAINING_METRICS_LOSS_VALID         (1u << 3)
 #define MSPLAT_TRAINING_METRICS_INTERSECTIONS_VALID (1u << 4)
 #define MSPLAT_TRAINING_METRICS_HAS_FAILED_STEP    (1u << 5)
+#define MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID (1u << 6)
 
 // Bit values for MsplatCompletedTrainingStep.overflowKinds.
 #define MSPLAT_RASTER_OVERFLOW_TILE_CAP        (1u << 0)
@@ -231,6 +235,50 @@ typedef struct {
     int32_t lastOverflowIteration;
     int32_t lastFailedIteration;
 } MsplatTrainingMetrics;
+
+/// ABI v12 completed-step telemetry. The first 64 bytes intentionally match
+/// MsplatCompletedTrainingStep exactly; new fields are appended only here.
+typedef struct {
+    int32_t iteration;
+    int32_t splatCount;
+    int32_t modelCapacity;
+    int32_t effectiveWidth;
+    int32_t effectiveHeight;
+    int32_t activeSHDegree;
+    float cpuSubmitMs;
+    float gpuExecutionMs;
+    float endToEndMs;
+    float loss;
+    uint32_t overflowKinds;
+    uint32_t reserved;
+    uint64_t retainedPackedIntersectionCount;
+    uint64_t packedIntersectionCapacity;
+    float imagePrepareMs;
+    float countGpuMs;
+    float countWaitWallMs;
+    float postCountEncodeMs;
+    float intersectionArenaGrowMs;
+    uint32_t maximumTileCount;
+    uint32_t activeTileCount;
+    uint32_t trivialTileCount;
+    uint32_t smallTileCount;
+    uint32_t mediumTileCount;
+    uint32_t largeTileCount;
+    uint32_t reservedV12;
+} MsplatCompletedTrainingStepV12;
+
+/// ABI v12 query snapshot. The v4 query remains available for existing clients.
+typedef struct {
+    uint32_t flags;
+    uint32_t reserved;
+    MsplatSubmittedTrainingStep submitted;
+    MsplatCompletedTrainingStepV12 completed;
+    uint64_t overflowedCompletedSteps;
+    uint64_t tileCapOverflowedSteps;
+    uint64_t packedCapacityOverflowedSteps;
+    int32_t lastOverflowIteration;
+    int32_t lastFailedIteration;
+} MsplatTrainingMetricsV12;
 
 // Flags for MsplatTrainingMemoryMetrics.flags.
 #define MSPLAT_MEMORY_METRICS_PHYS_FOOTPRINT_VALID (1u << 0)
@@ -589,11 +637,14 @@ MsplatStatus msplat_trainer_splat_count_v2(MsplatTrainer t, int* outCount,
                                            MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_iteration_v2(MsplatTrainer t, int* outIteration,
                                          MsplatErrorInfo* error);
-// ABI v4 query APIs. outputSize must exactly match the corresponding struct.
+// Versioned query APIs. outputSize must exactly match the corresponding struct.
 // A size mismatch leaves the output untouched. With a correct size, failures
 // zero the output before returning an error status.
 MsplatStatus msplat_trainer_metrics_v4(
     MsplatTrainer t, MsplatTrainingMetrics* outMetrics, size_t outputSize,
+    MsplatErrorInfo* error);
+MsplatStatus msplat_trainer_metrics_v12(
+    MsplatTrainer t, MsplatTrainingMetricsV12* outMetrics, size_t outputSize,
     MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_memory_metrics_v4(
     MsplatTrainer t, MsplatTrainingMemoryMetrics* outMetrics,

@@ -73,6 +73,12 @@ double elapsedMilliseconds(TelemetryClock::time_point start,
     return std::chrono::duration<double, std::milli>(end - start).count();
 }
 
+struct SynchronousGpuMetrics {
+    double waitWallMs = 0.0;
+    double gpuExecutionMs = 0.0;
+    bool gpuTimingValid = false;
+};
+
 } // namespace
 
 struct MsplatTrainingTelemetryState {
@@ -145,7 +151,8 @@ struct MsplatTrainingTelemetryState {
     void publishCompleted(uint64_t stepGeneration,
                           const MsplatCompletedTrainingStepMetrics& completed,
                           bool gpuTimingValid, bool lossValid,
-                          bool intersectionCountValid) noexcept {
+                          bool intersectionCountValid,
+                          bool countGpuTimingValid) noexcept {
         try {
             std::lock_guard<std::mutex> lock(mutex);
             if (stepGeneration != generation) return;
@@ -175,7 +182,8 @@ struct MsplatTrainingTelemetryState {
             snapshot.flags &= ~(
                 MSPLAT_TRAINING_TELEMETRY_GPU_TIMING_VALID |
                 MSPLAT_TRAINING_TELEMETRY_LOSS_VALID |
-                MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID);
+                MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID |
+                MSPLAT_TRAINING_TELEMETRY_COUNT_GPU_TIMING_VALID);
             if (gpuTimingValid)
                 snapshot.flags |= MSPLAT_TRAINING_TELEMETRY_GPU_TIMING_VALID;
             if (lossValid)
@@ -183,6 +191,10 @@ struct MsplatTrainingTelemetryState {
             if (intersectionCountValid) {
                 snapshot.flags |=
                     MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID;
+            }
+            if (countGpuTimingValid) {
+                snapshot.flags |=
+                    MSPLAT_TRAINING_TELEMETRY_COUNT_GPU_TIMING_VALID;
             }
             snapshot.completedStep = completed;
         } catch (...) {
@@ -219,10 +231,11 @@ struct MsplatLogicalTrainingStep {
     MsplatLogicalTrainingStep(MsplatTrainingTelemetryHandle telemetryState,
                               uint64_t stepGeneration, int64_t stepIteration,
                               TelemetryClock::time_point stepWallStart,
+                              TelemetryClock::time_point imagePrepareStart,
                               MTensor stepReadback)
         : telemetry(std::move(telemetryState)),
           generation(stepGeneration), iteration(stepIteration),
-          wallStart(stepWallStart),
+          wallStart(stepWallStart), imagePrepareStart(imagePrepareStart),
           readback(std::move(stepReadback)) {}
 
     MTensor& readbackBuffer() { return readback; }
@@ -232,7 +245,37 @@ struct MsplatLogicalTrainingStep {
         if (sealed || aborted)
             throw std::logic_error("Training telemetry step is no longer active");
         cpuStart = TelemetryClock::now();
+        imagePrepareMs = elapsedMilliseconds(imagePrepareStart, cpuStart);
         cpuStarted = true;
+    }
+
+    void recordExactCountPass(const SynchronousGpuMetrics& metrics) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (sealed || aborted) return;
+        countWaitWallMs = metrics.waitWallMs;
+        countGpuMs = metrics.gpuTimingValid ? metrics.gpuExecutionMs : 0.0;
+        countGpuTimingValid = metrics.gpuTimingValid;
+    }
+
+    void recordIntersectionLayout(
+        const msplat::TileIntersectionLayout& layout,
+        double arenaGrowDurationMs) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (sealed || aborted) return;
+        intersectionArenaGrowMs = arenaGrowDurationMs;
+        maximumTileCount = layout.maximumTileCount;
+        activeTileCount = layout.activeTileCount;
+        trivialTileCount = layout.trivialTileCount;
+        smallTileCount = layout.smallTileCount;
+        mediumTileCount = layout.mediumTileCount;
+        largeTileCount = layout.largeTileCount;
+    }
+
+    void recordPostCountEncode(TelemetryClock::time_point encodeStart,
+                               TelemetryClock::time_point encodeEnd) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (sealed || aborted) return;
+        postCountEncodeMs = elapsedMilliseconds(encodeStart, encodeEnd);
     }
 
     void validateForSubmit(
@@ -352,6 +395,17 @@ private:
             completed.commandBufferCount = commandBufferCount;
             completed.packedIntersectionCapacity =
                 packedIntersectionCapacity;
+            completed.imagePrepareMs = imagePrepareMs;
+            completed.countGpuMs = countGpuMs;
+            completed.countWaitWallMs = countWaitWallMs;
+            completed.postCountEncodeMs = postCountEncodeMs;
+            completed.intersectionArenaGrowMs = intersectionArenaGrowMs;
+            completed.maximumTileCount = maximumTileCount;
+            completed.activeTileCount = activeTileCount;
+            completed.trivialTileCount = trivialTileCount;
+            completed.smallTileCount = smallTileCount;
+            completed.mediumTileCount = mediumTileCount;
+            completed.largeTileCount = largeTileCount;
 
             bool lossValid = false;
             bool intersectionCountValid = false;
@@ -387,7 +441,7 @@ private:
                 completed.gpuExecutionMs = 0.0;
             telemetry->publishCompleted(
                 generation, completed, completedGpuTimingValid, lossValid,
-                intersectionCountValid);
+                intersectionCountValid, countGpuTimingValid);
         }
 
         telemetry->releaseReadback(std::move(readback));
@@ -397,6 +451,7 @@ private:
     uint64_t generation = 0;
     int64_t iteration = 0;
     TelemetryClock::time_point wallStart;
+    TelemetryClock::time_point imagePrepareStart;
     TelemetryClock::time_point cpuStart;
     MTensor readback;
     mutable std::mutex mutex;
@@ -408,8 +463,20 @@ private:
     double cpuSubmitMs = 0.0;
     double synchronousGpuWaitMs = 0.0;
     double gpuExecutionMs = 0.0;
+    double imagePrepareMs = 0.0;
+    double countGpuMs = 0.0;
+    double countWaitWallMs = 0.0;
+    double postCountEncodeMs = 0.0;
+    double intersectionArenaGrowMs = 0.0;
+    uint32_t maximumTileCount = 0;
+    uint32_t activeTileCount = 0;
+    uint32_t trivialTileCount = 0;
+    uint32_t smallTileCount = 0;
+    uint32_t mediumTileCount = 0;
+    uint32_t largeTileCount = 0;
     bool cpuStarted = false;
     bool gpuTimingValid = true;
+    bool countGpuTimingValid = false;
     bool readbackEncoded = false;
     bool commandBufferFailed = false;
     bool sealed = false;
@@ -568,12 +635,13 @@ struct MetalContext {
         }
         currentCBTrainingStep.reset();
     }
-    void syncCB() {
+    SynchronousGpuMetrics syncCB() {
         if (!g_gpu_timing_checked) {
             g_gpu_timing_enabled = std::getenv("PROFILE_GPU") != nullptr;
             g_gpu_timing_checked = true;
         }
         const bool collectTiming = g_gpu_timing_enabled;
+        SynchronousGpuMetrics metrics;
         char failure[1024] = {};
         MPSCommandBuffer* commandBuffer = _currentCB;
         auto logicalStep = currentCBTrainingStep;
@@ -606,6 +674,7 @@ struct MetalContext {
             const auto waitStart = TelemetryClock::now();
             [submitted waitUntilCompleted];
             const auto waitEnd = TelemetryClock::now();
+            metrics.waitWallMs += elapsedMilliseconds(waitStart, waitEnd);
             if (logicalStep) {
                 logicalStep->recordSynchronousGpuWait(waitStart, waitEnd);
             }
@@ -627,6 +696,14 @@ struct MetalContext {
                 logicalStep->finishCommandBuffer(
                     status == MTLCommandBufferStatusCompleted,
                     submitted.GPUStartTime, submitted.GPUEndTime);
+            }
+            if (status == MTLCommandBufferStatusCompleted &&
+                std::isfinite(submitted.GPUStartTime) &&
+                std::isfinite(submitted.GPUEndTime) &&
+                submitted.GPUEndTime > submitted.GPUStartTime) {
+                metrics.gpuExecutionMs =
+                    (submitted.GPUEndTime - submitted.GPUStartTime) * 1000.0;
+                metrics.gpuTimingValid = true;
             }
             if (collectTiming && status == MTLCommandBufferStatusCompleted) {
                 const double gpuMs =
@@ -655,6 +732,7 @@ struct MetalContext {
 
         if (failure[0])
             throw std::runtime_error(failure);
+        return metrics;
     }
 
     // Per-stage GPU timestamp profiling (Metal counter sample buffer)
@@ -1090,9 +1168,10 @@ MsplatLogicalTrainingStepHandle msplat_training_step_begin(
         throw std::logic_error("A logical training step is already active");
 
     MTensor readback = telemetry->acquireReadback(context->device);
+    const auto imagePrepareStart = TelemetryClock::now();
     auto step = std::make_shared<MsplatLogicalTrainingStep>(
         telemetry, telemetry->currentGeneration(), iteration, wallStart,
-        std::move(readback));
+        imagePrepareStart, std::move(readback));
     context->activeTrainingStep = step;
     return step;
 }
@@ -1203,7 +1282,7 @@ struct FusedTensorCache {
 
     // Forward intermediates
     MTensor xys, depths, radii_out, conics, colors, aabb;
-    MTensor gaussian_ids;
+    MTensor projected_opacities;
     MTensor packed_xy_opac, packed_conic, packed_rgb;
     MTensor out_img, final_Ts, final_idx;
     MTensor tile_bins;
@@ -1227,13 +1306,14 @@ struct FusedTensorCache {
     MTensor prefix_T, after_C;
 
     // Training-only backward gradient accumulators
-    MTensor v_xy, v_conic, v_colors_rast, v_opacity, v_depth;
+    MTensor v_xy, v_conic, v_colors_rast, v_opacity;
     MTensor v_mean3d, v_scale, v_quat;
 
     size_t sharedEstimatedBytes() const {
         const MTensor* tensors[] = {
             &xys, &depths, &radii_out, &conics, &colors, &aabb,
-            &gaussian_ids, &packed_xy_opac, &packed_conic, &packed_rgb,
+            &projected_opacities,
+            &packed_xy_opac, &packed_conic, &packed_rgb,
             &out_img, &final_Ts, &final_idx,
             &tile_bins, &tile_offsets, &tile_scatter_counters,
             &intersection_keys_a, &intersection_keys_b, &overflow_flag,
@@ -1252,7 +1332,7 @@ struct FusedTensorCache {
             &photometric_gradient, &pose_viewmat, &pose_cam_pos,
             &pose_gradient,
             &prefix_T, &after_C,
-            &v_xy, &v_conic, &v_colors_rast, &v_opacity, &v_depth,
+            &v_xy, &v_conic, &v_colors_rast, &v_opacity,
             &v_mean3d, &v_scale, &v_quat
         };
         size_t bytes = 0;
@@ -1275,7 +1355,7 @@ struct FusedTensorCache {
     void resetIntersectionArena() {
         capacity = -1;
         intersection_keys_a.reset(); intersection_keys_b.reset();
-        gaussian_ids.reset(); packed_xy_opac.reset();
+        packed_xy_opac.reset();
         packed_conic.reset(); packed_rgb.reset();
     }
 
@@ -1288,7 +1368,7 @@ struct FusedTensorCache {
         if (np != fwd_num_points) {
             fwd_num_points = -1;
             xys.reset(); depths.reset(); radii_out.reset(); conics.reset();
-            colors.reset(); aabb.reset();
+            colors.reset(); aabb.reset(); projected_opacities.reset();
 
             try {
                 xys = mtensor_empty(dev, {np, 2}, DType::Float32);
@@ -1297,9 +1377,11 @@ struct FusedTensorCache {
                 conics = mtensor_empty(dev, {np, 3}, DType::Float32);
                 colors = mtensor_empty(dev, {np, 3}, DType::Float32);
                 aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
+                projected_opacities =
+                    mtensor_empty(dev, {np}, DType::Float32);
             } catch (...) {
                 xys.reset(); depths.reset(); radii_out.reset(); conics.reset();
-                colors.reset(); aabb.reset();
+                colors.reset(); aabb.reset(); projected_opacities.reset();
                 throw;
             }
             fwd_num_points = np;
@@ -1340,7 +1422,7 @@ struct FusedTensorCache {
         }
     }
 
-    void ensure_intersection_arena(uint32_t requiredCount,
+    bool ensure_intersection_arena(uint32_t requiredCount,
                                    id<MTLDevice> dev) {
         const uint32_t currentCapacity = capacity > 0
             ? static_cast<uint32_t>(capacity)
@@ -1350,9 +1432,9 @@ struct FusedTensorCache {
                 requiredCount, currentCapacity, false);
         if (requestedCapacity == currentCapacity &&
             intersection_keys_a.defined() && intersection_keys_b.defined() &&
-            gaussian_ids.defined() && packed_xy_opac.defined() &&
-            packed_conic.defined() && packed_rgb.defined()) {
-            return;
+            packed_xy_opac.defined() && packed_conic.defined() &&
+            packed_rgb.defined()) {
+            return false;
         }
 
         const uint64_t largestBufferBytes =
@@ -1367,7 +1449,6 @@ struct FusedTensorCache {
         try {
             intersection_keys_a = mtensor_empty(dev, {cap}, DType::Int64);
             intersection_keys_b = mtensor_empty(dev, {cap}, DType::Int64);
-            gaussian_ids = mtensor_empty(dev, {cap}, DType::Int32);
             packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
@@ -1376,6 +1457,7 @@ struct FusedTensorCache {
             throw;
         }
         capacity = cap;
+        return true;
     }
 
     void ensure_training_image(int ih, int iw, id<MTLDevice> dev) {
@@ -1477,17 +1559,15 @@ struct FusedTensorCache {
     void ensure_backward(int np, id<MTLDevice> dev) {
         if (np != bwd_num_points || !v_xy.defined() || !v_conic.defined() ||
             !v_colors_rast.defined() || !v_opacity.defined() ||
-            !v_depth.defined() || !v_mean3d.defined() ||
-            !v_scale.defined() || !v_quat.defined()) {
+            !v_mean3d.defined() || !v_scale.defined() || !v_quat.defined()) {
             bwd_num_points = -1;
             v_xy.reset(); v_conic.reset(); v_colors_rast.reset(); v_opacity.reset();
-            v_depth.reset(); v_mean3d.reset(); v_scale.reset(); v_quat.reset();
+            v_mean3d.reset(); v_scale.reset(); v_quat.reset();
 
             v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
             v_conic = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_colors_rast = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_opacity = mtensor_empty(dev, {np, 1}, DType::Float32);
-            v_depth = mtensor_empty(dev, {np}, DType::Float32);
             v_mean3d = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_scale = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_quat = mtensor_empty(dev, {np, 4}, DType::Float32);
@@ -1560,6 +1640,7 @@ static void render_pipeline(
     MTensor &conics = g_tcache.conics;
     MTensor &colors = g_tcache.colors;
     MTensor &aabb = g_tcache.aabb;
+    MTensor &projected_opacities = g_tcache.projected_opacities;
     MTensor &tile_bins = g_tcache.tile_bins;
     MTensor &out_img = g_tcache.out_img;
     MTensor &final_Ts = g_tcache.final_Ts;
@@ -1648,7 +1729,6 @@ static void render_pipeline(
     g_tcache.ensure_intersection_arena(
         intersectionLayout.totalCount, ctx->device);
 
-    MTensor &gaussian_ids = g_tcache.gaussian_ids;
     MTensor &packed_xy_opac = g_tcache.packed_xy_opac;
     MTensor &packed_conic = g_tcache.packed_conic;
     MTensor &packed_rgb = g_tcache.packed_rgb;
@@ -1671,6 +1751,8 @@ static void render_pipeline(
         ENC_BUF(enc, g_tcache.intersection_keys_a, 8);
         ENC_SCALAR(enc, capacity_u32, 9);
         ENC_BUF(enc, g_tcache.overflow_flag, 10);
+        ENC_BUF(enc, opacities, 11);
+        ENC_BUF(enc, projected_opacities, 12);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(scatterTpg, 1, 1)];
 
@@ -1694,10 +1776,10 @@ static void render_pipeline(
         [enc setComputePipelineState:ctx->pack_sorted_gaussians_kernel_cpso];
         ENC_BUF(enc, g_tcache.intersection_keys_a, 0);
         ENC_BUF(enc, xys, 1); ENC_BUF(enc, conics, 2);
-        ENC_BUF(enc, colors, 3); ENC_BUF(enc, opacities, 4);
-        ENC_BUF(enc, gaussian_ids, 5); ENC_BUF(enc, packed_xy_opac, 6);
-        ENC_BUF(enc, packed_conic, 7); ENC_BUF(enc, packed_rgb, 8);
-        ENC_SCALAR(enc, total_intersections, 9);
+        ENC_BUF(enc, colors, 3); ENC_BUF(enc, projected_opacities, 4);
+        ENC_BUF(enc, packed_xy_opac, 5); ENC_BUF(enc, packed_conic, 6);
+        ENC_BUF(enc, packed_rgb, 7);
+        ENC_SCALAR(enc, total_intersections, 8);
         [enc dispatchThreads:MTLSizeMake(total_intersections, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(packTpg, 1, 1)];
     };
@@ -2050,6 +2132,7 @@ MTensor msplat_train_step(
     MTensor &conics = g_tcache.conics;
     MTensor &colors = g_tcache.colors;
     MTensor &aabb = g_tcache.aabb;
+    MTensor &projected_opacities = g_tcache.projected_opacities;
     MTensor &tile_bins = g_tcache.tile_bins;
     MTensor &loss_sum = g_tcache.loss_sum;
     MTensor &overflow_flag = logicalStep
@@ -2072,7 +2155,6 @@ MTensor msplat_train_step(
     MTensor &v_conic = g_tcache.v_conic;
     MTensor &v_colors_rast = g_tcache.v_colors_rast;
     MTensor &v_opacity = g_tcache.v_opacity;
-    MTensor &v_depth = g_tcache.v_depth;
     MTensor &v_mean3d = g_tcache.v_mean3d;
     MTensor &v_scale = g_tcache.v_scale;
     MTensor &v_quat = g_tcache.v_quat;
@@ -2193,7 +2275,10 @@ MTensor msplat_train_step(
             ctx->discardCB();
             throw std::runtime_error(encodingFailure);
         }
-        ctx->syncCB();
+        const SynchronousGpuMetrics countPassMetrics = ctx->syncCB();
+        if (logicalStep) {
+            logicalStep->recordExactCountPass(countPassMetrics);
+        }
     }
 
     const msplat::TileIntersectionLayout intersectionLayout =
@@ -2202,10 +2287,18 @@ MTensor msplat_train_step(
             g_tcache.tile_offsets.data<int32_t>(),
             static_cast<size_t>(num_tiles));
     msplat::validateTileIntersectionWorkLimit(intersectionLayout);
-    g_tcache.ensure_intersection_arena(
+    const auto arenaGrowStart = TelemetryClock::now();
+    const bool intersectionArenaGrew = g_tcache.ensure_intersection_arena(
         intersectionLayout.totalCount, ctx->device);
+    const auto arenaGrowEnd = TelemetryClock::now();
+    if (logicalStep) {
+        logicalStep->recordIntersectionLayout(
+            intersectionLayout,
+            intersectionArenaGrew
+                ? elapsedMilliseconds(arenaGrowStart, arenaGrowEnd)
+                : 0.0);
+    }
 
-    MTensor &gaussian_ids = g_tcache.gaussian_ids;
     MTensor &packed_xy_opac = g_tcache.packed_xy_opac;
     MTensor &packed_conic = g_tcache.packed_conic;
     MTensor &packed_rgb = g_tcache.packed_rgb;
@@ -2239,6 +2332,8 @@ MTensor msplat_train_step(
         ENC_BUF(enc, g_tcache.intersection_keys_a, 8);
         ENC_SCALAR(enc, capacity_u32, 9);
         ENC_BUF(enc, overflow_flag, 10);
+        ENC_BUF(enc, opacities, 11);
+        ENC_BUF(enc, projected_opacities, 12);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(scatterTpg, 1, 1)];
 
@@ -2262,10 +2357,10 @@ MTensor msplat_train_step(
         [enc setComputePipelineState:ctx->pack_sorted_gaussians_kernel_cpso];
         ENC_BUF(enc, g_tcache.intersection_keys_a, 0);
         ENC_BUF(enc, xys, 1); ENC_BUF(enc, conics, 2);
-        ENC_BUF(enc, colors, 3); ENC_BUF(enc, opacities, 4);
-        ENC_BUF(enc, gaussian_ids, 5); ENC_BUF(enc, packed_xy_opac, 6);
-        ENC_BUF(enc, packed_conic, 7); ENC_BUF(enc, packed_rgb, 8);
-        ENC_SCALAR(enc, total_intersections, 9);
+        ENC_BUF(enc, colors, 3); ENC_BUF(enc, projected_opacities, 4);
+        ENC_BUF(enc, packed_xy_opac, 5); ENC_BUF(enc, packed_conic, 6);
+        ENC_BUF(enc, packed_rgb, 7);
+        ENC_SCALAR(enc, total_intersections, 8);
         [enc dispatchThreads:MTLSizeMake(total_intersections, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(packTpg, 1, 1)];
     };
@@ -2390,7 +2485,8 @@ MTensor msplat_train_step(
             [enc setComputePipelineState:ctx->rasterize_backward_kernel_cpso];
             [enc setBytes:rast_tb->data() length:sizeof(*rast_tb) atIndex:0];
             [enc setBytes:rast_isz->data() length:sizeof(*rast_isz) atIndex:1];
-            ENC_BUF(enc, gaussian_ids, 2); ENC_BUF(enc, tile_bins, 3);
+            ENC_BUF(enc, g_tcache.intersection_keys_a, 2);
+            ENC_BUF(enc, tile_bins, 3);
             ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5);
             ENC_BUF(enc, packed_rgb, 6);
             ENC_BUF(enc, background, 7); ENC_BUF(enc, final_Ts, 8);
@@ -2420,7 +2516,8 @@ MTensor msplat_train_step(
             [enc setComputePipelineState:ctx->rasterize_backward_chunked_kernel_cpso];
             [enc setBytes:rast_tb->data() length:sizeof(*rast_tb) atIndex:0];
             [enc setBytes:rast_isz->data() length:sizeof(*rast_isz) atIndex:1];
-            ENC_BUF(enc, gaussian_ids, 2); ENC_BUF(enc, tile_bins, 3);
+            ENC_BUF(enc, g_tcache.intersection_keys_a, 2);
+            ENC_BUF(enc, tile_bins, 3);
             ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5);
             ENC_BUF(enc, packed_rgb, 6);
             ENC_BUF(enc, background, 7); ENC_BUF(enc, final_Ts, 8);
@@ -2490,26 +2587,27 @@ MTensor msplat_train_step(
         [enc setBytes:proj_bwd_intr->data() length:sizeof(*proj_bwd_intr) atIndex:7];
         [enc setBytes:proj_bwd_isz->data() length:sizeof(*proj_bwd_isz) atIndex:8];
         ENC_BUF(enc, radii_out, 9); ENC_BUF(enc, conics, 10);
-        ENC_BUF(enc, v_xy, 11); ENC_BUF(enc, v_depth, 12); ENC_BUF(enc, v_conic, 13);
-        ENC_BUF(enc, v_mean3d, 14); ENC_BUF(enc, v_scale, 15); ENC_BUF(enc, v_quat, 16);
-        ENC_SCALAR(enc, degree, 17); ENC_SCALAR(enc, degrees_to_use, 18);
+        ENC_BUF(enc, v_xy, 11); ENC_BUF(enc, v_conic, 12);
+        ENC_BUF(enc, v_mean3d, 13); ENC_BUF(enc, v_scale, 14);
+        ENC_BUF(enc, v_quat, 15);
+        ENC_SCALAR(enc, degree, 16); ENC_SCALAR(enc, degrees_to_use, 17);
         if (pose.enabled) {
-            ENC_BUF(enc, g_tcache.pose_cam_pos, 19);
+            ENC_BUF(enc, g_tcache.pose_cam_pos, 18);
         } else {
             [enc setBytes:cam_pos_arr->data()
-                   length:sizeof(*cam_pos_arr) atIndex:19];
+                   length:sizeof(*cam_pos_arr) atIndex:18];
         }
-        ENC_BUF(enc, v_colors_rast, 20);
+        ENC_BUF(enc, v_colors_rast, 19);
         // Fused SH backward + Adam: pass params + optimizer state instead of gradient buffers
-        [enc setBuffer:adam_params[3].buffer() offset:0 atIndex:21];  // features_dc params
-        [enc setBuffer:adam_params[4].buffer() offset:0 atIndex:22];  // features_rest params
-        [enc setBuffer:adam_exp_avg[3].buffer() offset:0 atIndex:23]; // dc exp_avg
-        [enc setBuffer:adam_exp_avg_sq[3].buffer() offset:0 atIndex:24]; // dc exp_avg_sq
-        [enc setBuffer:adam_exp_avg[4].buffer() offset:0 atIndex:25]; // rest exp_avg
-        [enc setBuffer:adam_exp_avg_sq[4].buffer() offset:0 atIndex:26]; // rest exp_avg_sq
-        [enc setBytes:sh_adam_hp.get() length:sizeof(SHAdamParams) atIndex:27];
-        ENC_SCALAR(enc, poseEnabled, 28);
-        ENC_BUF(enc, poseGradient, 29);
+        [enc setBuffer:adam_params[3].buffer() offset:0 atIndex:20];  // features_dc params
+        [enc setBuffer:adam_params[4].buffer() offset:0 atIndex:21];  // features_rest params
+        [enc setBuffer:adam_exp_avg[3].buffer() offset:0 atIndex:22]; // dc exp_avg
+        [enc setBuffer:adam_exp_avg_sq[3].buffer() offset:0 atIndex:23]; // dc exp_avg_sq
+        [enc setBuffer:adam_exp_avg[4].buffer() offset:0 atIndex:24]; // rest exp_avg
+        [enc setBuffer:adam_exp_avg_sq[4].buffer() offset:0 atIndex:25]; // rest exp_avg_sq
+        [enc setBytes:sh_adam_hp.get() length:sizeof(SHAdamParams) atIndex:26];
+        ENC_SCALAR(enc, poseEnabled, 27);
+        ENC_BUF(enc, poseGradient, 28);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         // Adam for remaining groups (skip 3=featuresDc, 4=featuresRest — fused above)
         if (num_adam_groups > 0) {
@@ -2584,7 +2682,6 @@ MTensor msplat_train_step(
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
         [blit fillBuffer:v_colors_rast.buffer() range:NSMakeRange(0, v_colors_rast.nbytes()) value:0];
         [blit fillBuffer:v_opacity.buffer() range:NSMakeRange(0, v_opacity.nbytes()) value:0];
-        [blit fillBuffer:v_depth.buffer() range:NSMakeRange(0, v_depth.nbytes()) value:0];
         [blit fillBuffer:v_mean3d.buffer() range:NSMakeRange(0, v_mean3d.nbytes()) value:0];
         [blit fillBuffer:v_scale.buffer() range:NSMakeRange(0, v_scale.nbytes()) value:0];
         [blit fillBuffer:v_quat.buffer() range:NSMakeRange(0, v_quat.nbytes()) value:0];
@@ -2614,6 +2711,7 @@ MTensor msplat_train_step(
         return true;
     };
 
+    const auto postCountEncodeStart = TelemetryClock::now();
     if (g_profile_stages && ctx->counterSamplingAvailable) {
         // Projection was sampled in the exact-count command buffer. The
         // remaining stages use separate encoders on the final command buffer.
@@ -2790,6 +2888,11 @@ MTensor msplat_train_step(
             ctx->discardCB();
             throw std::runtime_error(encodingFailure);
         }
+    }
+
+    if (logicalStep) {
+        logicalStep->recordPostCountEncode(
+            postCountEncodeStart, TelemetryClock::now());
     }
 
     // Loss is copied into the step's unique readback and published only after

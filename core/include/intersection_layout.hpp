@@ -10,8 +10,7 @@
 namespace msplat {
 
 inline constexpr uint32_t kExactIntersectionBytesPerEntry =
-    2 * sizeof(uint64_t) + sizeof(int32_t) +
-    3 * 3 * sizeof(float);
+    2 * sizeof(uint64_t) + 3 * 3 * sizeof(float);
 inline constexpr uint32_t kExactTileMetadataBytes =
     sizeof(uint32_t) + sizeof(int32_t) + 2 * sizeof(int32_t);
 // The current large-tile sorter assigns one threadgroup to a tile. Keep that
@@ -23,6 +22,11 @@ struct TileIntersectionLayout {
     uint32_t totalCount = 0;
     uint32_t maximumTileCount = 0;
     size_t maximumTileIndex = 0;
+    uint32_t activeTileCount = 0;
+    uint32_t trivialTileCount = 0;
+    uint32_t smallTileCount = 0;
+    uint32_t mediumTileCount = 0;
+    uint32_t largeTileCount = 0;
 };
 
 /// Converts exact per-tile counts into inclusive offsets for the packed arena.
@@ -45,6 +49,16 @@ inline TileIntersectionLayout buildTileIntersectionLayout(
                 "Exact tile-intersection count exceeds the native index range");
         }
         inclusiveOffsets[tile] = static_cast<int32_t>(running);
+        if (count > 0) ++layout.activeTileCount;
+        if (count <= 1) {
+            ++layout.trivialTileCount;
+        } else if (count <= 32) {
+            ++layout.smallTileCount;
+        } else if (count <= 2'048) {
+            ++layout.mediumTileCount;
+        } else {
+            ++layout.largeTileCount;
+        }
         if (count > layout.maximumTileCount) {
             layout.maximumTileCount = count;
             layout.maximumTileIndex = tile;

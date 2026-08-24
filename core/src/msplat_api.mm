@@ -491,6 +491,8 @@ TrainingMetrics Trainer::metrics() const {
     metrics.intersectionsValid =
         snapshot.flags & MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID;
     metrics.hasFailedStep = snapshot.flags & MSPLAT_TRAINING_TELEMETRY_HAS_FAILED;
+    metrics.countGpuTimeValid =
+        snapshot.flags & MSPLAT_TRAINING_TELEMETRY_COUNT_GPU_TIMING_VALID;
 
     auto copyDescriptor = [](const MsplatTrainingStepDescriptor& source,
                              SubmittedTrainingStep& destination) {
@@ -517,6 +519,24 @@ TrainingMetrics Trainer::metrics() const {
         snapshot.completedStep.retainedPackedIntersections;
     metrics.completed.packedIntersectionCapacity =
         snapshot.completedStep.packedIntersectionCapacity;
+    metrics.completed.imagePrepareMs =
+        static_cast<float>(snapshot.completedStep.imagePrepareMs);
+    metrics.completed.countGpuMs =
+        static_cast<float>(snapshot.completedStep.countGpuMs);
+    metrics.completed.countWaitWallMs =
+        static_cast<float>(snapshot.completedStep.countWaitWallMs);
+    metrics.completed.postCountEncodeMs =
+        static_cast<float>(snapshot.completedStep.postCountEncodeMs);
+    metrics.completed.intersectionArenaGrowMs =
+        static_cast<float>(snapshot.completedStep.intersectionArenaGrowMs);
+    metrics.completed.maximumTileCount =
+        snapshot.completedStep.maximumTileCount;
+    metrics.completed.activeTileCount = snapshot.completedStep.activeTileCount;
+    metrics.completed.trivialTileCount =
+        snapshot.completedStep.trivialTileCount;
+    metrics.completed.smallTileCount = snapshot.completedStep.smallTileCount;
+    metrics.completed.mediumTileCount = snapshot.completedStep.mediumTileCount;
+    metrics.completed.largeTileCount = snapshot.completedStep.largeTileCount;
     metrics.overflowedCompletedSteps = snapshot.overflowedStepCount;
     metrics.tileCapOverflowedSteps = snapshot.tileCapOverflowedStepCount;
     metrics.packedCapacityOverflowedSteps =
@@ -1648,6 +1668,85 @@ MsplatStatus msplat_trainer_metrics_v4(
             completed.retainedPackedIntersectionCount;
         outMetrics->completed.packedIntersectionCapacity =
             completed.packedIntersectionCapacity;
+        outMetrics->overflowedCompletedSteps = metrics.overflowedCompletedSteps;
+        outMetrics->tileCapOverflowedSteps = metrics.tileCapOverflowedSteps;
+        outMetrics->packedCapacityOverflowedSteps =
+            metrics.packedCapacityOverflowedSteps;
+        outMetrics->lastOverflowIteration = metrics.lastOverflowIteration;
+        outMetrics->lastFailedIteration = metrics.lastFailedIteration;
+    });
+}
+
+MsplatStatus msplat_trainer_metrics_v12(
+    MsplatTrainer t, MsplatTrainingMetricsV12* outMetrics, size_t outputSize,
+    MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(outputSize == sizeof(MsplatTrainingMetricsV12),
+                "Training metrics v12 size does not match this msplat ABI");
+        require(outMetrics != nullptr, "outMetrics must not be null");
+        *outMetrics = {};
+        require(t != nullptr, "Trainer handle must not be null");
+
+        const msplat::TrainingMetrics metrics =
+            trainerHandle(t).trainer->metrics();
+        if (metrics.hasSubmittedStep)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_HAS_SUBMITTED_STEP;
+        if (metrics.hasCompletedStep)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_HAS_COMPLETED_STEP;
+        if (metrics.gpuTimeValid)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_GPU_TIME_VALID;
+        if (metrics.lossValid)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_LOSS_VALID;
+        if (metrics.intersectionsValid)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_INTERSECTIONS_VALID;
+        if (metrics.hasFailedStep)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_HAS_FAILED_STEP;
+        if (metrics.countGpuTimeValid) {
+            outMetrics->flags |=
+                MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID;
+        }
+
+        auto copySubmitted = [](const msplat::SubmittedTrainingStep& source,
+                                MsplatSubmittedTrainingStep& destination) {
+            destination.iteration = source.iteration;
+            destination.splatCount = source.splatCount;
+            destination.modelCapacity = source.modelCapacity;
+            destination.effectiveWidth = source.effectiveWidth;
+            destination.effectiveHeight = source.effectiveHeight;
+            destination.activeSHDegree = source.activeSHDegree;
+            destination.cpuSubmitMs = source.cpuSubmitMs;
+        };
+        copySubmitted(metrics.submitted, outMetrics->submitted);
+
+        const msplat::CompletedTrainingStep& completed = metrics.completed;
+        MsplatCompletedTrainingStepV12& destination = outMetrics->completed;
+        destination.iteration = completed.iteration;
+        destination.splatCount = completed.splatCount;
+        destination.modelCapacity = completed.modelCapacity;
+        destination.effectiveWidth = completed.effectiveWidth;
+        destination.effectiveHeight = completed.effectiveHeight;
+        destination.activeSHDegree = completed.activeSHDegree;
+        destination.cpuSubmitMs = completed.cpuSubmitMs;
+        destination.gpuExecutionMs = completed.gpuExecutionMs;
+        destination.endToEndMs = completed.endToEndMs;
+        destination.loss = completed.loss;
+        destination.overflowKinds = completed.overflowKinds;
+        destination.retainedPackedIntersectionCount =
+            completed.retainedPackedIntersectionCount;
+        destination.packedIntersectionCapacity =
+            completed.packedIntersectionCapacity;
+        destination.imagePrepareMs = completed.imagePrepareMs;
+        destination.countGpuMs = completed.countGpuMs;
+        destination.countWaitWallMs = completed.countWaitWallMs;
+        destination.postCountEncodeMs = completed.postCountEncodeMs;
+        destination.intersectionArenaGrowMs = completed.intersectionArenaGrowMs;
+        destination.maximumTileCount = completed.maximumTileCount;
+        destination.activeTileCount = completed.activeTileCount;
+        destination.trivialTileCount = completed.trivialTileCount;
+        destination.smallTileCount = completed.smallTileCount;
+        destination.mediumTileCount = completed.mediumTileCount;
+        destination.largeTileCount = completed.largeTileCount;
+
         outMetrics->overflowedCompletedSteps = metrics.overflowedCompletedSteps;
         outMetrics->tileCapOverflowedSteps = metrics.tileCapOverflowedSteps;
         outMetrics->packedCapacityOverflowedSteps =

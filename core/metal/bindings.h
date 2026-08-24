@@ -47,6 +47,7 @@ enum MsplatTrainingTelemetryFlag : uint32_t {
     MSPLAT_TRAINING_TELEMETRY_LOSS_VALID = 1u << 3,
     MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID = 1u << 4,
     MSPLAT_TRAINING_TELEMETRY_HAS_FAILED = 1u << 5,
+    MSPLAT_TRAINING_TELEMETRY_COUNT_GPU_TIMING_VALID = 1u << 6,
 };
 
 struct MsplatTrainingStepDescriptor {
@@ -69,6 +70,17 @@ struct MsplatCompletedTrainingStepMetrics {
     uint64_t packedIntersectionCapacity = 0;
     uint32_t overflowReasons = MSPLAT_TRAINING_OVERFLOW_NONE;
     uint32_t commandBufferCount = 0;
+    double imagePrepareMs = 0.0;
+    double countGpuMs = 0.0;
+    double countWaitWallMs = 0.0;
+    double postCountEncodeMs = 0.0;
+    double intersectionArenaGrowMs = 0.0;
+    uint32_t maximumTileCount = 0;
+    uint32_t activeTileCount = 0;
+    uint32_t trivialTileCount = 0;
+    uint32_t smallTileCount = 0;
+    uint32_t mediumTileCount = 0;
+    uint32_t largeTileCount = 0;
 };
 
 struct MsplatTrainingTelemetrySnapshot {

@@ -146,6 +146,8 @@ poses.
 - ABI v11 versioned training-mask treatment options. Coverage remains the
   default; transparent mode adds full-frame alpha supervision without changing
   the locked `MsplatConfig` layout or any earlier entry point.
+- ABI v12 detailed count-barrier and tile-distribution telemetry through a new
+  query structure; the ABI v4 telemetry layout and entry point remain unchanged.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
@@ -298,7 +300,11 @@ descriptors may name different iterations. A completed descriptor is published
 only after every command buffer in that logical step succeeds;
 `gpuExecutionMs` sums their Metal GPU intervals, while `endToEndMs` is
 completion-observed wall latency, including queueing, completion-handler
-scheduling, and any required synchronous readbacks.
+scheduling, and any required synchronous readbacks. ABI v12 additionally
+reports image preparation, exact-count GPU and wall-wait time, post-count CPU
+encoding, intersection-arena growth, the exact intersection count, maximum
+tile population, and trivial/small/medium/large tile counts. This makes the
+per-step count barrier measurable without enabling the heavier stage profiler.
 `memoryMetrics()` separates model, render-transient, training-transient,
 telemetry-readback, and image-cache bytes from process `phys_footprint` and iOS
 available memory. The buffer categories are logical allocations, not a claim

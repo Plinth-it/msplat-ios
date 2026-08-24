@@ -79,6 +79,17 @@ struct CompletedTrainingStep : SubmittedTrainingStep {
     uint32_t overflowKinds = 0;
     uint64_t retainedPackedIntersectionCount = 0;
     uint64_t packedIntersectionCapacity = 0;
+    float imagePrepareMs = 0.0f;
+    float countGpuMs = 0.0f;
+    float countWaitWallMs = 0.0f;
+    float postCountEncodeMs = 0.0f;
+    float intersectionArenaGrowMs = 0.0f;
+    uint32_t maximumTileCount = 0;
+    uint32_t activeTileCount = 0;
+    uint32_t trivialTileCount = 0;
+    uint32_t smallTileCount = 0;
+    uint32_t mediumTileCount = 0;
+    uint32_t largeTileCount = 0;
 };
 
 struct TrainingMetrics {
@@ -88,6 +99,7 @@ struct TrainingMetrics {
     bool lossValid = false;
     bool intersectionsValid = false;
     bool hasFailedStep = false;
+    bool countGpuTimeValid = false;
     SubmittedTrainingStep submitted;
     CompletedTrainingStep completed;
     uint64_t overflowedCompletedSteps = 0;

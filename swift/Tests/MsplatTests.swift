@@ -134,12 +134,13 @@ final class MsplatTests: XCTestCase {
     }
 
     func testTrainingTelemetryConversionKeepsSubmissionAndCompletionSeparate() {
-        var native = MsplatTrainingMetrics()
+        var native = MsplatTrainingMetricsV12()
         native.flags = UInt32(MSPLAT_TRAINING_METRICS_HAS_SUBMITTED_STEP)
             | UInt32(MSPLAT_TRAINING_METRICS_HAS_COMPLETED_STEP)
             | UInt32(MSPLAT_TRAINING_METRICS_GPU_TIME_VALID)
             | UInt32(MSPLAT_TRAINING_METRICS_LOSS_VALID)
             | UInt32(MSPLAT_TRAINING_METRICS_INTERSECTIONS_VALID)
+            | UInt32(MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID)
         native.submitted.iteration = 12
         native.submitted.splatCount = 120
         native.submitted.modelCapacity = 150
@@ -161,6 +162,17 @@ final class MsplatTests: XCTestCase {
             | UInt32(MSPLAT_RASTER_OVERFLOW_PACKED_CAPACITY)
         native.completed.retainedPackedIntersectionCount = 4_000_000_001
         native.completed.packedIntersectionCapacity = 5_000_000_001
+        native.completed.imagePrepareMs = 2.25
+        native.completed.countGpuMs = 3.5
+        native.completed.countWaitWallMs = 6.75
+        native.completed.postCountEncodeMs = 0.5
+        native.completed.intersectionArenaGrowMs = 0.25
+        native.completed.maximumTileCount = 2_049
+        native.completed.activeTileCount = 400
+        native.completed.trivialTileCount = 100
+        native.completed.smallTileCount = 200
+        native.completed.mediumTileCount = 90
+        native.completed.largeTileCount = 10
         native.overflowedCompletedSteps = 3
         native.tileCapOverflowedSteps = 2
         native.packedCapacityOverflowedSteps = 1
@@ -181,12 +193,24 @@ final class MsplatTests: XCTestCase {
             telemetry.completed?.retainedPackedIntersectionCount,
             4_000_000_001
         )
+        XCTAssertEqual(telemetry.completed?.exactIntersectionCount, 4_000_000_001)
+        XCTAssertEqual(telemetry.completed?.imagePrepareMs, 2.25)
+        XCTAssertEqual(telemetry.completed?.countGpuMs, 3.5)
+        XCTAssertEqual(telemetry.completed?.countWaitWallMs, 6.75)
+        XCTAssertEqual(telemetry.completed?.postCountEncodeMs, 0.5)
+        XCTAssertEqual(telemetry.completed?.intersectionArenaGrowMs, 0.25)
+        XCTAssertEqual(telemetry.completed?.maximumTileCount, 2_049)
+        XCTAssertEqual(telemetry.completed?.activeTileCount, 400)
+        XCTAssertEqual(telemetry.completed?.trivialTileCount, 100)
+        XCTAssertEqual(telemetry.completed?.smallTileCount, 200)
+        XCTAssertEqual(telemetry.completed?.mediumTileCount, 90)
+        XCTAssertEqual(telemetry.completed?.largeTileCount, 10)
         XCTAssertEqual(telemetry.overflowedCompletedSteps, 3)
         XCTAssertEqual(telemetry.lastOverflowIteration, 10)
     }
 
     func testTrainingTelemetryValidityFlagsControlOptionals() {
-        var native = MsplatTrainingMetrics()
+        var native = MsplatTrainingMetricsV12()
         native.completed.iteration = 7
         native.completed.gpuExecutionMs = 99
         native.completed.loss = 99
@@ -200,6 +224,12 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(telemetry.completed?.iteration, 7)
         XCTAssertNil(telemetry.completed?.gpuExecutionMs)
         XCTAssertNil(telemetry.completed?.loss)
+        XCTAssertNil(telemetry.completed?.countGpuMs)
+
+        native.flags |= UInt32(MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID)
+        native.completed.countGpuMs = 4.5
+        telemetry = TrainingTelemetry(from: native)
+        XCTAssertEqual(telemetry.completed?.countGpuMs, 4.5)
     }
 
     func testTrainingMemoryConversionPreservesCountsAndValidity() {
@@ -256,6 +286,26 @@ final class MsplatTests: XCTestCase {
 
         XCTAssertEqual(trainer.iteration, 10)
         XCTAssertGreaterThan(trainer.splatCount, 100_000)
+
+        let telemetry = try trainer.trainingMetrics()
+        XCTAssertEqual(telemetry.submitted?.iteration, 10)
+        let completed = try XCTUnwrap(telemetry.completed)
+        XCTAssertGreaterThan(completed.iteration, 0)
+        XCTAssertLessThanOrEqual(completed.iteration, 10)
+        XCTAssertGreaterThan(completed.exactIntersectionCount ?? 0, 0)
+        XCTAssertGreaterThan(completed.maximumTileCount, 0)
+        XCTAssertGreaterThanOrEqual(completed.imagePrepareMs, 0)
+        XCTAssertGreaterThanOrEqual(completed.countWaitWallMs, 0)
+        XCTAssertGreaterThanOrEqual(completed.postCountEncodeMs, 0)
+        XCTAssertGreaterThanOrEqual(completed.intersectionArenaGrowMs, 0)
+        let tileCount = ((completed.effectiveWidth + 15) / 16)
+            * ((completed.effectiveHeight + 15) / 16)
+        XCTAssertEqual(
+            completed.trivialTileCount + completed.smallTileCount
+                + completed.mediumTileCount + completed.largeTileCount,
+            tileCount
+        )
+        XCTAssertLessThanOrEqual(completed.activeTileCount, tileCount)
     }
 
     func testRender() throws {

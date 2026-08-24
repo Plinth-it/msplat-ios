@@ -194,12 +194,12 @@ public final class MsplatSession {
     /// Polls submission and GPU-completion progress without submitting work.
     public func trainingMetrics() throws -> TrainingTelemetry {
         try withTrainer { trainer in
-            var metrics = MsplatTrainingMetrics()
+            var metrics = MsplatTrainingMetricsV12()
             var nativeError = MsplatErrorInfo()
-            let status = msplat_trainer_metrics_v4(
+            let status = msplat_trainer_metrics_v12(
                 trainer,
                 &metrics,
-                MemoryLayout<MsplatTrainingMetrics>.size,
+                MemoryLayout<MsplatTrainingMetricsV12>.size,
                 &nativeError
             )
             try checkNativeStatus(status, error: &nativeError)

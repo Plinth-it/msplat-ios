@@ -175,7 +175,7 @@ require_contains("${training_setup}"
 extract_section(host_source "auto encode_proj_sh_bwd_adam ="
     "// ========================== DISPATCH" host_backward)
 require_contains("${host_backward}"
-    "ENC_SCALAR(enc, poseEnabled, 28);\n        ENC_BUF(enc, poseGradient, 29);"
+    "ENC_SCALAR(enc, poseEnabled, 27);\n        ENC_BUF(enc, poseGradient, 28);"
     "backward pose bindings")
 require_contains("${host_backward}"
     "if (pose.enabled) {\n            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];\n            [enc setComputePipelineState:ctx->camera_pose_adam_kernel_cpso];"
@@ -201,8 +201,10 @@ require_contains("${host_forward}"
     "ENC_BUF(enc, g_tcache.pose_cam_pos, 18);"
     "refined forward camera-center binding")
 require_contains("${host_backward}"
-    "ENC_BUF(enc, g_tcache.pose_cam_pos, 19);"
+    "ENC_BUF(enc, g_tcache.pose_cam_pos, 18);"
     "refined backward camera-center binding")
+require_absent("${fused_backward}" "v_depth"
+    "fused backward depth cotangent")
 
 # Canonical render remains independent of training-only pose corrections.
 extract_section(model_source "MTensor Model::render("
