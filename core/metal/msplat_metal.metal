@@ -4233,7 +4233,9 @@ kernel void densify_classify_kernel(
     if (check_screen && max_2d_size[idx] > screen_thresh) do_split = true;
     do_split = do_split && high_grad;
 
-    bool do_dup = !is_large && high_grad;
+    // A screen-space split takes precedence even when the world-space scale is
+    // small. Keep the three classifier outcomes mutually exclusive.
+    bool do_dup = !do_split && high_grad;
 
     split_flag[idx] = do_split ? 1 : 0;
     dup_flag[idx]   = do_dup   ? 1 : 0;

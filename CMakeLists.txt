@@ -214,6 +214,14 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             ${FOUNDATION_LIBRARY})
         add_test(NAME msplat_masked_metrics
             COMMAND msplat_masked_metrics_tests)
+        add_executable(msplat_densification_tests
+            tests/test_densification.mm)
+        target_link_libraries(msplat_densification_tests PRIVATE msplat_core)
+        add_test(NAME msplat_densification_classification
+            COMMAND msplat_densification_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_densification_classification PROPERTIES
+            SKIP_RETURN_CODE 77)
         add_test(NAME msplat_exact_intersection_contract
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
@@ -234,6 +242,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
                 -P ${CMAKE_SOURCE_DIR}/tests/check_pose_refinement_contract.cmake)
+        add_test(NAME msplat_densification_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_densification_contract.cmake)
     endif()
 endif()
 
