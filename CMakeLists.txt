@@ -230,6 +230,14 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         set_tests_properties(msplat_transparent_training PROPERTIES
             SKIP_RETURN_CODE 77)
+        add_executable(msplat_terminal_backward_tests
+            tests/test_terminal_backward.mm)
+        target_link_libraries(msplat_terminal_backward_tests PRIVATE msplat_core)
+        add_test(NAME msplat_terminal_backward
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_terminal_backward PROPERTIES
+            SKIP_RETURN_CODE 77)
         add_test(NAME msplat_exact_intersection_contract
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
@@ -254,6 +262,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
                 -P ${CMAKE_SOURCE_DIR}/tests/check_pose_refinement_contract.cmake)
+        add_test(NAME msplat_terminal_backward_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_terminal_backward_contract.cmake)
         add_test(NAME msplat_densification_contract
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}

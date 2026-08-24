@@ -584,8 +584,11 @@ public struct TrainingPlan: Sendable, Equatable {
             }
 
             var trainingCacheBytes = try checkedSum([
+                // 52 bytes of projected forward state plus 36 bytes of
+                // raster-backward gradients per Gaussian. Geometry gradients
+                // remain register-local in the terminal update kernel.
                 try checkedProduct(
-                    [128, gaussianCount],
+                    [88, gaussianCount],
                     component: "training Gaussian cache"
                 ),
                 try checkedProduct(

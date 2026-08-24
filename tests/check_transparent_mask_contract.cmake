@@ -73,7 +73,7 @@ require_contains("${fused_loss}" "alpha_loss_sum"
 extract_section(host_source "auto encode_loss_fwd_bwd ="
     "auto encode_rast_bwd =" host_loss)
 extract_section(host_source "auto encode_rast_bwd ="
-    "// Packed SH Adam hyperparameters" host_raster_backward)
+    "// Packed optimizer hyperparameters" host_raster_backward)
 require_contains("${host_loss}"
     "ENC_BUF(enc, loss_coverage_buffer, 7);\n        ENC_SCALAR(enc, alpha_stride, 8);\n        ENC_BUF(enc, background, 9);"
     "horizontal loss bindings")

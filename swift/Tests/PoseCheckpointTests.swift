@@ -74,6 +74,9 @@ private func runPoseCheckpointRegression() throws {
 
     XCTAssertEqual(reloadedSnapshot, firstSnapshot)
     assertPoseSnapshot(resumedSnapshot, iteration: 4, expectedMovableSteps: 2)
+    XCTAssertNotEqual(resumedSnapshot.deltas, firstSnapshot.deltas)
+    XCTAssertNotEqual(resumedSnapshot.firstMoments, firstSnapshot.firstMoments)
+    XCTAssertNotEqual(resumedSnapshot.secondMoments, firstSnapshot.secondMoments)
 }
 
 private func makePoseFixtureConfig() -> TrainingConfig {
@@ -246,6 +249,8 @@ private func assertPoseSnapshot(
         (movableDelta + movableFirstMoment + movableSecondMoment)
             .allSatisfy(\.isFinite)
     )
+    XCTAssertTrue(movableDelta.contains { $0 != 0 })
+    XCTAssertTrue(movableFirstMoment.contains { $0 != 0 })
     XCTAssertTrue(movableSecondMoment.contains { $0 > 0 })
     XCTAssertLessThanOrEqual(vectorNorm(movableDelta[0..<3]), 0.050_001)
     XCTAssertLessThanOrEqual(vectorNorm(movableDelta[3..<6]), 0.052_361)

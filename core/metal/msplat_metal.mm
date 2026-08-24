@@ -42,9 +42,9 @@ static bool g_profile_stages_checked = false;
 // Stage names for training pipeline
 static const char* g_train_stage_names[] = {
     "blit_zero", "proj_sh_fwd", "exact_sort_pack", "rast_fwd",
-    "loss_fwd_bwd", "rast_bwd", "proj_sh_bwd_adam", "grad_stats"
+    "loss_fwd_bwd", "rast_bwd", "proj_sh_bwd_adam"
 };
-static constexpr int N_TRAIN_STAGES = 8;
+static constexpr int N_TRAIN_STAGES = 7;
 
 static std::mutex g_stage_timing_mutex;
 // Per-stage accumulated times (ms), indexed by stage
@@ -812,9 +812,8 @@ struct MetalContext {
     id<MTLComputePipelineState> prepare_camera_pose_kernel_cpso = nil;
     id<MTLComputePipelineState> camera_pose_adam_kernel_cpso = nil;
     // Backward pipeline kernels
-    id<MTLComputePipelineState> project_and_sh_backward_kernel_cpso = nil;
-    id<MTLComputePipelineState> fused_adam_kernel_cpso = nil;
-    id<MTLComputePipelineState> accumulate_grad_stats_kernel_cpso = nil;
+    id<MTLComputePipelineState> sh_opacity_backward_adam_kernel_cpso = nil;
+    id<MTLComputePipelineState> project_backward_adam_kernel_cpso = nil;
     // GPU densification kernels
     id<MTLComputePipelineState> densify_classify_kernel_cpso = nil;
     id<MTLComputePipelineState> densify_append_split_kernel_cpso = nil;
@@ -856,9 +855,8 @@ struct MetalContext {
             photometric_adam_kernel_cpso,
             prepare_camera_pose_kernel_cpso,
             camera_pose_adam_kernel_cpso,
-            project_and_sh_backward_kernel_cpso,
-            fused_adam_kernel_cpso,
-            accumulate_grad_stats_kernel_cpso,
+            sh_opacity_backward_adam_kernel_cpso,
+            project_backward_adam_kernel_cpso,
             densify_classify_kernel_cpso,
             densify_append_split_kernel_cpso,
             densify_append_dup_kernel_cpso,
@@ -1059,9 +1057,8 @@ MetalContext* init_msplat_metal_context() {
     ctx->prepare_camera_pose_kernel_cpso            = load(@"prepare_camera_pose_kernel");
     ctx->camera_pose_adam_kernel_cpso               = load(@"camera_pose_adam_kernel");
     // Backward pipeline
-    ctx->project_and_sh_backward_kernel_cpso      = load(@"project_and_sh_backward_kernel");
-    ctx->fused_adam_kernel_cpso                    = load(@"fused_adam_kernel");
-    ctx->accumulate_grad_stats_kernel_cpso        = load(@"accumulate_grad_stats_kernel");
+    ctx->sh_opacity_backward_adam_kernel_cpso     = load(@"sh_opacity_backward_adam_kernel");
+    ctx->project_backward_adam_kernel_cpso        = load(@"project_backward_adam_kernel");
     // GPU densification
     ctx->densify_classify_kernel_cpso             = load(@"densify_classify_kernel");
     ctx->densify_append_split_kernel_cpso         = load(@"densify_append_split_kernel");
@@ -1307,7 +1304,6 @@ struct FusedTensorCache {
 
     // Training-only backward gradient accumulators
     MTensor v_xy, v_conic, v_colors_rast, v_opacity;
-    MTensor v_mean3d, v_scale, v_quat;
 
     size_t sharedEstimatedBytes() const {
         const MTensor* tensors[] = {
@@ -1332,8 +1328,7 @@ struct FusedTensorCache {
             &photometric_gradient, &pose_viewmat, &pose_cam_pos,
             &pose_gradient,
             &prefix_T, &after_C,
-            &v_xy, &v_conic, &v_colors_rast, &v_opacity,
-            &v_mean3d, &v_scale, &v_quat
+            &v_xy, &v_conic, &v_colors_rast, &v_opacity
         };
         size_t bytes = 0;
         for (const MTensor* tensor : tensors) {
@@ -1558,19 +1553,14 @@ struct FusedTensorCache {
 
     void ensure_backward(int np, id<MTLDevice> dev) {
         if (np != bwd_num_points || !v_xy.defined() || !v_conic.defined() ||
-            !v_colors_rast.defined() || !v_opacity.defined() ||
-            !v_mean3d.defined() || !v_scale.defined() || !v_quat.defined()) {
+            !v_colors_rast.defined() || !v_opacity.defined()) {
             bwd_num_points = -1;
             v_xy.reset(); v_conic.reset(); v_colors_rast.reset(); v_opacity.reset();
-            v_mean3d.reset(); v_scale.reset(); v_quat.reset();
 
             v_xy = mtensor_empty(dev, {np, 2}, DType::Float32);
             v_conic = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_colors_rast = mtensor_empty(dev, {np, 3}, DType::Float32);
             v_opacity = mtensor_empty(dev, {np, 1}, DType::Float32);
-            v_mean3d = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_scale = mtensor_empty(dev, {np, 3}, DType::Float32);
-            v_quat = mtensor_empty(dev, {np, 4}, DType::Float32);
             bwd_num_points = np;
         }
     }
@@ -1959,6 +1949,11 @@ MTensor msplat_train_step(
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     MetalContext* ctx = get_global_context();
     auto logicalStep = ctx->activeTrainingStep;
+    constexpr int kExpectedAdamGroups = 6;
+    if (num_adam_groups != kExpectedAdamGroups) {
+        throw std::invalid_argument(
+            "Training requires exactly six Adam parameter groups");
+    }
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);
     int num_tiles = tile_bounds_x * tile_bounds_y;
@@ -2119,6 +2114,20 @@ MTensor msplat_train_step(
     const uint32_t cameraPoseOffset = pose.cameraIndex * 6u;
     const uint32_t poseEnabled = pose.enabled ? 1u : 0u;
 
+    if (collect_densification_stats) {
+        const auto validStatsTensor = [num_points](const MTensor& tensor) {
+            return tensor.defined() && tensor.isGpu() &&
+                tensor.dtype() == DType::Float32 &&
+                tensor.numel() >= num_points;
+        };
+        if (!validStatsTensor(vis_counts) ||
+            !validStatsTensor(xys_grad_norm) ||
+            !validStatsTensor(max_2d_size)) {
+            throw std::invalid_argument(
+                "Densification statistics must be GPU Float32 tensors with one value per Gaussian");
+        }
+    }
+
     // --- Cached buffer pool ---
     g_tcache.ensure_shared_forward(
         num_points, img_height, img_width, num_tiles, ctx->device);
@@ -2155,13 +2164,16 @@ MTensor msplat_train_step(
     MTensor &v_conic = g_tcache.v_conic;
     MTensor &v_colors_rast = g_tcache.v_colors_rast;
     MTensor &v_opacity = g_tcache.v_opacity;
-    MTensor &v_mean3d = g_tcache.v_mean3d;
-    MTensor &v_scale = g_tcache.v_scale;
-    MTensor &v_quat = g_tcache.v_quat;
-    // Wire backward outputs as Adam grads (MTensor references for gradient buffers)
-    auto adam_grads = std::make_shared<std::array<MTensor, 6>>(
-        std::array<MTensor, 6>{
-            v_mean3d, v_scale, v_quat, MTensor{}, MTensor{}, v_opacity});
+    // Metal requires every declared pointer binding to reference a buffer even
+    // when statistics collection is disabled. v_opacity is N-sized and the
+    // shader does not touch these aliases while collectStats is zero.
+    MTensor &visCountsBuffer = collect_densification_stats
+        ? vis_counts : v_opacity;
+    MTensor &xysGradNormBuffer = collect_densification_stats
+        ? xys_grad_norm : v_opacity;
+    MTensor &max2DSizeBuffer = collect_densification_stats
+        ? max_2d_size : v_opacity;
+    const uint32_t collectStats = collect_densification_stats ? 1u : 0u;
 
     // --- Constants (heap-allocated for Obj-C block capture) ---
     auto loss_img_size = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
@@ -2535,22 +2547,42 @@ MTensor msplat_train_step(
         }
     };
 
-    // Packed SH Adam hyperparameters (must match SHAdamParams in .metal)
-    struct SHAdamParams {
+    // Packed optimizer hyperparameters. Layouts must match the Metal structs.
+    struct SHOpacityAdamParams {
         float dc_step_size, dc_bc2_sqrt;
         float rest_step_size, rest_bc2_sqrt;
+        float opacity_step_size, opacity_bc2_sqrt;
         float beta1, beta2, eps;
     };
-    auto sh_adam_hp = std::make_shared<SHAdamParams>();
-    if (num_adam_groups >= 5) {
-        sh_adam_hp->dc_step_size = adam_step_sizes[3];
-        sh_adam_hp->dc_bc2_sqrt = adam_bc2_sqrts[3];
-        sh_adam_hp->rest_step_size = adam_step_sizes[4];
-        sh_adam_hp->rest_bc2_sqrt = adam_bc2_sqrts[4];
-        sh_adam_hp->beta1 = adam_beta1;
-        sh_adam_hp->beta2 = adam_beta2;
-        sh_adam_hp->eps = adam_eps;
-    }
+    static_assert(sizeof(SHOpacityAdamParams) == 36);
+    auto sh_adam_hp = std::make_shared<SHOpacityAdamParams>();
+    sh_adam_hp->dc_step_size = adam_step_sizes[3];
+    sh_adam_hp->dc_bc2_sqrt = adam_bc2_sqrts[3];
+    sh_adam_hp->rest_step_size = adam_step_sizes[4];
+    sh_adam_hp->rest_bc2_sqrt = adam_bc2_sqrts[4];
+    sh_adam_hp->opacity_step_size = adam_step_sizes[5];
+    sh_adam_hp->opacity_bc2_sqrt = adam_bc2_sqrts[5];
+    sh_adam_hp->beta1 = adam_beta1;
+    sh_adam_hp->beta2 = adam_beta2;
+    sh_adam_hp->eps = adam_eps;
+
+    struct GeometryAdamParams {
+        float mean_step_size, mean_bc2_sqrt;
+        float scale_step_size, scale_bc2_sqrt;
+        float quat_step_size, quat_bc2_sqrt;
+        float beta1, beta2, eps;
+    };
+    static_assert(sizeof(GeometryAdamParams) == 36);
+    auto geometry_adam_hp = std::make_shared<GeometryAdamParams>();
+    geometry_adam_hp->mean_step_size = adam_step_sizes[0];
+    geometry_adam_hp->mean_bc2_sqrt = adam_bc2_sqrts[0];
+    geometry_adam_hp->scale_step_size = adam_step_sizes[1];
+    geometry_adam_hp->scale_bc2_sqrt = adam_bc2_sqrts[1];
+    geometry_adam_hp->quat_step_size = adam_step_sizes[2];
+    geometry_adam_hp->quat_bc2_sqrt = adam_bc2_sqrts[2];
+    geometry_adam_hp->beta1 = adam_beta1;
+    geometry_adam_hp->beta2 = adam_beta2;
+    geometry_adam_hp->eps = adam_eps;
 
     struct PoseAdamParams {
         uint32_t pose_offset;
@@ -2579,58 +2611,58 @@ MTensor msplat_train_step(
     }
 
     auto encode_proj_sh_bwd_adam = [&](id<MTLComputeCommandEncoder> enc) {
-        NSUInteger tpg = MIN(ctx->project_and_sh_backward_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-        [enc setComputePipelineState:ctx->project_and_sh_backward_kernel_cpso];
-        ENC_SCALAR(enc, num_points, 0); ENC_BUF(enc, means3d, 1); ENC_BUF(enc, scales, 2);
-        ENC_SCALAR(enc, glob_scale, 3); ENC_BUF(enc, quats, 4);
+        NSUInteger shTpg = MIN(
+            ctx->sh_opacity_backward_adam_kernel_cpso.maxTotalThreadsPerThreadgroup,
+            (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->sh_opacity_backward_adam_kernel_cpso];
+        ENC_SCALAR(enc, num_points, 0);
+        ENC_BUF(enc, means3d, 1); ENC_BUF(enc, radii_out, 2);
+        ENC_SCALAR(enc, degree, 3); ENC_SCALAR(enc, degrees_to_use, 4);
+        if (pose.enabled) {
+            ENC_BUF(enc, g_tcache.pose_cam_pos, 5);
+        } else {
+            [enc setBytes:cam_pos_arr->data()
+                   length:sizeof(*cam_pos_arr) atIndex:5];
+        }
+        ENC_BUF(enc, v_colors_rast, 6);
+        ENC_BUF(enc, adam_params[3], 7); ENC_BUF(enc, adam_params[4], 8);
+        ENC_BUF(enc, adam_exp_avg[3], 9); ENC_BUF(enc, adam_exp_avg_sq[3], 10);
+        ENC_BUF(enc, adam_exp_avg[4], 11); ENC_BUF(enc, adam_exp_avg_sq[4], 12);
+        ENC_BUF(enc, v_opacity, 13); ENC_BUF(enc, adam_params[5], 14);
+        ENC_BUF(enc, adam_exp_avg[5], 15); ENC_BUF(enc, adam_exp_avg_sq[5], 16);
+        [enc setBytes:sh_adam_hp.get()
+               length:sizeof(SHOpacityAdamParams) atIndex:17];
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(shTpg, 1, 1)];
+
+        // SH reads means from the pre-update model. Complete those reads before
+        // the terminal geometry dispatch updates means in place.
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        NSUInteger geometryTpg = MIN(
+            ctx->project_backward_adam_kernel_cpso.maxTotalThreadsPerThreadgroup,
+            (NSUInteger)num_points);
+        [enc setComputePipelineState:ctx->project_backward_adam_kernel_cpso];
+        ENC_SCALAR(enc, num_points, 0);
+        ENC_BUF(enc, adam_params[0], 1); ENC_BUF(enc, adam_params[1], 2);
+        ENC_SCALAR(enc, glob_scale, 3); ENC_BUF(enc, adam_params[2], 4);
         ENC_BUF(enc, activeViewmat, 5); ENC_BUF(enc, projmat, 6);
         [enc setBytes:proj_bwd_intr->data() length:sizeof(*proj_bwd_intr) atIndex:7];
         [enc setBytes:proj_bwd_isz->data() length:sizeof(*proj_bwd_isz) atIndex:8];
         ENC_BUF(enc, radii_out, 9); ENC_BUF(enc, conics, 10);
         ENC_BUF(enc, v_xy, 11); ENC_BUF(enc, v_conic, 12);
-        ENC_BUF(enc, v_mean3d, 13); ENC_BUF(enc, v_scale, 14);
-        ENC_BUF(enc, v_quat, 15);
-        ENC_SCALAR(enc, degree, 16); ENC_SCALAR(enc, degrees_to_use, 17);
-        if (pose.enabled) {
-            ENC_BUF(enc, g_tcache.pose_cam_pos, 18);
-        } else {
-            [enc setBytes:cam_pos_arr->data()
-                   length:sizeof(*cam_pos_arr) atIndex:18];
-        }
-        ENC_BUF(enc, v_colors_rast, 19);
-        // Fused SH backward + Adam: pass params + optimizer state instead of gradient buffers
-        [enc setBuffer:adam_params[3].buffer() offset:0 atIndex:20];  // features_dc params
-        [enc setBuffer:adam_params[4].buffer() offset:0 atIndex:21];  // features_rest params
-        [enc setBuffer:adam_exp_avg[3].buffer() offset:0 atIndex:22]; // dc exp_avg
-        [enc setBuffer:adam_exp_avg_sq[3].buffer() offset:0 atIndex:23]; // dc exp_avg_sq
-        [enc setBuffer:adam_exp_avg[4].buffer() offset:0 atIndex:24]; // rest exp_avg
-        [enc setBuffer:adam_exp_avg_sq[4].buffer() offset:0 atIndex:25]; // rest exp_avg_sq
-        [enc setBytes:sh_adam_hp.get() length:sizeof(SHAdamParams) atIndex:26];
-        ENC_SCALAR(enc, poseEnabled, 27);
-        ENC_BUF(enc, poseGradient, 28);
-        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-        // Adam for remaining groups (skip 3=featuresDc, 4=featuresRest — fused above)
-        if (num_adam_groups > 0) {
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            for (int g = 0; g < num_adam_groups; ++g) {
-                if (g == 3 || g == 4) continue;  // fused into backward kernel
-                uint32_t n = adam_params[g].numel();
-                if (n == 0) continue;
-                NSUInteger atpg = MIN(ctx->fused_adam_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)n);
-                [enc setComputePipelineState:ctx->fused_adam_kernel_cpso];
-                [enc setBuffer:adam_params[g].buffer() offset:0 atIndex:0];
-                [enc setBuffer:(*adam_grads)[g].buffer() offset:0 atIndex:1];
-                [enc setBuffer:adam_exp_avg[g].buffer() offset:0 atIndex:2];
-                [enc setBuffer:adam_exp_avg_sq[g].buffer() offset:0 atIndex:3];
-                ENC_SCALAR(enc, adam_step_sizes[g], 4);
-                ENC_SCALAR(enc, adam_beta1, 5);
-                ENC_SCALAR(enc, adam_beta2, 6);
-                ENC_SCALAR(enc, adam_bc2_sqrts[g], 7);
-                ENC_SCALAR(enc, adam_eps, 8);
-                ENC_SCALAR(enc, n, 9);
-                [enc dispatchThreads:MTLSizeMake(n, 1, 1) threadsPerThreadgroup:MTLSizeMake(atpg, 1, 1)];
-            }
-        }
+        ENC_BUF(enc, adam_exp_avg[0], 13); ENC_BUF(enc, adam_exp_avg_sq[0], 14);
+        ENC_BUF(enc, adam_exp_avg[1], 15); ENC_BUF(enc, adam_exp_avg_sq[1], 16);
+        ENC_BUF(enc, adam_exp_avg[2], 17); ENC_BUF(enc, adam_exp_avg_sq[2], 18);
+        [enc setBytes:geometry_adam_hp.get()
+               length:sizeof(GeometryAdamParams) atIndex:19];
+        ENC_SCALAR(enc, poseEnabled, 20); ENC_BUF(enc, poseGradient, 21);
+        ENC_SCALAR(enc, collectStats, 22);
+        ENC_BUF(enc, visCountsBuffer, 23); ENC_BUF(enc, xysGradNormBuffer, 24);
+        ENC_BUF(enc, max2DSizeBuffer, 25); ENC_SCALAR(enc, inv_max_dim, 26);
+        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(geometryTpg, 1, 1)];
+
         if (pose.enabled) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             [enc setComputePipelineState:ctx->camera_pose_adam_kernel_cpso];
@@ -2646,21 +2678,6 @@ MTensor msplat_train_step(
     };
 
     // ========================== DISPATCH ==========================
-
-    // Encode accumulate_grad_stats as a lambda (shared by both paths)
-    auto encode_grad_stats = [&](id<MTLComputeCommandEncoder> enc) {
-        if (!collect_densification_stats) return;
-        NSUInteger tpg = MIN(ctx->accumulate_grad_stats_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)num_points);
-        [enc setComputePipelineState:ctx->accumulate_grad_stats_kernel_cpso];
-        ENC_SCALAR(enc, num_points, 0);
-        ENC_BUF(enc, radii_out, 1);
-        ENC_BUF(enc, v_xy, 2);
-        ENC_BUF(enc, vis_counts, 3);
-        ENC_BUF(enc, xys_grad_norm, 4);
-        ENC_BUF(enc, max_2d_size, 5);
-        ENC_SCALAR(enc, inv_max_dim, 6);
-        [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
-    };
 
     // Blit-zero helper (shared by both paths)
     auto do_blit_zero = [&](id<MTLCommandBuffer> cb) -> bool {
@@ -2682,9 +2699,6 @@ MTensor msplat_train_step(
         [blit fillBuffer:v_conic.buffer() range:NSMakeRange(0, v_conic.nbytes()) value:0];
         [blit fillBuffer:v_colors_rast.buffer() range:NSMakeRange(0, v_colors_rast.nbytes()) value:0];
         [blit fillBuffer:v_opacity.buffer() range:NSMakeRange(0, v_opacity.nbytes()) value:0];
-        [blit fillBuffer:v_mean3d.buffer() range:NSMakeRange(0, v_mean3d.nbytes()) value:0];
-        [blit fillBuffer:v_scale.buffer() range:NSMakeRange(0, v_scale.nbytes()) value:0];
-        [blit fillBuffer:v_quat.buffer() range:NSMakeRange(0, v_quat.nbytes()) value:0];
         [blit endEncoding];
         return true;
     };
@@ -2784,16 +2798,6 @@ MTensor msplat_train_step(
             encode_proj_sh_bwd_adam(enc);
             [enc endEncoding];
 
-            // Stage 7: grad_stats. Keep an empty encoder after the cutoff so
-            // the fixed counter-sample indices remain stable.
-            enc = make_profiled_encoder(6);
-            if (!enc) {
-                encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
-                return;
-            }
-            encode_grad_stats(enc);
-            [enc endEncoding];
-
             if (!encode_step_readback(command_buffer)) {
                 encodingFailure =
                     "msplat: failed to create a training telemetry blit encoder";
@@ -2819,7 +2823,8 @@ MTensor msplat_train_step(
                     uint64_t start = samples[i * 2].timestamp;
                     uint64_t end = samples[i * 2 + 1].timestamp;
                     if (start == MTLCounterErrorValue || end == MTLCounterErrorValue) continue;
-                    // stage_idx 0-7 maps to g_train_stage_names[1-8] (skip blit_zero)
+                    // Counter stage i maps to name i+1 because blit_zero has no
+                    // direct timestamp sample.
                     g_stage_times[i + 1].push_back((double)(end - start) * ticksToMs);
                 }
                 g_stage_report_count++;
@@ -2872,10 +2877,6 @@ MTensor msplat_train_step(
             encode_rast_bwd(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_proj_sh_bwd_adam(enc);
-            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-            // --- Accumulate grad stats ---
-            encode_grad_stats(enc);
 
             [enc endEncoding];
             if (!encode_step_readback(command_buffer)) {

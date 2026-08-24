@@ -46,11 +46,11 @@ extract_section(metal_source "kernel void prepare_camera_pose_kernel("
 extract_section(metal_source "kernel void camera_pose_adam_kernel("
     "// ===== Fused Projection + SH Kernels" pose_adam)
 extract_section(metal_source "kernel void project_and_sh_forward_kernel("
-    "kernel void project_and_sh_backward_kernel(" fused_forward)
-extract_section(metal_source "kernel void project_and_sh_backward_kernel("
+    "inline void adam_update_element(" fused_forward)
+extract_section(metal_source "kernel void project_backward_adam_kernel("
     "// ===== Exact Tile Intersection Pipeline" fused_backward)
 extract_section(metal_source "inline void atomic_add_threadgroup_float("
-    "// Packed Adam hyperparameters" pose_group_atomic_add)
+    "struct SHOpacityAdamParams" pose_group_atomic_add)
 
 # D * V0 convention and the camera center derived from the same refined view.
 require_contains("${pose_prepare}"
@@ -175,7 +175,7 @@ require_contains("${training_setup}"
 extract_section(host_source "auto encode_proj_sh_bwd_adam ="
     "// ========================== DISPATCH" host_backward)
 require_contains("${host_backward}"
-    "ENC_SCALAR(enc, poseEnabled, 27);\n        ENC_BUF(enc, poseGradient, 28);"
+    "ENC_SCALAR(enc, poseEnabled, 20); ENC_BUF(enc, poseGradient, 21);"
     "backward pose bindings")
 require_contains("${host_backward}"
     "if (pose.enabled) {\n            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];\n            [enc setComputePipelineState:ctx->camera_pose_adam_kernel_cpso];"
@@ -201,7 +201,7 @@ require_contains("${host_forward}"
     "ENC_BUF(enc, g_tcache.pose_cam_pos, 18);"
     "refined forward camera-center binding")
 require_contains("${host_backward}"
-    "ENC_BUF(enc, g_tcache.pose_cam_pos, 18);"
+    "ENC_BUF(enc, g_tcache.pose_cam_pos, 5);"
     "refined backward camera-center binding")
 require_absent("${fused_backward}" "v_depth"
     "fused backward depth cotangent")

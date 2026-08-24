@@ -63,6 +63,13 @@
   opacity once per visible Gaussian, and recovered backward Gaussian IDs directly
   from sorted keys. Exact-intersection storage drops from 56 to 52 bytes per
   entry without changing raster output or the training objective.
+- Fused geometry backward directly into the mean, scale, and quaternion Adam
+  updates, and folded opacity plus densification-stat updates into the terminal
+  backward stage. The training cache no longer owns or clears the three geometry
+  gradient tensors, removing 40 bytes per Gaussian and four standalone Adam plus
+  one statistics dispatch. Geometry and opacity preserve full-population
+  zero-gradient moment decay; SH retains its visibility/degree gates and now
+  includes degree-four backward updates.
 - Corrected the image-edge versus array-index conversion in Brown-Conrady
   rectification, including alpha=0 crop endpoints and paired mask sampling.
   The renderer now uses an exact homogeneous divide, propagates the missing

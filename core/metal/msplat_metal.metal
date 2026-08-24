@@ -502,6 +502,10 @@ inline float4 read_packed_float4(constant float* arr, int idx) {
     return float4(arr[4*idx], arr[4*idx+1], arr[4*idx+2], arr[4*idx+3]);
 }
 
+inline float4 read_packed_float4(device const float* arr, int idx) {
+    return float4(arr[4*idx], arr[4*idx+1], arr[4*idx+2], arr[4*idx+3]);
+}
+
 inline void write_packed_float4(device float* arr, int idx, float4 val) {
     arr[4*idx] = val.x;
     arr[4*idx+1] = val.y;
@@ -1478,7 +1482,8 @@ void project_cov3d_ewa_vjp(
     v_mean3d[2] += (float)dot(v_t, W[2]);
 }
 
-// Thread-local overload: reads cov3d from registers, writes v_cov3d to registers
+// Thread-local overload: reads cov3d from registers and keeps both output
+// cotangents in registers for the terminal backward/update kernel.
 void project_cov3d_ewa_vjp(
     thread float* cov3d,
     constant float* viewmat,
@@ -1487,7 +1492,7 @@ void project_cov3d_ewa_vjp(
     const float tan_fovx,
     const float tan_fovy,
     float3 v_cov2d,
-    device float* v_mean3d,
+    thread float* v_mean3d,
     thread float* v_cov3d,
     float3 p_view
 ) {
@@ -1705,14 +1710,14 @@ void scale_rot_to_cov3d_vjp(
     v_quat[3] = out_v_quat.w;
 }
 
-// Thread-local overload: reads v_cov3d from registers
+// Thread-local overload: keeps every cotangent in registers.
 void scale_rot_to_cov3d_vjp(
     const float3 scale,
     const float glob_scale,
     const float4 quat,
     const thread float* v_cov3d,
-    device float* v_scale,
-    device float* v_quat
+    thread float* v_scale,
+    thread float* v_quat
 ) {
     float3x3 v_V = float3x3(
         v_cov3d[0],
@@ -1835,58 +1840,6 @@ kernel void compute_cov2d_bounds_kernel(
     conics[index + 1] = conic.y;
     conics[index + 2] = conic.z;
     radii[row] = radius;
-}
-
-// Fused Adam optimizer kernel: single-pass update for params, exp_avg, exp_avg_sq.
-// Precomputed on CPU: step_size = lr / (1 - beta1^t), bc2_sqrt = sqrt(1 - beta2^t)
-// Fused per-step gradient accumulation for densification.
-// Replaces ~8 MPS dispatches (boolean mask, vector_norm, index_put_, max) with 1 kernel.
-kernel void accumulate_grad_stats_kernel(
-    constant int& num_points,
-    constant int* radii [[buffer(1)]],
-    constant float* xys_grad [[buffer(2)]],     // (N, 2) packed float2
-    device float* vis_counts [[buffer(3)]],      // (N,) in-place
-    device float* xys_grad_norm [[buffer(4)]],   // (N,) in-place
-    device float* max_2d_size [[buffer(5)]],     // (N,) in-place
-    constant float& inv_max_dim [[buffer(6)]],   // 1.0 / max(H, W)
-    uint idx [[thread_position_in_grid]]
-) {
-    if (idx >= (uint)num_points) return;
-    if (radii[idx] <= 0) return;
-
-    vis_counts[idx] += 1.0f;
-
-    float gx = xys_grad[idx * 2];
-    float gy = xys_grad[idx * 2 + 1];
-    xys_grad_norm[idx] += sqrt(gx * gx + gy * gy);
-
-    float r = (float)radii[idx] * inv_max_dim;
-    max_2d_size[idx] = max(max_2d_size[idx], r);
-}
-
-kernel void fused_adam_kernel(
-    device float * params [[buffer(0)]],
-    device const float * grads [[buffer(1)]],
-    device float * exp_avg [[buffer(2)]],
-    device float * exp_avg_sq [[buffer(3)]],
-    constant float & step_size [[buffer(4)]],
-    constant float & beta1 [[buffer(5)]],
-    constant float & beta2 [[buffer(6)]],
-    constant float & bc2_sqrt [[buffer(7)]],
-    constant float & eps [[buffer(8)]],
-    constant uint & n [[buffer(9)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= n) return;
-
-    float g = grads[tid];
-    float m = fma(beta1, exp_avg[tid], (1.0f - beta1) * g);
-    float v = fma(beta2, exp_avg_sq[tid], (1.0f - beta2) * g * g);
-
-    params[tid] -= step_size * m / (sqrt(v) / bc2_sqrt + eps);
-
-    exp_avg[tid] = m;
-    exp_avg_sq[tid] = v;
 }
 
 // ===== Optional camera-pose refinement =====
@@ -2181,24 +2134,196 @@ inline void atomic_add_threadgroup_float(
     }
 }
 
-// Packed Adam hyperparameters for SH groups (passed via setBytes)
-struct SHAdamParams {
+// Packed Adam hyperparameters for the appearance groups (passed via setBytes).
+struct SHOpacityAdamParams {
     float dc_step_size;
     float dc_bc2_sqrt;
     float rest_step_size;
     float rest_bc2_sqrt;
+    float opacity_step_size;
+    float opacity_bc2_sqrt;
     float beta1;
     float beta2;
     float eps;
 };
 
-kernel void project_and_sh_backward_kernel(
-    // Projection backward args
+// SH and opacity gradients are already materialized by raster backward. Apply
+// their Adam updates before geometry mutates the means used for the SH viewdir.
+// SH retains its existing visibility and active-degree gates. Opacity still
+// updates every Gaussian so its former full-tensor Adam decay is preserved.
+kernel void sh_opacity_backward_adam_kernel(
     constant int& num_points,
     constant float* means3d,
-    constant float* scales,
+    constant int* radii,
+    constant uint& degree,
+    constant uint& degrees_to_use,
+    constant float3& cam_pos,
+    constant float* v_colors,
+    device float* features_dc,
+    device float* features_rest,
+    device float* dc_exp_avg,
+    device float* dc_exp_avg_sq,
+    device float* rest_exp_avg,
+    device float* rest_exp_avg_sq,
+    constant float* v_opacity,
+    device float* opacities,
+    device float* opacity_exp_avg,
+    device float* opacity_exp_avg_sq,
+    constant SHOpacityAdamParams& adam_hp,
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)num_points) return;
+
+    const bool active = radii[idx] > 0;
+    const float3 color_gradient = active
+        ? read_packed_float3(v_colors, idx)
+        : float3(0.0f);
+    const uint num_channels = 3;
+    const uint num_bases = num_sh_bases(degree);
+    const uint dc_idx = num_channels * idx;
+    const uint rest_idx = (num_bases - 1) * num_channels * idx;
+
+    if (active) {
+        for (uint c = 0; c < num_channels; ++c) {
+            const float g = SH_C0 * color_gradient[c];
+            adam_update_element(features_dc[dc_idx + c], dc_exp_avg[dc_idx + c], dc_exp_avg_sq[dc_idx + c],
+                               g, adam_hp.dc_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.dc_bc2_sqrt, adam_hp.eps);
+        }
+    }
+
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float xx = 0.0f;
+    float xy = 0.0f;
+    float xz = 0.0f;
+    float yy = 0.0f;
+    float yz = 0.0f;
+    float zz = 0.0f;
+    if (active && degrees_to_use >= 1) {
+        const float3 viewdir = normalize(read_packed_float3(means3d, idx) - cam_pos);
+        x = viewdir.x;
+        y = viewdir.y;
+        z = viewdir.z;
+        xx = x * x;
+        xy = x * y;
+        xz = x * z;
+        yy = y * y;
+        yz = y * z;
+        zz = z * z;
+    }
+
+    if (active && degree >= 1 && degrees_to_use >= 1) {
+        const float basis_values[3] = {
+            -SH_C1 * y,
+            SH_C1 * z,
+            -SH_C1 * x,
+        };
+        for (uint basis = 0; basis < 3; ++basis) {
+            for (uint c = 0; c < num_channels; ++c) {
+                const uint i = rest_idx + basis * num_channels + c;
+                adam_update_element(
+                    features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
+                    basis_values[basis] * color_gradient[c],
+                    adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2,
+                    adam_hp.rest_bc2_sqrt, adam_hp.eps);
+            }
+        }
+    }
+    if (active && degree >= 2 && degrees_to_use >= 2) {
+        const float basis_values[5] = {
+            SH_C2[0] * xy,
+            SH_C2[1] * yz,
+            SH_C2[2] * (2.0f * zz - xx - yy),
+            SH_C2[3] * xz,
+            SH_C2[4] * (xx - yy),
+        };
+        for (uint basis = 0; basis < 5; ++basis) {
+            for (uint c = 0; c < num_channels; ++c) {
+                const uint i = rest_idx + (3 + basis) * num_channels + c;
+                adam_update_element(
+                    features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
+                    basis_values[basis] * color_gradient[c],
+                    adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2,
+                    adam_hp.rest_bc2_sqrt, adam_hp.eps);
+            }
+        }
+    }
+    if (active && degree >= 3 && degrees_to_use >= 3) {
+        const float basis_values[7] = {
+            SH_C3[0] * y * (3.0f * xx - yy),
+            SH_C3[1] * xy * z,
+            SH_C3[2] * y * (4.0f * zz - xx - yy),
+            SH_C3[3] * z *
+                (2.0f * zz - 3.0f * xx - 3.0f * yy),
+            SH_C3[4] * x * (4.0f * zz - xx - yy),
+            SH_C3[5] * z * (xx - yy),
+            SH_C3[6] * x * (xx - 3.0f * yy),
+        };
+        for (uint basis = 0; basis < 7; ++basis) {
+            for (uint c = 0; c < num_channels; ++c) {
+                const uint i = rest_idx + (8 + basis) * num_channels + c;
+                adam_update_element(
+                    features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
+                    basis_values[basis] * color_gradient[c],
+                    adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2,
+                    adam_hp.rest_bc2_sqrt, adam_hp.eps);
+            }
+        }
+    }
+    if (active && degree >= 4 && degrees_to_use >= 4) {
+        const float basis_values[9] = {
+            SH_C4[0] * xy * (xx - yy),
+            SH_C4[1] * yz * (3.0f * xx - yy),
+            SH_C4[2] * xy * (7.0f * zz - 1.0f),
+            SH_C4[3] * yz * (7.0f * zz - 3.0f),
+            SH_C4[4] * (zz * (35.0f * zz - 30.0f) + 3.0f),
+            SH_C4[5] * xz * (7.0f * zz - 3.0f),
+            SH_C4[6] * (xx - yy) * (7.0f * zz - 1.0f),
+            SH_C4[7] * xz * (xx - 3.0f * yy),
+            SH_C4[8] *
+                (xx * (xx - 3.0f * yy) - yy * (3.0f * xx - yy)),
+        };
+        for (uint basis = 0; basis < 9; ++basis) {
+            for (uint c = 0; c < num_channels; ++c) {
+                const uint i = rest_idx + (15 + basis) * num_channels + c;
+                adam_update_element(
+                    features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
+                    basis_values[basis] * color_gradient[c],
+                    adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2,
+                    adam_hp.rest_bc2_sqrt, adam_hp.eps);
+            }
+        }
+    }
+
+    const float opacity_gradient = active ? v_opacity[idx] : 0.0f;
+    adam_update_element(
+        opacities[idx], opacity_exp_avg[idx], opacity_exp_avg_sq[idx],
+        opacity_gradient, adam_hp.opacity_step_size, adam_hp.beta1,
+        adam_hp.beta2, adam_hp.opacity_bc2_sqrt, adam_hp.eps);
+}
+
+struct GeometryAdamParams {
+    float mean_step_size;
+    float mean_bc2_sqrt;
+    float scale_step_size;
+    float scale_bc2_sqrt;
+    float quat_step_size;
+    float quat_bc2_sqrt;
+    float beta1;
+    float beta2;
+    float eps;
+};
+
+// Terminal geometry backward pass. Geometry cotangents never leave registers:
+// this kernel immediately updates parameters and Adam state, and folds in the
+// per-Gaussian densification statistics while v_xy is still hot.
+kernel void project_backward_adam_kernel(
+    constant int& num_points,
+    device float* means3d,
+    device float* scales,
     constant float& glob_scale,
-    constant float* quats,
+    device float* quats,
     constant float* viewmat,
     constant float* projmat,
     constant float4& intrins,
@@ -2207,23 +2332,20 @@ kernel void project_and_sh_backward_kernel(
     constant float* conics,
     constant float* v_xy,
     constant float* v_conic,
-    device float* v_mean3d,
-    device float* v_scale,
-    device float* v_quat,
-    // SH backward + fused Adam args
-    constant uint& degree,
-    constant uint& degrees_to_use,
-    constant float3& cam_pos,
-    constant float* v_colors,
-    device float* features_dc,         // params (read-write for Adam)
-    device float* features_rest,       // params (read-write for Adam)
-    device float* dc_exp_avg,          // Adam state
-    device float* dc_exp_avg_sq,
-    device float* rest_exp_avg,
-    device float* rest_exp_avg_sq,
-    constant SHAdamParams& adam_hp,
+    device float* mean_exp_avg,
+    device float* mean_exp_avg_sq,
+    device float* scale_exp_avg,
+    device float* scale_exp_avg_sq,
+    device float* quat_exp_avg,
+    device float* quat_exp_avg_sq,
+    constant GeometryAdamParams& adam_hp,
     constant uint& pose_enabled,
     device atomic_float* pose_gradient,
+    constant uint& collect_densification_stats,
+    device float* vis_counts,
+    device float* xys_grad_norm,
+    device float* max_2d_size,
+    constant float& inv_max_dim,
     uint idx [[thread_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]
 ) {
@@ -2239,123 +2361,94 @@ kernel void project_and_sh_backward_kernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    const bool active =
-        idx < (uint)num_points && radii[idx] > 0;
-    float3 p_world = float3(0.0f);
+    const bool in_bounds = idx < (uint)num_points;
+    const bool active = in_bounds && radii[idx] > 0;
+    float local_v_mean3d[3] = {0.0f, 0.0f, 0.0f};
+    float local_v_scale[3] = {0.0f, 0.0f, 0.0f};
+    float local_v_quat[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
     if (active) {
-    p_world = read_packed_float3(means3d, idx);
-    const float fx = intrins.x;
-    const float fy = intrins.y;
+        const float3 p_world = read_packed_float3(means3d, idx);
+        const float fx = intrins.x;
+        const float fy = intrins.y;
+        const float3 p_view = transform_4x3(viewmat, p_world);
+        float3 pose_v_p_view = float3(0.0f);
+        float3x3 pose_v_view_rotation = float3x3(0.0f);
 
-    const float3 p_view = transform_4x3(viewmat, p_world);
-    float3 pose_v_p_view = float3(0.0f);
-    float3x3 pose_v_view_rotation = float3x3(0.0f);
-    if (pose_enabled != 0) {
-        pose_v_p_view = project_view_pix_vjp(
-            p_view, fx, fy, read_packed_float2(v_xy, idx));
-    } else {
-        // Preserve the canonical projection VJP arithmetic exactly when pose
-        // refinement is disabled.
-        write_packed_float3(
-            v_mean3d, idx,
-            project_pix_vjp(
-                projmat, p_world, img_size, read_packed_float2(v_xy, idx))
-        );
-    }
+        if (pose_enabled != 0) {
+            pose_v_p_view = project_view_pix_vjp(
+                p_view, fx, fy, read_packed_float2(v_xy, idx));
+        } else {
+            // Preserve the canonical projection VJP arithmetic exactly when pose
+            // refinement is disabled.
+            const float3 mean_gradient = project_pix_vjp(
+                projmat, p_world, img_size, read_packed_float2(v_xy, idx));
+            local_v_mean3d[0] = mean_gradient.x;
+            local_v_mean3d[1] = mean_gradient.y;
+            local_v_mean3d[2] = mean_gradient.z;
+        }
 
-    // v_cov2d from v_conic (thread-local, no device memory round-trip)
-    float local_v_cov2d[3];
-    cov2d_to_conic_vjp(
-        read_packed_float3(conics, idx),
-        read_packed_float3(v_conic, idx),
-        local_v_cov2d
-    );
+        float local_v_cov2d[3];
+        cov2d_to_conic_vjp(
+            read_packed_float3(conics, idx),
+            read_packed_float3(v_conic, idx),
+            local_v_cov2d);
 
-    // Recompute cov3d from scales+quats (avoids saving/reading 3.6MB tensor)
-    float3 exp_scale = exp(read_packed_float3(scales, idx));
-    float4 quat = read_packed_float4(quats, idx);
-    float local_cov3d[6];
-    scale_rot_to_cov3d(exp_scale, glob_scale, quat, local_cov3d);
+        const float3 exp_scale = exp(read_packed_float3(scales, idx));
+        const float4 quat = read_packed_float4(quats, idx);
+        float local_cov3d[6];
+        scale_rot_to_cov3d(exp_scale, glob_scale, quat, local_cov3d);
 
-    // v_cov3d (thread-local) and v_mean3d contribution
-    float tan_fovx = 0.5f * (float)img_size.x / fx;
-    float tan_fovy = 0.5f * (float)img_size.y / fy;
-    float local_v_cov3d[6];
-    if (pose_enabled != 0) {
-        float3 covariance_v_p_view;
-        project_cov3d_ewa_pose_vjp(
-            local_cov3d,
-            viewmat,
-            fx,
-            fy,
-            tan_fovx,
-            tan_fovy,
-            float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
-            local_v_cov3d,
-            covariance_v_p_view,
-            pose_v_view_rotation,
-            p_view
-        );
-        pose_v_p_view += covariance_v_p_view;
+        const float tan_fovx = 0.5f * (float)img_size.x / fx;
+        const float tan_fovy = 0.5f * (float)img_size.y / fy;
+        float local_v_cov3d[6];
+        if (pose_enabled != 0) {
+            float3 covariance_v_p_view;
+            project_cov3d_ewa_pose_vjp(
+                local_cov3d, viewmat, fx, fy, tan_fovx, tan_fovy,
+                float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
+                local_v_cov3d, covariance_v_p_view,
+                pose_v_view_rotation, p_view);
+            pose_v_p_view += covariance_v_p_view;
 
-        const float3x3 W = view_rotation(viewmat);
-        write_packed_float3(
-            v_mean3d, idx,
-            float3(
-                dot(pose_v_p_view, W[0]),
-                dot(pose_v_p_view, W[1]),
-                dot(pose_v_p_view, W[2]))
-        );
+            const float3x3 W = view_rotation(viewmat);
+            local_v_mean3d[0] = dot(pose_v_p_view, W[0]);
+            local_v_mean3d[1] = dot(pose_v_p_view, W[1]);
+            local_v_mean3d[2] = dot(pose_v_p_view, W[2]);
 
-        // Gradient for a positive local left perturbation Exp([v,w]) * V.
-        // Appearance direction is deliberately detached: this geometric pose
-        // optimizer follows the renderer's existing mean-gradient policy.
-        const float3 translation_gradient = pose_v_p_view;
-        const float3 rotation_gradient =
-            cross(p_view, pose_v_p_view) +
-            cross(W[0], pose_v_view_rotation[0]) +
-            cross(W[1], pose_v_view_rotation[1]) +
-            cross(W[2], pose_v_view_rotation[2]);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[0], translation_gradient.x);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[1], translation_gradient.y);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[2], translation_gradient.z);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[3], rotation_gradient.x);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[4], rotation_gradient.y);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[5], rotation_gradient.z);
-    } else {
-        project_cov3d_ewa_vjp(
-            local_cov3d,
-            viewmat,
-            fx,
-            fy,
-            tan_fovx,
-            tan_fovy,
-            float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
-            &(v_mean3d[3*idx]),
-            local_v_cov3d,
-            p_view
-        );
-    }
+            // Appearance direction is deliberately detached: the pose
+            // optimizer follows the renderer's existing geometry-only policy.
+            const float3 translation_gradient = pose_v_p_view;
+            const float3 rotation_gradient =
+                cross(p_view, pose_v_p_view) +
+                cross(W[0], pose_v_view_rotation[0]) +
+                cross(W[1], pose_v_view_rotation[1]) +
+                cross(W[2], pose_v_view_rotation[2]);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[0], translation_gradient.x);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[1], translation_gradient.y);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[2], translation_gradient.z);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[3], rotation_gradient.x);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[4], rotation_gradient.y);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[5], rotation_gradient.z);
+        } else {
+            project_cov3d_ewa_vjp(
+                local_cov3d, viewmat, fx, fy, tan_fovx, tan_fovy,
+                float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
+                local_v_mean3d, local_v_cov3d, p_view);
+        }
 
-    // v_scale and v_quat (reads v_cov3d from thread-local)
-    scale_rot_to_cov3d_vjp(
-        exp_scale,
-        glob_scale,
-        quat,
-        local_v_cov3d,
-        &(v_scale[3*idx]),
-        &(v_quat[4*idx])
-    );
-    // Chain rule: dL/d(log_s) = dL/d(exp_s) * exp(log_s)
-    v_scale[3*idx + 0] *= exp_scale.x;
-    v_scale[3*idx + 1] *= exp_scale.y;
-    v_scale[3*idx + 2] *= exp_scale.z;
+        scale_rot_to_cov3d_vjp(
+            exp_scale, glob_scale, quat, local_v_cov3d,
+            local_v_scale, local_v_quat);
+        local_v_scale[0] *= exp_scale.x;
+        local_v_scale[1] *= exp_scale.y;
+        local_v_scale[2] *= exp_scale.z;
     }
 
     if (pose_enabled != 0) {
@@ -2371,81 +2464,40 @@ kernel void project_and_sh_backward_kernel(
             }
         }
     }
-    if (!active) return;
+    if (!in_bounds) return;
 
-    // ---- Fused SH backward + Adam ----
-    // Compute SH gradients in registers and apply Adam inline.
-    // Eliminates v_features_dc/v_features_rest write+read round-trip (~600 MB/iter at 1.6M gaussians).
-    float3 viewdir = normalize(p_world - cam_pos);
-    const uint num_channels = 3;
-    uint num_bases = num_sh_bases(degree);
-    uint dc_idx = num_channels * idx;
-    uint rest_idx = (num_bases - 1) * num_channels * idx;
-    uint idx_col = num_channels * idx;
-
-    float vc[3] = { v_colors[idx_col], v_colors[idx_col + 1], v_colors[idx_col + 2] };
-
-    // DC: grad = SH_C0 * v_colors[c]
-    for (int c = 0; c < 3; c++) {
-        float g = SH_C0 * vc[c];
-        adam_update_element(features_dc[dc_idx + c], dc_exp_avg[dc_idx + c], dc_exp_avg_sq[dc_idx + c],
-                           g, adam_hp.dc_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.dc_bc2_sqrt, adam_hp.eps);
+    if (collect_densification_stats != 0 && active) {
+        vis_counts[idx] += 1.0f;
+        const float gx = v_xy[idx * 2];
+        const float gy = v_xy[idx * 2 + 1];
+        xys_grad_norm[idx] += sqrt(gx * gx + gy * gy);
+        max_2d_size[idx] = max(
+            max_2d_size[idx], (float)radii[idx] * inv_max_dim);
     }
 
-    if (degrees_to_use < 1) return;
-
-    float x = viewdir.x, y = viewdir.y, z = viewdir.z;
-    float xx = x*x, xy = x*y, xz = x*z, yy = y*y, yz = y*z, zz = z*z;
-
-    // SH degree 1 (3 bases)
-    float sh1[3] = { -SH_C1 * y, SH_C1 * z, -SH_C1 * x };
-    for (int b = 0; b < 3; b++) {
-        for (int c = 0; c < 3; c++) {
-            uint i = rest_idx + b * 3 + c;
-            float g = sh1[b] * vc[c];
-            adam_update_element(features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
-                               g, adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.rest_bc2_sqrt, adam_hp.eps);
-        }
+    const uint mean_offset = idx * 3;
+    for (uint component = 0; component < 3; ++component) {
+        const uint parameter_index = mean_offset + component;
+        adam_update_element(
+            means3d[parameter_index], mean_exp_avg[parameter_index],
+            mean_exp_avg_sq[parameter_index], local_v_mean3d[component],
+            adam_hp.mean_step_size, adam_hp.beta1, adam_hp.beta2,
+            adam_hp.mean_bc2_sqrt, adam_hp.eps);
+        adam_update_element(
+            scales[parameter_index], scale_exp_avg[parameter_index],
+            scale_exp_avg_sq[parameter_index], local_v_scale[component],
+            adam_hp.scale_step_size, adam_hp.beta1, adam_hp.beta2,
+            adam_hp.scale_bc2_sqrt, adam_hp.eps);
     }
 
-    if (degrees_to_use < 2) return;
-
-    // SH degree 2 (5 bases)
-    float sh2[5] = {
-        SH_C2[0] * xy,
-        SH_C2[1] * yz,
-        SH_C2[2] * (2.f * zz - xx - yy),
-        SH_C2[3] * xz,
-        SH_C2[4] * (xx - yy)
-    };
-    for (int b = 0; b < 5; b++) {
-        for (int c = 0; c < 3; c++) {
-            uint i = rest_idx + (3 + b) * 3 + c;
-            float g = sh2[b] * vc[c];
-            adam_update_element(features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
-                               g, adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.rest_bc2_sqrt, adam_hp.eps);
-        }
-    }
-
-    if (degrees_to_use < 3) return;
-
-    // SH degree 3 (7 bases)
-    float sh3[7] = {
-        SH_C3[0] * y * (3.f * xx - yy),
-        SH_C3[1] * xy * z,
-        SH_C3[2] * y * (4.f * zz - xx - yy),
-        SH_C3[3] * z * (2.f * zz - 3.f * xx - 3.f * yy),
-        SH_C3[4] * x * (4.f * zz - xx - yy),
-        SH_C3[5] * z * (xx - yy),
-        SH_C3[6] * x * (xx - 3.f * yy)
-    };
-    for (int b = 0; b < 7; b++) {
-        for (int c = 0; c < 3; c++) {
-            uint i = rest_idx + (8 + b) * 3 + c;
-            float g = sh3[b] * vc[c];
-            adam_update_element(features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
-                               g, adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.rest_bc2_sqrt, adam_hp.eps);
-        }
+    const uint quat_offset = idx * 4;
+    for (uint component = 0; component < 4; ++component) {
+        const uint parameter_index = quat_offset + component;
+        adam_update_element(
+            quats[parameter_index], quat_exp_avg[parameter_index],
+            quat_exp_avg_sq[parameter_index], local_v_quat[component],
+            adam_hp.quat_step_size, adam_hp.beta1, adam_hp.beta2,
+            adam_hp.quat_bc2_sqrt, adam_hp.eps);
     }
 }
 

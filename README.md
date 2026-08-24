@@ -381,9 +381,8 @@ Forward:
 Backward:
   ssim_v_bwd                 in-place final SSIM image gradient
   rasterize_backward         per-pixel backward compositing
-  project_and_sh_backward    fused projection + SH VJP + SH Adam update
-  fused_adam (×4 groups)     optimizer step
-  accumulate_grad_stats      gradient norms for densification
+  sh_opacity_backward_adam   register SH VJP + SH/opacity Adam update
+  project_backward_adam      register geometry VJP + Adam + densify stats
 ```
 
 Upstream's [README](https://github.com/rayanht/msplat) covers the design behind
