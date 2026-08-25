@@ -54,13 +54,14 @@ Prerequisites:
     identifies a dataset staged in the app's Documents directory.
 
 The app is built and installed once, then these isolated variants run:
-  baseline, difference-retry, gather, fused-ssim, raster-16x8, raster-16x16
+  baseline, arena-retry, difference-retry, gather, fused-ssim, raster-16x8,
+  raster-16x16
 
 Every run writes a console log and devicectl JSON result. Successful benchmark
 summaries are appended to results.jsonl; runs.tsv records every run's status.
 The script never removes app data and never sends a broad process kill.
 
-The six-run matrix is exploratory because its fixed order does not control
+The seven-run matrix is exploratory because its fixed order does not control
 device thermals. Before promoting a candidate, use --only with fresh result
 directories for a baseline/candidate/baseline comparison from matched states.
 USAGE
@@ -141,7 +142,7 @@ done
 (( WARMUP_ITERATIONS + MEASURED_ITERATIONS >= 2 )) || die \
     "Preview benchmarks require at least two total iterations"
 case "$ONLY_VARIANT" in
-    ""|baseline|difference-retry|gather|fused-ssim|raster-16x8|raster-16x16) ;;
+    ""|baseline|arena-retry|difference-retry|gather|fused-ssim|raster-16x8|raster-16x16) ;;
     *) die "unknown benchmark label: $ONLY_VARIANT" ;;
 esac
 
@@ -370,10 +371,12 @@ run_variant() {
 }
 
 # Each experiment changes only the named optimization from the explicit
-# baseline. The difference-count experiment uses the GPU layout/retry path as
-# one transactional unit because retry requires GPU-owned layout metadata.
+# baseline. Retry requires GPU-owned layout metadata; the separate
+# difference-retry row measures the exact difference-grid counter on that same
+# transactional path.
 CONFIGURATIONS=(
     'baseline|enumerated|cpu|exact|packed|staged|8x8'
+    'arena-retry|enumerated|gpu|retry|packed|staged|8x8'
     'difference-retry|difference|gpu|retry|packed|staged|8x8'
     'gather|enumerated|cpu|exact|gather|staged|8x8'
     'fused-ssim|enumerated|cpu|exact|packed|fused|8x8'
