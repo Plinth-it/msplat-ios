@@ -111,7 +111,7 @@ require_contains("${blit_zero}" "fillBuffer:photometric_gradient.buffer()"
     "per-step gradient scratch reset")
 
 extract_section(host_source "MTensor msplat_render("
-    "MTensor msplat_train_step(" canonical_host_render)
+    "static MTensor msplat_train_step_locked(" canonical_host_render)
 extract_section(model_source "MTensor Model::render("
     "void Model::fullIteration(" canonical_model_render)
 require_absent("${canonical_host_render}" "photometric"

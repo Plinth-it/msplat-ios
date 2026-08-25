@@ -166,7 +166,7 @@ require_contains("${canonical_render_pipeline}"
     "const uint32_t poseDisabled = 0u;\n        ENC_SCALAR(enc, poseDisabled, 23);"
     "canonical render pose-disabled binding")
 
-extract_section(host_source "MTensor msplat_train_step("
+extract_section(host_source "static MTensor msplat_train_step_locked("
     "// ========================== FORWARD ENCODE LAMBDAS" training_setup)
 require_contains("${training_setup}"
     "std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f}"

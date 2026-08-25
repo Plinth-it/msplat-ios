@@ -262,7 +262,7 @@ struct MsplatLogicalTrainingStep {
         double arenaGrowDurationMs) {
         std::lock_guard<std::mutex> lock(mutex);
         if (sealed || aborted) return;
-        intersectionArenaGrowMs = arenaGrowDurationMs;
+        intersectionArenaGrowMs += arenaGrowDurationMs;
         maximumTileCount = layout.maximumTileCount;
         activeTileCount = layout.activeTileCount;
         trivialTileCount = layout.trivialTileCount;
@@ -271,11 +271,19 @@ struct MsplatLogicalTrainingStep {
         largeTileCount = layout.largeTileCount;
     }
 
+    void recordRecoveredIntersectionRetry(uint32_t overflowReasons,
+                                          double arenaGrowDurationMs) {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (sealed || aborted) return;
+        recoveredOverflowReasons |= overflowReasons;
+        intersectionArenaGrowMs += arenaGrowDurationMs;
+    }
+
     void recordPostCountEncode(TelemetryClock::time_point encodeStart,
                                TelemetryClock::time_point encodeEnd) {
         std::lock_guard<std::mutex> lock(mutex);
         if (sealed || aborted) return;
-        postCountEncodeMs = elapsedMilliseconds(encodeStart, encodeEnd);
+        postCountEncodeMs += elapsedMilliseconds(encodeStart, encodeEnd);
     }
 
     void validateForSubmit(
@@ -411,9 +419,10 @@ private:
             bool intersectionCountValid = false;
             if (readbackEncoded && readback.defined()) {
                 const auto* words = readback.data<uint32_t>();
-                completed.overflowReasons = words[0] & (
+                completed.overflowReasons = recoveredOverflowReasons |
+                    (words[0] & (
                     MSPLAT_TRAINING_OVERFLOW_TILE_CAP |
-                    MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY);
+                    MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY));
 
                 float rawLoss = 0.0f;
                 std::memcpy(&rawLoss, &words[1], sizeof(rawLoss));
@@ -468,6 +477,7 @@ private:
     double countWaitWallMs = 0.0;
     double postCountEncodeMs = 0.0;
     double intersectionArenaGrowMs = 0.0;
+    uint32_t recoveredOverflowReasons = MSPLAT_TRAINING_OVERFLOW_NONE;
     uint32_t maximumTileCount = 0;
     uint32_t activeTileCount = 0;
     uint32_t trivialTileCount = 0;
@@ -795,6 +805,9 @@ struct MetalContext {
     bool difference_tile_counting = false;
     id<MTLComputePipelineState> build_tile_intersection_layout_kernel_cpso = nil;
     bool gpu_tile_layout = false;
+    bool retry_intersection_attempts = false;
+    id<MTLComputePipelineState> validate_tile_intersection_attempt_kernel_cpso = nil;
+    id<MTLComputePipelineState> finalize_tile_intersection_attempt_kernel_cpso = nil;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso = nil;
     uint32_t monolithic_raster_block_x = 8;
     uint32_t monolithic_raster_block_y = 8;
@@ -849,6 +862,8 @@ struct MetalContext {
             tile_count_diff_horizontal_kernel_cpso,
             tile_count_diff_vertical_kernel_cpso,
             build_tile_intersection_layout_kernel_cpso,
+            validate_tile_intersection_attempt_kernel_cpso,
+            finalize_tile_intersection_attempt_kernel_cpso,
             nd_rasterize_forward_kernel_cpso,
             float_rgb_to_preview_texture_kernel_cpso,
             scatter_to_exact_bins_kernel_cpso,
@@ -1073,6 +1088,22 @@ MetalContext* init_msplat_metal_context() {
         }
     }
 
+    const char* trainingArenaModeOverride =
+        std::getenv("MSPLAT_TRAINING_ARENA_MODE");
+    if (trainingArenaModeOverride) {
+        if (std::strcmp(trainingArenaModeOverride, "exact") == 0) {
+            // Keep the established synchronized exact-sizing path.
+        } else if (std::strcmp(trainingArenaModeOverride, "retry") == 0) {
+            ctx->retry_intersection_attempts = true;
+            // Retry mode depends on GPU-resident offsets and classification even
+            // when the standalone layout A/B override was not supplied.
+            ctx->gpu_tile_layout = true;
+        } else {
+            throw std::invalid_argument(
+                "msplat: MSPLAT_TRAINING_ARENA_MODE must be exact or retry");
+        }
+    }
+
     const char* rasterVariantOverride = std::getenv("MSPLAT_RASTER_VARIANT");
     NSString* monolithicRasterFunctionName = @"nd_rasterize_forward_kernel";
     if (rasterVariantOverride) {
@@ -1103,6 +1134,12 @@ MetalContext* init_msplat_metal_context() {
     if (ctx->gpu_tile_layout) {
         ctx->build_tile_intersection_layout_kernel_cpso =
             load(@"build_tile_intersection_layout_kernel");
+    }
+    if (ctx->retry_intersection_attempts) {
+        ctx->validate_tile_intersection_attempt_kernel_cpso =
+            load(@"validate_tile_intersection_attempt_kernel");
+        ctx->finalize_tile_intersection_attempt_kernel_cpso =
+            load(@"finalize_tile_intersection_attempt_kernel");
     }
     ctx->nd_rasterize_forward_kernel_cpso         = load(monolithicRasterFunctionName);
     ctx->float_rgb_to_preview_texture_kernel_cpso = load(@"float_rgb_to_preview_texture_kernel");
@@ -1164,6 +1201,10 @@ MetalContext* init_msplat_metal_context() {
     if (tileLayoutModeOverride) {
         fprintf(stderr, "msplat: MSPLAT_TILE_LAYOUT_MODE=%s\n",
                 tileLayoutModeOverride);
+    }
+    if (trainingArenaModeOverride) {
+        fprintf(stderr, "msplat: MSPLAT_TRAINING_ARENA_MODE=%s\n",
+                trainingArenaModeOverride);
     }
     if (ctx->small_sort_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup <
         msplat::kExactSmallTileMaximum) {
@@ -1284,6 +1325,37 @@ static void encode_gpu_tile_intersection_layout(
     ENC_BUF(encoder, sortableTileIndices, 3);
     ENC_BUF(encoder, metadata, 4);
     ENC_SCALAR(encoder, numTiles, 5);
+    [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+}
+
+static void encode_validate_tile_intersection_attempt(
+    MetalContext* ctx,
+    id<MTLComputeCommandEncoder> encoder,
+    MTensor& tileBins,
+    uint32_t numTiles,
+    uint32_t arenaCapacity,
+    uint32_t radixScratchAvailable,
+    uint32_t plannedChunkCount,
+    uint32_t packThreadsPerGroup,
+    MTensor& attemptStatus,
+    MTensor& layoutMetadata,
+    MTensor& dispatchControl,
+    MTensor& tileOffsets
+) {
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [encoder setComputePipelineState:
+        ctx->validate_tile_intersection_attempt_kernel_cpso];
+    ENC_BUF(encoder, layoutMetadata, 0);
+    ENC_BUF(encoder, tileBins, 1);
+    ENC_SCALAR(encoder, numTiles, 2);
+    ENC_SCALAR(encoder, arenaCapacity, 3);
+    ENC_SCALAR(encoder, radixScratchAvailable, 4);
+    ENC_SCALAR(encoder, plannedChunkCount, 5);
+    ENC_BUF(encoder, attemptStatus, 6);
+    ENC_BUF(encoder, dispatchControl, 7);
+    ENC_SCALAR(encoder, packThreadsPerGroup, 8);
+    ENC_BUF(encoder, tileOffsets, 9);
     [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
 }
@@ -1572,6 +1644,7 @@ struct FusedTensorCache {
     MTensor tile_offsets, tile_scatter_counters, sortable_tile_indices;
     MTensor tile_count_diff;
     MTensor tile_layout_metadata;
+    MTensor tile_attempt_dispatch_control;
     MTensor intersection_keys_a, intersection_keys_b;
 
     // Defensive invariant check: exact sizing should make this remain zero.
@@ -1599,6 +1672,7 @@ struct FusedTensorCache {
             &out_img, &final_Ts, &final_idx,
             &tile_bins, &tile_offsets, &tile_scatter_counters,
             &sortable_tile_indices, &tile_count_diff, &tile_layout_metadata,
+            &tile_attempt_dispatch_control,
             &intersection_keys_a, &intersection_keys_b, &overflow_flag,
             &chunk_T, &chunk_C, &chunk_final_idx
         };
@@ -1689,6 +1763,19 @@ struct FusedTensorCache {
             {static_cast<int64_t>(
                 msplat::kTileIntersectionLayoutMetadataWordCount)},
             DType::Int32);
+    }
+
+    void ensure_tile_attempt_dispatch_control(bool enabled,
+                                              id<MTLDevice> dev) {
+        if (!enabled) {
+            tile_attempt_dispatch_control.reset();
+            return;
+        }
+        if (tile_attempt_dispatch_control.defined()) return;
+        // Three MTLDispatchThreadgroupsIndirectArguments records followed by
+        // the small count, general count, and general-list offset scalars.
+        tile_attempt_dispatch_control =
+            mtensor_empty(dev, {12}, DType::Int32);
     }
 
     void ensure_shared_forward(int np, int ih, int iw, int nt,
@@ -2384,7 +2471,7 @@ MTensor msplat_render(
     return g_tcache.out_img;
 }
 
-MTensor msplat_train_step(
+static MTensor msplat_train_step_locked(
     int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
     MTensor &quats, MTensor &viewmat, MTensor &projmat,
     float fx, float fy, float cx, float cy,
@@ -2408,7 +2495,6 @@ MTensor msplat_train_step(
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
     float inv_max_dim
 ) {
-    std::lock_guard<std::mutex> lock(g_engine_mutex);
     MetalContext* ctx = get_global_context();
     auto logicalStep = ctx->activeTrainingStep;
     constexpr int kExpectedAdamGroups = 6;
@@ -2646,12 +2732,18 @@ MTensor msplat_train_step(
     }
 
     // --- Cached buffer pool ---
+    const bool intersectionResolutionChanged =
+        static_cast<int>(img_height) != g_tcache.shared_img_height ||
+        static_cast<int>(img_width) != g_tcache.shared_img_width ||
+        num_tiles != g_tcache.num_tiles;
     g_tcache.ensure_shared_forward(
         num_points, img_height, img_width, num_tiles, ctx->device);
     g_tcache.ensure_tile_count_diff(
         tile_bounds_x, tile_bounds_y, ctx->difference_tile_counting,
         ctx->device);
     g_tcache.ensure_tile_layout_metadata(ctx->gpu_tile_layout, ctx->device);
+    g_tcache.ensure_tile_attempt_dispatch_control(
+        ctx->retry_intersection_attempts, ctx->device);
     g_tcache.ensure_training_image(img_height, img_width, ctx->device);
     g_tcache.ensure_backward(num_points, ctx->device);
     if (pose.enabled) g_tcache.ensure_pose_refinement(ctx->device);
@@ -2700,6 +2792,28 @@ MTensor msplat_train_step(
     MTensor &max2DSizeBuffer = collect_densification_stats
         ? max_2d_size : v_opacity;
     const uint32_t collectStats = collect_densification_stats ? 1u : 0u;
+    const uint32_t attemptGatingEnabled =
+        ctx->retry_intersection_attempts ? 1u : 0u;
+
+    // A resolution change deliberately resets the arena high-water mark. That
+    // frame uses the established synchronized bootstrap; subsequent retry-mode
+    // frames keep layout, capacity, sorting, and raster selection on the GPU.
+    const bool gpuResidentIntersectionAttempt =
+        ctx->retry_intersection_attempts &&
+        !intersectionResolutionChanged && g_tcache.capacity > 0;
+    uint32_t plannedAttemptChunkCount = 1;
+    if (gpuResidentIntersectionAttempt && num_tiles < 400 &&
+        g_tcache.chunk_T.defined() && g_tcache.chunk_C.defined() &&
+        g_tcache.chunk_final_idx.defined() &&
+        g_tcache.prefix_T.defined() && g_tcache.after_C.defined() &&
+        g_tcache.forward_chunk_height == static_cast<int>(img_height) &&
+        g_tcache.forward_chunk_width == static_cast<int>(img_width) &&
+        g_tcache.backward_chunk_height == static_cast<int>(img_height) &&
+        g_tcache.backward_chunk_width == static_cast<int>(img_width)) {
+        plannedAttemptChunkCount = static_cast<uint32_t>(std::max(
+            1, std::min(g_tcache.forward_chunk_K_max,
+                        g_tcache.backward_chunk_K_max)));
+    }
 
     // --- Constants (heap-allocated for Obj-C block capture) ---
     auto loss_img_size = std::make_shared<std::array<uint32_t, 2>>(std::array<uint32_t, 2>{img_width, img_height});
@@ -2793,6 +2907,11 @@ MTensor msplat_train_step(
                        range:NSMakeRange(
                            0, tileCountStorage.nbytes())
                        value:0];
+            // Clear once, before layout publishes the capacity decision. The
+            // post-layout work must preserve this status through every
+            // persistent update and completion-side retry decision.
+            [blit fillBuffer:overflow_flag.buffer()
+                       range:NSMakeRange(0, sizeof(uint32_t)) value:0];
             [blit endEncoding];
 
             id<MTLComputeCommandEncoder> encoder = nil;
@@ -2827,20 +2946,41 @@ MTensor msplat_train_step(
                 g_tcache.sortable_tile_indices,
                 g_tcache.tile_layout_metadata,
                 static_cast<uint32_t>(num_tiles));
+            if (gpuResidentIntersectionAttempt) {
+                const uint32_t arenaCapacity =
+                    static_cast<uint32_t>(g_tcache.capacity);
+                const uint32_t radixScratchAvailable =
+                    g_tcache.intersection_keys_b.defined() ? 1u : 0u;
+                const uint32_t packThreadsPerGroup = static_cast<uint32_t>(
+                    ctx->pack_sorted_gaussians_kernel_cpso
+                        .maxTotalThreadsPerThreadgroup);
+                encode_validate_tile_intersection_attempt(
+                    ctx, encoder, g_tcache.tile_bins,
+                    static_cast<uint32_t>(num_tiles), arenaCapacity,
+                    radixScratchAvailable, plannedAttemptChunkCount,
+                    packThreadsPerGroup, overflow_flag,
+                    g_tcache.tile_layout_metadata,
+                    g_tcache.tile_attempt_dispatch_control,
+                    g_tcache.tile_offsets);
+            }
             [encoder endEncoding];
         });
         if (encodingFailure) {
             ctx->discardCB();
             throw std::runtime_error(encodingFailure);
         }
-        const SynchronousGpuMetrics countPassMetrics = ctx->syncCB();
-        if (logicalStep) {
-            logicalStep->recordExactCountPass(countPassMetrics);
+        if (!gpuResidentIntersectionAttempt) {
+            const SynchronousGpuMetrics countPassMetrics = ctx->syncCB();
+            if (logicalStep) {
+                logicalStep->recordExactCountPass(countPassMetrics);
+            }
         }
     }
 
-    const msplat::TileIntersectionLayout intersectionLayout =
-        ctx->gpu_tile_layout
+    msplat::TileIntersectionLayout intersectionLayout;
+    bool intersectionArenaGrew = false;
+    if (!gpuResidentIntersectionAttempt) {
+        intersectionLayout = ctx->gpu_tile_layout
             ? completed_gpu_tile_intersection_layout(num_tiles)
             : msplat::buildTileIntersectionLayout(
                 g_tcache.tile_scatter_counters.data<uint32_t>(),
@@ -2848,22 +2988,23 @@ MTensor msplat_train_step(
                 static_cast<size_t>(num_tiles),
                 g_tcache.tile_bins.data<int32_t>(),
                 g_tcache.sortable_tile_indices.data<uint32_t>());
-    msplat::validateTileIntersectionWorkLimit(intersectionLayout);
-    const bool needsRadixScratch =
-        msplat::tileIntersectionLayoutNeedsRadixScratch(intersectionLayout);
-    const auto arenaGrowStart = TelemetryClock::now();
-    const bool intersectionArenaGrew = g_tcache.ensure_intersection_arena(
-        intersectionLayout.totalCount, needsRadixScratch, ctx->device);
-    const auto arenaGrowEnd = TelemetryClock::now();
-    if (needsRadixScratch && !g_tcache.intersection_keys_b.defined()) {
-        throw std::logic_error("Exact radix sort requires its scratch arena");
-    }
-    if (logicalStep) {
-        logicalStep->recordIntersectionLayout(
-            intersectionLayout,
-            intersectionArenaGrew
-                ? elapsedMilliseconds(arenaGrowStart, arenaGrowEnd)
-                : 0.0);
+        msplat::validateTileIntersectionWorkLimit(intersectionLayout);
+        const bool needsRadixScratch =
+            msplat::tileIntersectionLayoutNeedsRadixScratch(intersectionLayout);
+        const auto arenaGrowStart = TelemetryClock::now();
+        intersectionArenaGrew = g_tcache.ensure_intersection_arena(
+            intersectionLayout.totalCount, needsRadixScratch, ctx->device);
+        const auto arenaGrowEnd = TelemetryClock::now();
+        if (needsRadixScratch && !g_tcache.intersection_keys_b.defined()) {
+            throw std::logic_error("Exact radix sort requires its scratch arena");
+        }
+        if (logicalStep) {
+            logicalStep->recordIntersectionLayout(
+                intersectionLayout,
+                intersectionArenaGrew
+                    ? elapsedMilliseconds(arenaGrowStart, arenaGrowEnd)
+                    : 0.0);
+        }
     }
 
     MTensor &packed_xy_opac = g_tcache.packed_xy_opac;
@@ -2875,22 +3016,29 @@ MTensor msplat_train_step(
             : g_tcache.intersection_keys_a;
     const uint32_t capacity_u32 = static_cast<uint32_t>(g_tcache.capacity);
     const uint32_t num_tiles_u32 = static_cast<uint32_t>(num_tiles);
-    const uint32_t sortable_tile_count =
-        intersectionLayout.sortableTileCount;
-    const uint32_t small_sort_tile_count =
-        intersectionLayout.smallTileCount;
-    const uint32_t general_sort_tile_count =
-        intersectionLayout.mediumTileCount + intersectionLayout.largeTileCount;
+    const uint32_t sortable_tile_count = gpuResidentIntersectionAttempt
+        ? 0u : intersectionLayout.sortableTileCount;
+    const uint32_t small_sort_tile_count = gpuResidentIntersectionAttempt
+        ? 0u : intersectionLayout.smallTileCount;
+    const uint32_t general_sort_tile_count = gpuResidentIntersectionAttempt
+        ? 0u
+        : intersectionLayout.mediumTileCount + intersectionLayout.largeTileCount;
     const uint32_t general_sort_tile_offset = small_sort_tile_count;
-    const uint32_t total_intersections = intersectionLayout.totalCount;
+    const uint32_t total_intersections = gpuResidentIntersectionAttempt
+        ? 0u : intersectionLayout.totalCount;
 
-    uint32_t K_max = 1;
     constexpr uint32_t CHUNK_SIZE = 512;
-    K_max = msplat::tileRasterChunkCount(
-        static_cast<uint32_t>(num_tiles),
-        intersectionLayout.maximumTileCount, CHUNK_SIZE);
-    g_tcache.ensure_forward_chunks(K_max, img_height, img_width, ctx->device);
-    g_tcache.ensure_backward_chunks(K_max, img_height, img_width, ctx->device);
+    const uint32_t K_max = gpuResidentIntersectionAttempt
+        ? plannedAttemptChunkCount
+        : msplat::tileRasterChunkCount(
+            static_cast<uint32_t>(num_tiles),
+            intersectionLayout.maximumTileCount, CHUNK_SIZE);
+    if (!gpuResidentIntersectionAttempt) {
+        g_tcache.ensure_forward_chunks(
+            K_max, img_height, img_width, ctx->device);
+        g_tcache.ensure_backward_chunks(
+            K_max, img_height, img_width, ctx->device);
+    }
 
     uint32_t bwd_K_max = K_max;
     constexpr uint32_t BWD_CHUNK_SIZE = 512;
@@ -2918,7 +3066,7 @@ MTensor msplat_train_step(
             threadsPerThreadgroup:MTLSizeMake(scatterTpg, 1, 1)];
 
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        if (small_sort_tile_count > 0) {
+        if (gpuResidentIntersectionAttempt || small_sort_tile_count > 0) {
             [enc setComputePipelineState:ctx->small_sort_per_tile_kernel_cpso];
             ENC_BUF(enc, g_tcache.tile_offsets, 0);
             ENC_BUF(enc, g_tcache.intersection_keys_a, 1);
@@ -2927,12 +3075,23 @@ MTensor msplat_train_step(
             ENC_SCALAR(enc, capacity_u32, 4);
             ENC_BUF(enc, overflow_flag, 5);
             ENC_BUF(enc, g_tcache.sortable_tile_indices, 6);
-            ENC_SCALAR(enc, small_sort_tile_count, 7);
-            [enc dispatchThreadgroups:MTLSizeMake(small_sort_tile_count, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(
-                    msplat::kExactSmallTileMaximum, 1, 1)];
+            if (gpuResidentIntersectionAttempt) {
+                [enc setBuffer:g_tcache.tile_attempt_dispatch_control.buffer()
+                        offset:9u * sizeof(uint32_t) atIndex:7];
+                [enc dispatchThreadgroupsWithIndirectBuffer:
+                        g_tcache.tile_attempt_dispatch_control.buffer()
+                    indirectBufferOffset:0
+                    threadsPerThreadgroup:MTLSizeMake(
+                        msplat::kExactSmallTileMaximum, 1, 1)];
+            } else {
+                ENC_SCALAR(enc, small_sort_tile_count, 7);
+                [enc dispatchThreadgroups:
+                        MTLSizeMake(small_sort_tile_count, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(
+                        msplat::kExactSmallTileMaximum, 1, 1)];
+            }
         }
-        if (general_sort_tile_count > 0) {
+        if (gpuResidentIntersectionAttempt || general_sort_tile_count > 0) {
             [enc setComputePipelineState:ctx->radix_sort_per_tile_kernel_cpso];
             ENC_BUF(enc, g_tcache.tile_offsets, 0);
             ENC_BUF(enc, g_tcache.intersection_keys_a, 1);
@@ -2942,28 +3101,74 @@ MTensor msplat_train_step(
             ENC_SCALAR(enc, capacity_u32, 5);
             ENC_BUF(enc, overflow_flag, 6);
             ENC_BUF(enc, g_tcache.sortable_tile_indices, 7);
-            ENC_SCALAR(enc, general_sort_tile_count, 8);
-            ENC_SCALAR(enc, general_sort_tile_offset, 9);
-            [enc dispatchThreadgroups:MTLSizeMake(general_sort_tile_count, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            if (gpuResidentIntersectionAttempt) {
+                [enc setBuffer:g_tcache.tile_attempt_dispatch_control.buffer()
+                        offset:10u * sizeof(uint32_t) atIndex:8];
+                [enc setBuffer:g_tcache.tile_attempt_dispatch_control.buffer()
+                        offset:11u * sizeof(uint32_t) atIndex:9];
+                [enc dispatchThreadgroupsWithIndirectBuffer:
+                        g_tcache.tile_attempt_dispatch_control.buffer()
+                    indirectBufferOffset:3u * sizeof(uint32_t)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                ENC_SCALAR(enc, general_sort_tile_count, 8);
+                ENC_SCALAR(enc, general_sort_tile_offset, 9);
+                [enc dispatchThreadgroups:
+                        MTLSizeMake(general_sort_tile_count, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            }
         }
 
-        if (total_intersections == 0) return;
-        if (sortable_tile_count > 0) {
+        if (gpuResidentIntersectionAttempt) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:
+                ctx->finalize_tile_intersection_attempt_kernel_cpso];
+            ENC_BUF(enc, tile_bins, 0);
+            ENC_BUF(enc, overflow_flag, 1);
+            ENC_SCALAR(enc, num_tiles_u32, 2);
+            ENC_BUF(enc, g_tcache.tile_attempt_dispatch_control, 3);
+            const NSUInteger finalizeTpg = MIN(
+                ctx->finalize_tile_intersection_attempt_kernel_cpso
+                    .maxTotalThreadsPerThreadgroup,
+                static_cast<NSUInteger>(num_tiles));
+            [enc dispatchThreads:MTLSizeMake(num_tiles, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(finalizeTpg, 1, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        } else {
+            if (total_intersections == 0) return;
+            if (sortable_tile_count > 0) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            }
         }
-        NSUInteger packTpg = MIN(
-            ctx->pack_sorted_gaussians_kernel_cpso.maxTotalThreadsPerThreadgroup,
-            static_cast<NSUInteger>(total_intersections));
+
+        const NSUInteger packTpg = gpuResidentIntersectionAttempt
+            ? ctx->pack_sorted_gaussians_kernel_cpso
+                .maxTotalThreadsPerThreadgroup
+            : MIN(
+                ctx->pack_sorted_gaussians_kernel_cpso
+                    .maxTotalThreadsPerThreadgroup,
+                static_cast<NSUInteger>(total_intersections));
         [enc setComputePipelineState:ctx->pack_sorted_gaussians_kernel_cpso];
         ENC_BUF(enc, g_tcache.intersection_keys_a, 0);
         ENC_BUF(enc, xys, 1); ENC_BUF(enc, conics, 2);
         ENC_BUF(enc, colors, 3); ENC_BUF(enc, projected_opacities, 4);
         ENC_BUF(enc, packed_xy_opac, 5); ENC_BUF(enc, packed_conic, 6);
         ENC_BUF(enc, packed_rgb, 7);
-        ENC_SCALAR(enc, total_intersections, 8);
-        [enc dispatchThreads:MTLSizeMake(total_intersections, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(packTpg, 1, 1)];
+        if (gpuResidentIntersectionAttempt) {
+            [enc setBuffer:g_tcache.tile_layout_metadata.buffer()
+                    offset:0 atIndex:8];
+        } else {
+            ENC_SCALAR(enc, total_intersections, 8);
+        }
+        if (gpuResidentIntersectionAttempt) {
+            [enc dispatchThreadgroupsWithIndirectBuffer:
+                    g_tcache.tile_attempt_dispatch_control.buffer()
+                indirectBufferOffset:6u * sizeof(uint32_t)
+                threadsPerThreadgroup:MTLSizeMake(packTpg, 1, 1)];
+        } else {
+            [enc dispatchThreads:MTLSizeMake(total_intersections, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(packTpg, 1, 1)];
+        }
     };
 
     auto encode_rast_fwd = [&](id<MTLComputeCommandEncoder> enc) {
@@ -3084,6 +3289,8 @@ MTensor msplat_train_step(
             ENC_SCALAR(enc, adam_eps, 9);
             ENC_SCALAR(enc, photometric.regularization, 10);
             ENC_SCALAR(enc, photometric.maxAbsLogGain, 11);
+            ENC_BUF(enc, overflow_flag, 12);
+            ENC_SCALAR(enc, attemptGatingEnabled, 13);
             [enc dispatchThreads:MTLSizeMake(3, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(3, 1, 1)];
         }
@@ -3210,6 +3417,9 @@ MTensor msplat_train_step(
     }
 
     auto encode_proj_sh_bwd_adam = [&](id<MTLComputeCommandEncoder> enc) {
+        // The attempt status is immutable after sort finalization. Publish it
+        // before any kernel that can mutate model or optimizer state.
+        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         NSUInteger shTpg = MIN(
             ctx->sh_opacity_backward_adam_kernel_cpso.maxTotalThreadsPerThreadgroup,
             (NSUInteger)num_points);
@@ -3231,6 +3441,8 @@ MTensor msplat_train_step(
         ENC_BUF(enc, adam_exp_avg[5], 15); ENC_BUF(enc, adam_exp_avg_sq[5], 16);
         [enc setBytes:sh_adam_hp.get()
                length:sizeof(SHOpacityAdamParams) atIndex:17];
+        ENC_BUF(enc, overflow_flag, 18);
+        ENC_SCALAR(enc, attemptGatingEnabled, 19);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(shTpg, 1, 1)];
 
@@ -3259,6 +3471,8 @@ MTensor msplat_train_step(
         ENC_SCALAR(enc, collectStats, 22);
         ENC_BUF(enc, visCountsBuffer, 23); ENC_BUF(enc, xysGradNormBuffer, 24);
         ENC_BUF(enc, max2DSizeBuffer, 25); ENC_SCALAR(enc, inv_max_dim, 26);
+        ENC_BUF(enc, overflow_flag, 27);
+        ENC_SCALAR(enc, attemptGatingEnabled, 28);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(geometryTpg, 1, 1)];
 
@@ -3271,6 +3485,8 @@ MTensor msplat_train_step(
             ENC_BUF(enc, poseExpAvgSq, 3);
             [enc setBytes:pose_adam_hp.get()
                    length:sizeof(PoseAdamParams) atIndex:4];
+            ENC_BUF(enc, overflow_flag, 5);
+            ENC_SCALAR(enc, attemptGatingEnabled, 6);
             [enc dispatchThreads:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         }
@@ -3289,8 +3505,6 @@ MTensor msplat_train_step(
             [blit fillBuffer:poseGradient.buffer()
                        range:NSMakeRange(0, poseGradient.nbytes()) value:0];
         }
-        [blit fillBuffer:overflow_flag.buffer()
-                   range:NSMakeRange(0, sizeof(uint32_t)) value:0];
         [blit fillBuffer:g_tcache.tile_scatter_counters.buffer()
                    range:NSMakeRange(
                        0, g_tcache.tile_scatter_counters.nbytes()) value:0];
@@ -3495,9 +3709,131 @@ MTensor msplat_train_step(
             postCountEncodeStart, TelemetryClock::now());
     }
 
+    if (ctx->retry_intersection_attempts) {
+        // Retry mode is deliberately serial for now: complete one transactional
+        // attempt, inspect only its tiny status/layout readback, then grow and
+        // replay the same logical step if its retained high-water buffers were
+        // insufficient. All model/Adam/stat mutations above are status-gated.
+        ctx->syncCB();
+
+        const msplat::TileIntersectionLayout completedLayout =
+            completed_gpu_tile_intersection_layout(num_tiles);
+        msplat::validateTileIntersectionWorkLimit(completedLayout);
+
+        constexpr uint32_t knownAttemptFailures =
+            MSPLAT_TRAINING_OVERFLOW_TILE_CAP |
+            MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY;
+        const uint32_t attemptFailures =
+            overflow_flag.data<uint32_t>()[0];
+        if ((attemptFailures & ~knownAttemptFailures) != 0u) {
+            throw std::runtime_error(
+                "GPU intersection attempt reported an unknown failure");
+        }
+        if ((attemptFailures & MSPLAT_TRAINING_OVERFLOW_TILE_CAP) != 0u) {
+            // Layout errors and the bounded per-tile work limit are not fixed
+            // by retaining a larger arena.
+            throw std::length_error(
+                "GPU intersection attempt exceeds the exact-sort work limit");
+        }
+
+        if ((attemptFailures &
+             MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY) != 0u) {
+            const auto retryGrowStart = TelemetryClock::now();
+            const bool needsRadixScratch =
+                msplat::tileIntersectionLayoutNeedsRadixScratch(
+                    completedLayout);
+            bool grew = g_tcache.ensure_intersection_arena(
+                completedLayout.totalCount, needsRadixScratch, ctx->device);
+
+            const uint32_t requiredChunkCount =
+                msplat::tileRasterChunkCount(
+                    static_cast<uint32_t>(num_tiles),
+                    completedLayout.maximumTileCount, CHUNK_SIZE);
+            const int previousForwardChunkCount =
+                g_tcache.forward_chunk_K_max;
+            const int previousBackwardChunkCount =
+                g_tcache.backward_chunk_K_max;
+            g_tcache.ensure_forward_chunks(
+                requiredChunkCount, img_height, img_width, ctx->device);
+            g_tcache.ensure_backward_chunks(
+                requiredChunkCount, img_height, img_width, ctx->device);
+            grew = grew ||
+                g_tcache.forward_chunk_K_max > previousForwardChunkCount ||
+                g_tcache.backward_chunk_K_max > previousBackwardChunkCount;
+
+            if (!grew) {
+                throw std::runtime_error(
+                    "GPU intersection attempt failed without a growable capacity shortfall");
+            }
+            const auto retryGrowEnd = TelemetryClock::now();
+            if (logicalStep) {
+                logicalStep->recordRecoveredIntersectionRetry(
+                    attemptFailures,
+                    elapsedMilliseconds(retryGrowStart, retryGrowEnd));
+            }
+
+            // The recursive call remains under the public operation's engine
+            // lock and within this logical training step, so neither shared
+            // cache state nor candidate Adam counters can advance between
+            // attempts.
+            return msplat_train_step_locked(
+                num_points, means3d, scales, glob_scale, quats, viewmat,
+                projmat, fx, fy, cx, cy, img_height, img_width, tile_bounds,
+                clip_thresh, degree, degrees_to_use, cam_pos, features_dc,
+                features_rest, opacities, background, gt, coverage_mask,
+                coverage_render_tiles, loss_coverage_units, ssim_weight,
+                loss_inv_n, transparent_mask, alpha_loss_weight,
+                num_adam_groups, adam_params, adam_exp_avg, adam_exp_avg_sq,
+                adam_step_sizes, adam_bc2_sqrts, adam_beta1, adam_beta2,
+                adam_eps, photometric, pose, collect_densification_stats,
+                vis_counts, xys_grad_norm, max_2d_size, inv_max_dim);
+        }
+
+        if (gpuResidentIntersectionAttempt && logicalStep) {
+            logicalStep->recordIntersectionLayout(completedLayout, 0.0);
+        }
+    }
+
     // Loss is copied into the step's unique readback and published only after
     // GPU completion; the synchronous return remains the densification radii.
     return radii_out;
+}
+
+MTensor msplat_train_step(
+    int num_points, MTensor &means3d, MTensor &scales, float glob_scale,
+    MTensor &quats, MTensor &viewmat, MTensor &projmat,
+    float fx, float fy, float cx, float cy,
+    unsigned img_height, unsigned img_width,
+    const std::tuple<int, int, int> tile_bounds, float clip_thresh,
+    unsigned degree, unsigned degrees_to_use, float cam_pos[3],
+    MTensor &features_dc, MTensor &features_rest,
+    MTensor &opacities, MTensor &background,
+    MTensor &gt, const MTensor* coverage_mask,
+    const MTensor* coverage_render_tiles,
+    uint64_t loss_coverage_units, float ssim_weight,
+    float loss_inv_n, bool transparent_mask,
+    float alpha_loss_weight,
+    int num_adam_groups,
+    MTensor adam_params[], MTensor adam_exp_avg[], MTensor adam_exp_avg_sq[],
+    float adam_step_sizes[], float adam_bc2_sqrts[],
+    float adam_beta1, float adam_beta2, float adam_eps,
+    const MsplatPhotometricRefinementStep& photometric,
+    const MsplatPoseRefinementStep& pose,
+    bool collect_densification_stats,
+    MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
+    float inv_max_dim
+) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    return msplat_train_step_locked(
+        num_points, means3d, scales, glob_scale, quats, viewmat, projmat,
+        fx, fy, cx, cy, img_height, img_width, tile_bounds, clip_thresh,
+        degree, degrees_to_use, cam_pos, features_dc, features_rest,
+        opacities, background, gt, coverage_mask, coverage_render_tiles,
+        loss_coverage_units, ssim_weight, loss_inv_n, transparent_mask,
+        alpha_loss_weight, num_adam_groups, adam_params, adam_exp_avg,
+        adam_exp_avg_sq, adam_step_sizes, adam_bc2_sqrts, adam_beta1,
+        adam_beta2, adam_eps, photometric, pose, collect_densification_stats,
+        vis_counts, xys_grad_norm, max_2d_size, inv_max_dim);
 }
 
 // ============================================================================

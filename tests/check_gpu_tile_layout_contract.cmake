@@ -222,8 +222,8 @@ require_count("${host_source}"
     "shared GPU-layout definition plus render and training calls")
 extract_section("${host_source}" "static void render_pipeline("
     "MTensor msplat_render(" render_pipeline)
-extract_section("${host_source}" "MTensor msplat_train_step("
-    "void msplat_prepare_densify(" training_pipeline)
+extract_section("${host_source}" "static MTensor msplat_train_step_locked("
+    "MTensor msplat_train_step(" training_pipeline)
 foreach(pipeline IN ITEMS render_pipeline training_pipeline)
     require_contains("${${pipeline}}"
         "g_tcache.ensure_tile_layout_metadata(ctx->gpu_tile_layout, ctx->device);"

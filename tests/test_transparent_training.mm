@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -35,6 +36,17 @@ struct StepResult {
     int nonfiniteOpacityCount = 0;
     int nonfiniteOpacityMomentCount = 0;
     int radius = 0;
+    float visibilityCount = 0.0f;
+    float lastVisibilityCount = 0.0f;
+    uint32_t overflowReasons = MSPLAT_TRAINING_OVERFLOW_NONE;
+    uint64_t retainedIntersectionCount = 0;
+    uint64_t intersectionCapacity = 0;
+    double intersectionArenaGrowMs = 0.0;
+    uint32_t maximumTileCount = 0;
+    uint64_t overflowedStepCount = 0;
+    uint64_t tileCapOverflowedStepCount = 0;
+    uint64_t packedCapacityOverflowedStepCount = 0;
+    int64_t lastOverflowIteration = 0;
 };
 
 MTensor gpuFloats(std::initializer_list<int64_t> shape,
@@ -58,7 +70,9 @@ StepResult runStep(bool transparent, float alphaLossWeight,
                    float initialAlpha = 0.1f,
                    bool packedMask = false,
                    bool useCoverageRenderTiles = false,
-                   bool allRenderTilesActive = false) {
+                   bool allRenderTilesActive = false,
+                   bool collectStats = false,
+                   bool collectTelemetry = false) {
     CHECK(gaussianCount > 0);
     std::vector<float> meanValues(static_cast<size_t>(gaussianCount) * 3);
     std::vector<float> scaleValues(static_cast<size_t>(gaussianCount) * 3);
@@ -177,22 +191,46 @@ StepResult runStep(bool transparent, float alphaLossWeight,
     const float lossInvN = static_cast<float>(
         255.0 / (static_cast<double>(coverageUnits) * 3.0));
 
-    MTensor radii = msplat_train_step(
-        gaussianCount, means, scales, 1.0f,
-        quats, viewmat, projmat,
-        32.0f, 32.0f, 16.0f, 16.0f,
-        kHeight, kWidth, std::make_tuple(2, 2, 1), 0.01f,
-        0, 0, cameraPosition,
-        featuresDc, featuresRest, opacities, background,
-        gt, packedMask ? &gt : &mask, coverageRenderTilePointer,
-        coverageUnits, 0.2f, lossInvN,
-        transparent, alphaLossWeight,
-        kAdamGroups, params.data(), expAvg.data(), expAvgSq.data(),
-        stepSizes, biasCorrection2Sqrts,
-        0.9f, 0.999f, 1.0e-8f,
-        photometric, pose, false,
-        visibility, xyGradientNorm, max2DSize, 1.0f / kWidth);
-    msplat_gpu_sync();
+    MsplatTrainingTelemetryHandle telemetry;
+    MsplatLogicalTrainingStepHandle logicalStep;
+    if (collectTelemetry) {
+        telemetry = msplat_training_telemetry_create();
+        logicalStep = msplat_training_step_begin(telemetry, 1);
+        msplat_training_step_mark_cpu_start(logicalStep);
+    }
+
+    MTensor radii;
+    try {
+        radii = msplat_train_step(
+            gaussianCount, means, scales, 1.0f,
+            quats, viewmat, projmat,
+            32.0f, 32.0f, 16.0f, 16.0f,
+            kHeight, kWidth, std::make_tuple(2, 2, 1), 0.01f,
+            0, 0, cameraPosition,
+            featuresDc, featuresRest, opacities, background,
+            gt, packedMask ? &gt : &mask, coverageRenderTilePointer,
+            coverageUnits, 0.2f, lossInvN,
+            transparent, alphaLossWeight,
+            kAdamGroups, params.data(), expAvg.data(), expAvgSq.data(),
+            stepSizes, biasCorrection2Sqrts,
+            0.9f, 0.999f, 1.0e-8f,
+            photometric, pose, collectStats,
+            visibility, xyGradientNorm, max2DSize, 1.0f / kWidth);
+        if (logicalStep) {
+            MsplatTrainingStepDescriptor descriptor;
+            descriptor.iteration = 1;
+            descriptor.splatCount = gaussianCount;
+            descriptor.modelCapacity = gaussianCount;
+            descriptor.effectiveWidth = kWidth;
+            descriptor.effectiveHeight = kHeight;
+            descriptor.activeShDegree = 0;
+            msplat_training_step_submit(logicalStep, descriptor);
+        }
+        msplat_gpu_sync();
+    } catch (...) {
+        if (logicalStep) msplat_training_step_abort(logicalStep);
+        throw;
+    }
 
     StepResult result;
     result.opacity = opacities.data<float>()[0];
@@ -213,6 +251,29 @@ StepResult runStep(bool transparent, float alphaLossWeight,
             ++result.positiveOpacityMomentCount;
     }
     result.radius = radii.data<int32_t>()[0];
+    result.visibilityCount = visibility.data<float>()[0];
+    result.lastVisibilityCount =
+        visibility.data<float>()[gaussianCount - 1];
+    if (telemetry) {
+        const MsplatTrainingTelemetrySnapshot snapshot =
+            msplat_training_telemetry_snapshot(telemetry);
+        CHECK((snapshot.flags &
+               MSPLAT_TRAINING_TELEMETRY_HAS_COMPLETED) != 0);
+        result.overflowReasons = snapshot.completedStep.overflowReasons;
+        result.retainedIntersectionCount =
+            snapshot.completedStep.retainedPackedIntersections;
+        result.intersectionCapacity =
+            snapshot.completedStep.packedIntersectionCapacity;
+        result.intersectionArenaGrowMs =
+            snapshot.completedStep.intersectionArenaGrowMs;
+        result.maximumTileCount = snapshot.completedStep.maximumTileCount;
+        result.overflowedStepCount = snapshot.overflowedStepCount;
+        result.tileCapOverflowedStepCount =
+            snapshot.tileCapOverflowedStepCount;
+        result.packedCapacityOverflowedStepCount =
+            snapshot.packedCapacityOverflowedStepCount;
+        result.lastOverflowIteration = snapshot.lastOverflowIteration;
+    }
     return result;
 }
 
@@ -321,6 +382,37 @@ void checkChunkedTransparentAlphaSupervision() {
     CHECK(transparent.nonfiniteOpacityMomentCount == 0);
 }
 
+void checkArenaRetryTransaction() {
+    const char *mode = std::getenv("MSPLAT_TRAINING_ARENA_MODE");
+    if (!mode || std::string(mode) != "retry") return;
+
+    // Earlier single-Gaussian steps establish a 4,097-entry arena without
+    // radix scratch. One identical 5,000-Gaussian tile then requires a larger
+    // arena, radix scratch, and more raster chunks in the GPU-resident path.
+    // The rejected attempt must not collect statistics; only its replay may
+    // mutate persistent state.
+    constexpr int gaussianCount = 5'000;
+    const StepResult retried = runStep(
+        false, 0.0f, gaussianCount, 0.001f,
+        false, false, false, true, true);
+
+    CHECK(retried.radius > 0);
+    CHECK(retried.visibilityCount == 1.0f);
+    CHECK(retried.lastVisibilityCount == 1.0f);
+    CHECK(retried.overflowReasons ==
+          MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY);
+    CHECK(retried.retainedIntersectionCount > 4'097u);
+    CHECK(retried.intersectionCapacity >=
+          retried.retainedIntersectionCount);
+    CHECK(std::isfinite(retried.intersectionArenaGrowMs));
+    CHECK(retried.intersectionArenaGrowMs >= 0.0);
+    CHECK(retried.maximumTileCount == gaussianCount);
+    CHECK(retried.overflowedStepCount == 1u);
+    CHECK(retried.tileCapOverflowedStepCount == 0u);
+    CHECK(retried.packedCapacityOverflowedStepCount == 1u);
+    CHECK(retried.lastOverflowIteration == 1);
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -331,6 +423,7 @@ int main(int argc, char **argv) {
             msplat_set_metallib_path_checked(argv[1]);
             checkTransparentAlphaSupervision();
             checkChunkedTransparentAlphaSupervision();
+            checkArenaRetryTransaction();
             cleanup_msplat_metal();
             return 0;
         } catch (const std::exception &error) {

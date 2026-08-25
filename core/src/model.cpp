@@ -2089,38 +2089,32 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
     const float lossInvN = static_cast<float>(
         255.0 / (static_cast<double>(objectiveCoverageUnits) * 3.0));
 
-    MTensor r;
+    MTensor r = msplat_train_step(
+        numPoints, means, scales, 1.0f,
+        quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
+        s.height, s.width, s.tileBounds, 0.01f,
+        s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
+        opacities, backgroundColor, gt, target.coverageMask,
+        coverageRenderTiles,
+        objectiveCoverageUnits, ssimWeight,
+        lossInvN, transparentMask, transparentAlphaLossWeight,
+        N_ADAM_GROUPS,
+        adam_p, adam_ea, adam_eas,
+        adam_ss, adam_bc2s,
+        adam_beta1, adam_beta2, adam_eps,
+        photometric,
+        pose,
+        collectDensificationStats,
+        visCounts, xysGradNorm, max2DSize, invMaxDim);
+
+    // Keep host optimizer state transactional with respect to synchronous
+    // encoding failures. The candidate counters above drive this step's bias
+    // correction, but become persistent only once the Metal step was accepted.
     adam_step_count = nextAdamStep;
     if (refinePhotometricGains)
         cameraLogGainStepCounts[cameraIndex] = nextPhotometricStep;
     if (poseStepEnabled)
         cameraPoseStepCounts[cameraIndex] = nextPoseStep;
-    try {
-        r = msplat_train_step(
-            numPoints, means, scales, 1.0f,
-            quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
-            s.height, s.width, s.tileBounds, 0.01f,
-            s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-            opacities, backgroundColor, gt, target.coverageMask,
-            coverageRenderTiles,
-            objectiveCoverageUnits, ssimWeight,
-            lossInvN, transparentMask, transparentAlphaLossWeight,
-            N_ADAM_GROUPS,
-            adam_p, adam_ea, adam_eas,
-            adam_ss, adam_bc2s,
-            adam_beta1, adam_beta2, adam_eps,
-            photometric,
-            pose,
-            collectDensificationStats,
-            visCounts, xysGradNorm, max2DSize, invMaxDim);
-    } catch (...) {
-        adam_step_count = previousAdamStep;
-        if (refinePhotometricGains)
-            cameraLogGainStepCounts[cameraIndex] = previousPhotometricStep;
-        if (poseStepEnabled)
-            cameraPoseStepCounts[cameraIndex] = previousPoseStep;
-        throw;
-    }
 
     if (collectDensificationStats) radii = r;
 }

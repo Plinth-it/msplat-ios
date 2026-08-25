@@ -223,7 +223,7 @@ extract_section(host_source "auto encode_rast_fwd_monolithic ="
     "auto encode_rast_fwd_chunked =" render_monolithic)
 extract_section(host_source "auto encode_rast_fwd_chunked ="
     "auto encode_rast_fwd =" render_chunked)
-extract_section(host_source "MTensor msplat_train_step("
+extract_section(host_source "static MTensor msplat_train_step_locked("
     "auto encode_rast_bwd =" training_before_backward)
 extract_section(training_before_backward "auto encode_rast_fwd ="
     "// Fused loss:" training_forward)

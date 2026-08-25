@@ -27,6 +27,7 @@ constexpr uint32_t kPoisonUint = 0xCDCDCDCDu;
 constexpr int32_t kPoisonInt = static_cast<int32_t>(0xCDCDCDCDu);
 constexpr uint32_t kSignedIndexOverflow =
     msplat::kTileIntersectionLayoutSignedIndexOverflow;
+constexpr uint32_t kTileCapacityOverflow = 1u << 0;
 constexpr size_t kMetadataWordCount =
     msplat::kTileIntersectionLayoutMetadataWordCount;
 
@@ -288,6 +289,95 @@ void runOverflowCase(
     CHECK(cpuRejected);
 }
 
+void runAttemptValidatorCase(
+    id<MTLDevice> device, id<MTLCommandQueue> queue,
+    id<MTLComputePipelineState> pipeline, bool corruptFinalOffset) {
+    constexpr uint32_t numTiles = 3;
+    constexpr uint32_t arenaCapacity = 10;
+    constexpr uint32_t radixScratchAvailable = 1;
+    constexpr uint32_t plannedChunkCount = 1;
+    constexpr uint32_t packThreadsPerGroup = 256;
+    const std::array<uint32_t, numTiles> counts = {2u, 0u, 3u};
+    std::array<int32_t, numTiles> offsets = {};
+    std::array<int32_t, numTiles * 2> bins = {};
+    std::array<uint32_t, numTiles> sortable = {};
+    const msplat::TileIntersectionLayout layout =
+        msplat::buildTileIntersectionLayout(
+            counts.data(), offsets.data(), counts.size(), bins.data(),
+            sortable.data());
+    std::array<uint32_t, kMetadataWordCount> metadata =
+        expectedMetadata(layout);
+    if (corruptFinalOffset) --offsets.back();
+
+    uint32_t attemptStatus = 0;
+    std::array<uint32_t, 12> dispatchControl = {};
+    id<MTLBuffer> metadataBuffer = makeBuffer(
+        device, metadata.data(), sizeof(metadata));
+    ScopedObjCRelease metadataOwner{metadataBuffer};
+    id<MTLBuffer> binsBuffer = makeBuffer(device, bins.data(), sizeof(bins));
+    ScopedObjCRelease binsOwner{binsBuffer};
+    id<MTLBuffer> statusBuffer = makeBuffer(
+        device, &attemptStatus, sizeof(attemptStatus));
+    ScopedObjCRelease statusOwner{statusBuffer};
+    id<MTLBuffer> dispatchBuffer = makeBuffer(
+        device, dispatchControl.data(), sizeof(dispatchControl));
+    ScopedObjCRelease dispatchOwner{dispatchBuffer};
+    id<MTLBuffer> offsetsBuffer = makeBuffer(
+        device, offsets.data(), sizeof(offsets));
+    ScopedObjCRelease offsetsOwner{offsetsBuffer};
+
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    CHECK(commandBuffer != nil);
+    id<MTLComputeCommandEncoder> encoder =
+        [commandBuffer computeCommandEncoder];
+    CHECK(encoder != nil);
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:metadataBuffer offset:0 atIndex:0];
+    [encoder setBuffer:binsBuffer offset:0 atIndex:1];
+    [encoder setBytes:&numTiles length:sizeof(numTiles) atIndex:2];
+    [encoder setBytes:&arenaCapacity length:sizeof(arenaCapacity) atIndex:3];
+    [encoder setBytes:&radixScratchAvailable
+                length:sizeof(radixScratchAvailable) atIndex:4];
+    [encoder setBytes:&plannedChunkCount
+                length:sizeof(plannedChunkCount) atIndex:5];
+    [encoder setBuffer:statusBuffer offset:0 atIndex:6];
+    [encoder setBuffer:dispatchBuffer offset:0 atIndex:7];
+    [encoder setBytes:&packThreadsPerGroup
+                length:sizeof(packThreadsPerGroup) atIndex:8];
+    [encoder setBuffer:offsetsBuffer offset:0 atIndex:9];
+    [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    if (commandBuffer.status == MTLCommandBufferStatusError) {
+        throw metalError(
+            "GPU attempt-validator command buffer failed",
+            commandBuffer.error);
+    }
+    CHECK(commandBuffer.status == MTLCommandBufferStatusCompleted);
+
+    const auto* actualStatus =
+        static_cast<const uint32_t*>(statusBuffer.contents);
+    const auto* actualControl =
+        static_cast<const uint32_t*>(dispatchBuffer.contents);
+    const auto* actualBins = static_cast<const int32_t*>(binsBuffer.contents);
+    if (corruptFinalOffset) {
+        CHECK(*actualStatus == kTileCapacityOverflow);
+        CHECK(actualControl[0] == 0u);
+        CHECK(actualControl[3] == 0u);
+        CHECK(actualControl[6] == 0u);
+        CHECK(std::all_of(actualBins, actualBins + bins.size(),
+                          [](int32_t value) { return value == 0; }));
+    } else {
+        CHECK(*actualStatus == 0u);
+        CHECK(actualControl[0] == 2u);
+        CHECK(actualControl[3] == 0u);
+        CHECK(actualControl[6] == 1u);
+        CHECK(std::equal(bins.begin(), bins.end(), actualBins));
+    }
+}
+
 std::vector<uint32_t> randomizedCounts(size_t count) {
     CHECK(count >= 12);
     std::mt19937 generator(0x4D53504Cu);
@@ -326,6 +416,21 @@ void checkGpuTileLayout(id<MTLDevice> device, const char* metallibPath) {
     ScopedObjCRelease pipelineOwner{pipeline};
     CHECK(pipeline.maxTotalThreadsPerThreadgroup >= 1);
 
+    id<MTLFunction> validatorFunction =
+        [library newFunctionWithName:@"validate_tile_intersection_attempt_kernel"];
+    CHECK(validatorFunction != nil);
+    ScopedObjCRelease validatorFunctionOwner{validatorFunction};
+    error = nil;
+    id<MTLComputePipelineState> validatorPipeline =
+        [device newComputePipelineStateWithFunction:validatorFunction
+                                              error:&error];
+    if (!validatorPipeline) {
+        throw metalError(
+            "Failed to create the GPU attempt-validator pipeline", error);
+    }
+    ScopedObjCRelease validatorPipelineOwner{validatorPipeline};
+    CHECK(validatorPipeline.maxTotalThreadsPerThreadgroup >= 1);
+
     id<MTLCommandQueue> queue = [device newCommandQueue];
     CHECK(queue != nil);
     ScopedObjCRelease queueOwner{queue};
@@ -342,6 +447,8 @@ void checkGpuTileLayout(id<MTLDevice> device, const char* metallibPath) {
          1u});
     runValidCase(device, queue, pipeline, randomizedCounts(4'097));
     runOverflowCase(device, queue, pipeline);
+    runAttemptValidatorCase(device, queue, validatorPipeline, false);
+    runAttemptValidatorCase(device, queue, validatorPipeline, true);
 }
 
 }  // namespace

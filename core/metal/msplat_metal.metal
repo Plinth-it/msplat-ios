@@ -7,6 +7,11 @@ using namespace metal;
 #define MSPLAT_OVERFLOW_TILE_CAP         (1u << 0)
 #define MSPLAT_OVERFLOW_PACKED_CAPACITY  (1u << 1)
 
+inline bool training_attempt_failed(device atomic_uint* attempt_status) {
+    return atomic_load_explicit(
+        attempt_status, memory_order_relaxed) != 0u;
+}
+
 #define BLOCK_X 16
 #define BLOCK_Y 16
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
@@ -2036,9 +2041,13 @@ kernel void camera_pose_adam_kernel(
     device float* exp_avg,
     device float* exp_avg_sq,
     constant PoseAdamParams& params,
+    device atomic_uint* attempt_status,
+    constant uint& attempt_gating_enabled,
     uint index [[thread_position_in_grid]]
 ) {
-    if (index != 0) return;
+    if (index != 0 ||
+        (attempt_gating_enabled != 0u &&
+         training_attempt_failed(attempt_status))) return;
 
     float3 translation = float3(
         pose_deltas[params.pose_offset],
@@ -2362,9 +2371,13 @@ kernel void sh_opacity_backward_adam_kernel(
     device float* opacity_exp_avg,
     device float* opacity_exp_avg_sq,
     constant SHOpacityAdamParams& adam_hp,
+    device atomic_uint* attempt_status,
+    constant uint& attempt_gating_enabled,
     uint idx [[thread_position_in_grid]]
 ) {
-    if (idx >= (uint)num_points) return;
+    if (idx >= (uint)num_points ||
+        (attempt_gating_enabled != 0u &&
+         training_attempt_failed(attempt_status))) return;
 
     const bool active = radii[idx] > 0;
     const float3 color_gradient = active
@@ -2538,9 +2551,18 @@ kernel void project_backward_adam_kernel(
     device float* xys_grad_norm,
     device float* max_2d_size,
     constant float& inv_max_dim,
+    device atomic_uint* attempt_status,
+    constant uint& attempt_gating_enabled,
     uint idx [[thread_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]
 ) {
+    // This must precede the optional pose-reduction barriers below. The status
+    // is immutable after exact sorting, so every thread in a group takes the
+    // same branch and an overflow attempt cannot decay Adam state or collect
+    // densification statistics.
+    if (attempt_gating_enabled != 0u &&
+        training_attempt_failed(attempt_status)) return;
+
     threadgroup atomic_uint pose_group_gradient[6];
     if (pose_enabled != 0) {
         if (thread_index == 0) {
@@ -2821,6 +2843,130 @@ kernel void build_tile_intersection_layout_kernel(
     metadata[EXACT_LAYOUT_MEDIUM_TILE_COUNT] = medium_tile_count;
     metadata[EXACT_LAYOUT_LARGE_TILE_COUNT] = large_tile_count;
     metadata[EXACT_LAYOUT_ERROR_FLAGS] = error_flags;
+}
+
+// Decide whether a GPU-resident exact layout fits the buffers already retained
+// by the high-water training path. The control words let the host encode the
+// two compact sort lists without reading their sizes. A failed attempt keeps
+// its exact metadata for the completion-side grow/retry decision, but exposes
+// neutral bins to rasterization and poisons every persistent update.
+kernel void validate_tile_intersection_attempt_kernel(
+    constant uint* metadata                  [[buffer(0)]],
+    device int* tile_bins                    [[buffer(1)]],
+    constant uint& num_tiles                 [[buffer(2)]],
+    constant uint& arena_capacity            [[buffer(3)]],
+    constant uint& radix_scratch_available   [[buffer(4)]],
+    constant uint& planned_chunk_count       [[buffer(5)]],
+    device atomic_uint* attempt_status       [[buffer(6)]],
+    device uint* dispatch_control            [[buffer(7)]],
+    constant uint& pack_threads_per_group    [[buffer(8)]],
+    constant int* inclusive_offsets          [[buffer(9)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index != 0) return;
+
+    const uint total_count = metadata[EXACT_LAYOUT_TOTAL_COUNT];
+    const uint maximum_tile_count =
+        metadata[EXACT_LAYOUT_MAXIMUM_TILE_COUNT];
+    const uint maximum_tile_index =
+        metadata[EXACT_LAYOUT_MAXIMUM_TILE_INDEX];
+    const uint active_tile_count =
+        metadata[EXACT_LAYOUT_ACTIVE_TILE_COUNT];
+    const uint sortable_tile_count =
+        metadata[EXACT_LAYOUT_SORTABLE_TILE_COUNT];
+    const uint trivial_tile_count =
+        metadata[EXACT_LAYOUT_TRIVIAL_TILE_COUNT];
+    const uint small_tile_count = metadata[EXACT_LAYOUT_SMALL_TILE_COUNT];
+    const uint medium_tile_count = metadata[EXACT_LAYOUT_MEDIUM_TILE_COUNT];
+    const uint large_tile_count = metadata[EXACT_LAYOUT_LARGE_TILE_COUNT];
+    const uint general_tile_count = medium_tile_count + large_tile_count;
+    const int final_offset = num_tiles > 0u
+        ? inclusive_offsets[num_tiles - 1u]
+        : 0;
+    const ulong classified_tile_count =
+        (ulong)trivial_tile_count + (ulong)sortable_tile_count;
+    const ulong categorized_sortable_tile_count =
+        (ulong)small_tile_count + (ulong)medium_tile_count +
+        (ulong)large_tile_count;
+
+    uint failure = 0u;
+    if (metadata[EXACT_LAYOUT_ERROR_FLAGS] != 0u ||
+        total_count > 0x7FFFFFFFu ||
+        classified_tile_count != (ulong)num_tiles ||
+        categorized_sortable_tile_count != (ulong)sortable_tile_count ||
+        active_tile_count > num_tiles ||
+        active_tile_count < sortable_tile_count ||
+        active_tile_count > total_count ||
+        (maximum_tile_count > 0u && maximum_tile_index >= num_tiles) ||
+        (maximum_tile_count == 0u && total_count != 0u) ||
+        maximum_tile_count > total_count ||
+        (large_tile_count == 0u &&
+         maximum_tile_count > EXACT_BITONIC_FAST_PATH) ||
+        (large_tile_count > 0u &&
+         maximum_tile_count <= EXACT_BITONIC_FAST_PATH) ||
+        final_offset < 0 || (uint)final_offset != total_count ||
+        maximum_tile_count > 65536u || pack_threads_per_group == 0u) {
+        failure |= MSPLAT_OVERFLOW_TILE_CAP;
+    }
+    if (total_count > arena_capacity ||
+        (maximum_tile_count > EXACT_BITONIC_FAST_PATH &&
+         radix_scratch_available == 0u)) {
+        failure |= MSPLAT_OVERFLOW_PACKED_CAPACITY;
+    }
+
+    const uint required_chunk_count = num_tiles >= 400u
+        ? 1u
+        : max(1u, (maximum_tile_count + 511u) / 512u);
+    if (required_chunk_count > planned_chunk_count) {
+        failure |= MSPLAT_OVERFLOW_PACKED_CAPACITY;
+    }
+
+    const uint enabled = failure == 0u ? 1u : 0u;
+    dispatch_control[0] = enabled * small_tile_count;
+    dispatch_control[1] = 1u;
+    dispatch_control[2] = 1u;
+    dispatch_control[3] = enabled * general_tile_count;
+    dispatch_control[4] = 1u;
+    dispatch_control[5] = 1u;
+    const uint safe_pack_threads_per_group = max(pack_threads_per_group, 1u);
+    dispatch_control[6] = enabled * (
+        (total_count + safe_pack_threads_per_group - 1u) /
+        safe_pack_threads_per_group);
+    dispatch_control[7] = 1u;
+    dispatch_control[8] = 1u;
+    dispatch_control[9] = small_tile_count;
+    dispatch_control[10] = general_tile_count;
+    dispatch_control[11] = small_tile_count;
+
+    if (failure != 0u) {
+        atomic_fetch_or_explicit(
+            attempt_status, failure, memory_order_relaxed);
+        for (uint tile = 0; tile < num_tiles; ++tile) {
+            tile_bins[tile * 2u] = 0;
+            tile_bins[tile * 2u + 1u] = 0;
+        }
+    }
+}
+
+// Scatter and segmented sort perform their own defensive checks and can poison
+// an attempt after the initial capacity decision. Neutralize every bin once
+// those checks have completed so the fixed raster/loss work can safely run on
+// background pixels while all persistent updates remain gated.
+kernel void finalize_tile_intersection_attempt_kernel(
+    device int* tile_bins                 [[buffer(0)]],
+    device atomic_uint* attempt_status    [[buffer(1)]],
+    constant uint& num_tiles              [[buffer(2)]],
+    device uint* dispatch_control         [[buffer(3)]],
+    uint tile [[thread_position_in_grid]]
+) {
+    if (tile >= num_tiles || !training_attempt_failed(attempt_status)) return;
+    if (tile == 0u) {
+        // Scatter/sort can discover a defensive failure after validation.
+        // Suppress packing without adding a status load to every intersection.
+        dispatch_control[6] = 0u;
+    }
+    tile_bins[tile * 2u] = 0;
+    tile_bins[tile * 2u + 1u] = 0;
 }
 
 // Scatter every Gaussian/tile intersection into the exact compact range that
@@ -4735,8 +4881,12 @@ kernel void photometric_adam_kernel(
     constant float& eps,
     constant float& regularization,
     constant float& max_abs_log_gain,
+    device atomic_uint* attempt_status,
+    constant uint& attempt_gating_enabled,
     uint channel [[thread_position_in_grid]]) {
-    if (channel >= 3) return;
+    if (channel >= 3 ||
+        (attempt_gating_enabled != 0u &&
+         training_attempt_failed(attempt_status))) return;
     const uint index = camera_gain_offset + channel;
     const float parameter = log_rgb_gains[index];
     const float gradient =

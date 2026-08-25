@@ -106,10 +106,22 @@ builds the same inclusive offsets, tile bins, stable small/medium/large sort
 lists, and checked summary metadata with one GPU thread. It composes with both
 tile-count modes, but the host still waits for completion, validates the final
 offset and metadata, and sizes the arena before submitting rasterization and
-optimizer work. This prerequisite therefore does **not** remove the per-step
-CPU/GPU barrier or claim a throughput improvement. Keep `cpu` as the shipping
-mode until the later high-water arena, overflow-safe no-op, and same-step retry
-work is implemented and validated on physical devices.
+optimizer work.
+
+`MSPLAT_TRAINING_ARENA_MODE=retry` is the next correctness-first experiment. It
+forces GPU tile layout, reuses the grow-only intersection high-water mark, and
+keeps the normal count/layout and training work in one GPU attempt. If the
+arena, radix scratch, or raster chunks are too small, persistent model updates
+are suppressed, the host grows the required resources, and the same logical
+step is retried. The initial attempt at a resolution still bootstraps the arena
+through the synchronized exact path, and steady-state retry mode synchronizes at
+attempt retirement before committing CPU training state. It therefore removes
+the mid-step sizing barrier and its GPU idle gap, but does not yet provide
+multi-step queue depth. Recovered attempts remain visible as packed-capacity
+overflow events, and their resource-growth and encoding costs are accumulated
+into the completed logical step's telemetry. Keep `exact` as the shipping mode
+until physical-device throughput, memory, and sustained-thermal measurements
+justify a default change.
 
 ## Correctness
 
@@ -406,6 +418,7 @@ Output: `.ply`, `.splat`, `.spz`.
 | `MSPLAT_CAMERA_PREFETCH` | Set exactly `1` to predecode one upcoming training camera. Default off. |
 | `MSPLAT_TILE_COUNT_MODE` | `enumerated` (default) or experimental exact `difference` counting. Set before first Metal use. |
 | `MSPLAT_TILE_LAYOUT_MODE` | `cpu` (default) or experimental exact `gpu` layout. The GPU mode retains the synchronized host validation and arena-sizing boundary. Set before first Metal use. |
+| `MSPLAT_TRAINING_ARENA_MODE` | `exact` (default) or experimental transactional `retry`. Retry forces GPU tile layout and replaces steady-state mid-step sizing with an end-of-attempt validation/retry boundary. Set before first Metal use. |
 | `MSPLAT_MEM_LOG_EVERY` | Memory breakdown every N steps. |
 | `MSPLAT_ISECT_LOG` | Intersection count against capacity at each sample. |
 

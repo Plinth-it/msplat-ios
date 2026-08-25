@@ -291,6 +291,9 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         add_test(NAME msplat_transparent_training_difference_gpu_layout
             COMMAND msplat_transparent_training_tests
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_arena_retry
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         set_tests_properties(msplat_transparent_training PROPERTIES
             ENVIRONMENT
                 "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu"
@@ -315,6 +318,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             ENVIRONMENT
                 "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=gpu"
             SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_arena_retry PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry"
+            SKIP_RETURN_CODE 77)
         add_executable(msplat_terminal_backward_tests
             tests/test_terminal_backward.mm)
         target_link_libraries(msplat_terminal_backward_tests PRIVATE msplat_core)
@@ -334,6 +341,9 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             COMMAND msplat_terminal_backward_tests
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         add_test(NAME msplat_terminal_backward_difference_gpu_layout
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_terminal_backward_arena_retry
             COMMAND msplat_terminal_backward_tests
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         set_tests_properties(msplat_terminal_backward PROPERTIES
@@ -360,6 +370,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             ENVIRONMENT
                 "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=gpu"
             SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_terminal_backward_arena_retry PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry"
+            SKIP_RETURN_CODE 77)
         add_test(NAME msplat_exact_intersection_contract
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
@@ -376,6 +390,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
                 -P ${CMAKE_SOURCE_DIR}/tests/check_gpu_tile_layout_contract.cmake)
+        add_test(NAME msplat_training_arena_retry_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_training_arena_retry_contract.cmake)
         add_test(NAME msplat_ssim_storage_contract
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}

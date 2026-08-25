@@ -278,18 +278,24 @@ string(REGEX MATCHALL
     "if \\(small_sort_tile_count > 0\\)"
     small_sort_guards "${host_source}")
 list(LENGTH small_sort_guards small_sort_guard_count)
-if(NOT small_sort_guard_count EQUAL 2)
+if(NOT small_sort_guard_count EQUAL 1)
     message(FATAL_ERROR
-        "Expected two non-empty small-sort guards, found ${small_sort_guard_count}")
+        "Expected the render non-empty small-sort guard, found ${small_sort_guard_count}")
 endif()
+require_contains("${host_source}"
+    "if (gpuResidentIntersectionAttempt || small_sort_tile_count > 0)"
+    "training small-sort exact/retry guard")
 string(REGEX MATCHALL
     "if \\(general_sort_tile_count > 0\\)"
     general_sort_guards "${host_source}")
 list(LENGTH general_sort_guards general_sort_guard_count)
-if(NOT general_sort_guard_count EQUAL 2)
+if(NOT general_sort_guard_count EQUAL 1)
     message(FATAL_ERROR
-        "Expected two non-empty general-sort guards, found ${general_sort_guard_count}")
+        "Expected the render non-empty general-sort guard, found ${general_sort_guard_count}")
 endif()
+require_contains("${host_source}"
+    "if (gpuResidentIntersectionAttempt || general_sort_tile_count > 0)"
+    "training general-sort exact/retry guard")
 string(REGEX MATCHALL
     "ENC_BUF\\(enc, g_tcache\\.sortable_tile_indices, 6\\)"
     small_sort_tile_bindings "${host_source}")
@@ -334,10 +340,13 @@ string(REGEX MATCHALL
     "dispatchThreadgroups:MTLSizeMake\\(small_sort_tile_count, 1, 1\\)"
     small_sort_dispatches "${host_source}")
 list(LENGTH small_sort_dispatches small_sort_dispatch_count)
-if(NOT small_sort_dispatch_count EQUAL 2)
+if(NOT small_sort_dispatch_count EQUAL 1)
     message(FATAL_ERROR
-        "Expected two compact small-sort dispatches, found ${small_sort_dispatch_count}")
+        "Expected the render compact small-sort dispatch, found ${small_sort_dispatch_count}")
 endif()
+require_contains("${host_source}"
+    "[enc dispatchThreadgroups:\n                        MTLSizeMake(small_sort_tile_count, 1, 1)"
+    "training compact small-sort dispatch")
 require_contains("${host_source}"
     "threadsPerThreadgroup:MTLSizeMake(\n                    msplat::kExactSmallTileMaximum, 1, 1)"
     "32-thread small-sort dispatch size")
@@ -345,10 +354,13 @@ string(REGEX MATCHALL
     "dispatchThreadgroups:MTLSizeMake\\(general_sort_tile_count, 1, 1\\)"
     general_sort_dispatches "${host_source}")
 list(LENGTH general_sort_dispatches general_sort_dispatch_count)
-if(NOT general_sort_dispatch_count EQUAL 2)
+if(NOT general_sort_dispatch_count EQUAL 1)
     message(FATAL_ERROR
-        "Expected two compact general-sort dispatches, found ${general_sort_dispatch_count}")
+        "Expected the render compact general-sort dispatch, found ${general_sort_dispatch_count}")
 endif()
+require_contains("${host_source}"
+    "[enc dispatchThreadgroups:\n                        MTLSizeMake(general_sort_tile_count, 1, 1)"
+    "training compact general-sort dispatch")
 require_contains("${host_source}"
     "threadsPerThreadgroup:MTLSizeMake(256, 1, 1)"
     "256-thread general-sort dispatch size")
