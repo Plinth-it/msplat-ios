@@ -72,7 +72,9 @@ StepResult runStep(bool transparent, float alphaLossWeight,
                    bool useCoverageRenderTiles = false,
                    bool allRenderTilesActive = false,
                    bool collectStats = false,
-                   bool collectTelemetry = false) {
+                   bool collectTelemetry = false,
+                   int width = kWidth,
+                   int height = kHeight) {
     CHECK(gaussianCount > 0);
     std::vector<float> meanValues(static_cast<size_t>(gaussianCount) * 3);
     std::vector<float> scaleValues(static_cast<size_t>(gaussianCount) * 3);
@@ -127,9 +129,9 @@ StepResult runStep(bool transparent, float alphaLossWeight,
         {gaussianCount, 0, 3}, DType::Float32);
     MTensor opacities = gpuFloats({gaussianCount, 1}, opacityValues);
     MTensor background = gpu_zeros({3}, DType::Float32);
-    MTensor gt = gpu_empty({kHeight, kWidth, 4}, DType::UInt8);
+    MTensor gt = gpu_empty({height, width, 4}, DType::UInt8);
     auto *targetBytes = gt.data<uint8_t>();
-    for (int pixel = 0; pixel < kWidth * kHeight; ++pixel) {
+    for (int pixel = 0; pixel < width * height; ++pixel) {
         const int offset = pixel * 4;
         // Deliberately asymmetric RGB exercises byte normalization in every
         // loss pass. The standalone-mask case gives alpha unrelated padding;
@@ -139,13 +141,13 @@ StepResult runStep(bool transparent, float alphaLossWeight,
         targetBytes[offset + 2] = 207;
         targetBytes[offset + 3] = 37;
     }
-    MTensor mask = gpu_zeros({kHeight, kWidth}, DType::UInt8);
+    MTensor mask = gpu_zeros({height, width}, DType::UInt8);
     for (int y = 0; y < 4; ++y) {
         for (int x = 0; x < 4; ++x)
-            mask.data<uint8_t>()[y * kWidth + x] = 255;
+            mask.data<uint8_t>()[y * width + x] = 255;
     }
     if (packedMask) {
-        for (int pixel = 0; pixel < kWidth * kHeight; ++pixel) {
+        for (int pixel = 0; pixel < width * height; ++pixel) {
             targetBytes[pixel * 4 + 3] = mask.data<uint8_t>()[pixel];
         }
     }
@@ -186,7 +188,7 @@ StepResult runStep(bool transparent, float alphaLossWeight,
     MTensor max2DSize = gpu_zeros({gaussianCount}, DType::Float32);
     float cameraPosition[3] = {0, 0, 0};
     const uint64_t coverageUnits = transparent
-        ? static_cast<uint64_t>(kWidth) * kHeight * 255u
+        ? static_cast<uint64_t>(width) * height * 255u
         : 4u * 4u * 255u;
     const float lossInvN = static_cast<float>(
         255.0 / (static_cast<double>(coverageUnits) * 3.0));
@@ -204,8 +206,11 @@ StepResult runStep(bool transparent, float alphaLossWeight,
         radii = msplat_train_step(
             gaussianCount, means, scales, 1.0f,
             quats, viewmat, projmat,
-            32.0f, 32.0f, 16.0f, 16.0f,
-            kHeight, kWidth, std::make_tuple(2, 2, 1), 0.01f,
+            float(width), float(height),
+            0.5f * float(width), 0.5f * float(height),
+            height, width,
+            std::make_tuple((width + 15) / 16, (height + 15) / 16, 1),
+            0.01f,
             0, 0, cameraPosition,
             featuresDc, featuresRest, opacities, background,
             gt, packedMask ? &gt : &mask, coverageRenderTilePointer,
@@ -215,14 +220,14 @@ StepResult runStep(bool transparent, float alphaLossWeight,
             stepSizes, biasCorrection2Sqrts,
             0.9f, 0.999f, 1.0e-8f,
             photometric, pose, collectStats,
-            visibility, xyGradientNorm, max2DSize, 1.0f / kWidth);
+            visibility, xyGradientNorm, max2DSize, 1.0f / float(width));
         if (logicalStep) {
             MsplatTrainingStepDescriptor descriptor;
             descriptor.iteration = 1;
             descriptor.splatCount = gaussianCount;
             descriptor.modelCapacity = gaussianCount;
-            descriptor.effectiveWidth = kWidth;
-            descriptor.effectiveHeight = kHeight;
+            descriptor.effectiveWidth = width;
+            descriptor.effectiveHeight = height;
             descriptor.activeShDegree = 0;
             msplat_training_step_submit(logicalStep, descriptor);
         }
@@ -382,6 +387,19 @@ void checkChunkedTransparentAlphaSupervision() {
     CHECK(transparent.nonfiniteOpacityMomentCount == 0);
 }
 
+void checkPartialSsimThreadgroups() {
+    const float initialOpacity = std::log(0.1f / 0.9f);
+    const StepResult partial = runStep(
+        true, 0.1f, 1, 0.1f,
+        false, false, false, false, false,
+        31, 23);
+    CHECK(partial.radius > 0);
+    CHECK(std::isfinite(partial.opacity));
+    CHECK(std::isfinite(partial.opacityFirstMoment));
+    CHECK(partial.opacity < initialOpacity);
+    CHECK(partial.opacityFirstMoment > 0.0f);
+}
+
 void checkArenaRetryTransaction() {
     const char *mode = std::getenv("MSPLAT_TRAINING_ARENA_MODE");
     if (!mode || std::string(mode) != "retry") return;
@@ -424,6 +442,7 @@ int main(int argc, char **argv) {
             checkTransparentAlphaSupervision();
             checkChunkedTransparentAlphaSupervision();
             checkArenaRetryTransaction();
+            checkPartialSsimThreadgroups();
             cleanup_msplat_metal();
             return 0;
         } catch (const std::exception &error) {

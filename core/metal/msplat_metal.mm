@@ -829,7 +829,9 @@ struct MetalContext {
     id<MTLComputePipelineState> ssim_h_fwd_kernel_cpso = nil;
     id<MTLComputePipelineState> ssim_v_fwd_kernel_cpso = nil;
     id<MTLComputePipelineState> ssim_fused_v_fwd_h_bwd_kernel_cpso = nil;
+    id<MTLComputePipelineState> ssim_fused_v_fwd_bwd_kernel_cpso = nil;
     id<MTLComputePipelineState> ssim_v_bwd_kernel_cpso = nil;
+    bool fused_ssim_backward = false;
     id<MTLComputePipelineState> photometric_adam_kernel_cpso = nil;
     id<MTLComputePipelineState> prepare_camera_pose_kernel_cpso = nil;
     id<MTLComputePipelineState> camera_pose_adam_kernel_cpso = nil;
@@ -880,6 +882,7 @@ struct MetalContext {
             ssim_h_fwd_kernel_cpso,
             ssim_v_fwd_kernel_cpso,
             ssim_fused_v_fwd_h_bwd_kernel_cpso,
+            ssim_fused_v_fwd_bwd_kernel_cpso,
             ssim_v_bwd_kernel_cpso,
             photometric_adam_kernel_cpso,
             prepare_camera_pose_kernel_cpso,
@@ -1104,6 +1107,18 @@ MetalContext* init_msplat_metal_context() {
         }
     }
 
+    const char* ssimModeOverride = std::getenv("MSPLAT_SSIM_MODE");
+    if (ssimModeOverride) {
+        if (std::strcmp(ssimModeOverride, "staged") == 0) {
+            // Keep the established three-dispatch derivative path.
+        } else if (std::strcmp(ssimModeOverride, "fused") == 0) {
+            ctx->fused_ssim_backward = true;
+        } else {
+            throw std::invalid_argument(
+                "msplat: MSPLAT_SSIM_MODE must be staged or fused");
+        }
+    }
+
     const char* rasterVariantOverride = std::getenv("MSPLAT_RASTER_VARIANT");
     NSString* monolithicRasterFunctionName = @"nd_rasterize_forward_kernel";
     if (rasterVariantOverride) {
@@ -1159,8 +1174,14 @@ MetalContext* init_msplat_metal_context() {
     // Separable SSIM loss
     ctx->ssim_h_fwd_kernel_cpso                   = load(@"ssim_h_fwd_kernel");
     ctx->ssim_v_fwd_kernel_cpso                   = load(@"ssim_v_fwd_kernel");
-    ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso       = load(@"ssim_fused_v_fwd_h_bwd_kernel");
-    ctx->ssim_v_bwd_kernel_cpso                   = load(@"ssim_v_bwd_kernel");
+    if (ctx->fused_ssim_backward) {
+        ctx->ssim_fused_v_fwd_bwd_kernel_cpso =
+            load(@"ssim_fused_v_fwd_bwd_kernel");
+    } else {
+        ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso =
+            load(@"ssim_fused_v_fwd_h_bwd_kernel");
+        ctx->ssim_v_bwd_kernel_cpso = load(@"ssim_v_bwd_kernel");
+    }
     ctx->photometric_adam_kernel_cpso              = load(@"photometric_adam_kernel");
     ctx->prepare_camera_pose_kernel_cpso            = load(@"prepare_camera_pose_kernel");
     ctx->camera_pose_adam_kernel_cpso               = load(@"camera_pose_adam_kernel");
@@ -1189,6 +1210,21 @@ MetalContext* init_msplat_metal_context() {
             "msplat: selected monolithic raster variant exceeds the Metal "
             "pipeline threadgroup limit");
     }
+    if (ctx->fused_ssim_backward) {
+        constexpr NSUInteger fusedSsimThreads = 16u * 8u;
+        const id<MTLComputePipelineState> fusedSsimPipeline =
+            ctx->ssim_fused_v_fwd_bwd_kernel_cpso;
+        if (fusedSsimPipeline.maxTotalThreadsPerThreadgroup <
+            fusedSsimThreads) {
+            throw std::runtime_error(
+                "msplat: fused SSIM requires 128 threads per threadgroup");
+        }
+        if (fusedSsimPipeline.staticThreadgroupMemoryLength >
+            ctx->device.maxThreadgroupMemoryLength) {
+            throw std::runtime_error(
+                "msplat: fused SSIM exceeds the device threadgroup-memory limit");
+        }
+    }
     if (rasterVariantOverride) {
         fprintf(stderr,
                 "msplat: MSPLAT_RASTER_VARIANT=%s (monolithic forward only)\n",
@@ -1205,6 +1241,9 @@ MetalContext* init_msplat_metal_context() {
     if (trainingArenaModeOverride) {
         fprintf(stderr, "msplat: MSPLAT_TRAINING_ARENA_MODE=%s\n",
                 trainingArenaModeOverride);
+    }
+    if (ssimModeOverride) {
+        fprintf(stderr, "msplat: MSPLAT_SSIM_MODE=%s\n", ssimModeOverride);
     }
     if (ctx->small_sort_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup <
         msplat::kExactSmallTileMaximum) {
@@ -1892,9 +1931,12 @@ struct FusedTensorCache {
         return true;
     }
 
-    void ensure_training_image(int ih, int iw, id<MTLDevice> dev) {
+    void ensure_training_image(int ih, int iw, bool needsDerivativeBuffer,
+                               id<MTLDevice> dev) {
+        const bool derivativeBufferReady =
+            !needsDerivativeBuffer || ssim_deriv_h_buf.defined();
         if (ih == training_img_height && iw == training_img_width &&
-            ssim_deriv_h_buf.defined() && ssim_h_buf.defined() &&
+            derivativeBufferReady && ssim_h_buf.defined() &&
             loss_sum.defined() && photometric_gradient.defined()) {
             return;
         }
@@ -1903,8 +1945,10 @@ struct FusedTensorCache {
         ssim_deriv_h_buf.reset(); ssim_h_buf.reset();
         loss_sum.reset(); photometric_gradient.reset();
 
-        ssim_deriv_h_buf = mtensor_empty(
-            dev, {(int64_t)ih, (int64_t)iw, 9}, DType::Float32);
+        if (needsDerivativeBuffer) {
+            ssim_deriv_h_buf = mtensor_empty(
+                dev, {(int64_t)ih, (int64_t)iw, 9}, DType::Float32);
+        }
         ssim_h_buf = mtensor_empty(
             dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
         loss_sum = mtensor_empty(dev, {1}, DType::Float32);
@@ -2744,7 +2788,8 @@ static MTensor msplat_train_step_locked(
     g_tcache.ensure_tile_layout_metadata(ctx->gpu_tile_layout, ctx->device);
     g_tcache.ensure_tile_attempt_dispatch_control(
         ctx->retry_intersection_attempts, ctx->device);
-    g_tcache.ensure_training_image(img_height, img_width, ctx->device);
+    g_tcache.ensure_training_image(
+        img_height, img_width, !ctx->fused_ssim_backward, ctx->device);
     g_tcache.ensure_backward(num_points, ctx->device);
     if (pose.enabled) g_tcache.ensure_pose_refinement(ctx->device);
 
@@ -2768,7 +2813,6 @@ static MTensor msplat_train_step_locked(
     MTensor &out_img = g_tcache.out_img;
     MTensor &final_Ts = g_tcache.final_Ts;
     MTensor &final_idx = g_tcache.final_idx;
-    MTensor &ssim_deriv_h_buf = g_tcache.ssim_deriv_h_buf;
     MTensor &photometric_gradient = g_tcache.photometric_gradient;
     MTensor &activeViewmat = pose.enabled ? g_tcache.pose_viewmat : viewmat;
     MTensor &poseGradient = pose.enabled
@@ -3218,8 +3262,10 @@ static MTensor msplat_train_step_locked(
         }
     };
 
-    // Fused loss: ssim_h_fwd → fused_v_fwd_h_bwd → ssim_v_bwd.
-    // The fused middle pass writes only its compact horizontal derivatives.
+    // Fused loss: SSIM always begins with a horizontal image convolution.
+    // The staged default materializes compact horizontal derivatives before
+    // its vertical backward pass; the opt-in fused path keeps both derivative
+    // convolutions in one 16x8 threadgroup and writes only the final gradient.
     auto encode_loss_fwd_bwd = [&](id<MTLComputeCommandEncoder> enc) {
         MTLSize threadgroups = MTLSizeMake(
             (img_width + 15) / 16, (img_height + 15) / 16, 1);
@@ -3238,41 +3284,72 @@ static MTensor msplat_train_step_locked(
         ENC_SCALAR(enc, target_pixel_stride_bytes, 10);
         [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // Pass 2: Fused V fwd + H bwd
-        [enc setComputePipelineState:ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
-        ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
-        [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
-        ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
-        ENC_BUF(enc, ssim_deriv_h_buf, 6); ENC_BUF(enc, loss_sum, 7);
-        ENC_BUF(enc, loss_coverage_buffer, 8);
-        ENC_SCALAR(enc, coverage_layout, 9);
-        ENC_BUF(enc, photometricLogGains, 10);
-        ENC_SCALAR(enc, cameraGainOffset, 11);
-        ENC_SCALAR(enc, photometricEnabled, 12);
-        ENC_SCALAR(enc, alpha_layout, 13);
-        ENC_BUF(enc, background, 14);
-        ENC_BUF(enc, final_Ts, 15);
-        ENC_SCALAR(enc, alpha_loss_weight, 16);
-        ENC_SCALAR(enc, target_pixel_stride_bytes, 17);
-        [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
-        [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        // Pass 3: V bwd
-        [enc setComputePipelineState:ctx->ssim_v_bwd_kernel_cpso];
-        ENC_BUF(enc, rendered_gradient, 0); ENC_BUF(enc, gt, 1);
-        ENC_BUF(enc, ssim_deriv_h_buf, 2);
-        [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:3];
-        ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
-        ENC_BUF(enc, loss_coverage_buffer, 6);
-        ENC_SCALAR(enc, coverage_layout, 7);
-        ENC_BUF(enc, photometricLogGains, 8);
-        ENC_SCALAR(enc, cameraGainOffset, 9);
-        ENC_BUF(enc, photometric_gradient, 10);
-        ENC_SCALAR(enc, photometricEnabled, 11);
-        ENC_SCALAR(enc, alpha_layout, 12);
-        ENC_BUF(enc, background, 13);
-        ENC_SCALAR(enc, target_pixel_stride_bytes, 14);
-        [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
+        if (ctx->fused_ssim_backward) {
+            MTLSize fusedThreadgroups = MTLSizeMake(
+                (img_width + 15) / 16, (img_height + 7) / 8, 1);
+            MTLSize fusedTg = MTLSizeMake(16, 8, 1);
+            [enc setComputePipelineState:
+                ctx->ssim_fused_v_fwd_bwd_kernel_cpso];
+            ENC_BUF(enc, rendered_gradient, 0); ENC_BUF(enc, gt, 1);
+            ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
+            [enc setBytes:loss_img_size->data()
+                   length:sizeof(*loss_img_size) atIndex:3];
+            ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
+            ENC_BUF(enc, loss_sum, 6);
+            ENC_BUF(enc, loss_coverage_buffer, 7);
+            ENC_SCALAR(enc, coverage_layout, 8);
+            ENC_BUF(enc, photometricLogGains, 9);
+            ENC_SCALAR(enc, cameraGainOffset, 10);
+            ENC_BUF(enc, photometric_gradient, 11);
+            ENC_SCALAR(enc, photometricEnabled, 12);
+            ENC_SCALAR(enc, alpha_layout, 13);
+            ENC_BUF(enc, background, 14);
+            ENC_BUF(enc, final_Ts, 15);
+            ENC_SCALAR(enc, alpha_loss_weight, 16);
+            ENC_SCALAR(enc, target_pixel_stride_bytes, 17);
+            [enc dispatchThreadgroups:fusedThreadgroups
+                threadsPerThreadgroup:fusedTg];
+        } else {
+            // Pass 2: Fused V fwd + H bwd
+            [enc setComputePipelineState:
+                ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso];
+            ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+            ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
+            [enc setBytes:loss_img_size->data()
+                   length:sizeof(*loss_img_size) atIndex:3];
+            ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
+            ENC_BUF(enc, g_tcache.ssim_deriv_h_buf, 6);
+            ENC_BUF(enc, loss_sum, 7);
+            ENC_BUF(enc, loss_coverage_buffer, 8);
+            ENC_SCALAR(enc, coverage_layout, 9);
+            ENC_BUF(enc, photometricLogGains, 10);
+            ENC_SCALAR(enc, cameraGainOffset, 11);
+            ENC_SCALAR(enc, photometricEnabled, 12);
+            ENC_SCALAR(enc, alpha_layout, 13);
+            ENC_BUF(enc, background, 14);
+            ENC_BUF(enc, final_Ts, 15);
+            ENC_SCALAR(enc, alpha_loss_weight, 16);
+            ENC_SCALAR(enc, target_pixel_stride_bytes, 17);
+            [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            // Pass 3: V bwd
+            [enc setComputePipelineState:ctx->ssim_v_bwd_kernel_cpso];
+            ENC_BUF(enc, rendered_gradient, 0); ENC_BUF(enc, gt, 1);
+            ENC_BUF(enc, g_tcache.ssim_deriv_h_buf, 2);
+            [enc setBytes:loss_img_size->data()
+                   length:sizeof(*loss_img_size) atIndex:3];
+            ENC_SCALAR(enc, ssim_weight, 4); ENC_SCALAR(enc, loss_inv_n, 5);
+            ENC_BUF(enc, loss_coverage_buffer, 6);
+            ENC_SCALAR(enc, coverage_layout, 7);
+            ENC_BUF(enc, photometricLogGains, 8);
+            ENC_SCALAR(enc, cameraGainOffset, 9);
+            ENC_BUF(enc, photometric_gradient, 10);
+            ENC_SCALAR(enc, photometricEnabled, 11);
+            ENC_SCALAR(enc, alpha_layout, 12);
+            ENC_BUF(enc, background, 13);
+            ENC_SCALAR(enc, target_pixel_stride_bytes, 14);
+            [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
+        }
 
         if (photometric.enabled) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];

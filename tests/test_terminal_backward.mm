@@ -238,8 +238,16 @@ void checkTerminalStep(bool collectStats, int degreesToUse) {
     }
 
     MTensor logRgbGains = gpu_zeros({1, 3}, DType::Float32);
+    MTensor logRgbGainsExpAvg = gpu_zeros({1, 3}, DType::Float32);
+    MTensor logRgbGainsExpAvgSq = gpu_zeros({1, 3}, DType::Float32);
     MsplatPhotometricRefinementStep photometric;
+    photometric.enabled = true;
     photometric.logRgbGains = &logRgbGains;
+    photometric.expAvg = &logRgbGainsExpAvg;
+    photometric.expAvgSq = &logRgbGainsExpAvgSq;
+    photometric.adamStepSize = 0.005f;
+    photometric.adamBiasCorrection2Sqrt = std::sqrt(0.001f);
+    photometric.maxAbsLogGain = 1.38629436112f; // log(4)
     MTensor poseDeltas = gpu_zeros({1, 6}, DType::Float32);
     MsplatPoseRefinementStep pose;
     pose.deltas = &poseDeltas;
@@ -281,6 +289,33 @@ void checkTerminalStep(bool collectStats, int degreesToUse) {
         photometric, pose, collectStats,
         visibility, xyGradientNorm, max2DSize, 1.0f / kWidth);
     msplat_gpu_sync();
+
+    constexpr std::array<float, 3> expectedPhotometricFirstMoments = {
+        -7.47689e-6f,
+        -1.47715e-5f,
+        -1.52062e-5f,
+    };
+    for (int channel = 0; channel < 3; ++channel) {
+        const float parameter = logRgbGains.data<float>()[channel];
+        const float firstMoment =
+            logRgbGainsExpAvg.data<float>()[channel];
+        const float secondMoment =
+            logRgbGainsExpAvgSq.data<float>()[channel];
+        CHECK(std::isfinite(parameter));
+        CHECK(std::isfinite(firstMoment));
+        CHECK(std::isfinite(secondMoment));
+        CHECK(std::abs(firstMoment -
+            expectedPhotometricFirstMoments[channel]) <= 1.0e-9f);
+        const float gradient = firstMoment / (1.0f - kBeta1);
+        const float expectedSecondMoment =
+            (1.0f - kBeta2) * gradient * gradient;
+        const float expectedParameter = -photometric.adamStepSize *
+            firstMoment /
+            (std::sqrt(secondMoment) /
+                photometric.adamBiasCorrection2Sqrt + kEpsilon);
+        CHECK(std::abs(secondMoment - expectedSecondMoment) <= 1.0e-14f);
+        CHECK(std::abs(parameter - expectedParameter) <= 1.0e-8f);
+    }
 
     CHECK(radii.data<int32_t>()[0] > 0);
     CHECK(radii.data<int32_t>()[1] == 0);

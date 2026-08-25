@@ -4683,6 +4683,278 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             loss_sum, tg_scratch[0], memory_order_relaxed);
 }
 
+// Opt-in terminal SSIM pass: vertical forward, both derivative convolutions,
+// final rendered-image gradient, and loss/photometric reductions. A 16x8
+// output group keeps the complete 26x28 statistics halo below 16 KiB. Each
+// phase retains its outputs privately, then reuses the same threadgroup tile
+// after a barrier instead of materializing the 9-float-per-pixel derivative
+// buffer in device memory.
+kernel void ssim_fused_v_fwd_bwd_kernel(
+    device float* rendered_gradient,
+    constant float* gt,             // UInt8 RGBA or Float32 RGB, selected by stride
+    constant float* ssim_h_buf,
+    constant uint2& img_size,
+    constant float& ssim_weight,
+    constant float& inv_n,
+    device atomic_float* loss_sum,
+    constant uchar* coverage_mask, // packed alpha or (H, W), disabled by x=0
+    constant uint2& coverage_layout,
+    constant float* log_rgb_gains, // (cameraCount, 3)
+    constant uint& camera_gain_offset,
+    device atomic_float* log_gain_gradient, // (3)
+    constant uint& photometric_enabled,
+    constant uint2& alpha_layout,
+    constant float* background,
+    constant float* final_Ts,
+    constant float& alpha_loss_weight,
+    constant uint& target_pixel_stride_bytes,
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    const uint W = img_size.x, H = img_size.y;
+    const uint px = gid.x, py = gid.y;
+    constexpr uint OUTPUT_W = 16;
+    constexpr uint OUTPUT_H = 8;
+    constexpr uint THREADS_PER_GROUP = OUTPUT_W * OUTPUT_H;
+    constexpr uint STATS_W = OUTPUT_W + 2 * SSIM_HALF_WIN; // 26
+    constexpr uint STATS_H = OUTPUT_H + 4 * SSIM_HALF_WIN; // 28
+    constexpr uint STATS_PIXELS = STATS_W * STATS_H;
+    constexpr uint RAW_H = OUTPUT_H + 2 * SSIM_HALF_WIN;   // 18
+    constexpr uint RAW_PIXELS = STATS_W * RAW_H;
+    constexpr uint H_PIXELS = OUTPUT_W * RAW_H;
+    constexpr uint RAW_VALUES_PER_THREAD =
+        (RAW_PIXELS + THREADS_PER_GROUP - 1) / THREADS_PER_GROUP;
+    constexpr uint H_VALUES_PER_THREAD =
+        (H_PIXELS + THREADS_PER_GROUP - 1) / THREADS_PER_GROUP;
+    const int output_base_x = int(tgid.x * OUTPUT_W);
+    const int output_base_y = int(tgid.y * OUTPUT_H);
+    const int stats_base_x = output_base_x - SSIM_HALF_WIN;
+    const int stats_base_y = output_base_y - 2 * SSIM_HALF_WIN;
+    const int raw_base_x = stats_base_x;
+    const int raw_base_y = output_base_y - SSIM_HALF_WIN;
+
+    float ssim_sum = 0.0f, l1_sum = 0.0f, coverage_sum = 0.0f;
+    float alpha_loss_sum = 0.0f;
+    float3 local_log_gain_gradient = float3(0.0f);
+    threadgroup float tg_gain[3];
+    threadgroup float tg_scratch[STATS_PIXELS * 5];
+
+    if (tr < 3) {
+        tg_gain[tr] = photometric_enabled != 0
+            ? photometric_gain(log_rgb_gains, camera_gain_offset, tr)
+            : 1.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint c = 0; c < 3; ++c) {
+        const float gain = tg_gain[c];
+        for (uint i = tr; i < STATS_PIXELS; i += THREADS_PER_GROUP) {
+            const uint sy = i / STATS_W, sx = i % STATS_W;
+            const int gy = stats_base_y + int(sy);
+            const int gx = stats_base_x + int(sx);
+            const bool valid_sample =
+                gx >= 0 && gx < int(W) && gy >= 0 && gy < int(H);
+            const uint hp = valid_sample
+                ? (uint(gy) * W + uint(gx)) * 15 + c * 5
+                : 0;
+            for (uint field = 0; field < 5; ++field) {
+                tg_scratch[i * 5 + field] = valid_sample
+                    ? ssim_h_buf[hp + field]
+                    : 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float3 phase_values[RAW_VALUES_PER_THREAD] = {};
+        for (uint slot = 0; slot < RAW_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= RAW_PIXELS) continue;
+            const uint ry = i / STATS_W, rx = i % STATS_W;
+            float mu_x = 0.0f, mu_y = 0.0f;
+            float sq_x = 0.0f, sq_y = 0.0f, cross_xy = 0.0f;
+            for (uint k = 0; k < SSIM_WIN; ++k) {
+                const float w = GAUSS_1D[k];
+                const uint hp = ((ry + k) * STATS_W + rx) * 5;
+                mu_x += w * tg_scratch[hp + 0];
+                mu_y += w * tg_scratch[hp + 1];
+                sq_x += w * tg_scratch[hp + 2];
+                sq_y += w * tg_scratch[hp + 3];
+                cross_xy += w * tg_scratch[hp + 4];
+            }
+
+            const int gpx = raw_base_x + int(rx);
+            const int gpy = raw_base_y + int(ry);
+            const bool valid_center =
+                gpx >= 0 && gpx < int(W) && gpy >= 0 && gpy < int(H);
+            if (!valid_center) {
+                phase_values[slot] = float3(0.0f);
+                continue;
+            }
+            const float coverage = coverage_layout.x == 0
+                ? 1.0f
+                : training_mask_coverage(
+                    coverage_mask, uint(gpy) * W + uint(gpx),
+                    coverage_layout);
+            const float sigma_x_sq = sq_x - mu_x * mu_x;
+            const float sigma_y_sq = sq_y - mu_y * mu_y;
+            const float sigma_xy = cross_xy - mu_x * mu_y;
+            const float A = 2.0f * mu_x * mu_y + SSIM_C1;
+            const float B = 2.0f * sigma_xy + SSIM_C2;
+            const float Cd = mu_x * mu_x + mu_y * mu_y + SSIM_C1;
+            const float D = sigma_x_sq + sigma_y_sq + SSIM_C2;
+            const float iCD = 1.0f / (Cd * D);
+            const float dmu =
+                2.0f * B * (mu_x * Cd - A * mu_y) / (Cd * Cd * D);
+            const float dsyq = -A * B * iCD / D;
+            const float dsxy = 2.0f * A * iCD;
+            phase_values[slot] = coverage * float3(
+                dmu - 2.0f * mu_y * dsyq - mu_x * dsxy,
+                2.0f * dsyq,
+                dsxy);
+
+            const bool owns_loss_center =
+                rx >= SSIM_HALF_WIN &&
+                rx < SSIM_HALF_WIN + OUTPUT_W &&
+                ry >= SSIM_HALF_WIN &&
+                ry < SSIM_HALF_WIN + OUTPUT_H;
+            if (owns_loss_center) {
+                ssim_sum += coverage * (A * B) / (Cd * D);
+                const uint center_pixel = uint(gpy) * W + uint(gpx);
+                const float target = training_target_rgb(
+                    gt, coverage_mask, alpha_layout, background,
+                    target_pixel_stride_bytes, center_pixel, c);
+                l1_sum += coverage * fabs(
+                    target - rendered_gradient[center_pixel * 3 + c] * gain);
+                coverage_sum += coverage;
+                if (c == 0 && alpha_layout.x != 0) {
+                    const float target_alpha = training_mask_coverage(
+                        coverage_mask, center_pixel, alpha_layout);
+                    alpha_loss_sum += alpha_loss_weight * fabs(
+                        (1.0f - final_Ts[center_pixel]) - target_alpha);
+                }
+            }
+        }
+
+        // All statistics reads must finish before the raw derivative planes
+        // overwrite the shared tile. Loss owners also read rendered_gradient
+        // cooperatively, so fence device memory before output-owner threads
+        // begin replacing those pixels in place.
+        threadgroup_barrier(
+            mem_flags::mem_threadgroup | mem_flags::mem_device);
+        for (uint slot = 0; slot < RAW_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= RAW_PIXELS) continue;
+            tg_scratch[i] = phase_values[slot].x;
+            tg_scratch[RAW_PIXELS + i] = phase_values[slot].y;
+            tg_scratch[2 * RAW_PIXELS + i] = phase_values[slot].z;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint slot = 0; slot < H_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= H_PIXELS) continue;
+            const uint hy = i / OUTPUT_W, hx = i % OUTPUT_W;
+            float3 value = float3(0.0f);
+            for (uint dx = 0; dx < SSIM_WIN; ++dx) {
+                const float w = GAUSS_1D[SSIM_WIN - 1 - dx];
+                const uint raw = hy * STATS_W + hx + dx;
+                value.x += w * tg_scratch[raw];
+                value.y += w * tg_scratch[RAW_PIXELS + raw];
+                value.z += w * tg_scratch[2 * RAW_PIXELS + raw];
+            }
+            phase_values[slot] = value;
+        }
+
+        // Horizontal results reuse the raw derivative planes only after every
+        // thread has completed its reads.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint slot = 0; slot < H_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= H_PIXELS) continue;
+            tg_scratch[i] = phase_values[slot].x;
+            tg_scratch[H_PIXELS + i] = phase_values[slot].y;
+            tg_scratch[2 * H_PIXELS + i] = phase_values[slot].z;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (px < W && py < H) {
+            float3 convolved = float3(0.0f);
+            for (uint dy = 0; dy < SSIM_WIN; ++dy) {
+                const float w = GAUSS_1D[SSIM_WIN - 1 - dy];
+                const uint hp = (lid.y + dy) * OUTPUT_W + lid.x;
+                convolved.x += w * tg_scratch[hp];
+                convolved.y += w * tg_scratch[H_PIXELS + hp];
+                convolved.z += w * tg_scratch[2 * H_PIXELS + hp];
+            }
+
+            const uint pixel = py * W + px;
+            const uint pixel_channel = pixel * 3 + c;
+            const float raw_rend_val = rendered_gradient[pixel_channel];
+            const float rend_val = raw_rend_val * gain;
+            const float gt_val = training_target_rgb(
+                gt, coverage_mask, alpha_layout, background,
+                target_pixel_stride_bytes, pixel, c);
+            const float v_ssim = convolved.x +
+                rend_val * convolved.y + gt_val * convolved.z;
+            const float coverage = coverage_layout.x == 0
+                ? 1.0f
+                : training_mask_coverage(
+                    coverage_mask, pixel, coverage_layout);
+            const float v_l1 = coverage * (
+                (gt_val > rend_val) ? -1.0f :
+                ((gt_val < rend_val) ? 1.0f : 0.0f));
+            const float adjusted_gradient = inv_n * (
+                -ssim_weight * v_ssim +
+                (1.0f - ssim_weight) * v_l1);
+            rendered_gradient[pixel_channel] = adjusted_gradient * gain;
+            local_log_gain_gradient[c] = adjusted_gradient * rend_val;
+        }
+
+        // The next channel reloads the statistics tile.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float loss_contribution =
+        ssim_weight * (coverage_sum - ssim_sum) / 3.0f +
+        (1.0f - ssim_weight) * l1_sum / 3.0f +
+        alpha_loss_sum;
+    tg_scratch[tr] = loss_contribution;
+    if (photometric_enabled != 0) {
+        tg_scratch[THREADS_PER_GROUP + tr] = local_log_gain_gradient.x;
+        tg_scratch[2 * THREADS_PER_GROUP + tr] = local_log_gain_gradient.y;
+        tg_scratch[3 * THREADS_PER_GROUP + tr] = local_log_gain_gradient.z;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = THREADS_PER_GROUP / 2; stride > 0; stride >>= 1) {
+        if (tr < stride) {
+            tg_scratch[tr] += tg_scratch[tr + stride];
+            if (photometric_enabled != 0) {
+                for (uint c = 1; c <= 3; ++c) {
+                    const uint base = c * THREADS_PER_GROUP;
+                    tg_scratch[base + tr] +=
+                        tg_scratch[base + tr + stride];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tr == 0) {
+        atomic_fetch_add_explicit(
+            loss_sum, tg_scratch[0], memory_order_relaxed);
+        if (photometric_enabled != 0) {
+            for (uint c = 0; c < 3; ++c) {
+                atomic_fetch_add_explicit(
+                    log_gain_gradient + c,
+                    tg_scratch[(c + 1) * THREADS_PER_GROUP],
+                    memory_order_relaxed);
+            }
+        }
+    }
+}
+
 // Backward pass 1: compute derivative fields + horizontal convolution.
 // For each pixel, computes F1, F2, F3 from intermediates, then convolves horizontally.
 // Output: ssim_h_buf (H, W, 15) — 3 values per channel at stride 5

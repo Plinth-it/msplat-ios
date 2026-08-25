@@ -294,33 +294,40 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         add_test(NAME msplat_transparent_training_arena_retry
             COMMAND msplat_transparent_training_tests
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_ssim_fused
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         set_tests_properties(msplat_transparent_training PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu"
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_transparent_training_16x8 PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=16x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu"
+                "MSPLAT_RASTER_VARIANT=16x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_transparent_training_16x16 PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=16x16;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu"
+                "MSPLAT_RASTER_VARIANT=16x16;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_transparent_training_difference PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=cpu"
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_transparent_training_gpu_layout PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=gpu"
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=gpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_transparent_training_difference_gpu_layout PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=gpu"
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=gpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_transparent_training_arena_retry PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry"
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry;MSPLAT_SSIM_MODE=staged"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_ssim_fused PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=fused"
             SKIP_RETURN_CODE 77)
         add_executable(msplat_terminal_backward_tests
             tests/test_terminal_backward.mm)
@@ -346,33 +353,40 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         add_test(NAME msplat_terminal_backward_arena_retry
             COMMAND msplat_terminal_backward_tests
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_terminal_backward_ssim_fused
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         set_tests_properties(msplat_terminal_backward PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu"
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_terminal_backward_16x8 PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=16x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu"
+                "MSPLAT_RASTER_VARIANT=16x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_terminal_backward_16x16 PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=16x16;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu"
+                "MSPLAT_RASTER_VARIANT=16x16;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_terminal_backward_difference PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=cpu"
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_terminal_backward_gpu_layout PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=gpu"
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=gpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_terminal_backward_difference_gpu_layout PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=gpu"
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=gpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_terminal_backward_arena_retry PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry"
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry;MSPLAT_SSIM_MODE=staged"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_terminal_backward_ssim_fused PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=fused"
             SKIP_RETURN_CODE 77)
         add_test(NAME msplat_exact_intersection_contract
             COMMAND ${CMAKE_COMMAND}

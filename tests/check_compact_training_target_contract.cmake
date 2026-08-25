@@ -132,11 +132,13 @@ require_absent("${target_helper}" "bytes[pixel * 4 + 3]"
 extract_section(metal_source "kernel void ssim_h_fwd_kernel("
     "kernel void ssim_v_fwd_kernel(" horizontal_forward)
 extract_section(metal_source "kernel void ssim_fused_v_fwd_h_bwd_kernel("
-    "kernel void ssim_h_bwd_kernel(" fused_middle)
+    "kernel void ssim_fused_v_fwd_bwd_kernel(" staged_middle)
+extract_section(metal_source "kernel void ssim_fused_v_fwd_bwd_kernel("
+    "kernel void ssim_h_bwd_kernel(" fused_terminal)
 extract_section(metal_source "kernel void ssim_v_bwd_kernel("
     "kernel void photometric_adam_kernel(" vertical_backward)
 
-foreach(section IN ITEMS horizontal_forward fused_middle vertical_backward)
+foreach(section IN ITEMS horizontal_forward staged_middle vertical_backward)
     require_contains("${${section}}" "target_pixel_stride_bytes"
         "${section} receives target byte stride")
     require_contains("${${section}}" "training_target_rgb("
@@ -144,6 +146,18 @@ foreach(section IN ITEMS horizontal_forward fused_middle vertical_backward)
     require_contains("${${section}}" "for (uint c = 0; c < 3; c++)"
         "${section} reads RGB only")
 endforeach()
+require_contains("${fused_terminal}" "constant uint& target_pixel_stride_bytes"
+    "fused terminal receives target byte stride")
+require_contains("${fused_terminal}" "training_target_rgb("
+    "fused terminal reads the target through the compact helper")
+require_contains("${fused_terminal}" "for (uint c = 0; c < 3; ++c)"
+    "fused terminal reads RGB only")
+require_contains("${fused_terminal}"
+    "target_pixel_stride_bytes, center_pixel, c"
+    "fused terminal loss uses compact-target addressing")
+require_contains("${fused_terminal}"
+    "target_pixel_stride_bytes, pixel, c"
+    "fused terminal backward uses compact-target addressing")
 
 extract_section(host_source "auto encode_loss_fwd_bwd ="
     "auto encode_rast_bwd =" host_loss)
@@ -152,7 +166,15 @@ require_contains("${host_loss}"
     "horizontal-forward target-stride binding")
 require_contains("${host_loss}"
     "ENC_SCALAR(enc, target_pixel_stride_bytes, 17);"
-    "fused-middle target-stride binding")
+    "fused and staged-middle target-stride binding")
 require_contains("${host_loss}"
     "ENC_SCALAR(enc, target_pixel_stride_bytes, 14);"
     "vertical-backward target-stride binding")
+require_contains("${host_loss}"
+    "ctx->ssim_fused_v_fwd_bwd_kernel_cpso"
+    "compact-target fused terminal dispatch")
+require_contains("${host_loss}"
+    "ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso"
+    "compact-target staged middle dispatch")
+require_contains("${host_loss}" "ctx->ssim_v_bwd_kernel_cpso"
+    "compact-target staged vertical-backward dispatch")
