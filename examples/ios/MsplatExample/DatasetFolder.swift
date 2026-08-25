@@ -39,6 +39,7 @@ final class DatasetFolder {
     private static let pointReadChunkSize = 64 * 1_024
     private static let maximumPointTextLineBytes = 16 * 1_024 * 1_024
     private static let minimumBinaryPointRecordBytes = 51
+    private static let lastPickedBookmarkKey = "lastPickedDatasetFolderBookmark"
     private static let nerfstudioImageExtensions = [
         ".png", ".jpg", ".jpeg", ".JPG",
     ]
@@ -63,6 +64,90 @@ final class DatasetFolder {
         self.url = url
         self.kind = kind
         self.scoped = scoped
+    }
+
+    /// Resolves the most recently picked dataset without implicitly starting
+    /// its security scope. This instance owns that scope until deallocation.
+    static func restoreLastPicked(
+        from defaults: UserDefaults = .standard
+    ) -> DatasetFolder? {
+        guard defaults.object(forKey: lastPickedBookmarkKey) != nil else {
+            return nil
+        }
+        guard let data = defaults.data(forKey: lastPickedBookmarkKey) else {
+            defaults.removeObject(forKey: lastPickedBookmarkKey)
+            return nil
+        }
+
+        do {
+            var isStale = false
+            let url = try URL(
+                resolvingBookmarkData: data,
+                options: [.withoutUI, .withoutImplicitStartAccessing],
+                relativeTo: nil,
+                bookmarkDataIsStale: &isStale
+            )
+            guard let folder = DatasetFolder(picked: url) else {
+                defaults.removeObject(forKey: lastPickedBookmarkKey)
+                return nil
+            }
+
+            if isStale {
+                do {
+                    try folder.persistAsLastPicked(in: defaults)
+                } catch {
+                    defaults.removeObject(forKey: lastPickedBookmarkKey)
+                }
+            }
+            return folder
+        } catch {
+            defaults.removeObject(forKey: lastPickedBookmarkKey)
+            return nil
+        }
+    }
+
+    /// Resolves an app-container dataset for unattended physical-device runs.
+    /// The environment value is relative to Documents and cannot escape it.
+    static func benchmarkDatasetFromDocuments(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        documentsDirectory: URL = .documentsDirectory
+    ) -> DatasetFolder? {
+        guard let rawPath = environment["MSPLAT_BENCHMARK_DATASET"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !rawPath.isEmpty,
+              !rawPath.hasPrefix("/") else {
+            return nil
+        }
+
+        let documents = documentsDirectory
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let candidate = documents
+            .appending(path: rawPath, directoryHint: .isDirectory)
+            .standardizedFileURL
+            .resolvingSymlinksInPath()
+        let documentsPrefix = documents.path.hasSuffix("/")
+            ? documents.path : documents.path + "/"
+        guard candidate.path.hasPrefix(documentsPrefix) else { return nil }
+        return DatasetFolder(picked: candidate)
+    }
+
+    /// iOS bookmark data carries the picker URL's implicit security scope.
+    /// `withSecurityScope` is a macOS-only bookmark option.
+    func persistAsLastPicked(
+        in defaults: UserDefaults = .standard
+    ) throws {
+        do {
+            let data = try url.bookmarkData(
+                options: .minimalBookmark,
+                includingResourceValuesForKeys: nil,
+                relativeTo: nil
+            )
+            defaults.set(data, forKey: Self.lastPickedBookmarkKey)
+        } catch {
+            defaults.removeObject(forKey: Self.lastPickedBookmarkKey)
+            throw error
+        }
     }
 
     deinit { release() }

@@ -9,6 +9,7 @@ struct ContentView: View {
     @State private var pickError: String?
     @State private var trainingMaskCandidateCount: Int?
     @State private var trainingMaskSelectionWasEdited = false
+    @State private var didAttemptDatasetRestore = false
 
     var body: some View {
         NavigationStack {
@@ -23,12 +24,7 @@ struct ContentView: View {
                 switch result {
                 case .success(let url):
                     if let picked = DatasetFolder(picked: url) {
-                        folder = picked
-                        trainingMaskCandidateCount = nil
-                        trainingMaskSelectionWasEdited = false
-                        session.trainingMasksEnabled = false
-                        session.trainingMaskMode = .transparent
-                        pickError = nil
+                        select(picked, persistBookmark: true)
                     } else {
                         pickError = "Choose a folder with root transforms.json, or COLMAP cameras.bin/cameras.txt at its root or in sparse/0."
                     }
@@ -36,10 +32,51 @@ struct ContentView: View {
                     pickError = error.localizedDescription
                 }
             }
+            .task {
+                restoreLastDatasetIfNeeded()
+            }
             .task(id: folder?.id) {
                 guard let selectedFolder = folder else { return }
                 await scanTrainingMasks(in: selectedFolder)
+                session.startBenchmarkIfRequested(
+                    folder: selectedFolder,
+                    maskCandidateCount: trainingMaskCandidateCount
+                )
             }
+        }
+    }
+
+    @MainActor
+    private func restoreLastDatasetIfNeeded() {
+        guard !didAttemptDatasetRestore else { return }
+        didAttemptDatasetRestore = true
+        guard folder == nil else { return }
+        let restored = DatasetFolder.benchmarkDatasetFromDocuments()
+            ?? DatasetFolder.restoreLastPicked()
+        guard let restored else {
+            return
+        }
+        select(restored, persistBookmark: false)
+    }
+
+    @MainActor
+    private func select(
+        _ selectedFolder: DatasetFolder,
+        persistBookmark: Bool
+    ) {
+        folder = selectedFolder
+        trainingMaskCandidateCount = nil
+        trainingMaskSelectionWasEdited = false
+        session.trainingMasksEnabled = false
+        session.trainingMaskMode = .transparent
+        pickError = nil
+
+        guard persistBookmark else { return }
+        do {
+            try selectedFolder.persistAsLastPicked()
+        } catch {
+            pickError = "The folder is selected, but it could not be remembered: " +
+                error.localizedDescription
         }
     }
 

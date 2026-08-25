@@ -66,6 +66,8 @@ final class TrainingSession: ObservableObject {
     @Published private(set) var plannedSHDegree = 0
     @Published private(set) var plannedInitialGaussians = 0
     @Published private(set) var plannedMaximumGaussians = 0
+    @Published private(set) var benchmarkResultURL: URL?
+    @Published private(set) var benchmarkSummary: String?
 
     /// Total steps. Kept modest by default: on a phone this is a battery and
     /// thermal budget as much as a quality one.
@@ -84,8 +86,47 @@ final class TrainingSession: ObservableObject {
     private var pendingPreviewFailure: Error?
     private var nextPreviewID: UInt64 = 0
     private var previewGeneration: UInt64 = 0
+    private var benchmarkRequestHandled = false
 
     func start(folder: DatasetFolder) {
+        start(
+            folder: folder,
+            benchmark: nil,
+            trainingMaskCandidateCount: nil
+        )
+    }
+
+    /// Starts one launch-configured physical-device benchmark after dataset
+    /// mask discovery has settled. Repeated SwiftUI task invocations are safe.
+    func startBenchmarkIfRequested(
+        folder: DatasetFolder,
+        maskCandidateCount: Int?
+    ) {
+        guard !benchmarkRequestHandled,
+              let benchmark = TrainingBenchmarkConfiguration.requested(),
+              phase == .idle || phase == .cancelled || phase == .finished || isFailed else {
+            return
+        }
+        if folder.supportsAutomaticTrainingMaskDiscovery,
+           maskCandidateCount == nil {
+            return
+        }
+
+        benchmarkRequestHandled = true
+        iterations = benchmark.totalIterations
+        qualityProfile = .preview
+        start(
+            folder: folder,
+            benchmark: benchmark,
+            trainingMaskCandidateCount: maskCandidateCount
+        )
+    }
+
+    private func start(
+        folder: DatasetFolder,
+        benchmark: TrainingBenchmarkConfiguration?,
+        trainingMaskCandidateCount: Int?
+    ) {
         guard phase == .idle || phase == .cancelled || phase == .finished || isFailed else { return }
         phase = .planning
         submittedIteration = 0
@@ -116,11 +157,13 @@ final class TrainingSession: ObservableObject {
         plannedSHDegree = 0
         plannedInitialGaussians = 0
         plannedMaximumGaussians = 0
+        benchmarkResultURL = nil
+        benchmarkSummary = nil
         pendingPreviewFailure = nil
         previewGeneration &+= 1
 
-        let steps = iterations
-        let profile = qualityProfile
+        let steps = benchmark?.totalIterations ?? iterations
+        let profile: QualityProfile = benchmark == nil ? qualityProfile : .preview
         let useTrainingMasks = trainingMasksEnabled
         let selectedTrainingMaskMode = trainingMaskMode
 
@@ -131,7 +174,9 @@ final class TrainingSession: ObservableObject {
                 steps: steps,
                 profile: profile,
                 useTrainingMasks: useTrainingMasks,
-                trainingMaskMode: selectedTrainingMaskMode
+                trainingMaskMode: selectedTrainingMaskMode,
+                benchmark: benchmark,
+                trainingMaskCandidateCount: trainingMaskCandidateCount
             )
         }
     }
@@ -148,13 +193,24 @@ final class TrainingSession: ObservableObject {
         steps: Int,
         profile: QualityProfile,
         useTrainingMasks: Bool,
-        trainingMaskMode: TrainingMaskMode
+        trainingMaskMode: TrainingMaskMode,
+        benchmark: TrainingBenchmarkConfiguration?,
+        trainingMaskCandidateCount: Int?
     ) async {
         var session: MsplatSession?
         var resultURL: URL?
         var finalSplatCount = 0
         var failureMessage: String?
         var wasCancelled = false
+        var benchmarkRecorder = benchmark.map {
+            TrainingBenchmarkRecorder(
+                configuration: $0,
+                folder: folder,
+                trainingMaskCandidateCount: trainingMaskCandidateCount,
+                trainingMasksEnabled: useTrainingMasks,
+                trainingMaskMode: trainingMaskMode
+            )
+        }
 
         do {
             let datasetURL = folder.url
@@ -204,6 +260,10 @@ final class TrainingSession: ObservableObject {
 
             var baseConfig = TrainingConfig()
             baseConfig.trainingMaskMode = trainingMaskMode
+            if benchmark != nil {
+                // Benchmark the same fixed topology across every native mode.
+                baseConfig.stopDensifyAt = 0
+            }
             let activeSession = try await MsplatSession(
                 datasetURL: folder.url,
                 trainingPlan: plan,
@@ -219,21 +279,45 @@ final class TrainingSession: ObservableObject {
             }
             trainingCameras = cameras
             phase = .training
-            let previewPose = try await activeSession.cameraPose(at: 0)
+            let previewPose: CameraPose?
+            if benchmark == nil {
+                previewPose = try await activeSession.cameraPose(at: 0)
+            } else {
+                previewPose = nil
+            }
 
             // Preview submission is asynchronous, but still costs a full
             // forward pass. Keep one submission in flight and sample it less
             // frequently than the independent telemetry poll.
             let previewEvery = Self.previewInterval(for: steps)
             let telemetryEvery = max(steps / 40, 10)
+            var latestStats: TrainingStats?
+            var measuredStartedAt: TimeInterval?
 
             for i in 0..<steps {
                 try Task.checkCancellation()
                 try throwPendingPreviewFailure()
+                if let benchmark, i == benchmark.warmupIterations {
+                    // Drain warm-up work so this interval measures only steady-state
+                    // submissions through completion, without setup or export time.
+                    msplatSync()
+                    measuredStartedAt = ProcessInfo.processInfo.systemUptime
+                }
                 let stats = try await activeSession.step()
+                latestStats = stats
                 let isFinalStep = i == steps - 1
 
-                if isFinalStep {
+                if benchmark != nil {
+                    let snapshot = try await telemetrySnapshot(
+                        session: activeSession,
+                        fallback: stats
+                    )
+                    benchmarkRecorder?.record(
+                        telemetry: snapshot.telemetry,
+                        memory: snapshot.memory,
+                        thermalState: thermalState
+                    )
+                } else if isFinalStep, let previewPose {
                     // Preserve the last completed surface while the final one
                     // finishes, and do not tear down the native session until
                     // its app-owned texture is ready.
@@ -245,7 +329,7 @@ final class TrainingSession: ObservableObject {
                     )
                     await drainPendingPreview()
                     try throwPendingPreviewFailure()
-                } else if i % previewEvery == 0 {
+                } else if i % previewEvery == 0, let previewPose {
                     try await submitPreviewIfIdle(
                         session: activeSession,
                         pose: previewPose
@@ -255,7 +339,7 @@ final class TrainingSession: ObservableObject {
                 // This is a non-blocking snapshot. Submitted and completed
                 // iterations may legitimately differ now that preview display
                 // no longer drains the training queue.
-                if i % telemetryEvery == 0 || isFinalStep {
+                if benchmark == nil && (i % telemetryEvery == 0 || isFinalStep) {
                     try await refreshTelemetry(
                         session: activeSession,
                         fallback: stats
@@ -264,15 +348,57 @@ final class TrainingSession: ObservableObject {
             }
 
             try Task.checkCancellation()
-            let url = URL.documentsDirectory.appending(path: "msplat-scene.ply")
-            try await activeSession.exportPLY(to: url)
-            try Task.checkCancellation()
-            guard FileManager.default.fileExists(atPath: url.path) else {
-                throw MsplatError.ioFailure("Training finished, but the PLY file was not created.")
+            let measuredElapsedSeconds: TimeInterval?
+            if benchmark != nil, let measuredStartedAt {
+                msplatSync()
+                measuredElapsedSeconds = ProcessInfo.processInfo.systemUptime - measuredStartedAt
+            } else {
+                measuredElapsedSeconds = nil
+            }
+            if benchmark == nil {
+                let url = URL.documentsDirectory.appending(path: "msplat-scene.ply")
+                try await activeSession.exportPLY(to: url)
+                try Task.checkCancellation()
+                guard FileManager.default.fileExists(atPath: url.path) else {
+                    throw MsplatError.ioFailure(
+                        "Training finished, but the PLY file was not created."
+                    )
+                }
+                resultURL = url
             }
             finalSplatCount = try await activeSession.splatCount
+            if benchmarkRecorder != nil {
+                guard let latestStats else {
+                    throw MsplatError.internalFailure(
+                        "Benchmark completed without submitting a training step."
+                    )
+                }
+                let snapshot = try await telemetrySnapshot(
+                    session: activeSession,
+                    fallback: latestStats
+                )
+                benchmarkRecorder?.record(
+                    telemetry: snapshot.telemetry,
+                    memory: snapshot.memory,
+                    thermalState: thermalState,
+                    isFinalDescriptor: true
+                )
+                if var recorder = benchmarkRecorder {
+                    guard let measuredElapsedSeconds else {
+                        throw MsplatError.internalFailure(
+                            "Benchmark measured interval was not started."
+                        )
+                    }
+                    let output = try recorder.finish(
+                        measuredElapsedSeconds: measuredElapsedSeconds
+                    )
+                    benchmarkRecorder = recorder
+                    benchmarkResultURL = output.url
+                    benchmarkSummary = output.summaryLine
+                    print("MSPLAT_BENCHMARK_RESULT \(output.summaryLine)")
+                }
+            }
             try Task.checkCancellation()
-            resultURL = url
         } catch is CancellationError {
             // A cancelled run deliberately does not export a partial scene.
             wasCancelled = true
@@ -300,8 +426,17 @@ final class TrainingSession: ObservableObject {
 
         if let failureMessage {
             phase = .failed(failureMessage)
+            if benchmark != nil {
+                let singleLine = failureMessage
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .replacingOccurrences(of: "\r", with: " ")
+                print("MSPLAT_BENCHMARK_FAILURE \(singleLine)")
+            }
         } else if wasCancelled {
             phase = .cancelled
+            if benchmark != nil {
+                print("MSPLAT_BENCHMARK_FAILURE cancelled")
+            }
         } else {
             splatCount = finalSplatCount
             exportedPly = resultURL
@@ -415,8 +550,27 @@ final class TrainingSession: ObservableObject {
         session: MsplatSession,
         fallback stats: TrainingStats
     ) async throws {
+        _ = try await telemetrySnapshot(session: session, fallback: stats)
+    }
+
+    private func telemetrySnapshot(
+        session: MsplatSession,
+        fallback stats: TrainingStats
+    ) async throws -> (
+        telemetry: TrainingTelemetry,
+        memory: TrainingMemorySnapshot
+    ) {
         let telemetry = try await session.trainingMetrics()
         let memory = try await session.memoryMetrics()
+        applyTelemetry(telemetry, memory: memory, fallback: stats)
+        return (telemetry, memory)
+    }
+
+    private func applyTelemetry(
+        _ telemetry: TrainingTelemetry,
+        memory: TrainingMemorySnapshot,
+        fallback stats: TrainingStats
+    ) {
         submittedIteration = telemetry.submitted?.iteration ?? stats.iteration
         cpuSubmitMs = telemetry.submitted?.cpuSubmitMs ?? stats.cpuSubmitMs
         if let completed = telemetry.completed {

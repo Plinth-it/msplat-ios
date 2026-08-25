@@ -71,6 +71,61 @@ final class TrainingMaskOptionsTests: XCTestCase {
         )
     }
 
+    func testDatasetFolderBookmarkRoundTrip() throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let suiteName = "msplat-example-bookmark-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let selected = try XCTUnwrap(DatasetFolder(picked: temporaryDirectory))
+
+        try selected.persistAsLastPicked(in: defaults)
+        let restored = try XCTUnwrap(
+            DatasetFolder.restoreLastPicked(from: defaults)
+        )
+
+        XCTAssertEqual(restored.url.standardizedFileURL,
+                       temporaryDirectory.standardizedFileURL)
+        XCTAssertEqual(restored.kind, .colmap)
+    }
+
+    func testBenchmarkDatasetStaysInsideDocumentsDirectory() throws {
+        let root = try XCTUnwrap(temporaryDirectory)
+        let documents = root.appending(path: "Documents", directoryHint: .isDirectory)
+        let dataset = documents.appending(path: "egg", directoryHint: .isDirectory)
+        let outside = root.appending(path: "outside", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dataset, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outside, withIntermediateDirectories: true)
+        try Data().write(to: dataset.appending(path: "cameras.txt"))
+        try Data().write(to: outside.appending(path: "cameras.txt"))
+        let restored = try XCTUnwrap(
+            DatasetFolder.benchmarkDatasetFromDocuments(
+                environment: ["MSPLAT_BENCHMARK_DATASET": "egg"],
+                documentsDirectory: documents
+            )
+        )
+
+        XCTAssertEqual(restored.url.standardizedFileURL,
+                       dataset.standardizedFileURL)
+        XCTAssertNil(
+            DatasetFolder.benchmarkDatasetFromDocuments(
+                environment: ["MSPLAT_BENCHMARK_DATASET": "../outside"],
+                documentsDirectory: documents
+            )
+        )
+
+        let link = documents.appending(path: "linked-outside")
+        try FileManager.default.createSymbolicLink(
+            at: link,
+            withDestinationURL: outside
+        )
+        XCTAssertNil(
+            DatasetFolder.benchmarkDatasetFromDocuments(
+                environment: ["MSPLAT_BENCHMARK_DATASET": "linked-outside"],
+                documentsDirectory: documents
+            )
+        )
+    }
+
     func testDatasetFolderPrefersNerfstudioOverColmap() throws {
         let directory = try XCTUnwrap(temporaryDirectory)
         let pointCloud = directory.appending(path: "cloud/sparse.ply")
@@ -329,7 +384,7 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(plan.maximumGaussianCount, 313_214)
         XCTAssertEqual(plan.resolvedStages.first?.dimensions.width, 1_200)
         XCTAssertEqual(plan.resolvedStages.first?.dimensions.height, 1_600)
-        XCTAssertEqual(iOSMemory.estimatedPeakMemory, 2_340_264_941)
+        XCTAssertEqual(iOSMemory.estimatedPeakMemory, 2_340_300_941)
         XCTAssertLessThan(
             iOSMemory.estimatedPeakMemory,
             3_351 * 1_024 * 1_024
@@ -375,6 +430,53 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(TrainingSession.previewInterval(for: 200), 100)
         XCTAssertEqual(TrainingSession.previewInterval(for: 2_000), 100)
         XCTAssertEqual(TrainingSession.previewInterval(for: 20_000), 1_000)
+    }
+
+    func testBenchmarkConfigurationDefaultsAndOverrides() throws {
+        XCTAssertNil(TrainingBenchmarkConfiguration.requested(environment: [:]))
+
+        let defaults = try XCTUnwrap(
+            TrainingBenchmarkConfiguration.requested(environment: [
+                "MSPLAT_BENCHMARK": "1",
+            ])
+        )
+        XCTAssertEqual(defaults.label, "baseline")
+        XCTAssertEqual(defaults.warmupIterations, 50)
+        XCTAssertEqual(defaults.measuredIterations, 300)
+        XCTAssertEqual(defaults.totalIterations, 350)
+
+        let overridden = try XCTUnwrap(
+            TrainingBenchmarkConfiguration.requested(environment: [
+                "MSPLAT_BENCHMARK": "1",
+                "MSPLAT_BENCHMARK_LABEL": "gather",
+                "MSPLAT_BENCHMARK_WARMUP": "10",
+                "MSPLAT_BENCHMARK_MEASURED": "25",
+            ])
+        )
+        XCTAssertEqual(overridden.label, "gather")
+        XCTAssertEqual(overridden.warmupIterations, 10)
+        XCTAssertEqual(overridden.measuredIterations, 25)
+        XCTAssertEqual(overridden.totalIterations, 35)
+
+        let tooShort = try XCTUnwrap(
+            TrainingBenchmarkConfiguration.requested(environment: [
+                "MSPLAT_BENCHMARK": "1",
+                "MSPLAT_BENCHMARK_WARMUP": "0",
+                "MSPLAT_BENCHMARK_MEASURED": "1",
+            ])
+        )
+        XCTAssertEqual(tooShort.warmupIterations, 50)
+        XCTAssertEqual(tooShort.measuredIterations, 300)
+    }
+
+    func testBenchmarkDistributionUsesMedianAndNearestRankP90() throws {
+        let distribution = try XCTUnwrap(
+            TrainingBenchmarkDistribution.make((1...10).map(Double.init))
+        )
+
+        XCTAssertEqual(distribution.count, 10)
+        XCTAssertEqual(distribution.median, 5.5)
+        XCTAssertEqual(distribution.p90, 9)
     }
 
     func testPreviewTextureTransformPreservesExtentAndFlipsVertically() {
