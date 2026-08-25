@@ -429,6 +429,9 @@ reports image preparation, exact-count GPU and wall-wait time, post-count CPU
 encoding, intersection-arena growth, the exact intersection count, maximum
 tile population, and trivial/small/medium/large tile counts. This makes the
 per-step count barrier measurable without enabling the heavier stage profiler.
+When `PROFILE_STAGES=1` is enabled, exact-intersection work is reported as
+separate `proj_layout_validate`, `scatter_sort_finalize`, and `pack` stages so
+retry preflight cost is not folded into the asynchronous training tail.
 With camera prefetch enabled, decode work overlapped with the preceding Metal
 step is outside the next step's `imagePrepareMs`; any remaining wait plus target
 installation and GPU upload is still included.

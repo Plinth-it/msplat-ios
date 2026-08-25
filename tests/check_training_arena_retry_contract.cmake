@@ -546,8 +546,26 @@ require_contains("${post_count_dispatch}" "encode_pack(enc);"
 require_absent("${post_count_dispatch}" "ctx->syncCB()"
     "post-count synchronization")
 require_contains("${host_source}"
-    "if (index == 2 && g_retry_stage_profile.load(std::memory_order_relaxed))\n        return \"pack_only\";"
-    "retry stage profile labels the asynchronous sample as pack-only")
+    "\"proj_layout_validate\", \"scatter_sort_finalize\", \"pack\""
+    "retry profiling splits layout, sorting, and packing")
+require_contains("${host_source}"
+    "owner->object = ctx->newTrainingCounterSampleBuffer();"
+    "logical-step profiling buffer allocation")
+require_contains("${host_source}"
+    "auto csbOwner = stageCounterOwner;"
+    "logical-step profiling buffer completion lifetime")
+require_contains("${host_source}"
+    "[device sampleTimestamps:&cpuStart gpuTimestamp:&gpuStart];"
+    "paired CPU/GPU timestamp calibration")
+require_contains("${host_source}"
+    "static_cast<double>(cpuEnd - cpuStart) / 1e6;"
+    "nanosecond CPU timestamp conversion")
+require_contains("${retry_preflight}"
+    ".startOfEncoderSampleIndex = 2;"
+    "retry preflight scatter-sort profiling start")
+require_contains("${retry_preflight}"
+    ".endOfEncoderSampleIndex = 3;"
+    "retry preflight scatter-sort profiling end")
 foreach(forbidden_retry_action IN ITEMS
         msplat_training_step_begin
         msplat_training_step_submit
@@ -671,6 +689,15 @@ require_contains("${retry_fixture_source}"
 require_contains("${cmake_source}"
     "add_test(NAME msplat_transparent_training_arena_retry"
     "forced-retry fixture registration")
+require_contains("${cmake_source}"
+    "add_test(NAME msplat_transparent_training_profile"
+    "exact stage-profile fixture registration")
+require_contains("${cmake_source}"
+    "add_test(NAME msplat_transparent_training_arena_retry_profile"
+    "retry stage-profile fixture registration")
+require_contains("${cmake_source}"
+    "PROFILE_STAGES=1;MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated"
+    "stage-profile fixture environment")
 require_contains("${cmake_source}"
     "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry"
     "forced-retry fixture environment")

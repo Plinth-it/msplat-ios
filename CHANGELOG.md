@@ -113,6 +113,11 @@
   completed-count host wait, metadata validation, work-limit check, and host
   arena sizing. It is groundwork for—not an implementation of—the planned
   high-water arena, overflow-safe no-op, and retry design.
+- Split `PROFILE_STAGES` exact-intersection timing into projection/layout/
+  validation, scatter/sort/finalization, and attribute packing. Retry profiling
+  now measures its synchronized preflight separately from the queued training
+  tail, owns timestamp storage per logical step, and converts GPU ticks using
+  paired CPU/GPU samples rather than the CPU Mach timebase.
 - Fused geometry backward directly into the mean, scale, and quaternion Adam
   updates, and folded opacity plus densification-stat updates into the terminal
   backward stage. The training cache no longer owns or clears the three geometry

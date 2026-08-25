@@ -487,6 +487,45 @@ void checkArenaRetryTransaction() {
     CHECK(gather ? packedAttributeBytes == 0 : packedAttributeBytes > 0);
 }
 
+void checkStageProfiling() {
+    if (!std::getenv("PROFILE_STAGES")) return;
+
+    msplat_gpu_sync();
+    constexpr int maxStages = 16;
+    std::vector<double> stageTimes[maxStages];
+    const char* stageNames[maxStages] = {};
+    int stageCount = 0;
+    msplat_drain_stage_times(
+        stageTimes, maxStages, stageCount, stageNames);
+
+    const std::array<const char*, 8> expectedNames = {
+        "blit_zero", "proj_layout_validate", "scatter_sort_finalize", "pack",
+        "rast_fwd", "loss_fwd_bwd", "rast_bwd", "proj_sh_bwd_adam",
+    };
+    CHECK(stageCount == static_cast<int>(expectedNames.size()));
+    size_t profiledStepCount = 0;
+    for (int index = 0; index < stageCount; ++index) {
+        CHECK(stageNames[index] != nullptr);
+        CHECK(std::string(stageNames[index]) == expectedNames[index]);
+        if (index > 0 && !stageTimes[index].empty() && profiledStepCount == 0)
+            profiledStepCount = stageTimes[index].size();
+    }
+    // Counter sampling is not available on every macOS Metal device. When it
+    // is available, every active compute stage must produce a measurement.
+    if (profiledStepCount == 0) return;
+    const char* arenaMode = std::getenv("MSPLAT_TRAINING_ARENA_MODE");
+    const bool retry = arenaMode && std::string(arenaMode) == "retry";
+    CHECK(profiledStepCount == (retry ? 13u : 12u));
+    for (int index = 1; index < stageCount; ++index) {
+        CHECK(stageTimes[index].size() == profiledStepCount);
+        for (double sampleMs : stageTimes[index]) {
+            CHECK(std::isfinite(sampleMs));
+            CHECK(sampleMs >= 0.0);
+            CHECK(sampleMs < 60'000.0);
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char **argv) {
@@ -499,6 +538,7 @@ int main(int argc, char **argv) {
             checkChunkedTransparentAlphaSupervision();
             checkArenaRetryTransaction();
             checkPartialSsimThreadgroups();
+            checkStageProfiling();
             cleanup_msplat_metal();
             return 0;
         } catch (const std::exception &error) {

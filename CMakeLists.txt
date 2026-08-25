@@ -301,6 +301,9 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         add_test(NAME msplat_transparent_training
             COMMAND msplat_transparent_training_tests
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_profile
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         add_test(NAME msplat_transparent_training_16x8
             COMMAND msplat_transparent_training_tests
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
@@ -319,6 +322,9 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         add_test(NAME msplat_transparent_training_arena_retry
             COMMAND msplat_transparent_training_tests
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_arena_retry_profile
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         add_test(NAME msplat_transparent_training_difference_arena_retry
             COMMAND msplat_transparent_training_tests
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
@@ -334,6 +340,10 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         set_tests_properties(msplat_transparent_training PROPERTIES
             ENVIRONMENT
                 "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_profile PROPERTIES
+            ENVIRONMENT
+                "PROFILE_STAGES=1;MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_TRAINING_ARENA_MODE=exact;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_transparent_training_16x8 PROPERTIES
             ENVIRONMENT
@@ -358,6 +368,11 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         set_tests_properties(msplat_transparent_training_arena_retry PROPERTIES
             ENVIRONMENT
                 "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(
+            msplat_transparent_training_arena_retry_profile PROPERTIES
+            ENVIRONMENT
+                "PROFILE_STAGES=1;MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
             SKIP_RETURN_CODE 77)
         set_tests_properties(
             msplat_transparent_training_difference_arena_retry PROPERTIES

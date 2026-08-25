@@ -42,15 +42,12 @@ static bool g_profile_stages_checked = false;
 
 // Stage names for training pipeline
 static const char* g_train_stage_names[] = {
-    "blit_zero", "proj_sh_fwd", "exact_sort_pack", "rast_fwd",
-    "loss_fwd_bwd", "rast_bwd", "proj_sh_bwd_adam"
+    "blit_zero", "proj_layout_validate", "scatter_sort_finalize", "pack",
+    "rast_fwd", "loss_fwd_bwd", "rast_bwd", "proj_sh_bwd_adam"
 };
-static constexpr int N_TRAIN_STAGES = 7;
-static std::atomic<bool> g_retry_stage_profile{false};
+static constexpr int N_TRAIN_STAGES = 8;
 
 static const char* trainingStageName(int index) {
-    if (index == 2 && g_retry_stage_profile.load(std::memory_order_relaxed))
-        return "pack_only";
     return g_train_stage_names[index];
 }
 
@@ -758,10 +755,35 @@ struct MetalContext {
         return metrics;
     }
 
-    // Per-stage GPU timestamp profiling (Metal counter sample buffer)
-    id<MTLCounterSampleBuffer> counterSampleBuffer = nil;
+    // Per-stage GPU timestamp profiling. Each logical training step owns its
+    // own sample buffer so queued completion handlers cannot observe samples
+    // overwritten by a later step.
+    id<MTLCounterSet> timestampCounterSet = nil;
     bool counterSamplingAvailable = false;
     double ticksToMs = 0.0;  // conversion factor from GPU ticks to milliseconds
+
+    id<MTLCounterSampleBuffer> newTrainingCounterSampleBuffer() {
+        if (!timestampCounterSet) return nil;
+
+        MTLCounterSampleBufferDescriptor *desc =
+            [MTLCounterSampleBufferDescriptor new];
+        ScopedObjCRelease descOwner{desc};
+        desc.counterSet = timestampCounterSet;
+        desc.sampleCount = N_TRAIN_STAGES * 2;
+        desc.storageMode = MTLStorageModeShared;
+        desc.label = @"msplat training stage profiling";
+
+        NSError *error = nil;
+        id<MTLCounterSampleBuffer> sampleBuffer =
+            [device newCounterSampleBufferWithDescriptor:desc error:&error];
+        if (!sampleBuffer) {
+            const char *description = error.localizedDescription.UTF8String;
+            fprintf(stderr,
+                    "PROFILE_STAGES: Failed to create counter sample buffer%s%s\n",
+                    description ? ": " : "", description ? description : "");
+        }
+        return sampleBuffer;
+    }
 
     void initCounterSampling() {
         // Need 2 samples per stage (start + end)
@@ -786,25 +808,52 @@ struct MetalContext {
             return;
         }
 
-        MTLCounterSampleBufferDescriptor *desc = [MTLCounterSampleBufferDescriptor new];
-        ScopedObjCRelease descOwner{desc};
-        desc.counterSet = timestampSet;
-        desc.sampleCount = sampleCount;
-        desc.storageMode = MTLStorageModeShared;
-        desc.label = @"msplat stage profiling";
-
-        NSError *error = nil;
-        counterSampleBuffer = [device newCounterSampleBufferWithDescriptor:desc error:&error];
-        if (!counterSampleBuffer) {
-            fprintf(stderr, "PROFILE_STAGES: Failed to create counter sample buffer: %s\n",
-                    error.localizedDescription.UTF8String);
+        timestampCounterSet = [timestampSet retain];
+        id<MTLCounterSampleBuffer> probe = newTrainingCounterSampleBuffer();
+        if (!probe) {
+            [timestampCounterSet release];
+            timestampCounterSet = nil;
             return;
         }
+        [probe release];
 
-        // Compute ticks-to-ms conversion (Apple Silicon: mach_absolute_time units)
-        mach_timebase_info_data_t tb;
-        mach_timebase_info(&tb);
-        ticksToMs = (double)tb.numer / (double)tb.denom / 1e6;
+        // Derive the GPU tick duration from two paired CPU/GPU samples rather
+        // than assuming GPU timestamps use the CPU's Mach timebase.
+        mach_timebase_info_data_t timebase = {};
+        MTLTimestamp cpuStart = 0;
+        MTLTimestamp gpuStart = 0;
+        MTLTimestamp cpuEnd = 0;
+        MTLTimestamp gpuEnd = 0;
+        if (mach_timebase_info(&timebase) != KERN_SUCCESS ||
+            timebase.numer == 0 || timebase.denom == 0) {
+            fprintf(stderr,
+                    "PROFILE_STAGES: Failed to read the CPU timebase\n");
+            [timestampCounterSet release];
+            timestampCounterSet = nil;
+            return;
+        }
+        [device sampleTimestamps:&cpuStart gpuTimestamp:&gpuStart];
+        constexpr uint64_t calibrationNanoseconds = 5'000'000;
+        const uint64_t calibrationCpuTicks =
+            (calibrationNanoseconds * timebase.denom +
+             timebase.numer - 1) / timebase.numer;
+        mach_wait_until(mach_absolute_time() + calibrationCpuTicks);
+        [device sampleTimestamps:&cpuEnd gpuTimestamp:&gpuEnd];
+        if (cpuEnd > cpuStart && gpuEnd > gpuStart) {
+            // Metal reports the paired CPU timestamps in nanoseconds.
+            const double cpuElapsedMs =
+                static_cast<double>(cpuEnd - cpuStart) / 1e6;
+            ticksToMs = cpuElapsedMs /
+                static_cast<double>(gpuEnd - gpuStart);
+        }
+        if (!std::isfinite(ticksToMs) || ticksToMs <= 0.0) {
+            fprintf(stderr,
+                    "PROFILE_STAGES: Failed to calibrate GPU timestamps\n");
+            [timestampCounterSet release];
+            timestampCounterSet = nil;
+            ticksToMs = 0.0;
+            return;
+        }
 
         counterSamplingAvailable = true;
         fprintf(stderr, "PROFILE_STAGES: GPU timestamp profiling enabled (%lu sample slots)\n",
@@ -875,7 +924,7 @@ struct MetalContext {
         }
 
         id resources[] = {
-            counterSampleBuffer,
+            timestampCounterSet,
             project_and_sh_forward_kernel_cpso,
             tile_count_diff_horizontal_kernel_cpso,
             tile_count_diff_vertical_kernel_cpso,
@@ -1179,9 +1228,6 @@ MetalContext* init_msplat_metal_context() {
                 "msplat: MSPLAT_TRAINING_ARENA_MODE must be exact or retry");
         }
     }
-    g_retry_stage_profile.store(
-        ctx->retry_intersection_attempts, std::memory_order_relaxed);
-
     const char* ssimModeOverride = std::getenv("MSPLAT_SSIM_MODE");
     if (ssimModeOverride) {
         if (std::strcmp(ssimModeOverride, "staged") == 0) {
@@ -1369,7 +1415,7 @@ MetalContext* init_msplat_metal_context() {
     }
 
     // Initialize counter sampling if PROFILE_STAGES is set
-    ctx->counterSampleBuffer = nil;
+    ctx->timestampCounterSet = nil;
     ctx->counterSamplingAvailable = false;
     ctx->ticksToMs = 0.0;
     if (std::getenv("PROFILE_STAGES")) {
@@ -2721,6 +2767,18 @@ static MTensor msplat_train_step_locked(
         g_profile_stages = std::getenv("PROFILE_STAGES") != nullptr;
         g_profile_stages_checked = true;
     }
+    std::shared_ptr<ScopedObjCRelease> stageCounterOwner;
+    id<MTLCounterSampleBuffer> stageCounterSampleBuffer = nil;
+    if (g_profile_stages && ctx->counterSamplingAvailable) {
+        auto owner = std::make_shared<ScopedObjCRelease>();
+        owner->object = ctx->newTrainingCounterSampleBuffer();
+        if (owner->object) {
+            stageCounterSampleBuffer =
+                static_cast<id<MTLCounterSampleBuffer>>(owner->object);
+            stageCounterOwner = std::move(owner);
+        }
+    }
+    const bool profileThisStep = stageCounterSampleBuffer != nil;
     uint32_t channels = 3;
     const uint64_t pixelCount = static_cast<uint64_t>(img_height) *
         static_cast<uint64_t>(img_width);
@@ -3126,11 +3184,11 @@ static MTensor msplat_train_step_locked(
             [blit endEncoding];
 
             id<MTLComputeCommandEncoder> encoder = nil;
-            if (g_profile_stages && ctx->counterSamplingAvailable) {
+            if (profileThisStep) {
                 MTLComputePassDescriptor *passDescriptor =
                     [MTLComputePassDescriptor computePassDescriptor];
                 passDescriptor.sampleBufferAttachments[0].sampleBuffer =
-                    ctx->counterSampleBuffer;
+                    stageCounterSampleBuffer;
                 passDescriptor.sampleBufferAttachments[0]
                     .startOfEncoderSampleIndex = 0;
                 passDescriptor.sampleBufferAttachments[0]
@@ -3883,8 +3941,21 @@ static MTensor msplat_train_step_locked(
                 return;
             }
 
-            id<MTLComputeCommandEncoder> enc =
-                [commandBuffer computeCommandEncoder];
+            id<MTLComputeCommandEncoder> enc = nil;
+            if (profileThisStep) {
+                MTLComputePassDescriptor *passDescriptor =
+                    [MTLComputePassDescriptor computePassDescriptor];
+                passDescriptor.sampleBufferAttachments[0].sampleBuffer =
+                    stageCounterSampleBuffer;
+                passDescriptor.sampleBufferAttachments[0]
+                    .startOfEncoderSampleIndex = 2;
+                passDescriptor.sampleBufferAttachments[0]
+                    .endOfEncoderSampleIndex = 3;
+                enc = [commandBuffer
+                    computeCommandEncoderWithDescriptor:passDescriptor];
+            } else {
+                enc = [commandBuffer computeCommandEncoder];
+            }
             if (!enc) {
                 encodingFailure =
                     "msplat: failed to create a Metal compute encoder";
@@ -3937,13 +4008,14 @@ static MTensor msplat_train_step_locked(
     };
 
     const auto postCountEncodeStart = TelemetryClock::now();
-    if (g_profile_stages && ctx->counterSamplingAvailable) {
+    if (profileThisStep) {
         // Projection was sampled in the exact-count command buffer. The
         // remaining stages use separate encoders on the final command buffer.
         id<MTLCommandBuffer> command_buffer = ctx->getCommandBuffer();
         __block const char* encodingFailure = nullptr;
 
-        id<MTLCounterSampleBuffer> csb = ctx->counterSampleBuffer;
+        id<MTLCounterSampleBuffer> csb = stageCounterSampleBuffer;
+        auto csbOwner = stageCounterOwner;
         double ticksToMs = ctx->ticksToMs;
 
         dispatch_sync(ctx->d_queue, ^(){
@@ -3966,21 +4038,30 @@ static MTensor msplat_train_step_locked(
 
             id<MTLComputeCommandEncoder> enc;
 
-            // Stage 2: exact scatter/sort plus pack. Retry mode retired the
-            // status-writing scatter/sort work in its preflight, so only pack
-            // remains in this profiled encoder.
-            enc = make_profiled_encoder(1);
+            // Stage 2: exact scatter/sort/finalize. Retry mode sampled this
+            // status-writing work in its synchronized preflight.
+            if (!ctx->retry_intersection_attempts) {
+                enc = make_profiled_encoder(1);
+                if (!enc) {
+                    encodingFailure =
+                        "msplat: failed to create a profiled Metal compute encoder";
+                    return;
+                }
+                encode_scatter_sort_finalize(enc);
+                [enc endEncoding];
+            }
+
+            // Stage 3: attribute pack.
+            enc = make_profiled_encoder(2);
             if (!enc) {
                 encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
                 return;
             }
-            if (!ctx->retry_intersection_attempts)
-                encode_scatter_sort_finalize(enc);
             encode_pack(enc);
             [enc endEncoding];
 
-            // Stage 3: rast_fwd
-            enc = make_profiled_encoder(2);
+            // Stage 4: rast_fwd
+            enc = make_profiled_encoder(3);
             if (!enc) {
                 encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
                 return;
@@ -3988,8 +4069,8 @@ static MTensor msplat_train_step_locked(
             encode_rast_fwd(enc);
             [enc endEncoding];
 
-            // Stage 4+5: loss_fwd_bwd (fused)
-            enc = make_profiled_encoder(3);
+            // Stage 5: loss_fwd_bwd
+            enc = make_profiled_encoder(4);
             if (!enc) {
                 encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
                 return;
@@ -3997,8 +4078,8 @@ static MTensor msplat_train_step_locked(
             encode_loss_fwd_bwd(enc);
             [enc endEncoding];
 
-            // Stage 5: rast_bwd
-            enc = make_profiled_encoder(4);
+            // Stage 6: rast_bwd
+            enc = make_profiled_encoder(5);
             if (!enc) {
                 encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
                 return;
@@ -4006,8 +4087,8 @@ static MTensor msplat_train_step_locked(
             encode_rast_bwd(enc);
             [enc endEncoding];
 
-            // Stage 6: proj_sh_bwd + Adam
-            enc = make_profiled_encoder(5);
+            // Stage 7: proj_sh_bwd + Adam
+            enc = make_profiled_encoder(6);
             if (!enc) {
                 encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
                 return;
@@ -4030,6 +4111,8 @@ static MTensor msplat_train_step_locked(
         // Add completion handler to read timestamps after GPU finishes
         [command_buffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
             @autoreleasepool {
+                (void)cb;
+                (void)csbOwner;
                 NSData *data = [csb resolveCounterRange:NSMakeRange(0, (N_TRAIN_STAGES - 1) * 2)];
                 if (!data) return;
                 const MTLCounterResultTimestamp *samples =
@@ -4039,7 +4122,10 @@ static MTensor msplat_train_step_locked(
                 for (int i = 0; i < N_TRAIN_STAGES - 1; i++) {
                     uint64_t start = samples[i * 2].timestamp;
                     uint64_t end = samples[i * 2 + 1].timestamp;
-                    if (start == MTLCounterErrorValue || end == MTLCounterErrorValue) continue;
+                    if (start == MTLCounterErrorValue ||
+                        end == MTLCounterErrorValue || end < start) {
+                        continue;
+                    }
                     // Counter stage i maps to name i+1 because blit_zero has no
                     // direct timestamp sample.
                     g_stage_times[i + 1].push_back((double)(end - start) * ticksToMs);
