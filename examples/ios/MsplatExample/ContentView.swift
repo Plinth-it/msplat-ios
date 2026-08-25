@@ -3,6 +3,7 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var session = TrainingSession()
     @State private var folder: DatasetFolder?
     @State private var picking = false
@@ -38,12 +39,23 @@ struct ContentView: View {
             .task(id: folder?.id) {
                 guard let selectedFolder = folder else { return }
                 await scanTrainingMasks(in: selectedFolder)
-                session.startBenchmarkIfRequested(
-                    folder: selectedFolder,
-                    maskCandidateCount: trainingMaskCandidateCount
-                )
+                startBenchmarkIfReady()
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                if newPhase == .active {
+                    startBenchmarkIfReady()
+                }
             }
         }
+    }
+
+    @MainActor
+    private func startBenchmarkIfReady() {
+        guard scenePhase == .active, let folder else { return }
+        session.startBenchmarkIfRequested(
+            folder: folder,
+            maskCandidateCount: trainingMaskCandidateCount
+        )
     }
 
     @MainActor
