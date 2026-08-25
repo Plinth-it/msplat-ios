@@ -16,7 +16,7 @@ inline constexpr uint32_t kExactIntersectionBytesPerEntry =
 inline constexpr uint32_t kExactBitonicOnlyIntersectionBytesPerEntry =
     kExactIntersectionBytesPerEntry - kExactRadixScratchBytesPerEntry;
 inline constexpr uint32_t kExactTileMetadataBytes =
-    sizeof(uint32_t) + sizeof(int32_t) + 2 * sizeof(int32_t);
+    2 * sizeof(uint32_t) + sizeof(int32_t) + 2 * sizeof(int32_t);
 // The current large-tile sorter assigns one threadgroup to a tile. Keep that
 // work bounded so a pathological screen-filling population fails before arena
 // allocation or optimizer submission instead of risking the GPU watchdog.
@@ -27,6 +27,7 @@ struct TileIntersectionLayout {
     uint32_t maximumTileCount = 0;
     size_t maximumTileIndex = 0;
     uint32_t activeTileCount = 0;
+    uint32_t sortableTileCount = 0;
     uint32_t trivialTileCount = 0;
     uint32_t smallTileCount = 0;
     uint32_t mediumTileCount = 0;
@@ -42,7 +43,9 @@ inline bool tileIntersectionLayoutNeedsRadixScratch(
 /// The native rasterizer uses signed 32-bit ranges, so a larger scene is
 /// rejected before any packed buffers or optimizer work are submitted.
 inline TileIntersectionLayout buildTileIntersectionLayout(
-    const uint32_t* counts, int32_t* inclusiveOffsets, size_t tileCount) {
+    const uint32_t* counts, int32_t* inclusiveOffsets, size_t tileCount,
+    int32_t* tileBins = nullptr,
+    uint32_t* sortableTileIndices = nullptr) {
     if (tileCount > 0 && (!counts || !inclusiveOffsets)) {
         throw std::invalid_argument(
             "Tile-intersection counts and offsets must not be null");
@@ -52,21 +55,34 @@ inline TileIntersectionLayout buildTileIntersectionLayout(
     uint64_t running = 0;
     for (size_t tile = 0; tile < tileCount; ++tile) {
         const uint32_t count = counts[tile];
+        const int32_t start = static_cast<int32_t>(running);
         running += count;
         if (running > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
             throw std::overflow_error(
                 "Exact tile-intersection count exceeds the native index range");
         }
-        inclusiveOffsets[tile] = static_cast<int32_t>(running);
+        const int32_t end = static_cast<int32_t>(running);
+        inclusiveOffsets[tile] = end;
+        if (tileBins) {
+            tileBins[2 * tile] = start;
+            tileBins[2 * tile + 1] = end;
+        }
         if (count > 0) ++layout.activeTileCount;
         if (count <= 1) {
             ++layout.trivialTileCount;
-        } else if (count <= 32) {
-            ++layout.smallTileCount;
-        } else if (count <= kExactBitonicFastPath) {
-            ++layout.mediumTileCount;
         } else {
-            ++layout.largeTileCount;
+            if (sortableTileIndices) {
+                sortableTileIndices[layout.sortableTileCount] =
+                    static_cast<uint32_t>(tile);
+            }
+            ++layout.sortableTileCount;
+            if (count <= 32) {
+                ++layout.smallTileCount;
+            } else if (count <= kExactBitonicFastPath) {
+                ++layout.mediumTileCount;
+            } else {
+                ++layout.largeTileCount;
+            }
         }
         if (count > layout.maximumTileCount) {
             layout.maximumTileCount = count;

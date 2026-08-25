@@ -12,6 +12,7 @@ int main() {
     CHECK(noTiles.totalCount == 0);
     CHECK(noTiles.maximumTileCount == 0);
     CHECK(noTiles.activeTileCount == 0);
+    CHECK(noTiles.sortableTileCount == 0);
     CHECK(noTiles.trivialTileCount == 0);
 
     const uint32_t zeroCount[] = {0};
@@ -21,16 +22,21 @@ int main() {
     CHECK(zero.totalCount == 0);
     CHECK(zero.maximumTileCount == 0);
     CHECK(zero.activeTileCount == 0);
+    CHECK(zero.sortableTileCount == 0);
     CHECK(zero.trivialTileCount == 1);
     CHECK(zeroOffset[0] == 0);
 
     const uint32_t counts[] = {0, 3, 1, 0, 4};
     int32_t offsets[5] = {};
-    const auto layout = msplat::buildTileIntersectionLayout(counts, offsets, 5);
+    int32_t bins[10] = {};
+    uint32_t sortableTileIndices[5] = {};
+    const auto layout = msplat::buildTileIntersectionLayout(
+        counts, offsets, 5, bins, sortableTileIndices);
     CHECK(layout.totalCount == 8);
     CHECK(layout.maximumTileCount == 4);
     CHECK(layout.maximumTileIndex == 4);
     CHECK(layout.activeTileCount == 3);
+    CHECK(layout.sortableTileCount == 2);
     CHECK(layout.trivialTileCount == 3);
     CHECK(layout.smallTileCount == 2);
     CHECK(layout.mediumTileCount == 0);
@@ -41,6 +47,13 @@ int main() {
     CHECK(offsets[2] == 4);
     CHECK(offsets[3] == 4);
     CHECK(offsets[4] == 8);
+    CHECK(bins[0] == 0 && bins[1] == 0);
+    CHECK(bins[2] == 0 && bins[3] == 3);
+    CHECK(bins[4] == 3 && bins[5] == 4);
+    CHECK(bins[6] == 4 && bins[7] == 4);
+    CHECK(bins[8] == 4 && bins[9] == 8);
+    CHECK(sortableTileIndices[0] == 1);
+    CHECK(sortableTileIndices[1] == 4);
 
     const uint32_t emptyCounts[] = {0, 0};
     int32_t emptyOffsets[2] = {-1, -1};
@@ -49,6 +62,7 @@ int main() {
     CHECK(empty.totalCount == 0);
     CHECK(empty.maximumTileCount == 0);
     CHECK(empty.activeTileCount == 0);
+    CHECK(empty.sortableTileCount == 0);
     CHECK(empty.trivialTileCount == 2);
     CHECK(emptyOffsets[0] == 0);
     CHECK(emptyOffsets[1] == 0);
@@ -65,14 +79,20 @@ int main() {
 
     const uint32_t bucketBoundaryCounts[] = {1, 2, 32, 33, 2'048, 2'049};
     int32_t bucketBoundaryOffsets[6] = {};
+    uint32_t bucketBoundarySortableTiles[6] = {};
     const auto bucketBoundaries = msplat::buildTileIntersectionLayout(
-        bucketBoundaryCounts, bucketBoundaryOffsets, 6);
+        bucketBoundaryCounts, bucketBoundaryOffsets, 6, nullptr,
+        bucketBoundarySortableTiles);
     CHECK(bucketBoundaries.activeTileCount == 6);
+    CHECK(bucketBoundaries.sortableTileCount == 5);
     CHECK(bucketBoundaries.trivialTileCount == 1);
     CHECK(bucketBoundaries.smallTileCount == 2);
     CHECK(bucketBoundaries.mediumTileCount == 2);
     CHECK(bucketBoundaries.largeTileCount == 1);
     CHECK(msplat::tileIntersectionLayoutNeedsRadixScratch(bucketBoundaries));
+    for (uint32_t index = 0; index < 5; ++index) {
+        CHECK(bucketBoundarySortableTiles[index] == index + 1);
+    }
 
     const uint32_t bitonicBoundaryCounts[] = {2'048};
     int32_t bitonicBoundaryOffsets[1] = {};
@@ -157,7 +177,7 @@ int main() {
     CHECK(msplat::kExactRadixScratchBytesPerEntry == 8);
     CHECK(msplat::kExactBitonicOnlyIntersectionBytesPerEntry == 44);
     CHECK(msplat::kExactIntersectionBytesPerEntry == 52);
-    CHECK(msplat::kExactTileMetadataBytes == 16);
+    CHECK(msplat::kExactTileMetadataBytes == 20);
     CHECK(msplat::tileRasterChunkCount(1, 0) == 1);
     CHECK(msplat::tileRasterChunkCount(1, 1) == 1);
     CHECK(msplat::tileRasterChunkCount(1, 512) == 1);

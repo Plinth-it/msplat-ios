@@ -62,6 +62,15 @@ require_contains("${layout_header}" "kExactBitonicFastPath = 2'048"
 require_contains("${layout_header}"
     "tileIntersectionLayoutNeedsRadixScratch("
     "host radix-scratch decision")
+require_contains("${layout_header}"
+    "int32_t* tileBins = nullptr,\n    uint32_t* sortableTileIndices = nullptr"
+    "optional compact-sort layout outputs")
+require_contains("${layout_header}"
+    "tileBins[2 * tile] = start;\n            tileBins[2 * tile + 1] = end;"
+    "all-tile range initialization")
+require_contains("${layout_header}"
+    "sortableTileIndices[layout.sortableTileCount] ="
+    "compact sortable-tile append")
 require_contains("${metal_source}" "for (uint pass = 0; pass < 8; ++pass)"
     "eight full-key radix passes")
 require_contains("${metal_source}" "const uint shift = pass * 8u"
@@ -159,6 +168,28 @@ require_contains("${metal_source}"
 require_contains("${metal_source}"
     "device uint64_t* source = (pass & 1u) == 0u ? keys_a : keys_b;"
     "radix scratch runtime use")
+require_contains("${metal_source}"
+    "constant uint* sortable_tile_indices [[buffer(7)]]"
+    "compact sortable-tile shader input")
+require_contains("${metal_source}"
+    "const uint tile_id = sortable_tile_indices[sort_index];"
+    "compact work-index mapping")
+string(REGEX MATCHALL
+    "ENC_BUF\\(enc, g_tcache\\.sortable_tile_indices, 7\\)"
+    sortable_tile_bindings "${host_source}")
+list(LENGTH sortable_tile_bindings sortable_tile_binding_count)
+if(NOT sortable_tile_binding_count EQUAL 2)
+    message(FATAL_ERROR
+        "Expected two compact sortable-tile bindings, found ${sortable_tile_binding_count}")
+endif()
+string(REGEX MATCHALL
+    "dispatchThreadgroups:MTLSizeMake\\(sortable_tile_count, 1, 1\\)"
+    compact_sort_dispatches "${host_source}")
+list(LENGTH compact_sort_dispatches compact_sort_dispatch_count)
+if(NOT compact_sort_dispatch_count EQUAL 2)
+    message(FATAL_ERROR
+        "Expected two compact exact-sort dispatches, found ${compact_sort_dispatch_count}")
+endif()
 require_contains("${host_source}"
     "radix_sort_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup <"
     "256-thread radix support check")
@@ -184,6 +215,9 @@ require_absent("${host_source}"
     "unconditional radix-scratch binding")
 require_absent("${host_source}" "retainRadixScratch"
     "radix scratch retained across a bitonic-only arena rebuild")
+require_absent("${host_source}"
+    "dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1)"
+    "full-grid exact-sort dispatch")
 require_absent("${metal_source}"
     "const float opacity = 1.f / (1.f + exp(-opacities[gaussian_id]));"
     "per-intersection opacity sigmoid")

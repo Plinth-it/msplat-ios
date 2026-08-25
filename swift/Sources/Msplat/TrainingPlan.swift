@@ -600,7 +600,8 @@ public struct TrainingPlan: Sendable, Equatable {
                     component: "exact intersection arenas and packed cache"
                 ),
                 try checkedProduct([116, pixelCount], component: "training pixel cache"),
-                try checkedProduct([16, tileCount], component: "training tile metadata"),
+                // Counts, inclusive offsets, int2 ranges, and compact sortable IDs.
+                try checkedProduct([20, tileCount], component: "training tile metadata"),
                 8,
             ], component: "training cache")
             if chunkCount > 1 {

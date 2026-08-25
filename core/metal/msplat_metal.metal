@@ -2637,13 +2637,24 @@ kernel void radix_sort_per_tile_kernel(
     device int* tile_bins            [[buffer(4)]],
     constant uint& capacity          [[buffer(5)]],
     device atomic_uint* overflow_flag [[buffer(6)]],
-    uint tile_id [[threadgroup_position_in_grid]],
+    constant uint* sortable_tile_indices [[buffer(7)]],
+    constant uint& sortable_tile_count [[buffer(8)]],
+    uint sort_index [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_width [[threads_per_simdgroup]]
 ) {
-    if (tile_id >= num_tiles) return;
+    if (sort_index >= sortable_tile_count) return;
+    const uint tile_id = sortable_tile_indices[sort_index];
+    if (tile_id >= num_tiles) {
+        if (tid == 0) {
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
 
     const int start_i = tile_id == 0 ? 0 : tile_offsets[tile_id - 1];
     const int end_i = tile_offsets[tile_id];

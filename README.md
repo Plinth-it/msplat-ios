@@ -68,11 +68,14 @@ and scales to 64 at 1920×1440, above the measured 43.5. The runtime still count
 and sizes each frame exactly. The second 8-byte key arena is allocated only after
 a tile exceeds the 2,048-entry bitonic path; bitonic-only resolution stages use
 44 rather than 52 runtime bytes per arena slot, while the planner retains the
-52-byte worst case. ImageIO is asked to decode a thumbnail at the selected input
-resolution, and the app-owned decode allowance therefore scales with that target.
-It is intentionally conservative, but it is not a jetsam guarantee:
-codec-private surfaces, Metal driver state, framework allocations, other process
-memory, and changing system pressure are outside the model. A valid
+52-byte worst case. The synchronized layout pass also precomputes every tile
+range and compacts tiles with more than one entry, so exact sorting skips empty
+and already-sorted single-entry tiles. ImageIO is asked to decode a thumbnail at
+the selected input resolution, and the app-owned decode allowance therefore
+scales with that target. It is intentionally conservative, but it is not a
+jetsam guarantee: codec-private surfaces, Metal driver state, framework
+allocations, other process memory, and changing system pressure are outside the
+model. A valid
 `MSPLAT_IMAGE_CACHE_MB` override is reflected automatically; use
 `memoryEstimate(imageCacheBudgetBytes:)` to evaluate another budget explicitly.
 The model term remains the topology-enabled peak; runtime model storage falls
