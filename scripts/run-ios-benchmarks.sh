@@ -19,6 +19,7 @@ MEASURED_ITERATIONS=300
 RUN_TIMEOUT_SECONDS=1800
 RESULTS_DIR=""
 ONLY_VARIANT=""
+PROFILE_STAGES_ENABLED=0
 CURRENT_LAUNCH_PID=""
 
 usage() {
@@ -41,7 +42,9 @@ Options:
   --timeout <seconds>      Per-variant launch timeout (default: 1800).
   --results-dir <path>     Output directory. Default:
                            build/ios-benchmarks/<UTC timestamp>.
-  --only <label>           Run one matrix label instead of all six.
+  --only <label>           Run one matrix label instead of all seven.
+  --profile-stages         Enable per-stage Metal timestamp logging; requires
+                           at least 500 total iterations.
   -h, --help               Show this help.
 
 Prerequisites:
@@ -125,6 +128,10 @@ while [[ $# -gt 0 ]]; do
             ONLY_VARIANT="$2"
             shift 2
             ;;
+        --profile-stages)
+            PROFILE_STAGES_ENABLED=1
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -141,6 +148,10 @@ done
 [[ "$RUN_TIMEOUT_SECONDS" =~ ^[1-9][0-9]*$ ]] || die "--timeout must be a positive integer"
 (( WARMUP_ITERATIONS + MEASURED_ITERATIONS >= 2 )) || die \
     "Preview benchmarks require at least two total iterations"
+if (( PROFILE_STAGES_ENABLED &&
+      WARMUP_ITERATIONS + MEASURED_ITERATIONS < 500 )); then
+    die "--profile-stages requires at least 500 total iterations"
+fi
 case "$ONLY_VARIANT" in
     ""|baseline|arena-retry|difference-retry|gather|fused-ssim|raster-16x8|raster-16x16) ;;
     *) die "unknown benchmark label: $ONLY_VARIANT" ;;
@@ -254,9 +265,14 @@ run_variant() {
     local bridge_timeout=$((RUN_TIMEOUT_SECONDS + 10))
     local outcome=""
     local launcher_exit=0
+    local profile_stages_json=""
+
+    if (( PROFILE_STAGES_ENABLED )); then
+        profile_stages_json=',"PROFILE_STAGES":"1"'
+    fi
 
     printf -v environment_json \
-        '{"MSPLAT_BENCHMARK":"1","MSPLAT_BENCHMARK_LABEL":"%s","MSPLAT_BENCHMARK_WARMUP":"%s","MSPLAT_BENCHMARK_MEASURED":"%s","MSPLAT_BENCHMARK_DATASET":"%s","MSPLAT_TILE_COUNT_MODE":"%s","MSPLAT_TILE_LAYOUT_MODE":"%s","MSPLAT_TRAINING_ARENA_MODE":"%s","MSPLAT_INTERSECTION_ATTRIBUTES":"%s","MSPLAT_SSIM_MODE":"%s","MSPLAT_RASTER_VARIANT":"%s","MSPLAT_DENSIFY_RANDOM_MODE":"cpu"}' \
+        '{"MSPLAT_BENCHMARK":"1","MSPLAT_BENCHMARK_LABEL":"%s","MSPLAT_BENCHMARK_WARMUP":"%s","MSPLAT_BENCHMARK_MEASURED":"%s","MSPLAT_BENCHMARK_DATASET":"%s","MSPLAT_TILE_COUNT_MODE":"%s","MSPLAT_TILE_LAYOUT_MODE":"%s","MSPLAT_TRAINING_ARENA_MODE":"%s","MSPLAT_INTERSECTION_ATTRIBUTES":"%s","MSPLAT_SSIM_MODE":"%s","MSPLAT_RASTER_VARIANT":"%s","MSPLAT_DENSIFY_RANDOM_MODE":"cpu"%s}' \
         "$(json_escape "$label")" \
         "$WARMUP_ITERATIONS" \
         "$MEASURED_ITERATIONS" \
@@ -266,7 +282,8 @@ run_variant() {
         "$arena_mode" \
         "$intersection_attributes" \
         "$ssim_mode" \
-        "$raster_variant"
+        "$raster_variant" \
+        "$profile_stages_json"
 
     echo "[$label] launching; console: $console_log"
     : > "$console_log"
@@ -409,5 +426,5 @@ fi
 if [[ -n "$ONLY_VARIANT" ]]; then
     echo "Benchmark variant '$ONLY_VARIANT' completed successfully."
 else
-    echo "All six benchmark variants completed successfully."
+    echo "All seven benchmark variants completed successfully."
 fi

@@ -471,6 +471,8 @@ struct TrainingBenchmarkRecorder {
                 environment["MSPLAT_DENSIFY_RANDOM_MODE"] ?? "cpu",
             "MSPLAT_IMAGE_CACHE_MB": environment["MSPLAT_IMAGE_CACHE_MB"] ?? "512",
             "MSPLAT_CAMERA_PREFETCH": "1 (enabled by MsplatExample)",
+            "PROFILE_STAGES": environment["PROFILE_STAGES"] == nil
+                ? "disabled" : "enabled",
         ]
     }
 
