@@ -135,11 +135,16 @@ step is retried. The initial attempt at a resolution still bootstraps the arena
 through the synchronized exact path, and steady-state retry mode synchronizes at
 attempt retirement before committing CPU training state. It therefore removes
 the mid-step sizing barrier and its GPU idle gap, but does not yet provide
-multi-step queue depth. Recovered attempts remain visible as packed-capacity
-overflow events, and their resource-growth and encoding costs are accumulated
-into the completed logical step's telemetry. Keep `exact` as the shipping mode
-until physical-device throughput, memory, and sustained-thermal measurements
-justify a default change.
+multi-step queue depth. Before that retirement, the GPU copies attempt status,
+the checked ten-word layout, and its final inclusive offset into the logical
+step's own readback; retry decisions and completed tile telemetry no longer
+depend on reusable global layout buffers. Direct native calls without logical
+telemetry still copy those values immediately after the synchronized preflight
+while holding the engine lock, so they cannot outlive the reusable buffers.
+Recovered attempts remain visible as packed-capacity overflow events, and their
+resource-growth and encoding costs are accumulated into the completed logical
+step's telemetry. Keep `exact` as the shipping mode until physical-device
+throughput, memory, and sustained-thermal measurements justify a default change.
 
 The separable SSIM derivative path likewise keeps its established staged mode
 by default. `MSPLAT_SSIM_MODE=fused` uses a 16x8 terminal threadgroup to retain

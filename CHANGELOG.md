@@ -118,6 +118,11 @@
   now measures its synchronized preflight separately from the queued training
   tail, owns timestamp storage per logical step, and converts GPU ticks using
   paired CPU/GPU samples rather than the CPU Mach timebase.
+- Made retry-attempt results step-owned. Status, all ten checked GPU-layout
+  metadata words, and the final inclusive offset are captured after
+  scatter/sort finalization, so capacity retries and completed tile telemetry
+  no longer read reusable global layout buffers. The synchronized retry decision
+  remains in place until later steps can be transactionally poisoned and replayed.
 - Made key-driven intersection-attribute gathers the default after sustained,
   counterbalanced physical-device profiling found effectively neutral throughput
   while saving 68.83 MiB at 313,214 Gaussians. The default arena retains only

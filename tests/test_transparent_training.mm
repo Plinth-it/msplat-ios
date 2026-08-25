@@ -48,6 +48,11 @@ struct StepResult {
     double countWaitWallMs = 0.0;
     uint32_t commandBufferCount = 0;
     uint32_t maximumTileCount = 0;
+    uint32_t activeTileCount = 0;
+    uint32_t trivialTileCount = 0;
+    uint32_t smallTileCount = 0;
+    uint32_t mediumTileCount = 0;
+    uint32_t largeTileCount = 0;
     uint64_t overflowedStepCount = 0;
     uint64_t tileCapOverflowedStepCount = 0;
     uint64_t packedCapacityOverflowedStepCount = 0;
@@ -80,7 +85,9 @@ StepResult runStep(bool transparent, float alphaLossWeight,
                    bool collectTelemetry = false,
                    int width = kWidth,
                    int height = kHeight,
-                   bool exerciseAppearance = false) {
+                   bool exerciseAppearance = false,
+                   MsplatTrainingTelemetryHandle telemetry = {},
+                   int64_t iteration = 1) {
     CHECK(gaussianCount > 0);
     std::vector<float> meanValues(static_cast<size_t>(gaussianCount) * 3);
     std::vector<float> scaleValues(static_cast<size_t>(gaussianCount) * 3);
@@ -207,11 +214,11 @@ StepResult runStep(bool transparent, float alphaLossWeight,
     const float lossInvN = static_cast<float>(
         255.0 / (static_cast<double>(coverageUnits) * 3.0));
 
-    MsplatTrainingTelemetryHandle telemetry;
     MsplatLogicalTrainingStepHandle logicalStep;
     if (collectTelemetry) {
-        telemetry = msplat_training_telemetry_create();
-        logicalStep = msplat_training_step_begin(telemetry, 1);
+        if (!telemetry)
+            telemetry = msplat_training_telemetry_create();
+        logicalStep = msplat_training_step_begin(telemetry, iteration);
         msplat_training_step_mark_cpu_start(logicalStep);
     }
 
@@ -237,7 +244,7 @@ StepResult runStep(bool transparent, float alphaLossWeight,
             visibility, xyGradientNorm, max2DSize, 1.0f / float(width));
         if (logicalStep) {
             MsplatTrainingStepDescriptor descriptor;
-            descriptor.iteration = 1;
+            descriptor.iteration = iteration;
             descriptor.splatCount = gaussianCount;
             descriptor.modelCapacity = gaussianCount;
             descriptor.effectiveWidth = width;
@@ -300,6 +307,11 @@ StepResult runStep(bool transparent, float alphaLossWeight,
         result.commandBufferCount =
             snapshot.completedStep.commandBufferCount;
         result.maximumTileCount = snapshot.completedStep.maximumTileCount;
+        result.activeTileCount = snapshot.completedStep.activeTileCount;
+        result.trivialTileCount = snapshot.completedStep.trivialTileCount;
+        result.smallTileCount = snapshot.completedStep.smallTileCount;
+        result.mediumTileCount = snapshot.completedStep.mediumTileCount;
+        result.largeTileCount = snapshot.completedStep.largeTileCount;
         result.overflowedStepCount = snapshot.overflowedStepCount;
         result.tileCapOverflowedStepCount =
             snapshot.tileCapOverflowedStepCount;
@@ -448,11 +460,20 @@ void checkArenaRetryTransaction() {
     if (!mode || std::string(mode) != "retry") return;
 
     // Earlier single-Gaussian steps establish a 4,097-entry arena without
-    // radix scratch. One identical 5,000-Gaussian tile then requires a larger
-    // arena, radix scratch, and more raster chunks in the GPU-resident path.
-    // The rejected attempt must not collect statistics; only its replay may
-    // mutate persistent state.
-    constexpr int gaussianCount = 5'000;
+    // radix scratch. First force the synchronous, engine-lock-held fallback
+    // used by direct native callers that do not collect telemetry. Its rejected
+    // attempt must not collect statistics; only its replay may mutate state.
+    constexpr int fallbackGaussianCount = 5'000;
+    const StepResult fallback = runStep(
+        false, 0.0f, fallbackGaussianCount, 0.001f,
+        false, false, false, true, false);
+    CHECK(fallback.radius > 0);
+    CHECK(fallback.visibilityCount == 1.0f);
+    CHECK(fallback.lastVisibilityCount == 1.0f);
+
+    // The fallback grows to 9,096 entries. A larger logical step then forces
+    // the step-owned readback path through the same retry transaction.
+    constexpr int gaussianCount = 10'000;
     const StepResult retried = runStep(
         false, 0.0f, gaussianCount, 0.001f,
         false, false, false, true, true);
@@ -462,7 +483,7 @@ void checkArenaRetryTransaction() {
     CHECK(retried.lastVisibilityCount == 1.0f);
     CHECK(retried.overflowReasons ==
           MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY);
-    CHECK(retried.retainedIntersectionCount > 4'097u);
+    CHECK(retried.retainedIntersectionCount == gaussianCount);
     CHECK(retried.intersectionCapacity >=
           retried.retainedIntersectionCount);
     CHECK(std::isfinite(retried.intersectionArenaGrowMs));
@@ -474,6 +495,13 @@ void checkArenaRetryTransaction() {
     // Failed preflight + successful preflight + asynchronous post-count work.
     CHECK(retried.commandBufferCount == 3u);
     CHECK(retried.maximumTileCount == gaussianCount);
+    CHECK(retried.activeTileCount == 1u);
+    CHECK(retried.trivialTileCount == 3u);
+    CHECK(retried.smallTileCount == 0u);
+    CHECK(retried.mediumTileCount == 0u);
+    CHECK(retried.largeTileCount == 1u);
+    CHECK(retried.trivialTileCount + retried.smallTileCount +
+          retried.mediumTileCount + retried.largeTileCount == 4u);
     CHECK(retried.overflowedStepCount == 1u);
     CHECK(retried.tileCapOverflowedStepCount == 0u);
     CHECK(retried.packedCapacityOverflowedStepCount == 1u);
@@ -485,6 +513,38 @@ void checkArenaRetryTransaction() {
     const size_t packedAttributeBytes =
         msplat_packed_intersection_attribute_bytes();
     CHECK(gather ? packedAttributeBytes == 0 : packedAttributeBytes > 0);
+}
+
+void checkRetryReadbackPoolReuse() {
+    const char *mode = std::getenv("MSPLAT_TRAINING_ARENA_MODE");
+    if (!mode || std::string(mode) != "retry") return;
+
+    const MsplatTrainingTelemetryHandle telemetry =
+        msplat_training_telemetry_create();
+    const StepResult dense = runStep(
+        false, 0.0f, 64, 0.01f,
+        false, false, false, false, true,
+        kWidth, kHeight, false, telemetry, 11);
+    CHECK(dense.retainedIntersectionCount == 64u);
+    CHECK(dense.maximumTileCount == 64u);
+    CHECK(dense.mediumTileCount == 1u);
+    const size_t firstReadbackBytes =
+        msplat_training_telemetry_readback_bytes(telemetry);
+    CHECK(firstReadbackBytes > 0);
+
+    const StepResult sparse = runStep(
+        false, 0.0f, 1, 0.01f,
+        false, false, false, false, true,
+        kWidth, kHeight, false, telemetry, 12);
+    CHECK(msplat_training_telemetry_readback_bytes(telemetry) ==
+          firstReadbackBytes);
+    CHECK(sparse.retainedIntersectionCount == 1u);
+    CHECK(sparse.maximumTileCount == 1u);
+    CHECK(sparse.activeTileCount == 1u);
+    CHECK(sparse.trivialTileCount == 4u);
+    CHECK(sparse.smallTileCount == 0u);
+    CHECK(sparse.mediumTileCount == 0u);
+    CHECK(sparse.largeTileCount == 0u);
 }
 
 void checkStageProfiling() {
@@ -515,7 +575,7 @@ void checkStageProfiling() {
     if (profiledStepCount == 0) return;
     const char* arenaMode = std::getenv("MSPLAT_TRAINING_ARENA_MODE");
     const bool retry = arenaMode && std::string(arenaMode) == "retry";
-    CHECK(profiledStepCount == (retry ? 13u : 12u));
+    CHECK(profiledStepCount == (retry ? 16u : 12u));
     for (int index = 1; index < stageCount; ++index) {
         CHECK(stageTimes[index].size() == profiledStepCount);
         for (double sampleMs : stageTimes[index]) {
@@ -536,6 +596,7 @@ int main(int argc, char **argv) {
             msplat_set_metallib_path_checked(argv[1]);
             checkTransparentAlphaSupervision();
             checkChunkedTransparentAlphaSupervision();
+            checkRetryReadbackPoolReuse();
             checkArenaRetryTransaction();
             checkPartialSsimThreadgroups();
             checkStageProfiling();

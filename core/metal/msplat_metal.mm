@@ -64,12 +64,19 @@ static std::mutex g_engine_mutex;
 namespace {
 
 using TelemetryClock = std::chrono::steady_clock;
-static constexpr size_t kTrainingReadbackWordCount = 4;
+static constexpr size_t kTrainingReadbackAttemptMetadataWord =
+    4;
+static constexpr size_t kTrainingReadbackWordCount =
+    kTrainingReadbackAttemptMetadataWord +
+    msplat::kTileIntersectionLayoutMetadataWordCount;
 static constexpr size_t kTrainingReadbackBytes =
     kTrainingReadbackWordCount * sizeof(uint32_t);
 static constexpr NSUInteger kTrainingReadbackLossOffset = sizeof(uint32_t);
+static constexpr size_t kTrainingReadbackIntersectionWord = 2;
 static constexpr NSUInteger kTrainingReadbackIntersectionOffset =
-    2 * sizeof(uint32_t);
+    kTrainingReadbackIntersectionWord * sizeof(uint32_t);
+static constexpr NSUInteger kTrainingReadbackAttemptMetadataOffset =
+    kTrainingReadbackAttemptMetadataWord * sizeof(uint32_t);
 static_assert(sizeof(std::array<float, 4>) == 16,
               "Metal constant float3 arguments require 16 bytes");
 
@@ -82,6 +89,14 @@ struct SynchronousGpuMetrics {
     double waitWallMs = 0.0;
     double gpuExecutionMs = 0.0;
     bool gpuTimingValid = false;
+};
+
+struct RetryAttemptSnapshot {
+    uint32_t failureReasons = MSPLAT_TRAINING_OVERFLOW_NONE;
+    std::array<uint32_t, msplat::kTileIntersectionLayoutMetadataWordCount>
+        layoutMetadata{};
+    int32_t finalInclusiveOffset = 0;
+    size_t tileCount = 0;
 };
 
 } // namespace
@@ -245,6 +260,49 @@ struct MsplatLogicalTrainingStep {
 
     MTensor& readbackBuffer() { return readback; }
 
+    RetryAttemptSnapshot completedRetryAttemptSnapshot() const {
+        std::lock_guard<std::mutex> lock(mutex);
+        return completedRetryAttemptSnapshotLocked();
+    }
+
+private:
+    RetryAttemptSnapshot completedRetryAttemptSnapshotLocked() const {
+        validateRetryAttemptReadbackLocked();
+        const auto* words = readback.data<uint32_t>();
+        RetryAttemptSnapshot snapshot;
+        snapshot.failureReasons = words[0];
+        std::copy_n(
+            words + kTrainingReadbackAttemptMetadataWord,
+            snapshot.layoutMetadata.size(), snapshot.layoutMetadata.begin());
+        std::memcpy(
+            &snapshot.finalInclusiveOffset,
+            words + kTrainingReadbackIntersectionWord,
+            sizeof(snapshot.finalInclusiveOffset));
+        snapshot.tileCount = retryAttemptTileCount;
+        return snapshot;
+    }
+
+public:
+    void markRetryAttemptSnapshotEncoded(size_t tileCount) {
+        std::lock_guard<std::mutex> lock(mutex);
+        retryAttemptTileCount = tileCount;
+        retryAttemptSnapshotEncoded = true;
+    }
+
+private:
+    void validateRetryAttemptReadbackLocked() const {
+        if (!readback.defined() ||
+            readback.numel() < static_cast<int64_t>(kTrainingReadbackWordCount)) {
+            throw std::logic_error(
+                "Training retry-attempt readback is unavailable");
+        }
+        if (!retryAttemptSnapshotEncoded || retryAttemptTileCount == 0) {
+            throw std::logic_error(
+                "Training retry-attempt snapshot was not encoded");
+        }
+    }
+
+public:
     void markCpuStart() {
         std::lock_guard<std::mutex> lock(mutex);
         if (sealed || aborted)
@@ -424,6 +482,29 @@ private:
             completed.mediumTileCount = mediumTileCount;
             completed.largeTileCount = largeTileCount;
 
+            if (retryAttemptSnapshotEncoded) {
+                try {
+                    const RetryAttemptSnapshot snapshot =
+                        completedRetryAttemptSnapshotLocked();
+                    const msplat::TileIntersectionLayout layout =
+                        msplat::tileIntersectionLayoutFromGpuMetadata(
+                            snapshot.layoutMetadata.data(),
+                            snapshot.layoutMetadata.size(), snapshot.tileCount,
+                            snapshot.finalInclusiveOffset);
+                    msplat::validateTileIntersectionWorkLimit(layout);
+                    completed.maximumTileCount = layout.maximumTileCount;
+                    completed.activeTileCount = layout.activeTileCount;
+                    completed.trivialTileCount = layout.trivialTileCount;
+                    completed.smallTileCount = layout.smallTileCount;
+                    completed.mediumTileCount = layout.mediumTileCount;
+                    completed.largeTileCount = layout.largeTileCount;
+                } catch (...) {
+                    telemetry->publishFailure(generation, iteration);
+                    telemetry->releaseReadback(std::move(readback));
+                    return;
+                }
+            }
+
             bool lossValid = false;
             bool intersectionCountValid = false;
             if (readbackEncoded && readback.defined()) {
@@ -498,6 +579,8 @@ private:
     bool countGpuTimingValid = false;
     bool countGpuTimingRecorded = false;
     bool readbackEncoded = false;
+    size_t retryAttemptTileCount = 0;
+    bool retryAttemptSnapshotEncoded = false;
     bool commandBufferFailed = false;
     bool sealed = false;
     bool aborted = false;
@@ -3851,16 +3934,62 @@ static MTensor msplat_train_step_locked(
         return true;
     };
 
-    auto inspectCompletedRetryAttempt = [&]() {
-        const msplat::TileIntersectionLayout completedLayout =
-            completed_gpu_tile_intersection_layout(num_tiles);
-        msplat::validateTileIntersectionWorkLimit(completedLayout);
+    auto encode_retry_attempt_snapshot = [&](id<MTLCommandBuffer> cb) -> bool {
+        if (!logicalStep) return true;
+        id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+        if (!blit) return false;
+        [blit copyFromBuffer:g_tcache.tile_layout_metadata.buffer()
+                sourceOffset:0
+                    toBuffer:logicalStep->readbackBuffer().buffer()
+           destinationOffset:kTrainingReadbackAttemptMetadataOffset
+                        size:msplat::kTileIntersectionLayoutMetadataWordCount *
+                             sizeof(uint32_t)];
+        [blit copyFromBuffer:g_tcache.tile_offsets.buffer()
+                sourceOffset:static_cast<NSUInteger>(num_tiles - 1) *
+                             sizeof(int32_t)
+                    toBuffer:logicalStep->readbackBuffer().buffer()
+           destinationOffset:kTrainingReadbackIntersectionOffset
+                        size:sizeof(int32_t)];
+        [blit endEncoding];
+        logicalStep->markRetryAttemptSnapshotEncoded(
+            static_cast<size_t>(num_tiles));
+        return true;
+    };
 
+    auto readCompletedRetryAttemptSnapshot = [&]() {
+        if (logicalStep) {
+            return logicalStep->completedRetryAttemptSnapshot();
+        }
+
+        // Direct native callers without a logical telemetry step still run
+        // under the public engine lock. This fallback executes only after the
+        // retry preflight's syncCB(), so copy the reusable globals by value
+        // before deciding whether to replay the same call.
+        RetryAttemptSnapshot snapshot;
+        snapshot.failureReasons = overflow_flag.data<uint32_t>()[0];
+        std::copy_n(
+            g_tcache.tile_layout_metadata.data<uint32_t>(),
+            snapshot.layoutMetadata.size(), snapshot.layoutMetadata.begin());
+        snapshot.finalInclusiveOffset = num_tiles > 0
+            ? g_tcache.tile_offsets.data<int32_t>()[num_tiles - 1]
+            : 0;
+        snapshot.tileCount = static_cast<size_t>(num_tiles);
+        return snapshot;
+    };
+
+    auto inspectCompletedRetryAttempt = [&]() {
         constexpr uint32_t knownAttemptFailures =
             MSPLAT_TRAINING_OVERFLOW_TILE_CAP |
             MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY;
-        const uint32_t attemptFailures =
-            overflow_flag.data<uint32_t>()[0];
+        const RetryAttemptSnapshot snapshot =
+            readCompletedRetryAttemptSnapshot();
+        const msplat::TileIntersectionLayout completedLayout =
+            msplat::tileIntersectionLayoutFromGpuMetadata(
+                snapshot.layoutMetadata.data(),
+                snapshot.layoutMetadata.size(), snapshot.tileCount,
+                snapshot.finalInclusiveOffset);
+        msplat::validateTileIntersectionWorkLimit(completedLayout);
+        const uint32_t attemptFailures = snapshot.failureReasons;
         if ((attemptFailures & ~knownAttemptFailures) != 0u) {
             throw std::runtime_error(
                 "GPU intersection attempt reported an unknown failure");
@@ -3884,7 +4013,7 @@ static MTensor msplat_train_step_locked(
 
             const uint32_t requiredChunkCount =
                 msplat::tileRasterChunkCount(
-                    static_cast<uint32_t>(num_tiles),
+                    static_cast<uint32_t>(snapshot.tileCount),
                     completedLayout.maximumTileCount, CHUNK_SIZE);
             const int previousForwardChunkCount =
                 g_tcache.forward_chunk_K_max;
@@ -3908,10 +4037,10 @@ static MTensor msplat_train_step_locked(
                     attemptFailures,
                     elapsedMilliseconds(retryGrowStart, retryGrowEnd));
             }
-            return std::make_pair(completedLayout, true);
+            return true;
         }
 
-        return std::make_pair(completedLayout, false);
+        return false;
     };
 
     auto replaySameLogicalStep = [&]() -> MTensor {
@@ -3966,6 +4095,11 @@ static MTensor msplat_train_step_locked(
             // packing and the expensive training tail can then stay queued.
             encode_scatter_sort_finalize(enc);
             [enc endEncoding];
+            if (!encode_retry_attempt_snapshot(commandBuffer)) {
+                encodingFailure =
+                    "msplat: failed to create a retry snapshot blit encoder";
+                return;
+            }
         });
         if (encodingFailure) {
             ctx->discardCB();
@@ -3978,11 +4112,8 @@ static MTensor msplat_train_step_locked(
             // count/layout/scatter/sort preflight as one GPU phase.
             logicalStep->recordExactCountPass(preflightMetrics);
         }
-        const auto completedAttempt = inspectCompletedRetryAttempt();
-        if (completedAttempt.second)
+        if (inspectCompletedRetryAttempt())
             return replaySameLogicalStep();
-        if (gpuResidentIntersectionAttempt && logicalStep)
-            logicalStep->recordIntersectionLayout(completedAttempt.first, 0.0);
     }
 
     auto encode_step_readback = [&](id<MTLCommandBuffer> cb) -> bool {

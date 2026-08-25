@@ -4,6 +4,8 @@ endif()
 
 file(READ "${MSPLAT_SOURCE_DIR}/core/metal/msplat_metal.metal" metal_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/metal/msplat_metal.mm" host_source)
+file(READ "${MSPLAT_SOURCE_DIR}/core/include/intersection_layout.hpp"
+    layout_header)
 file(READ "${MSPLAT_SOURCE_DIR}/core/src/model.cpp" model_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/src/msplat_api.mm" api_source)
 file(READ "${MSPLAT_SOURCE_DIR}/tests/test_transparent_training.mm"
@@ -88,6 +90,14 @@ extract_section("${training_pipeline}" "auto encode_proj_sh_bwd_adam ="
 extract_section("${training_pipeline}" "auto do_blit_zero ="
     "auto encode_step_readback =" post_layout_zero)
 extract_section("${training_pipeline}"
+    "auto encode_retry_attempt_snapshot ="
+    "auto readCompletedRetryAttemptSnapshot ="
+    retry_snapshot_encoding)
+extract_section("${training_pipeline}"
+    "auto readCompletedRetryAttemptSnapshot ="
+    "auto inspectCompletedRetryAttempt ="
+    retry_snapshot_readback)
+extract_section("${training_pipeline}"
     "auto inspectCompletedRetryAttempt ="
     "auto replaySameLogicalStep =" retry_inspection)
 extract_section("${training_pipeline}"
@@ -114,6 +124,9 @@ extract_section("${logical_step_telemetry}"
 extract_section("${logical_step_telemetry}"
     "void finishIfReadyLocked() noexcept {"
     "MsplatTrainingTelemetryHandle telemetry;" completed_telemetry)
+extract_section("${logical_step_telemetry}"
+    "RetryAttemptSnapshot completedRetryAttemptSnapshot() const {"
+    "void markRetryAttemptSnapshotEncoded(" retry_snapshot_accessor)
 extract_section("${retry_fixture_source}"
     "void checkArenaRetryTransaction() {"
     "}  // namespace" retry_fixture)
@@ -485,18 +498,26 @@ require_absent("${training_pipeline}"
     "nested locked-helper engine lock")
 require_ordered("${retry_preflight}"
     "encode_scatter_sort_finalize(enc);"
+    "encode_retry_attempt_snapshot(commandBuffer)"
+    "attempt snapshot follows every status writer")
+require_ordered("${retry_preflight}"
+    "encode_retry_attempt_snapshot(commandBuffer)"
     "ctx->syncCB();"
-    "all status writers complete before retirement")
+    "attempt snapshot completes before retirement")
 require_ordered("${retry_preflight}"
     "ctx->syncCB();"
-    "const auto completedAttempt = inspectCompletedRetryAttempt();"
+    "if (inspectCompletedRetryAttempt())"
     "preflight completion precedes status readback")
 require_ordered("${retry_preflight}"
-    "const auto completedAttempt = inspectCompletedRetryAttempt();"
+    "if (inspectCompletedRetryAttempt())"
     "return replaySameLogicalStep();"
     "preflight retry decision precedes replay")
 require_ordered("${retry_inspection}"
-    "overflow_flag.data<uint32_t>()[0]"
+    "const RetryAttemptSnapshot snapshot ="
+    "const uint32_t attemptFailures = snapshot.failureReasons;"
+    "attempt status comes from the copied snapshot")
+require_ordered("${retry_inspection}"
+    "const uint32_t attemptFailures = snapshot.failureReasons;"
     "g_tcache.ensure_intersection_arena("
     "attempt status readback precedes arena growth")
 require_ordered("${retry_inspection}"
@@ -515,10 +536,90 @@ require_contains("${retry_inspection}"
     "backward chunk growth")
 require_ordered("${retry_inspection}"
     "if (!grew) {"
-    "return std::make_pair(completedLayout, true);"
+    "return true;"
     "non-progress rejection precedes retry result")
 require_absent("${retry_inspection}" "lock.unlock()"
     "inter-attempt engine unlock")
+foreach(shared_retry_result IN ITEMS
+        completed_gpu_tile_intersection_layout
+        g_tcache.tile_layout_metadata
+        g_tcache.tile_offsets.data
+        overflow_flag.data)
+    require_absent("${retry_inspection}" "${shared_retry_result}"
+        "mutable retry result ${shared_retry_result}")
+endforeach()
+require_contains("${host_source}"
+    "static constexpr size_t kTrainingReadbackAttemptMetadataWord ="
+    "step-owned retry metadata slot")
+require_contains("${host_source}"
+    "msplat::kTileIntersectionLayoutMetadataWordCount;"
+    "retry metadata readback capacity")
+require_contains("${retry_snapshot_encoding}"
+    "copyFromBuffer:g_tcache.tile_layout_metadata.buffer()"
+    "retry metadata snapshot source")
+require_contains("${retry_snapshot_encoding}"
+    "toBuffer:logicalStep->readbackBuffer().buffer()"
+    "retry metadata step-owned destination")
+require_contains("${retry_snapshot_encoding}"
+    "destinationOffset:kTrainingReadbackAttemptMetadataOffset"
+    "retry metadata non-overlapping destination")
+require_contains("${retry_snapshot_encoding}"
+    "copyFromBuffer:g_tcache.tile_offsets.buffer()"
+    "retry final-offset snapshot source")
+require_contains("${retry_snapshot_encoding}"
+    "destinationOffset:kTrainingReadbackIntersectionOffset"
+    "retry final-offset step-owned destination")
+require_ordered("${retry_snapshot_encoding}"
+    "[blit endEncoding];"
+    "logicalStep->markRetryAttemptSnapshotEncoded("
+    "retry snapshot validity follows encoded copies")
+require_contains("${retry_snapshot_readback}"
+    "logicalStep->completedRetryAttemptSnapshot("
+    "retry inspection prefers the logical-step snapshot")
+require_contains("${retry_snapshot_readback}"
+    "This fallback executes only after the"
+    "no-telemetry fallback documents synchronous ownership")
+require_contains("${retry_snapshot_accessor}"
+    "std::copy_n("
+    "step accessor copies every metadata word by value")
+require_contains("${retry_snapshot_accessor}"
+    "std::memcpy("
+    "step accessor copies the final offset by value")
+require_contains("${retry_snapshot_accessor}"
+    "snapshot.tileCount = retryAttemptTileCount;"
+    "step accessor owns its recorded tile count")
+require_contains("${logical_step_telemetry}"
+    "if (!retryAttemptSnapshotEncoded || retryAttemptTileCount == 0)"
+    "unencoded retry snapshots are rejected")
+require_contains("${retry_inspection}"
+    "const RetryAttemptSnapshot snapshot ="
+    "retry failure owns copied layout values")
+require_contains("${retry_inspection}"
+    "snapshot.layoutMetadata.data()"
+    "retry layout consumes copied metadata")
+require_contains("${retry_inspection}"
+    "snapshot.finalInclusiveOffset"
+    "retry layout consumes copied final offset")
+require_ordered("${retry_inspection}"
+    "msplat::tileIntersectionLayoutFromGpuMetadata("
+    "msplat::validateTileIntersectionWorkLimit(completedLayout);"
+    "copied layout is validated before growth")
+require_ordered("${retry_inspection}"
+    "msplat::validateTileIntersectionWorkLimit(completedLayout);"
+    "const uint32_t attemptFailures = snapshot.failureReasons;"
+    "copied layout is transactionally validated before status branching")
+require_contains("${layout_header}"
+    "int32_t finalOffset)"
+    "layout decoder accepts a copied final offset")
+require_contains("${completed_telemetry}"
+    "if (retryAttemptSnapshotEncoded) {"
+    "completion snapshot validity gate")
+require_contains("${completed_telemetry}"
+    "completedRetryAttemptSnapshotLocked()"
+    "completion consumes the step-owned retry snapshot")
+require_contains("${completed_telemetry}"
+    "completed.maximumTileCount = layout.maximumTileCount;"
+    "completion publishes snapshotted tile telemetry")
 require_count("${retry_replay}"
     "return msplat_train_step_locked\\(" 1
     "same-step replay calls")
@@ -531,6 +632,18 @@ require_contains("${retry_replay}"
 require_contains("${retry_replay}"
     "adam_eps, photometric, pose, collect_densification_stats,"
     "same optimizer and refinement replay")
+require_contains("${retry_fixture}"
+    "constexpr int fallbackGaussianCount = 5'000;"
+    "forced retry without logical telemetry")
+require_contains("${retry_fixture}"
+    "CHECK(retried.retainedIntersectionCount == gaussianCount);"
+    "copied final offset exact runtime assertion")
+require_contains("${retry_fixture}"
+    "void checkRetryReadbackPoolReuse()"
+    "pooled retry readback runtime coverage")
+require_contains("${retry_fixture}"
+    "msplat_training_telemetry_readback_bytes(telemetry) =="
+    "pooled retry readback allocation assertion")
 require_contains("${retry_preflight}" "do_blit_zero(commandBuffer)"
     "preflight transient clear")
 require_contains("${retry_preflight}" "encode_scatter_sort_finalize(enc);"
@@ -620,7 +733,7 @@ require_ordered("${retry_inspection}"
     "retry grow timing ends after all allocations")
 require_ordered("${retry_inspection}"
     "logicalStep->recordRecoveredIntersectionRetry("
-    "return std::make_pair(completedLayout, true);"
+    "return true;"
     "recovered telemetry recorded before retry result")
 require_contains("${retry_inspection}"
     "attemptFailures,\n                    elapsedMilliseconds(retryGrowStart, retryGrowEnd)"
@@ -642,13 +755,14 @@ require_absent("${logical_step_telemetry}"
     "countWaitWallMs = metrics.waitWallMs;"
     "overwriting count-wait telemetry")
 
-# The macOS Metal fixture deterministically warms a small arena, then submits a
-# 5,000-Gaussian single-tile step. It proves the rejected attempt is a no-op,
-# the replay succeeds once, and recovered overflow reaches aggregate telemetry.
+# The macOS Metal fixture deterministically warms a small arena, exercises a
+# direct 5,000-Gaussian retry without telemetry, then submits a 10,000-Gaussian
+# logical step. It proves rejected attempts are no-ops, each replay succeeds
+# once, and recovered overflow reaches aggregate telemetry.
 require_contains("${retry_fixture}"
     "std::string(mode) != \"retry\""
     "retry-only fixture gate")
-require_contains("${retry_fixture}" "constexpr int gaussianCount = 5'000;"
+require_contains("${retry_fixture}" "constexpr int gaussianCount = 10'000;"
     "forced under-capacity population")
 require_contains("${retry_fixture}"
     "false, false, false, true, true);"

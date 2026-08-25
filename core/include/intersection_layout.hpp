@@ -55,14 +55,10 @@ struct TileIntersectionLayout {
 /// metadata cannot determine an arena allocation or dispatch size.
 inline TileIntersectionLayout tileIntersectionLayoutFromGpuMetadata(
     const uint32_t* metadata, size_t metadataWordCount, size_t tileCount,
-    const int32_t* inclusiveOffsets) {
+    int32_t finalOffset) {
     if (!metadata || metadataWordCount < kTileIntersectionLayoutMetadataWordCount) {
         throw std::invalid_argument(
             "GPU tile-intersection layout metadata is missing or truncated");
-    }
-    if (tileCount > 0 && !inclusiveOffsets) {
-        throw std::invalid_argument(
-            "GPU tile-intersection offsets must not be null");
     }
     if (metadata[kTileIntersectionLayoutErrorFlagsWord] &
         kTileIntersectionLayoutSignedIndexOverflow) {
@@ -121,15 +117,26 @@ inline TileIntersectionLayout tileIntersectionLayoutFromGpuMetadata(
             "GPU tile-intersection layout metadata is inconsistent");
     }
 
-    const int32_t finalOffset = tileCount > 0
-        ? inclusiveOffsets[tileCount - 1]
-        : 0;
     if (finalOffset < 0 ||
         static_cast<uint32_t>(finalOffset) != layout.totalCount) {
         throw std::runtime_error(
             "GPU tile-intersection layout offset does not match its total");
     }
     return layout;
+}
+
+inline TileIntersectionLayout tileIntersectionLayoutFromGpuMetadata(
+    const uint32_t* metadata, size_t metadataWordCount, size_t tileCount,
+    const int32_t* inclusiveOffsets) {
+    if (tileCount > 0 && !inclusiveOffsets) {
+        throw std::invalid_argument(
+            "GPU tile-intersection offsets must not be null");
+    }
+    const int32_t finalOffset = tileCount > 0
+        ? inclusiveOffsets[tileCount - 1]
+        : 0;
+    return tileIntersectionLayoutFromGpuMetadata(
+        metadata, metadataWordCount, tileCount, finalOffset);
 }
 
 inline bool tileIntersectionLayoutNeedsRadixScratch(

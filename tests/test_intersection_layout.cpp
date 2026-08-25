@@ -1,5 +1,7 @@
 #include "intersection_layout.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
@@ -70,6 +72,45 @@ int main() {
     CHECK(gpuLayout.smallTileCount == layout.smallTileCount);
     CHECK(gpuLayout.mediumTileCount == layout.mediumTileCount);
     CHECK(gpuLayout.largeTileCount == layout.largeTileCount);
+
+    struct AttemptSnapshot {
+        uint32_t failureReasons;
+        std::array<uint32_t, msplat::kTileIntersectionLayoutMetadataWordCount>
+            metadata;
+        int32_t finalInclusiveOffset;
+    };
+    uint32_t sourceFailureReasons = 1u << 1;
+    AttemptSnapshot attemptSnapshot{
+        sourceFailureReasons, {}, offsets[4]
+    };
+    std::copy_n(
+        gpuMetadata, attemptSnapshot.metadata.size(),
+        attemptSnapshot.metadata.begin());
+
+    // The decoder must consume copied values rather than reusable source
+    // buffers that a later GPU attempt can overwrite.
+    sourceFailureReasons = 0;
+    gpuMetadata[msplat::kTileIntersectionLayoutTotalCountWord] = 0;
+    offsets[4] = 0;
+    const auto snapshottedLayout =
+        msplat::tileIntersectionLayoutFromGpuMetadata(
+            attemptSnapshot.metadata.data(), attemptSnapshot.metadata.size(),
+            5, attemptSnapshot.finalInclusiveOffset);
+    CHECK(attemptSnapshot.failureReasons == (1u << 1));
+    CHECK(snapshottedLayout.totalCount == layout.totalCount);
+    CHECK(snapshottedLayout.maximumTileCount == layout.maximumTileCount);
+    CHECK(snapshottedLayout.maximumTileIndex == layout.maximumTileIndex);
+    CHECK(snapshottedLayout.activeTileCount == layout.activeTileCount);
+    CHECK(snapshottedLayout.sortableTileCount == layout.sortableTileCount);
+    CHECK(snapshottedLayout.trivialTileCount == layout.trivialTileCount);
+    CHECK(snapshottedLayout.smallTileCount == layout.smallTileCount);
+    CHECK(snapshottedLayout.mediumTileCount == layout.mediumTileCount);
+    CHECK(snapshottedLayout.largeTileCount == layout.largeTileCount);
+
+    std::copy_n(
+        attemptSnapshot.metadata.begin(), attemptSnapshot.metadata.size(),
+        gpuMetadata);
+    offsets[4] = attemptSnapshot.finalInclusiveOffset;
 
     bool truncatedGpuMetadataRejected = false;
     try {
