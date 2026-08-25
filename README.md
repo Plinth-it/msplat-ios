@@ -151,8 +151,9 @@ Densification split offsets keep the established libc++ CPU normal stream by
 default. `MSPLAT_DENSIFY_RANDOM_MODE=gpu` replaces the periodic host fill with
 a stateless counter-based Box-Muller stream generated directly by each split
 thread from the logical step and dense split ordinal. The experimental path
-avoids the sample-buffer write/read traffic but deliberately retains that
-capacity-sized allocation so CPU and GPU modes remain directly comparable.
+avoids the sample-buffer write/read traffic and replaces the capacity-sized
+legacy sample arena with a one-float binding placeholder, saving almost
+12 bytes per Gaussian of model capacity while densification remains active.
 Because the random sequence changes the training trajectory, keep `cpu` as the
 shipping mode until fixed-checkpoint quality, densification-step timing, and
 sustained physical-device thermal results justify promotion. Resume with the

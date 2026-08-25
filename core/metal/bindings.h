@@ -25,6 +25,10 @@ void* msplat_device();
 MTensor gpu_zeros(std::vector<int64_t> shape, DType dtype);
 MTensor gpu_empty(std::vector<int64_t> shape, DType dtype);
 
+// The densification random mode is selected once with the Metal context.
+// GPU mode does not retain the capacity-sized legacy sample arena.
+bool msplat_densify_uses_gpu_random();
+
 // Commit current command buffer (non-blocking)
 void msplat_commit();
 

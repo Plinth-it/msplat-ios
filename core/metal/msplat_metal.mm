@@ -1505,6 +1505,11 @@ MTensor gpu_empty(std::vector<int64_t> shape, DType dtype) {
     return mtensor_empty(get_global_context()->device, std::move(shape), dtype);
 }
 
+bool msplat_densify_uses_gpu_random() {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    return get_global_context()->gpu_densify_random;
+}
+
 MsplatTrainingTelemetryHandle msplat_training_telemetry_create() {
     return std::make_shared<MsplatTrainingTelemetryState>();
 }
@@ -4423,7 +4428,6 @@ int msplat_densify(
         throw std::runtime_error("Densification population does not match its prefixes");
     }
 
-    requireElements(random_samples, 6LL * num_splits, "random_samples");
     const int64_t compact_elements = static_cast<int64_t>(population) * max_stride;
     requireElements(compact_scratch, compact_elements, "compact_scratch");
     if (compact_elements > std::numeric_limits<uint32_t>::max())
@@ -4440,6 +4444,10 @@ int msplat_densify(
     MetalContext* ctx = get_global_context();
     const uint32_t generate_random_on_gpu =
         ctx->gpu_densify_random ? 1u : 0u;
+    requireElements(
+        random_samples,
+        generate_random_on_gpu != 0u ? 1LL : 6LL * num_splits,
+        "random_samples");
     if (generate_random_on_gpu == 0u) {
         // Preserve the legacy libc++ stream exactly in the default mode. The
         // classification pass has already synchronized shared storage.

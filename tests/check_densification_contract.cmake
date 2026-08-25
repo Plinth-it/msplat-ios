@@ -269,6 +269,24 @@ endforeach()
 require_contains("${bindings_header}"
     "MTensor &random_samples, uint32_t random_seed"
     "densification-random binding seed")
+require_contains("${bindings_header}"
+    "bool msplat_densify_uses_gpu_random();"
+    "densification-random mode query")
+foreach(token IN ITEMS
+        "bool msplat_densify_uses_gpu_random()"
+        "return get_global_context()->gpu_densify_random;"
+        "generate_random_on_gpu != 0u ? 1LL : 6LL * num_splits")
+    require_contains("${host_source}" "${token}"
+        "densification-random scratch ${token}")
+endforeach()
+foreach(token IN ITEMS
+        "if (msplat_densify_uses_gpu_random()) {"
+        "scratch.randomSamples = gpu_zeros({1}, DType::Float32);"
+        "if (!msplat_densify_uses_gpu_random()) {"
+        "tasks.push_back({&densify_random_samples, {new_cap, 3}, false});")
+    require_contains("${model_source}" "${token}"
+        "densification-random model scratch ${token}")
+endforeach()
 require_contains("${model_source}"
     "densify_random_samples, static_cast<uint32_t>(step)"
     "logical-step densification seed")
@@ -297,7 +315,13 @@ require_absent("${densification_ctests}" "WILL_FAIL"
     "invalid-mode false-positive test")
 foreach(token IN ITEMS
         "constexpr uint32_t kRandomScratchSentinelBits = 0x7f7fffffu;"
-        "DensifyRandomResult runDensifyRandomFixture(uint32_t randomSeed)"
+        "DensifyRandomResult runDensifyRandomFixture("
+        "uint32_t randomSeed, bool gpuMode,"
+        "bool forceUndersizedRandomScratch = false)"
+        "CHECK(msplat_densify_uses_gpu_random() == gpuMode);"
+        "CHECK(first.randomScratchBits.size() == 1u);"
+        "runDensifyRandomFixture(600u, false, true);"
+        "Densification buffer is too small: random_samples"
         "first.childMeanBits == repeated.childMeanBits"
         "first.childMeanBits != different.childMeanBits"
         "bits == kRandomScratchSentinelBits"

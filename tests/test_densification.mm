@@ -195,7 +195,9 @@ struct DensifyRandomResult {
     std::vector<uint32_t> capacityTailBits;
 };
 
-DensifyRandomResult runDensifyRandomFixture(uint32_t randomSeed) {
+DensifyRandomResult runDensifyRandomFixture(
+    uint32_t randomSeed, bool gpuMode,
+    bool forceUndersizedRandomScratch = false) {
     constexpr int featuresRestStride = 1;
     constexpr int parameterStrides[] = {3, 3, 4, 3, 1, 1};
 
@@ -242,7 +244,10 @@ DensifyRandomResult runDensifyRandomFixture(uint32_t randomSeed) {
     MTensor compactScratch = gpu_zeros(
         {4LL * kRandomFixturePopulation}, DType::Float32);
     MTensor randomSamples = gpu_empty(
-        {kRandomFixtureCapacity, 3}, DType::Float32);
+        gpuMode || forceUndersizedRandomScratch
+            ? std::vector<int64_t>{1}
+            : std::vector<int64_t>{kRandomFixtureCapacity, 3},
+        DType::Float32);
 
     const float sentinel = floatFromBits(kRandomScratchSentinelBits);
     for (int index = 0; index < randomSamples.numel(); ++index)
@@ -289,10 +294,11 @@ DensifyRandomResult runDensifyRandomFixture(uint32_t randomSeed) {
 }
 
 void checkDensificationRandomMode(bool gpuMode) {
-    DensifyRandomResult first = runDensifyRandomFixture(600u);
-    DensifyRandomResult repeated = runDensifyRandomFixture(600u);
+    CHECK(msplat_densify_uses_gpu_random() == gpuMode);
+    DensifyRandomResult first = runDensifyRandomFixture(600u, gpuMode);
+    DensifyRandomResult repeated = runDensifyRandomFixture(600u, gpuMode);
     DensifyRandomResult different = runDensifyRandomFixture(
-        std::numeric_limits<uint32_t>::max());
+        std::numeric_limits<uint32_t>::max(), gpuMode);
 
     CHECK(first.childMeanBits == repeated.childMeanBits);
     CHECK(first.childMeanBits != different.childMeanBits);
@@ -302,6 +308,7 @@ void checkDensificationRandomMode(bool gpuMode) {
     const int64_t generatedSampleCount =
         6LL * kRandomFixtureParents;
     if (gpuMode) {
+        CHECK(first.randomScratchBits.size() == 1u);
         for (uint32_t bits : first.randomScratchBits)
             CHECK(bits == kRandomScratchSentinelBits);
         constexpr uint32_t representativeOrdinals[] = {
@@ -317,6 +324,15 @@ void checkDensificationRandomMode(bool gpuMode) {
             }
         }
     } else {
+        bool rejectedUndersizedScratch = false;
+        try {
+            (void)runDensifyRandomFixture(600u, false, true);
+        } catch (const std::runtime_error& error) {
+            rejectedUndersizedScratch = std::string(error.what()) ==
+                "Densification buffer is too small: random_samples";
+        }
+        CHECK(rejectedUndersizedScratch);
+
         std::mt19937 expectedGenerator(600u);
         std::normal_distribution<float> expectedDistribution(0.0f, 1.0f);
         for (int64_t index = 0; index < generatedSampleCount; ++index) {

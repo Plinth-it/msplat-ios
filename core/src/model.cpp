@@ -97,7 +97,13 @@ DensificationScratch makeDensificationScratch(int capacity,
     const int64_t maxBlocks =
         (static_cast<int64_t>(capacity) + 1023) / 1024;
     scratch.blockTotals = gpu_zeros({maxBlocks}, DType::Int32);
-    scratch.randomSamples = gpu_zeros({capacity, 3}, DType::Float32);
+    if (msplat_densify_uses_gpu_random()) {
+        // The specialized GPU kernel derives samples from its seed and never
+        // reads this binding. Metal still requires a valid non-empty buffer.
+        scratch.randomSamples = gpu_zeros({1}, DType::Float32);
+    } else {
+        scratch.randomSamples = gpu_zeros({capacity, 3}, DType::Float32);
+    }
     return scratch;
 }
 
@@ -533,7 +539,9 @@ void Model::ensureCapacity(int needed){
     tasks.push_back({&densify_block_totals, {max_blocks}, false});
     tasks.push_back({&densify_compact_scratch,
                      {static_cast<int64_t>(new_cap) * compact_stride}, false});
-    tasks.push_back({&densify_random_samples, {new_cap, 3}, false});
+    if (!msplat_densify_uses_gpu_random()) {
+        tasks.push_back({&densify_random_samples, {new_cap, 3}, false});
+    }
 
     // Replacing the largest allocations first minimizes the final transient:
     // by the time most new buffers exist, only small old buffers remain.
