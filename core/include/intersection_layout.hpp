@@ -9,8 +9,12 @@
 
 namespace msplat {
 
+inline constexpr uint32_t kExactBitonicFastPath = 2'048;
+inline constexpr uint32_t kExactRadixScratchBytesPerEntry = sizeof(uint64_t);
 inline constexpr uint32_t kExactIntersectionBytesPerEntry =
     2 * sizeof(uint64_t) + 3 * 3 * sizeof(float);
+inline constexpr uint32_t kExactBitonicOnlyIntersectionBytesPerEntry =
+    kExactIntersectionBytesPerEntry - kExactRadixScratchBytesPerEntry;
 inline constexpr uint32_t kExactTileMetadataBytes =
     sizeof(uint32_t) + sizeof(int32_t) + 2 * sizeof(int32_t);
 // The current large-tile sorter assigns one threadgroup to a tile. Keep that
@@ -28,6 +32,11 @@ struct TileIntersectionLayout {
     uint32_t mediumTileCount = 0;
     uint32_t largeTileCount = 0;
 };
+
+inline bool tileIntersectionLayoutNeedsRadixScratch(
+    const TileIntersectionLayout& layout) {
+    return layout.maximumTileCount > kExactBitonicFastPath;
+}
 
 /// Converts exact per-tile counts into inclusive offsets for the packed arena.
 /// The native rasterizer uses signed 32-bit ranges, so a larger scene is
@@ -54,7 +63,7 @@ inline TileIntersectionLayout buildTileIntersectionLayout(
             ++layout.trivialTileCount;
         } else if (count <= 32) {
             ++layout.smallTileCount;
-        } else if (count <= 2'048) {
+        } else if (count <= kExactBitonicFastPath) {
             ++layout.mediumTileCount;
         } else {
             ++layout.largeTileCount;

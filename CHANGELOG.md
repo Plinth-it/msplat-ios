@@ -83,7 +83,10 @@
 - Removed the unused depth cotangent from RGB training, computed projected
   opacity once per visible Gaussian, and recovered backward Gaussian IDs directly
   from sorted keys. Exact-intersection storage drops from 56 to 52 bytes per
-  entry without changing raster output or the training objective.
+  entry without changing raster output or the training objective. A resolution
+  stage now allocates the second 8-byte key arena only after a tile exceeds the
+  2,048-entry bitonic path, so bitonic-only stages use 44 bytes per arena slot at
+  runtime while memory planning retains the 52-byte worst case.
 - Fused geometry backward directly into the mean, scale, and quaternion Adam
   updates, and folded opacity plus densification-stat updates into the terminal
   backward stage. The training cache no longer owns or clears the three geometry

@@ -4,6 +4,7 @@ endif()
 
 file(READ "${MSPLAT_SOURCE_DIR}/core/metal/msplat_metal.metal" metal_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/metal/msplat_metal.mm" host_source)
+file(READ "${MSPLAT_SOURCE_DIR}/core/include/intersection_layout.hpp" layout_header)
 
 function(require_contains contents needle label)
     string(FIND "${contents}" "${needle}" position)
@@ -56,6 +57,11 @@ require_contains("${metal_source}"
     "one sigmoid evaluation per visible Gaussian")
 require_contains("${metal_source}" "EXACT_BITONIC_FAST_PATH 2048"
     "exact-range bitonic fast path")
+require_contains("${layout_header}" "kExactBitonicFastPath = 2'048"
+    "matching host bitonic fast-path boundary")
+require_contains("${layout_header}"
+    "tileIntersectionLayoutNeedsRadixScratch("
+    "host radix-scratch decision")
 require_contains("${metal_source}" "for (uint pass = 0; pass < 8; ++pass)"
     "eight full-key radix passes")
 require_contains("${metal_source}" "const uint shift = pass * 8u"
@@ -101,6 +107,58 @@ require_contains("${host_source}"
     "backward sorted-key binding")
 require_contains("${host_source}" "ENC_SCALAR(enc, capacity_u32, 5)"
     "radix capacity binding")
+require_contains("${host_source}" "bool needsRadixScratch,"
+    "lazy radix-scratch arena input")
+require_contains("${host_source}"
+    "if (!needsRadixScratch || intersection_keys_b.defined())"
+    "lazy radix-scratch allocation gate")
+require_contains("${host_source}"
+    "if (needsRadixScratch) {\n                intersection_keys_b ="
+    "conditional radix-scratch allocation after arena growth")
+require_contains("${host_source}"
+    "needsRadixScratch ? \"radix\" : \"bitonic\""
+    "accurate exact-sort benchmark label")
+string(REGEX MATCHALL
+    "tileIntersectionLayoutNeedsRadixScratch\\(intersectionLayout\\)"
+    radix_scratch_decisions "${host_source}")
+list(LENGTH radix_scratch_decisions radix_scratch_decision_count)
+if(NOT radix_scratch_decision_count EQUAL 2)
+    message(FATAL_ERROR
+        "Expected render and training radix-scratch decisions, found ${radix_scratch_decision_count}")
+endif()
+string(REGEX MATCHALL
+    "ENC_BUF\\(enc, radix_sort_scratch_keys, 2\\)"
+    radix_scratch_bindings "${host_source}")
+list(LENGTH radix_scratch_bindings radix_scratch_binding_count)
+if(NOT radix_scratch_binding_count EQUAL 2)
+    message(FATAL_ERROR
+        "Expected two safe radix-scratch bindings, found ${radix_scratch_binding_count}")
+endif()
+string(REGEX MATCHALL
+    "radix_sort_scratch_keys ="
+    radix_scratch_fallbacks "${host_source}")
+list(LENGTH radix_scratch_fallbacks radix_scratch_fallback_count)
+if(NOT radix_scratch_fallback_count EQUAL 2)
+    message(FATAL_ERROR
+        "Expected two radix-scratch fallback initializers, found ${radix_scratch_fallback_count}")
+endif()
+require_contains("${host_source}"
+    "? g_tcache.intersection_keys_b\n            : g_tcache.intersection_keys_a;"
+    "primary-key fallback when radix scratch is absent")
+string(REGEX MATCHALL
+    "if \\(needsRadixScratch && !g_tcache\\.intersection_keys_b\\.defined\\(\\)\\)"
+    radix_scratch_invariants "${host_source}")
+list(LENGTH radix_scratch_invariants radix_scratch_invariant_count)
+if(NOT radix_scratch_invariant_count EQUAL 2)
+    message(FATAL_ERROR
+        "Expected render and training radix-scratch invariants, found ${radix_scratch_invariant_count}")
+endif()
+require_contains("${metal_source}"
+    "        return;\n    }\n\n    threadgroup atomic_uint digit_histogram"
+    "bitonic return before radix scratch use")
+require_contains("${metal_source}"
+    "device uint64_t* source = (pass & 1u) == 0u ? keys_a : keys_b;"
+    "radix scratch runtime use")
 require_contains("${host_source}"
     "radix_sort_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup <"
     "256-thread radix support check")
@@ -121,6 +179,11 @@ require_absent("${host_source}" "MTensor gaussian_ids;"
     "redundant Gaussian-ID arena")
 require_absent("${host_source}" "ENC_BUF(enc, gaussian_ids"
     "redundant Gaussian-ID binding")
+require_absent("${host_source}"
+    "ENC_BUF(enc, g_tcache.intersection_keys_b, 2);"
+    "unconditional radix-scratch binding")
+require_absent("${host_source}" "retainRadixScratch"
+    "radix scratch retained across a bitonic-only arena rebuild")
 require_absent("${metal_source}"
     "const float opacity = 1.f / (1.f + exp(-opacities[gaussian_id]));"
     "per-intersection opacity sigmoid")

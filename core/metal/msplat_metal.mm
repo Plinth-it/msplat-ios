@@ -1535,6 +1535,7 @@ struct FusedTensorCache {
     }
 
     bool ensure_intersection_arena(uint32_t requiredCount,
+                                   bool needsRadixScratch,
                                    id<MTLDevice> dev) {
         const uint32_t currentCapacity = capacity > 0
             ? static_cast<uint32_t>(capacity)
@@ -1542,11 +1543,16 @@ struct FusedTensorCache {
         const uint32_t requestedCapacity =
             msplat::tileIntersectionArenaCapacity(
                 requiredCount, currentCapacity, false);
-        if (requestedCapacity == currentCapacity &&
-            intersection_keys_a.defined() && intersection_keys_b.defined() &&
-            packed_xy_opac.defined() && packed_conic.defined() &&
-            packed_rgb.defined()) {
-            return false;
+        const bool baseArenaReady = requestedCapacity == currentCapacity &&
+            intersection_keys_a.defined() && packed_xy_opac.defined() &&
+            packed_conic.defined() && packed_rgb.defined();
+        if (baseArenaReady) {
+            if (!needsRadixScratch || intersection_keys_b.defined()) {
+                return false;
+            }
+            intersection_keys_b =
+                mtensor_empty(dev, {capacity}, DType::Int64);
+            return true;
         }
 
         const uint64_t largestBufferBytes =
@@ -1560,10 +1566,13 @@ struct FusedTensorCache {
         const int64_t cap = requestedCapacity;
         try {
             intersection_keys_a = mtensor_empty(dev, {cap}, DType::Int64);
-            intersection_keys_b = mtensor_empty(dev, {cap}, DType::Int64);
             packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
             packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
+            if (needsRadixScratch) {
+                intersection_keys_b =
+                    mtensor_empty(dev, {cap}, DType::Int64);
+            }
         } catch (...) {
             resetIntersectionArena();
             throw;
@@ -1837,12 +1846,21 @@ static void render_pipeline(
             g_tcache.tile_offsets.data<int32_t>(),
             static_cast<size_t>(num_tiles));
     msplat::validateTileIntersectionWorkLimit(intersectionLayout);
+    const bool needsRadixScratch =
+        msplat::tileIntersectionLayoutNeedsRadixScratch(intersectionLayout);
     g_tcache.ensure_intersection_arena(
-        intersectionLayout.totalCount, ctx->device);
+        intersectionLayout.totalCount, needsRadixScratch, ctx->device);
+    if (needsRadixScratch && !g_tcache.intersection_keys_b.defined()) {
+        throw std::logic_error("Exact radix sort requires its scratch arena");
+    }
 
     MTensor &packed_xy_opac = g_tcache.packed_xy_opac;
     MTensor &packed_conic = g_tcache.packed_conic;
     MTensor &packed_rgb = g_tcache.packed_rgb;
+    MTensor &radix_sort_scratch_keys =
+        g_tcache.intersection_keys_b.defined()
+            ? g_tcache.intersection_keys_b
+            : g_tcache.intersection_keys_a;
     const uint32_t capacity_u32 = static_cast<uint32_t>(g_tcache.capacity);
     const uint32_t num_tiles_u32 = static_cast<uint32_t>(num_tiles);
     const uint32_t total_intersections = intersectionLayout.totalCount;
@@ -1874,7 +1892,7 @@ static void render_pipeline(
         [enc setComputePipelineState:ctx->radix_sort_per_tile_kernel_cpso];
         ENC_BUF(enc, g_tcache.tile_offsets, 0);
         ENC_BUF(enc, g_tcache.intersection_keys_a, 1);
-        ENC_BUF(enc, g_tcache.intersection_keys_b, 2);
+        ENC_BUF(enc, radix_sort_scratch_keys, 2);
         ENC_SCALAR(enc, num_tiles_u32, 3);
         ENC_BUF(enc, tile_bins, 4);
         ENC_SCALAR(enc, capacity_u32, 5);
@@ -1915,9 +1933,14 @@ static void render_pipeline(
                 tile_bounds_x, tile_bounds_y, num_tiles);
         fprintf(stderr, "  SH degree:      %u (bases: %u)\n",
                 degree, (degree + 1) * (degree + 1));
-        fprintf(stderr, "  sort:           tile-local exact radix\n");
+        fprintf(stderr, "  sort:           tile-local exact %s\n",
+                needsRadixScratch ? "radix" : "bitonic");
         fprintf(stderr, "  sort arenas:    %.1f MB\n",
-                static_cast<double>(capacity_u32) * 16.0 / 1e6);
+                static_cast<double>(
+                    g_tcache.intersection_keys_a.nbytes() +
+                    (g_tcache.intersection_keys_b.defined()
+                        ? g_tcache.intersection_keys_b.nbytes()
+                        : 0)) / 1e6);
         fprintf(stderr, "===========================\n\n");
     }
 
@@ -2481,10 +2504,15 @@ MTensor msplat_train_step(
             g_tcache.tile_offsets.data<int32_t>(),
             static_cast<size_t>(num_tiles));
     msplat::validateTileIntersectionWorkLimit(intersectionLayout);
+    const bool needsRadixScratch =
+        msplat::tileIntersectionLayoutNeedsRadixScratch(intersectionLayout);
     const auto arenaGrowStart = TelemetryClock::now();
     const bool intersectionArenaGrew = g_tcache.ensure_intersection_arena(
-        intersectionLayout.totalCount, ctx->device);
+        intersectionLayout.totalCount, needsRadixScratch, ctx->device);
     const auto arenaGrowEnd = TelemetryClock::now();
+    if (needsRadixScratch && !g_tcache.intersection_keys_b.defined()) {
+        throw std::logic_error("Exact radix sort requires its scratch arena");
+    }
     if (logicalStep) {
         logicalStep->recordIntersectionLayout(
             intersectionLayout,
@@ -2496,6 +2524,10 @@ MTensor msplat_train_step(
     MTensor &packed_xy_opac = g_tcache.packed_xy_opac;
     MTensor &packed_conic = g_tcache.packed_conic;
     MTensor &packed_rgb = g_tcache.packed_rgb;
+    MTensor &radix_sort_scratch_keys =
+        g_tcache.intersection_keys_b.defined()
+            ? g_tcache.intersection_keys_b
+            : g_tcache.intersection_keys_a;
     const uint32_t capacity_u32 = static_cast<uint32_t>(g_tcache.capacity);
     const uint32_t num_tiles_u32 = static_cast<uint32_t>(num_tiles);
     const uint32_t total_intersections = intersectionLayout.totalCount;
@@ -2537,7 +2569,7 @@ MTensor msplat_train_step(
         [enc setComputePipelineState:ctx->radix_sort_per_tile_kernel_cpso];
         ENC_BUF(enc, g_tcache.tile_offsets, 0);
         ENC_BUF(enc, g_tcache.intersection_keys_a, 1);
-        ENC_BUF(enc, g_tcache.intersection_keys_b, 2);
+        ENC_BUF(enc, radix_sort_scratch_keys, 2);
         ENC_SCALAR(enc, num_tiles_u32, 3);
         ENC_BUF(enc, tile_bins, 4);
         ENC_SCALAR(enc, capacity_u32, 5);

@@ -594,6 +594,8 @@ public struct TrainingPlan: Sendable, Equatable {
                     component: "training Gaussian cache"
                 ),
                 try checkedProduct(
+                    // Conservatively include both 8-byte key arenas. Runtime
+                    // omits radix scratch until a tile exceeds 2,048 entries.
                     [52, intersectionCapacity],
                     component: "exact intersection arenas and packed cache"
                 ),

@@ -35,6 +35,7 @@ int main() {
     CHECK(layout.smallTileCount == 2);
     CHECK(layout.mediumTileCount == 0);
     CHECK(layout.largeTileCount == 0);
+    CHECK(!msplat::tileIntersectionLayoutNeedsRadixScratch(layout));
     CHECK(offsets[0] == 0);
     CHECK(offsets[1] == 3);
     CHECK(offsets[2] == 4);
@@ -71,6 +72,21 @@ int main() {
     CHECK(bucketBoundaries.smallTileCount == 2);
     CHECK(bucketBoundaries.mediumTileCount == 2);
     CHECK(bucketBoundaries.largeTileCount == 1);
+    CHECK(msplat::tileIntersectionLayoutNeedsRadixScratch(bucketBoundaries));
+
+    const uint32_t bitonicBoundaryCounts[] = {2'048};
+    int32_t bitonicBoundaryOffsets[1] = {};
+    const auto bitonicBoundary = msplat::buildTileIntersectionLayout(
+        bitonicBoundaryCounts, bitonicBoundaryOffsets, 1);
+    CHECK(bitonicBoundary.maximumTileCount == 2'048);
+    CHECK(!msplat::tileIntersectionLayoutNeedsRadixScratch(bitonicBoundary));
+
+    const uint32_t radixBoundaryCounts[] = {2'049};
+    int32_t radixBoundaryOffsets[1] = {};
+    const auto radixBoundary = msplat::buildTileIntersectionLayout(
+        radixBoundaryCounts, radixBoundaryOffsets, 1);
+    CHECK(radixBoundary.maximumTileCount == 2'049);
+    CHECK(msplat::tileIntersectionLayoutNeedsRadixScratch(radixBoundary));
 
     const msplat::TileIntersectionLayout workLimitBoundary{
         65'536, 65'536, 0};
@@ -137,6 +153,9 @@ int main() {
     }
     CHECK(arenaOverflowRejected);
 
+    CHECK(msplat::kExactBitonicFastPath == 2'048);
+    CHECK(msplat::kExactRadixScratchBytesPerEntry == 8);
+    CHECK(msplat::kExactBitonicOnlyIntersectionBytesPerEntry == 44);
     CHECK(msplat::kExactIntersectionBytesPerEntry == 52);
     CHECK(msplat::kExactTileMetadataBytes == 16);
     CHECK(msplat::tileRasterChunkCount(1, 0) == 1);
