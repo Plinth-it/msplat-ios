@@ -42,7 +42,7 @@ Options:
   --timeout <seconds>      Per-variant launch timeout (default: 1800).
   --results-dir <path>     Output directory. Default:
                            build/ios-benchmarks/<UTC timestamp>.
-  --only <label>           Run one matrix label instead of all seven.
+  --only <label>           Run one matrix label instead of all eight.
   --profile-stages         Enable per-stage Metal timestamp logging; requires
                            at least 500 total iterations.
   -h, --help               Show this help.
@@ -57,14 +57,14 @@ Prerequisites:
     identifies a dataset staged in the app's Documents directory.
 
 The app is built and installed once, then these isolated variants run:
-  baseline, arena-retry, difference-retry, packed, staged-ssim, raster-16x8,
-  raster-16x16
+  baseline, difference, arena-retry, difference-retry, packed, staged-ssim,
+  raster-16x8, raster-16x16
 
 Every run writes a console log and devicectl JSON result. Successful benchmark
 summaries are appended to results.jsonl; runs.tsv records every run's status.
 The script never removes app data and never sends a broad process kill.
 
-The seven-run matrix is exploratory because its fixed order does not control
+The eight-run matrix is exploratory because its fixed order does not control
 device thermals. Before promoting a candidate, use --only with fresh result
 directories for a baseline/candidate/baseline comparison from matched states.
 USAGE
@@ -153,7 +153,7 @@ if (( PROFILE_STAGES_ENABLED &&
     die "--profile-stages requires at least 500 total iterations"
 fi
 case "$ONLY_VARIANT" in
-    ""|baseline|arena-retry|difference-retry|packed|staged-ssim|raster-16x8|raster-16x16) ;;
+    ""|baseline|difference|arena-retry|difference-retry|packed|staged-ssim|raster-16x8|raster-16x16) ;;
     *) die "unknown benchmark label: $ONLY_VARIANT" ;;
 esac
 
@@ -388,11 +388,13 @@ run_variant() {
 }
 
 # Each experiment changes only the named optimization from the explicit
-# baseline. Retry requires GPU-owned layout metadata; the separate
-# difference-retry row measures the exact difference-grid counter on that same
-# transactional path.
+# baseline. The difference row isolates the exact difference-grid counter while
+# retaining CPU layout and exact arena sizing. Retry requires GPU-owned layout
+# metadata; difference-retry measures the same counter on that transactional
+# path.
 CONFIGURATIONS=(
     'baseline|enumerated|cpu|exact|gather|fused|8x8'
+    'difference|difference|cpu|exact|gather|fused|8x8'
     'arena-retry|enumerated|gpu|retry|gather|fused|8x8'
     'difference-retry|difference|gpu|retry|gather|fused|8x8'
     'packed|enumerated|cpu|exact|packed|fused|8x8'
@@ -426,5 +428,5 @@ fi
 if [[ -n "$ONLY_VARIANT" ]]; then
     echo "Benchmark variant '$ONLY_VARIANT' completed successfully."
 else
-    echo "All seven benchmark variants completed successfully."
+    echo "All eight benchmark variants completed successfully."
 fi
