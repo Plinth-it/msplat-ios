@@ -257,7 +257,9 @@ poses.
   default; transparent mode adds full-frame alpha supervision without changing
   the locked `MsplatConfig` layout or any earlier entry point.
 - ABI v12 detailed count-barrier and tile-distribution telemetry through a new
-  query structure; the ABI v4 telemetry layout and entry point remain unchanged.
+  query structure; its reserved tail word now reports the optional intra-step
+  GPU queue gap without changing either ABI layout. The ABI v4 telemetry layout
+  and entry point remain unchanged.
 - ABI v13 GPU-native preview submission through an immutable BGRA8Unorm Metal
   surface; existing CPU render entry points remain available.
 - ABI v14 instance-scoped training-target prefetch exposed through Swift
@@ -433,11 +435,15 @@ descriptors may name different iterations. A completed descriptor is published
 only after every command buffer in that logical step succeeds;
 `gpuExecutionMs` sums their Metal GPU intervals, while `endToEndMs` is
 completion-observed wall latency, including queueing, completion-handler
-scheduling, and any required synchronous readbacks. ABI v12 additionally
-reports image preparation, exact-count GPU and wall-wait time, post-count CPU
-encoding, intersection-arena growth, the exact intersection count, maximum
-tile population, and trivial/small/medium/large tile counts. This makes the
-per-step count barrier measurable without enabling the heavier stage profiler.
+scheduling, and any required synchronous readbacks. `queueIdleMs` merges any
+overlapping command-buffer intervals and reports the uncovered gaps between
+them. It therefore measures intra-step GPU queue bubbles, including retry gaps,
+but not backlog before the step's first GPU interval or latency after its last.
+ABI v12 additionally reports image preparation, exact-count GPU and wall-wait
+time, post-count CPU encoding, intersection-arena growth, the exact intersection
+count, maximum tile population, and trivial/small/medium/large tile counts. This
+makes the per-step count barrier measurable without enabling the heavier stage
+profiler.
 When `PROFILE_STAGES=1` is enabled, exact-intersection work is reported as
 separate `proj_layout_validate`, `scatter_sort_finalize`, and `pack` stages so
 retry preflight cost is not folded into the asynchronous training tail.

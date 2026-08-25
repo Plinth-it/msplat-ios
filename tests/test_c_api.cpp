@@ -25,6 +25,7 @@
 static_assert(MSPLAT_ABI_VERSION == 14u);
 static_assert(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS == (1u << 0));
 static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS == (1u << 1));
+static_assert(MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID == (1u << 7));
 static_assert((MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS &
                MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) == 0u);
 static_assert(sizeof(MsplatConfig) == 76);
@@ -64,7 +65,7 @@ static_assert(offsetof(MsplatCompletedTrainingStepV12, imagePrepareMs) == 64);
 static_assert(offsetof(MsplatCompletedTrainingStepV12, countGpuMs) == 68);
 static_assert(offsetof(MsplatCompletedTrainingStepV12, maximumTileCount) == 84);
 static_assert(offsetof(MsplatCompletedTrainingStepV12, largeTileCount) == 104);
-static_assert(offsetof(MsplatCompletedTrainingStepV12, reservedV12) == 108);
+static_assert(offsetof(MsplatCompletedTrainingStepV12, queueIdleMs) == 108);
 static_assert(std::is_standard_layout<MsplatTrainingMetricsV12>::value);
 static_assert(sizeof(MsplatTrainingMetricsV12) == 184);
 static_assert(alignof(MsplatTrainingMetricsV12) == 8);

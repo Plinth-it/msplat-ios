@@ -6,8 +6,13 @@ file(READ "${MSPLAT_SOURCE_DIR}/core/metal/msplat_metal.metal" metal_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/metal/msplat_metal.mm" host_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/include/intersection_layout.hpp"
     layout_header)
+file(READ "${MSPLAT_SOURCE_DIR}/core/include/msplat_c_api.h" c_api_header)
 file(READ "${MSPLAT_SOURCE_DIR}/core/src/model.cpp" model_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/src/msplat_api.mm" api_source)
+file(READ "${MSPLAT_SOURCE_DIR}/swift/Sources/Msplat/TrainingStats.swift"
+    swift_training_stats)
+file(READ "${MSPLAT_SOURCE_DIR}/examples/ios/MsplatExample/TrainingBenchmark.swift"
+    benchmark_source)
 file(READ "${MSPLAT_SOURCE_DIR}/tests/test_transparent_training.mm"
     retry_fixture_source)
 file(READ "${MSPLAT_SOURCE_DIR}/CMakeLists.txt" cmake_source)
@@ -755,6 +760,54 @@ require_absent("${logical_step_telemetry}"
     "countWaitWallMs = metrics.waitWallMs;"
     "overwriting count-wait telemetry")
 
+# Queue-idle telemetry is the union gap between this logical step's completed
+# GPU command-buffer intervals. It includes retry attempts but excludes backlog
+# before the first interval and latency after the final interval.
+require_contains("${logical_step_telemetry}"
+    "gpuIntervals[gpuIntervalCount++] ="
+    "per-command-buffer GPU interval capture")
+require_contains("${logical_step_telemetry}"
+    "gpuIntervalCount != commandBufferCount"
+    "complete GPU interval coverage gate")
+require_contains("${logical_step_telemetry}"
+    "std::sort("
+    "unordered completion interval sort")
+require_ordered("${logical_step_telemetry}"
+    "if (interval.first > mergedEnd) {"
+    "queueIdleMs += interval.first - mergedEnd;"
+    "positive uncovered interval accumulation")
+require_contains("${logical_step_telemetry}"
+    "mergedEnd = std::max(mergedEnd, interval.second);"
+    "overlapping GPU interval merge")
+require_contains("${logical_step_telemetry}"
+    "queueIdleMs *= 1000.0;"
+    "queue-idle seconds-to-milliseconds conversion")
+require_ordered("${completed_telemetry}"
+    "calculateQueueIdleMsLocked(completed.queueIdleMs)"
+    "telemetry->publishCompleted("
+    "queue-idle calculation before completion publication")
+require_contains("${host_source}"
+    "MSPLAT_TRAINING_TELEMETRY_QUEUE_IDLE_TIMING_VALID"
+    "queue-idle native validity propagation")
+require_contains("${c_api_header}"
+    "MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID (1u << 7)"
+    "queue-idle public validity bit")
+require_contains("${c_api_header}"
+    "float queueIdleMs;"
+    "queue-idle ABI v12 reserved slot")
+require_contains("${api_source}"
+    "destination.queueIdleMs = completed.queueIdleMs;"
+    "queue-idle C API export")
+require_contains("${swift_training_stats}"
+    "MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID"
+    "queue-idle Swift optional mapping")
+require_contains("${benchmark_source}"
+    "let queueIdleMs: TrainingBenchmarkDistribution?"
+    "queue-idle benchmark distribution")
+require_contains("${benchmark_source}"
+    "schemaVersion: 3"
+    "queue-idle benchmark schema bump")
+
 # The macOS Metal fixture deterministically warms a small arena, exercises a
 # direct 5,000-Gaussian retry without telemetry, then submits a 10,000-Gaussian
 # logical step. It proves rejected attempts are no-ops, each replay succeeds
@@ -785,6 +838,12 @@ require_contains("${retry_fixture}"
 require_contains("${retry_fixture}"
     "CHECK(retried.commandBufferCount == 3u);"
     "failed and successful preflights plus queued post-count work")
+require_contains("${retry_fixture}"
+    "CHECK(retried.queueIdleTimeValid);"
+    "multi-command-buffer queue-idle validity")
+require_contains("${retry_fixture}"
+    "CHECK(retried.queueIdleMs >= 0.0);"
+    "nonnegative retry queue-idle runtime value")
 require_contains("${retry_fixture}"
     "CHECK(retried.overflowedStepCount == 1u);"
     "aggregate recovered-overflow count")

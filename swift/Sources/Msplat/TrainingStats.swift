@@ -91,6 +91,10 @@ public struct CompletedTrainingStep: Sendable, Equatable {
     /// Wall time spent waiting for the exact-count command buffer. This also
     /// exposes queue drain latency ahead of the count pass.
     public let countWaitWallMs: Float
+    /// Uncovered time between this logical step's Metal command-buffer GPU
+    /// intervals. This excludes backlog before the first interval and latency
+    /// after the final interval.
+    public let queueIdleMs: Float?
     /// CPU time used to encode the stages after exact-count readback.
     public let postCountEncodeMs: Float
     /// CPU time spent growing the exact-intersection arena, or zero when reused.
@@ -131,6 +135,9 @@ public struct CompletedTrainingStep: Sendable, Equatable {
             flags & UInt32(MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID) != 0
             ? c.countGpuMs : nil
         countWaitWallMs = c.countWaitWallMs
+        queueIdleMs =
+            flags & UInt32(MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID) != 0
+            ? c.queueIdleMs : nil
         postCountEncodeMs = c.postCountEncodeMs
         intersectionArenaGrowMs = c.intersectionArenaGrowMs
         maximumTileCount = Int(c.maximumTileCount)

@@ -254,6 +254,7 @@ struct ContentView: View {
                 LabeledContent("CPU submit", value: duration(session.cpuSubmitMs))
                 LabeledContent("Image prepare", value: duration(session.imagePrepareMs))
                 LabeledContent("GPU execute", value: duration(session.gpuExecutionMs))
+                LabeledContent("GPU gap", value: duration(session.queueIdleMs))
                 LabeledContent("End to end", value: duration(session.endToEndMs))
                 LabeledContent("Loss", value: session.loss.map {
                     String(format: "%.5f", $0)

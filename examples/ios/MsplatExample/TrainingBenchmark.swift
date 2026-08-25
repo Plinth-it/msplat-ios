@@ -131,6 +131,7 @@ struct TrainingBenchmarkSample: Codable, Sendable {
     let cpuSubmitMs: Float
     let imagePrepareMs: Float
     let gpuExecutionMs: Float?
+    let queueIdleMs: Float?
     let endToEndMs: Float
     let countGpuMs: Float?
     let countWaitWallMs: Float
@@ -169,6 +170,7 @@ struct TrainingBenchmarkSample: Codable, Sendable {
         cpuSubmitMs = completed.cpuSubmitMs
         imagePrepareMs = completed.imagePrepareMs
         gpuExecutionMs = completed.gpuExecutionMs
+        queueIdleMs = completed.queueIdleMs
         endToEndMs = completed.endToEndMs
         countGpuMs = completed.countGpuMs
         countWaitWallMs = completed.countWaitWallMs
@@ -220,6 +222,7 @@ struct TrainingBenchmarkDistributions: Codable, Sendable {
     let cpuSubmitMs: TrainingBenchmarkDistribution?
     let imagePrepareMs: TrainingBenchmarkDistribution?
     let gpuExecutionMs: TrainingBenchmarkDistribution?
+    let queueIdleMs: TrainingBenchmarkDistribution?
     let endToEndMs: TrainingBenchmarkDistribution?
     let countGpuMs: TrainingBenchmarkDistribution?
     let countWaitWallMs: TrainingBenchmarkDistribution?
@@ -235,6 +238,7 @@ struct TrainingBenchmarkDistributions: Codable, Sendable {
         cpuSubmitMs = Self.distribution(samples.map { Double($0.cpuSubmitMs) })
         imagePrepareMs = Self.distribution(samples.map { Double($0.imagePrepareMs) })
         gpuExecutionMs = Self.distribution(samples.compactMap { $0.gpuExecutionMs.map(Double.init) })
+        queueIdleMs = Self.distribution(samples.compactMap { $0.queueIdleMs.map(Double.init) })
         endToEndMs = Self.distribution(samples.map { Double($0.endToEndMs) })
         countGpuMs = Self.distribution(samples.compactMap { $0.countGpuMs.map(Double.init) })
         countWaitWallMs = Self.distribution(samples.map { Double($0.countWaitWallMs) })
@@ -433,7 +437,7 @@ struct TrainingBenchmarkRecorder {
             missingMeasuredIterations: Array(missingIterations)
         )
         let report = TrainingBenchmarkReport(
-            schemaVersion: 2,
+            schemaVersion: 3,
             startedAt: startedAt,
             finishedAt: finishedAt,
             datasetName: datasetName,

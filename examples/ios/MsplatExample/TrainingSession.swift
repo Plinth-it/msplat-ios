@@ -45,6 +45,7 @@ final class TrainingSession: ObservableObject {
     @Published private(set) var cpuSubmitMs: Float = 0
     @Published private(set) var imagePrepareMs: Float = 0
     @Published private(set) var gpuExecutionMs: Float?
+    @Published private(set) var queueIdleMs: Float?
     @Published private(set) var endToEndMs: Float?
     @Published private(set) var loss: Float?
     @Published private(set) var effectiveWidth = 0
@@ -136,6 +137,7 @@ final class TrainingSession: ObservableObject {
         cpuSubmitMs = 0
         imagePrepareMs = 0
         gpuExecutionMs = nil
+        queueIdleMs = nil
         endToEndMs = nil
         loss = nil
         effectiveWidth = 0
@@ -579,6 +581,7 @@ final class TrainingSession: ObservableObject {
             modelCapacity = completed.modelCapacity
             imagePrepareMs = completed.imagePrepareMs
             gpuExecutionMs = completed.gpuExecutionMs
+            queueIdleMs = completed.queueIdleMs
             endToEndMs = completed.endToEndMs
             loss = completed.loss
             effectiveWidth = completed.effectiveWidth

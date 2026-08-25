@@ -663,6 +663,8 @@ TrainingMetrics Trainer::metrics() const {
     metrics.hasFailedStep = snapshot.flags & MSPLAT_TRAINING_TELEMETRY_HAS_FAILED;
     metrics.countGpuTimeValid =
         snapshot.flags & MSPLAT_TRAINING_TELEMETRY_COUNT_GPU_TIMING_VALID;
+    metrics.queueIdleTimeValid =
+        snapshot.flags & MSPLAT_TRAINING_TELEMETRY_QUEUE_IDLE_TIMING_VALID;
 
     auto copyDescriptor = [](const MsplatTrainingStepDescriptor& source,
                              SubmittedTrainingStep& destination) {
@@ -695,6 +697,8 @@ TrainingMetrics Trainer::metrics() const {
         static_cast<float>(snapshot.completedStep.countGpuMs);
     metrics.completed.countWaitWallMs =
         static_cast<float>(snapshot.completedStep.countWaitWallMs);
+    metrics.completed.queueIdleMs =
+        static_cast<float>(snapshot.completedStep.queueIdleMs);
     metrics.completed.postCountEncodeMs =
         static_cast<float>(snapshot.completedStep.postCountEncodeMs);
     metrics.completed.intersectionArenaGrowMs =
@@ -1942,6 +1946,10 @@ MsplatStatus msplat_trainer_metrics_v12(
             outMetrics->flags |=
                 MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID;
         }
+        if (metrics.queueIdleTimeValid) {
+            outMetrics->flags |=
+                MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID;
+        }
 
         auto copySubmitted = [](const msplat::SubmittedTrainingStep& source,
                                 MsplatSubmittedTrainingStep& destination) {
@@ -1983,6 +1991,7 @@ MsplatStatus msplat_trainer_metrics_v12(
         destination.smallTileCount = completed.smallTileCount;
         destination.mediumTileCount = completed.mediumTileCount;
         destination.largeTileCount = completed.largeTileCount;
+        destination.queueIdleMs = completed.queueIdleMs;
 
         outMetrics->overflowedCompletedSteps = metrics.overflowedCompletedSteps;
         outMetrics->tileCapOverflowedSteps = metrics.tileCapOverflowedSteps;

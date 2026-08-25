@@ -62,6 +62,7 @@ enum MsplatTrainingTelemetryFlag : uint32_t {
     MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID = 1u << 4,
     MSPLAT_TRAINING_TELEMETRY_HAS_FAILED = 1u << 5,
     MSPLAT_TRAINING_TELEMETRY_COUNT_GPU_TIMING_VALID = 1u << 6,
+    MSPLAT_TRAINING_TELEMETRY_QUEUE_IDLE_TIMING_VALID = 1u << 7,
 };
 
 struct MsplatTrainingStepDescriptor {
@@ -87,6 +88,7 @@ struct MsplatCompletedTrainingStepMetrics {
     double imagePrepareMs = 0.0;
     double countGpuMs = 0.0;
     double countWaitWallMs = 0.0;
+    double queueIdleMs = 0.0;
     double postCountEncodeMs = 0.0;
     double intersectionArenaGrowMs = 0.0;
     uint32_t maximumTileCount = 0;

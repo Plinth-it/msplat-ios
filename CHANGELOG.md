@@ -118,6 +118,10 @@
   now measures its synchronized preflight separately from the queued training
   tail, owns timestamp storage per logical step, and converts GPU ticks using
   paired CPU/GPU samples rather than the CPU Mach timebase.
+- Added optional ABI v12 `queueIdleMs` telemetry in its reserved tail word,
+  without changing the structure size or ABI version. It merges overlapping
+  Metal command-buffer intervals and reports only the uncovered intra-step gaps;
+  Swift, MsplatExample, and benchmark schema v3 expose the same value.
 - Made retry-attempt results step-owned. Status, all ten checked GPU-layout
   metadata words, and the final inclusive offset are captured after
   scatter/sort finalization, so capacity retries and completed tile telemetry

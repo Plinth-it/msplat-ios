@@ -198,6 +198,7 @@ typedef struct {
 #define MSPLAT_TRAINING_METRICS_INTERSECTIONS_VALID (1u << 4)
 #define MSPLAT_TRAINING_METRICS_HAS_FAILED_STEP    (1u << 5)
 #define MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID (1u << 6)
+#define MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID (1u << 7)
 
 // Bit values for MsplatCompletedTrainingStep.overflowKinds.
 #define MSPLAT_RASTER_OVERFLOW_TILE_CAP        (1u << 0)
@@ -276,7 +277,7 @@ typedef struct {
     uint32_t smallTileCount;
     uint32_t mediumTileCount;
     uint32_t largeTileCount;
-    uint32_t reservedV12;
+    float queueIdleMs;
 } MsplatCompletedTrainingStepV12;
 
 /// ABI v12 query snapshot. The v4 query remains available for existing clients.

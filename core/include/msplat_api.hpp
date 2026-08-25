@@ -84,6 +84,7 @@ struct CompletedTrainingStep : SubmittedTrainingStep {
     float imagePrepareMs = 0.0f;
     float countGpuMs = 0.0f;
     float countWaitWallMs = 0.0f;
+    float queueIdleMs = 0.0f;
     float postCountEncodeMs = 0.0f;
     float intersectionArenaGrowMs = 0.0f;
     uint32_t maximumTileCount = 0;
@@ -102,6 +103,7 @@ struct TrainingMetrics {
     bool intersectionsValid = false;
     bool hasFailedStep = false;
     bool countGpuTimeValid = false;
+    bool queueIdleTimeValid = false;
     SubmittedTrainingStep submitted;
     CompletedTrainingStep completed;
     uint64_t overflowedCompletedSteps = 0;

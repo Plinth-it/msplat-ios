@@ -141,6 +141,7 @@ final class MsplatTests: XCTestCase {
             | UInt32(MSPLAT_TRAINING_METRICS_LOSS_VALID)
             | UInt32(MSPLAT_TRAINING_METRICS_INTERSECTIONS_VALID)
             | UInt32(MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID)
+            | UInt32(MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID)
         native.submitted.iteration = 12
         native.submitted.splatCount = 120
         native.submitted.modelCapacity = 150
@@ -165,6 +166,7 @@ final class MsplatTests: XCTestCase {
         native.completed.imagePrepareMs = 2.25
         native.completed.countGpuMs = 3.5
         native.completed.countWaitWallMs = 6.75
+        native.completed.queueIdleMs = 1.75
         native.completed.postCountEncodeMs = 0.5
         native.completed.intersectionArenaGrowMs = 0.25
         native.completed.maximumTileCount = 2_049
@@ -197,6 +199,7 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(telemetry.completed?.imagePrepareMs, 2.25)
         XCTAssertEqual(telemetry.completed?.countGpuMs, 3.5)
         XCTAssertEqual(telemetry.completed?.countWaitWallMs, 6.75)
+        XCTAssertEqual(telemetry.completed?.queueIdleMs, 1.75)
         XCTAssertEqual(telemetry.completed?.postCountEncodeMs, 0.5)
         XCTAssertEqual(telemetry.completed?.intersectionArenaGrowMs, 0.25)
         XCTAssertEqual(telemetry.completed?.maximumTileCount, 2_049)
@@ -214,6 +217,7 @@ final class MsplatTests: XCTestCase {
         native.completed.iteration = 7
         native.completed.gpuExecutionMs = 99
         native.completed.loss = 99
+        native.completed.queueIdleMs = 99
 
         var telemetry = TrainingTelemetry(from: native)
         XCTAssertNil(telemetry.submitted)
@@ -225,11 +229,18 @@ final class MsplatTests: XCTestCase {
         XCTAssertNil(telemetry.completed?.gpuExecutionMs)
         XCTAssertNil(telemetry.completed?.loss)
         XCTAssertNil(telemetry.completed?.countGpuMs)
+        XCTAssertNil(telemetry.completed?.queueIdleMs)
 
         native.flags |= UInt32(MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID)
         native.completed.countGpuMs = 4.5
         telemetry = TrainingTelemetry(from: native)
         XCTAssertEqual(telemetry.completed?.countGpuMs, 4.5)
+        XCTAssertNil(telemetry.completed?.queueIdleMs)
+
+        native.flags |= UInt32(MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID)
+        native.completed.queueIdleMs = 1.25
+        telemetry = TrainingTelemetry(from: native)
+        XCTAssertEqual(telemetry.completed?.queueIdleMs, 1.25)
     }
 
     func testTrainingMemoryConversionPreservesCountsAndValidity() {
@@ -296,6 +307,9 @@ final class MsplatTests: XCTestCase {
         XCTAssertGreaterThan(completed.maximumTileCount, 0)
         XCTAssertGreaterThanOrEqual(completed.imagePrepareMs, 0)
         XCTAssertGreaterThanOrEqual(completed.countWaitWallMs, 0)
+        if let queueIdleMs = completed.queueIdleMs {
+            XCTAssertGreaterThanOrEqual(queueIdleMs, 0)
+        }
         XCTAssertGreaterThanOrEqual(completed.postCountEncodeMs, 0)
         XCTAssertGreaterThanOrEqual(completed.intersectionArenaGrowMs, 0)
         let tileCount = ((completed.effectiveWidth + 15) / 16)

@@ -25,6 +25,7 @@
 #import <random>
 #import <stdexcept>
 #import <string>
+#import <utility>
 #import <vector>
 #import <mach/mach_time.h>
 
@@ -172,7 +173,8 @@ struct MsplatTrainingTelemetryState {
                           const MsplatCompletedTrainingStepMetrics& completed,
                           bool gpuTimingValid, bool lossValid,
                           bool intersectionCountValid,
-                          bool countGpuTimingValid) noexcept {
+                          bool countGpuTimingValid,
+                          bool queueIdleTimingValid) noexcept {
         try {
             std::lock_guard<std::mutex> lock(mutex);
             if (stepGeneration != generation) return;
@@ -203,7 +205,8 @@ struct MsplatTrainingTelemetryState {
                 MSPLAT_TRAINING_TELEMETRY_GPU_TIMING_VALID |
                 MSPLAT_TRAINING_TELEMETRY_LOSS_VALID |
                 MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID |
-                MSPLAT_TRAINING_TELEMETRY_COUNT_GPU_TIMING_VALID);
+                MSPLAT_TRAINING_TELEMETRY_COUNT_GPU_TIMING_VALID |
+                MSPLAT_TRAINING_TELEMETRY_QUEUE_IDLE_TIMING_VALID);
             if (gpuTimingValid)
                 snapshot.flags |= MSPLAT_TRAINING_TELEMETRY_GPU_TIMING_VALID;
             if (lossValid)
@@ -215,6 +218,10 @@ struct MsplatTrainingTelemetryState {
             if (countGpuTimingValid) {
                 snapshot.flags |=
                     MSPLAT_TRAINING_TELEMETRY_COUNT_GPU_TIMING_VALID;
+            }
+            if (queueIdleTimingValid) {
+                snapshot.flags |=
+                    MSPLAT_TRAINING_TELEMETRY_QUEUE_IDLE_TIMING_VALID;
             }
             snapshot.completedStep = completed;
         } catch (...) {
@@ -401,6 +408,12 @@ public:
             } else {
                 gpuExecutionMs +=
                     (gpuEndSeconds - gpuStartSeconds) * 1000.0;
+                if (gpuIntervalCount < gpuIntervals.size()) {
+                    gpuIntervals[gpuIntervalCount++] =
+                        {gpuStartSeconds, gpuEndSeconds};
+                } else {
+                    queueIdleIntervalsValid = false;
+                }
             }
             if (pendingCommandBuffers > 0) --pendingCommandBuffers;
             finishIfReadyLocked();
@@ -453,6 +466,35 @@ public:
     }
 
 private:
+    bool calculateQueueIdleMsLocked(double& queueIdleMs) noexcept {
+        queueIdleMs = 0.0;
+        if (!gpuTimingValid || !queueIdleIntervalsValid ||
+            commandBufferCount == 0 ||
+            gpuIntervalCount != commandBufferCount) {
+            return false;
+        }
+
+        std::sort(
+            gpuIntervals.begin(), gpuIntervals.begin() + gpuIntervalCount,
+            [](const auto& lhs, const auto& rhs) noexcept {
+                return lhs.first < rhs.first;
+            });
+        double mergedEnd = gpuIntervals.front().second;
+        for (size_t index = 1; index < gpuIntervalCount; ++index) {
+            const auto& interval = gpuIntervals[index];
+            if (interval.first > mergedEnd) {
+                queueIdleMs += interval.first - mergedEnd;
+            }
+            mergedEnd = std::max(mergedEnd, interval.second);
+        }
+        queueIdleMs *= 1000.0;
+        if (!std::isfinite(queueIdleMs) || queueIdleMs < 0.0) {
+            queueIdleMs = 0.0;
+            return false;
+        }
+        return true;
+    }
+
     void finishIfReadyLocked() noexcept {
         if (published || pendingCommandBuffers != 0 || (!sealed && !aborted))
             return;
@@ -538,9 +580,12 @@ private:
                 commandBufferCount > 0 && gpuTimingValid;
             if (!completedGpuTimingValid)
                 completed.gpuExecutionMs = 0.0;
+            const bool queueIdleTimingValid =
+                calculateQueueIdleMsLocked(completed.queueIdleMs);
             telemetry->publishCompleted(
                 generation, completed, completedGpuTimingValid, lossValid,
-                intersectionCountValid, countGpuTimingValid);
+                intersectionCountValid, countGpuTimingValid,
+                queueIdleTimingValid);
         }
 
         telemetry->releaseReadback(std::move(readback));
@@ -562,6 +607,12 @@ private:
     double cpuSubmitMs = 0.0;
     double synchronousGpuWaitMs = 0.0;
     double gpuExecutionMs = 0.0;
+    // Current exact and retry paths use at most three roots. Keep additional
+    // headroom for later queue-depth experiments without allocating in a GPU
+    // completion callback; larger future chains simply omit this metric.
+    std::array<std::pair<double, double>, 8> gpuIntervals{};
+    size_t gpuIntervalCount = 0;
+    bool queueIdleIntervalsValid = true;
     double imagePrepareMs = 0.0;
     double countGpuMs = 0.0;
     double countWaitWallMs = 0.0;

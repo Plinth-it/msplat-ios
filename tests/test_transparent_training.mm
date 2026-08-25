@@ -46,6 +46,8 @@ struct StepResult {
     double intersectionArenaGrowMs = 0.0;
     double countGpuMs = 0.0;
     double countWaitWallMs = 0.0;
+    double queueIdleMs = 0.0;
+    bool queueIdleTimeValid = false;
     uint32_t commandBufferCount = 0;
     uint32_t maximumTileCount = 0;
     uint32_t activeTileCount = 0;
@@ -304,6 +306,10 @@ StepResult runStep(bool transparent, float alphaLossWeight,
             snapshot.completedStep.intersectionArenaGrowMs;
         result.countGpuMs = snapshot.completedStep.countGpuMs;
         result.countWaitWallMs = snapshot.completedStep.countWaitWallMs;
+        result.queueIdleMs = snapshot.completedStep.queueIdleMs;
+        result.queueIdleTimeValid =
+            (snapshot.flags &
+             MSPLAT_TRAINING_TELEMETRY_QUEUE_IDLE_TIMING_VALID) != 0;
         result.commandBufferCount =
             snapshot.completedStep.commandBufferCount;
         result.maximumTileCount = snapshot.completedStep.maximumTileCount;
@@ -492,6 +498,9 @@ void checkArenaRetryTransaction() {
     CHECK(retried.countGpuMs >= 0.0);
     CHECK(std::isfinite(retried.countWaitWallMs));
     CHECK(retried.countWaitWallMs >= 0.0);
+    CHECK(retried.queueIdleTimeValid);
+    CHECK(std::isfinite(retried.queueIdleMs));
+    CHECK(retried.queueIdleMs >= 0.0);
     // Failed preflight + successful preflight + asynchronous post-count work.
     CHECK(retried.commandBufferCount == 3u);
     CHECK(retried.maximumTileCount == gaussianCount);
