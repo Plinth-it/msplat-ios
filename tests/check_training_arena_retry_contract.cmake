@@ -78,7 +78,7 @@ extract_section("${count_phase}" "id<MTLBlitCommandEncoder> blit ="
     "[blit endEncoding];" pre_layout_zero)
 extract_section("${training_pipeline}" "auto encode_loss_fwd_bwd ="
     "auto encode_rast_bwd =" loss_and_photometric_host)
-extract_section("${training_pipeline}" "auto encode_sort_pack ="
+extract_section("${training_pipeline}" "auto encode_scatter_sort_finalize ="
     "auto encode_rast_fwd =" sort_pack_host)
 extract_section("${sort_pack_host}"
     "ctx->finalize_tile_intersection_attempt_kernel_cpso"
@@ -88,8 +88,18 @@ extract_section("${training_pipeline}" "auto encode_proj_sh_bwd_adam ="
 extract_section("${training_pipeline}" "auto do_blit_zero ="
     "auto encode_step_readback =" post_layout_zero)
 extract_section("${training_pipeline}"
-    "if (ctx->retry_intersection_attempts) {\n        // Retry mode is deliberately serial for now:"
-    "// Loss is copied into the step's unique readback" retry_retirement)
+    "auto inspectCompletedRetryAttempt ="
+    "auto replaySameLogicalStep =" retry_inspection)
+extract_section("${training_pipeline}"
+    "auto replaySameLogicalStep ="
+    "if (ctx->retry_intersection_attempts) {\n        id<MTLCommandBuffer> commandBuffer ="
+    retry_replay)
+extract_section("${training_pipeline}"
+    "if (ctx->retry_intersection_attempts) {\n        id<MTLCommandBuffer> commandBuffer ="
+    "const auto postCountEncodeStart" retry_preflight)
+extract_section("${training_pipeline}"
+    "const auto postCountEncodeStart"
+    "// Loss is copied into the step's unique readback" post_count_dispatch)
 extract_section("${host_source}" "struct MsplatLogicalTrainingStep {"
     "struct ScopedObjCRelease" logical_step_telemetry)
 extract_section("${logical_step_telemetry}"
@@ -343,7 +353,7 @@ require_ordered("${count_phase}"
     "layout validated before post-count work")
 require_contains("${count_phase}"
     "if (!gpuResidentIntersectionAttempt) {\n            const SynchronousGpuMetrics countPassMetrics = ctx->syncCB();"
-    "exact path retains the count barrier")
+    "bootstrap count barrier")
 require_absent("${post_layout_zero}"
     "fillBuffer:overflow_flag.buffer()"
     "post-layout attempt-status clear")
@@ -454,11 +464,13 @@ require_contains("${terminal_update_host}"
     "ENC_SCALAR(enc, attemptGatingEnabled, 6);"
     "camera-pose attempt-enable binding")
 
-# The public entry point owns one engine lock across every attempt. Retry
-# retirement happens before it can return success. A packed capacity failure
-# grows every resource derived from the completed layout, then replays the exact
-# arguments through the locked helper while the caller's logical-step handle,
-# camera, optimizer candidates, and iteration are still unchanged.
+# The public entry point owns one engine lock across every attempt. GPU-resident
+# retry preflight retires validation, scatter, and sort before raster/backward
+# can mutate persistent state. A packed capacity failure grows every resource
+# derived from the completed layout, then replays the exact arguments through
+# the locked helper while the caller's logical-step handle, camera, optimizer
+# candidates, and iteration are still unchanged. Successful post-count work
+# remains queued so the next step's count validation can pipeline behind it.
 require_ordered("${public_training_wrapper}"
     "std::lock_guard<std::mutex> lock(g_engine_mutex);"
     "return msplat_train_step_locked("
@@ -471,49 +483,78 @@ require_absent("${public_training_wrapper}" "lock.unlock()"
 require_absent("${training_pipeline}"
     "std::lock_guard<std::mutex> lock(g_engine_mutex);"
     "nested locked-helper engine lock")
-require_ordered("${retry_retirement}"
+require_ordered("${retry_preflight}"
+    "encode_scatter_sort_finalize(enc);"
     "ctx->syncCB();"
+    "all status writers complete before retirement")
+require_ordered("${retry_preflight}"
+    "ctx->syncCB();"
+    "const auto completedAttempt = inspectCompletedRetryAttempt();"
+    "preflight completion precedes status readback")
+require_ordered("${retry_preflight}"
+    "const auto completedAttempt = inspectCompletedRetryAttempt();"
+    "return replaySameLogicalStep();"
+    "preflight retry decision precedes replay")
+require_ordered("${retry_inspection}"
     "overflow_flag.data<uint32_t>()[0]"
-    "attempt completion precedes status readback")
-require_ordered("${retry_retirement}"
+    "g_tcache.ensure_intersection_arena("
+    "attempt status readback precedes arena growth")
+require_ordered("${retry_inspection}"
     "MSPLAT_TRAINING_OVERFLOW_TILE_CAP"
     "throw std::length_error("
     "non-growable tile failure is rejected")
-require_ordered("${retry_retirement}"
+require_ordered("${retry_inspection}"
     "MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY"
     "g_tcache.ensure_intersection_arena("
     "packed failure grows the intersection arena")
-require_contains("${retry_retirement}"
+require_contains("${retry_inspection}"
     "g_tcache.ensure_forward_chunks("
     "forward chunk growth")
-require_contains("${retry_retirement}"
+require_contains("${retry_inspection}"
     "g_tcache.ensure_backward_chunks("
     "backward chunk growth")
-require_ordered("${retry_retirement}"
+require_ordered("${retry_inspection}"
     "if (!grew) {"
-    "return msplat_train_step_locked("
-    "non-progress rejection precedes replay")
-require_absent("${retry_retirement}" "lock.unlock()"
+    "return std::make_pair(completedLayout, true);"
+    "non-progress rejection precedes retry result")
+require_absent("${retry_inspection}" "lock.unlock()"
     "inter-attempt engine unlock")
-require_count("${retry_retirement}"
+require_count("${retry_replay}"
     "return msplat_train_step_locked\\(" 1
     "same-step replay calls")
-require_contains("${retry_retirement}"
+require_contains("${retry_replay}"
     "projmat, fx, fy, cx, cy, img_height, img_width, tile_bounds,"
     "same camera and resolution replay")
-require_contains("${retry_retirement}"
+require_contains("${retry_replay}"
     "features_rest, opacities, background, gt, coverage_mask,"
     "same model and target replay")
-require_contains("${retry_retirement}"
+require_contains("${retry_replay}"
     "adam_eps, photometric, pose, collect_densification_stats,"
     "same optimizer and refinement replay")
+require_contains("${retry_preflight}" "do_blit_zero(commandBuffer)"
+    "preflight transient clear")
+require_contains("${retry_preflight}" "encode_scatter_sort_finalize(enc);"
+    "preflight status writers")
+require_absent("${retry_preflight}" "encode_pack("
+    "preflight attribute packing")
+require_absent("${retry_preflight}" "encode_rast_fwd("
+    "preflight raster encoding")
+require_absent("${retry_preflight}" "encode_proj_sh_bwd_adam("
+    "preflight persistent update encoding")
+require_contains("${post_count_dispatch}" "encode_pack(enc);"
+    "asynchronous post-count packing")
+require_absent("${post_count_dispatch}" "ctx->syncCB()"
+    "post-count synchronization")
+require_contains("${host_source}"
+    "if (index == 2 && g_retry_stage_profile.load(std::memory_order_relaxed))\n        return \"pack_only\";"
+    "retry stage profile labels the asynchronous sample as pack-only")
 foreach(forbidden_retry_action IN ITEMS
         msplat_training_step_begin
         msplat_training_step_submit
         schedulersStep
         afterTrain
         advanceCamera)
-    require_absent("${retry_retirement}" "${forbidden_retry_action}"
+    require_absent("${retry_replay}" "${forbidden_retry_action}"
         "retry-side ${forbidden_retry_action}")
 endforeach()
 
@@ -551,21 +592,37 @@ require_ordered("${completed_telemetry}"
     "completed.overflowReasons = recoveredOverflowReasons |"
     "telemetry->publishCompleted("
     "recovered overflow published with the completed step")
-require_ordered("${retry_retirement}"
+require_ordered("${retry_inspection}"
     "const auto retryGrowStart = TelemetryClock::now();"
     "g_tcache.ensure_intersection_arena("
     "retry grow timing begins before allocation")
-require_ordered("${retry_retirement}"
+require_ordered("${retry_inspection}"
     "g_tcache.ensure_backward_chunks("
     "const auto retryGrowEnd = TelemetryClock::now();"
     "retry grow timing ends after all allocations")
-require_ordered("${retry_retirement}"
+require_ordered("${retry_inspection}"
     "logicalStep->recordRecoveredIntersectionRetry("
-    "return msplat_train_step_locked("
-    "recovered telemetry recorded before replay")
-require_contains("${retry_retirement}"
+    "return std::make_pair(completedLayout, true);"
+    "recovered telemetry recorded before retry result")
+require_contains("${retry_inspection}"
     "attemptFailures,\n                    elapsedMilliseconds(retryGrowStart, retryGrowEnd)"
     "recovered reason and grow-duration recording")
+require_ordered("${training_pipeline}"
+    "logicalStep->recordIntersectionLayout("
+    "const auto postCountEncodeStart"
+    "successful preflight telemetry precedes post-count encoding")
+
+# Multiple count validations can belong to one recovered logical step. Their
+# timing must accumulate rather than report only the replay's final pass.
+require_contains("${logical_step_telemetry}"
+    "countWaitWallMs += metrics.waitWallMs;"
+    "count-wait accumulation")
+require_contains("${logical_step_telemetry}"
+    "countGpuMs += metrics.gpuExecutionMs;"
+    "count-GPU accumulation")
+require_absent("${logical_step_telemetry}"
+    "countWaitWallMs = metrics.waitWallMs;"
+    "overwriting count-wait telemetry")
 
 # The macOS Metal fixture deterministically warms a small arena, then submits a
 # 5,000-Gaussian single-tile step. It proves the rejected attempt is a no-op,
@@ -594,6 +651,9 @@ require_contains("${retry_fixture}"
     "CHECK(retried.intersectionArenaGrowMs >= 0.0);"
     "nonnegative recovered grow telemetry")
 require_contains("${retry_fixture}"
+    "CHECK(retried.commandBufferCount == 3u);"
+    "failed and successful preflights plus queued post-count work")
+require_contains("${retry_fixture}"
     "CHECK(retried.overflowedStepCount == 1u);"
     "aggregate recovered-overflow count")
 require_contains("${retry_fixture}"
@@ -614,6 +674,9 @@ require_contains("${cmake_source}"
 require_contains("${cmake_source}"
     "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry"
     "forced-retry fixture environment")
+require_contains("${cmake_source}"
+    "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TRAINING_ARENA_MODE=retry"
+    "device-matching difference/retry fixture environment")
 
 # CPU optimizer counters are candidate values while the Metal attempt is being
 # encoded. They become persistent only after msplat_train_step has accepted the

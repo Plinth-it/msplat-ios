@@ -44,6 +44,9 @@ struct StepResult {
     uint64_t retainedIntersectionCount = 0;
     uint64_t intersectionCapacity = 0;
     double intersectionArenaGrowMs = 0.0;
+    double countGpuMs = 0.0;
+    double countWaitWallMs = 0.0;
+    uint32_t commandBufferCount = 0;
     uint32_t maximumTileCount = 0;
     uint64_t overflowedStepCount = 0;
     uint64_t tileCapOverflowedStepCount = 0;
@@ -292,6 +295,10 @@ StepResult runStep(bool transparent, float alphaLossWeight,
             snapshot.completedStep.packedIntersectionCapacity;
         result.intersectionArenaGrowMs =
             snapshot.completedStep.intersectionArenaGrowMs;
+        result.countGpuMs = snapshot.completedStep.countGpuMs;
+        result.countWaitWallMs = snapshot.completedStep.countWaitWallMs;
+        result.commandBufferCount =
+            snapshot.completedStep.commandBufferCount;
         result.maximumTileCount = snapshot.completedStep.maximumTileCount;
         result.overflowedStepCount = snapshot.overflowedStepCount;
         result.tileCapOverflowedStepCount =
@@ -460,6 +467,12 @@ void checkArenaRetryTransaction() {
           retried.retainedIntersectionCount);
     CHECK(std::isfinite(retried.intersectionArenaGrowMs));
     CHECK(retried.intersectionArenaGrowMs >= 0.0);
+    CHECK(std::isfinite(retried.countGpuMs));
+    CHECK(retried.countGpuMs >= 0.0);
+    CHECK(std::isfinite(retried.countWaitWallMs));
+    CHECK(retried.countWaitWallMs >= 0.0);
+    // Failed preflight + successful preflight + asynchronous post-count work.
+    CHECK(retried.commandBufferCount == 3u);
     CHECK(retried.maximumTileCount == gaussianCount);
     CHECK(retried.overflowedStepCount == 1u);
     CHECK(retried.tileCapOverflowedStepCount == 0u);

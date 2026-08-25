@@ -46,6 +46,13 @@ static const char* g_train_stage_names[] = {
     "loss_fwd_bwd", "rast_bwd", "proj_sh_bwd_adam"
 };
 static constexpr int N_TRAIN_STAGES = 7;
+static std::atomic<bool> g_retry_stage_profile{false};
+
+static const char* trainingStageName(int index) {
+    if (index == 2 && g_retry_stage_profile.load(std::memory_order_relaxed))
+        return "pack_only";
+    return g_train_stage_names[index];
+}
 
 static std::mutex g_stage_timing_mutex;
 // Per-stage accumulated times (ms), indexed by stage
@@ -253,9 +260,13 @@ struct MsplatLogicalTrainingStep {
     void recordExactCountPass(const SynchronousGpuMetrics& metrics) {
         std::lock_guard<std::mutex> lock(mutex);
         if (sealed || aborted) return;
-        countWaitWallMs = metrics.waitWallMs;
-        countGpuMs = metrics.gpuTimingValid ? metrics.gpuExecutionMs : 0.0;
-        countGpuTimingValid = metrics.gpuTimingValid;
+        countWaitWallMs += metrics.waitWallMs;
+        if (metrics.gpuTimingValid)
+            countGpuMs += metrics.gpuExecutionMs;
+        countGpuTimingValid = countGpuTimingRecorded
+            ? countGpuTimingValid && metrics.gpuTimingValid
+            : metrics.gpuTimingValid;
+        countGpuTimingRecorded = true;
     }
 
     void recordIntersectionLayout(
@@ -488,6 +499,7 @@ private:
     bool cpuStarted = false;
     bool gpuTimingValid = true;
     bool countGpuTimingValid = false;
+    bool countGpuTimingRecorded = false;
     bool readbackEncoded = false;
     bool commandBufferFailed = false;
     bool sealed = false;
@@ -1167,6 +1179,8 @@ MetalContext* init_msplat_metal_context() {
                 "msplat: MSPLAT_TRAINING_ARENA_MODE must be exact or retry");
         }
     }
+    g_retry_stage_profile.store(
+        ctx->retry_intersection_attempts, std::memory_order_relaxed);
 
     const char* ssimModeOverride = std::getenv("MSPLAT_SSIM_MODE");
     if (ssimModeOverride) {
@@ -1754,7 +1768,7 @@ void msplat_drain_stage_times(std::vector<double> stage_times[], int max_stages,
     for (int i = 0; i < n_stages; i++) {
         stage_times[i] = std::move(g_stage_times[i]);
         g_stage_times[i].clear();
-        stage_names[i] = g_train_stage_names[i];
+        stage_names[i] = trainingStageName(i);
     }
 }
 
@@ -3249,7 +3263,8 @@ static MTensor msplat_train_step_locked(
     uint32_t bwd_K_max = K_max;
     constexpr uint32_t BWD_CHUNK_SIZE = 512;
 
-    auto encode_sort_pack = [&](id<MTLComputeCommandEncoder> enc) {
+    auto encode_scatter_sort_finalize =
+        [&](id<MTLComputeCommandEncoder> enc) {
         NSUInteger scatterTpg = MIN(
             ctx->scatter_to_exact_bins_kernel_cpso.maxTotalThreadsPerThreadgroup,
             static_cast<NSUInteger>(num_points));
@@ -3347,7 +3362,13 @@ static MTensor msplat_train_step_locked(
             }
         }
 
-        if (ctx->gather_intersection_attributes) return;
+    };
+
+    auto encode_pack = [&](id<MTLComputeCommandEncoder> enc) {
+        if (ctx->gather_intersection_attributes ||
+            (!gpuResidentIntersectionAttempt && total_intersections == 0u)) {
+            return;
+        }
         const NSUInteger packTpg = gpuResidentIntersectionAttempt
             ? ctx->pack_sorted_gaussians_kernel_cpso
                 .maxTotalThreadsPerThreadgroup
@@ -3772,6 +3793,127 @@ static MTensor msplat_train_step_locked(
         return true;
     };
 
+    auto inspectCompletedRetryAttempt = [&]() {
+        const msplat::TileIntersectionLayout completedLayout =
+            completed_gpu_tile_intersection_layout(num_tiles);
+        msplat::validateTileIntersectionWorkLimit(completedLayout);
+
+        constexpr uint32_t knownAttemptFailures =
+            MSPLAT_TRAINING_OVERFLOW_TILE_CAP |
+            MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY;
+        const uint32_t attemptFailures =
+            overflow_flag.data<uint32_t>()[0];
+        if ((attemptFailures & ~knownAttemptFailures) != 0u) {
+            throw std::runtime_error(
+                "GPU intersection attempt reported an unknown failure");
+        }
+        if ((attemptFailures & MSPLAT_TRAINING_OVERFLOW_TILE_CAP) != 0u) {
+            // Layout errors and the bounded per-tile work limit are not fixed
+            // by retaining a larger arena.
+            throw std::length_error(
+                "GPU intersection attempt exceeds the exact-sort work limit");
+        }
+
+        if ((attemptFailures &
+             MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY) != 0u) {
+            const auto retryGrowStart = TelemetryClock::now();
+            const bool needsRadixScratch =
+                msplat::tileIntersectionLayoutNeedsRadixScratch(
+                    completedLayout);
+            bool grew = g_tcache.ensure_intersection_arena(
+                completedLayout.totalCount, needsRadixScratch,
+                !ctx->gather_intersection_attributes, ctx->device);
+
+            const uint32_t requiredChunkCount =
+                msplat::tileRasterChunkCount(
+                    static_cast<uint32_t>(num_tiles),
+                    completedLayout.maximumTileCount, CHUNK_SIZE);
+            const int previousForwardChunkCount =
+                g_tcache.forward_chunk_K_max;
+            const int previousBackwardChunkCount =
+                g_tcache.backward_chunk_K_max;
+            g_tcache.ensure_forward_chunks(
+                requiredChunkCount, img_height, img_width, ctx->device);
+            g_tcache.ensure_backward_chunks(
+                requiredChunkCount, img_height, img_width, ctx->device);
+            grew = grew ||
+                g_tcache.forward_chunk_K_max > previousForwardChunkCount ||
+                g_tcache.backward_chunk_K_max > previousBackwardChunkCount;
+
+            if (!grew) {
+                throw std::runtime_error(
+                    "GPU intersection attempt failed without a growable capacity shortfall");
+            }
+            const auto retryGrowEnd = TelemetryClock::now();
+            if (logicalStep) {
+                logicalStep->recordRecoveredIntersectionRetry(
+                    attemptFailures,
+                    elapsedMilliseconds(retryGrowStart, retryGrowEnd));
+            }
+            return std::make_pair(completedLayout, true);
+        }
+
+        return std::make_pair(completedLayout, false);
+    };
+
+    auto replaySameLogicalStep = [&]() -> MTensor {
+        // The recursive call remains under the public operation's engine lock
+        // and within this logical training step, so neither shared cache state
+        // nor candidate Adam counters can advance between attempts.
+        return msplat_train_step_locked(
+            num_points, means3d, scales, glob_scale, quats, viewmat,
+            projmat, fx, fy, cx, cy, img_height, img_width, tile_bounds,
+            clip_thresh, degree, degrees_to_use, cam_pos, features_dc,
+            features_rest, opacities, background, gt, coverage_mask,
+            coverage_render_tiles, loss_coverage_units, ssim_weight,
+            loss_inv_n, transparent_mask, alpha_loss_weight,
+            num_adam_groups, adam_params, adam_exp_avg, adam_exp_avg_sq,
+            adam_step_sizes, adam_bc2_sqrts, adam_beta1, adam_beta2,
+            adam_eps, photometric, pose, collect_densification_stats,
+            vis_counts, xys_grad_norm, max_2d_size, inv_max_dim);
+    };
+
+    if (ctx->retry_intersection_attempts) {
+        id<MTLCommandBuffer> commandBuffer = ctx->getCommandBuffer();
+        __block const char* encodingFailure = nullptr;
+        dispatch_sync(ctx->d_queue, ^{
+            if (!do_blit_zero(commandBuffer)) {
+                encodingFailure =
+                    "msplat: failed to create a Metal blit encoder";
+                return;
+            }
+
+            id<MTLComputeCommandEncoder> enc =
+                [commandBuffer computeCommandEncoder];
+            if (!enc) {
+                encodingFailure =
+                    "msplat: failed to create a Metal compute encoder";
+                return;
+            }
+            // Scatter and both sort paths are the final kernels allowed to
+            // poison an attempt. Retire them before any model/Adam mutation;
+            // packing and the expensive training tail can then stay queued.
+            encode_scatter_sort_finalize(enc);
+            [enc endEncoding];
+        });
+        if (encodingFailure) {
+            ctx->discardCB();
+            throw std::runtime_error(encodingFailure);
+        }
+
+        const SynchronousGpuMetrics preflightMetrics = ctx->syncCB();
+        if (logicalStep) {
+            // In retry mode this field represents the synchronized
+            // count/layout/scatter/sort preflight as one GPU phase.
+            logicalStep->recordExactCountPass(preflightMetrics);
+        }
+        const auto completedAttempt = inspectCompletedRetryAttempt();
+        if (completedAttempt.second)
+            return replaySameLogicalStep();
+        if (gpuResidentIntersectionAttempt && logicalStep)
+            logicalStep->recordIntersectionLayout(completedAttempt.first, 0.0);
+    }
+
     auto encode_step_readback = [&](id<MTLCommandBuffer> cb) -> bool {
         if (!logicalStep) return true;
         id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
@@ -3805,8 +3947,10 @@ static MTensor msplat_train_step_locked(
         double ticksToMs = ctx->ticksToMs;
 
         dispatch_sync(ctx->d_queue, ^(){
-            // Blit zero has no direct timestamp sample.
-            if (!do_blit_zero(command_buffer)) {
+            // Retry mode already cleared transients in its synchronized
+            // preflight. Exact mode retains the established post-count clear.
+            if (!ctx->retry_intersection_attempts &&
+                !do_blit_zero(command_buffer)) {
                 encodingFailure = "msplat: failed to create a Metal blit encoder";
                 return;
             }
@@ -3822,13 +3966,17 @@ static MTensor msplat_train_step_locked(
 
             id<MTLComputeCommandEncoder> enc;
 
-            // Stage 2: exact scatter, radix sort, and pack
+            // Stage 2: exact scatter/sort plus pack. Retry mode retired the
+            // status-writing scatter/sort work in its preflight, so only pack
+            // remains in this profiled encoder.
             enc = make_profiled_encoder(1);
             if (!enc) {
                 encodingFailure = "msplat: failed to create a profiled Metal compute encoder";
                 return;
             }
-            encode_sort_pack(enc);
+            if (!ctx->retry_intersection_attempts)
+                encode_scatter_sort_finalize(enc);
+            encode_pack(enc);
             [enc endEncoding];
 
             // Stage 3: rast_fwd
@@ -3911,7 +4059,7 @@ static MTensor msplat_train_step_locked(
                         for (auto x : sorted) sum += x;
                         total_median += med;
                         fprintf(stderr, "  %-20s median=%.3fms  mean=%.3fms\n",
-                                g_train_stage_names[i], med, sum / sorted.size());
+                                trainingStageName(i), med, sum / sorted.size());
                     }
                     fprintf(stderr, "  %-20s %.3fms\n", "TOTAL (sum medians)", total_median);
                 }
@@ -3924,7 +4072,8 @@ static MTensor msplat_train_step_locked(
         __block const char* encodingFailure = nullptr;
 
         dispatch_sync(ctx->d_queue, ^(){
-            if (!do_blit_zero(command_buffer)) {
+            if (!ctx->retry_intersection_attempts &&
+                !do_blit_zero(command_buffer)) {
                 encodingFailure = "msplat: failed to create a Metal blit encoder";
                 return;
             }
@@ -3936,7 +4085,9 @@ static MTensor msplat_train_step_locked(
             }
 
             // --- Forward: exact sort/pack → raster → loss ---
-            encode_sort_pack(enc);
+            if (!ctx->retry_intersection_attempts)
+                encode_scatter_sort_finalize(enc);
+            encode_pack(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             encode_rast_fwd(enc);
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
@@ -3963,92 +4114,6 @@ static MTensor msplat_train_step_locked(
     if (logicalStep) {
         logicalStep->recordPostCountEncode(
             postCountEncodeStart, TelemetryClock::now());
-    }
-
-    if (ctx->retry_intersection_attempts) {
-        // Retry mode is deliberately serial for now: complete one transactional
-        // attempt, inspect only its tiny status/layout readback, then grow and
-        // replay the same logical step if its retained high-water buffers were
-        // insufficient. All model/Adam/stat mutations above are status-gated.
-        ctx->syncCB();
-
-        const msplat::TileIntersectionLayout completedLayout =
-            completed_gpu_tile_intersection_layout(num_tiles);
-        msplat::validateTileIntersectionWorkLimit(completedLayout);
-
-        constexpr uint32_t knownAttemptFailures =
-            MSPLAT_TRAINING_OVERFLOW_TILE_CAP |
-            MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY;
-        const uint32_t attemptFailures =
-            overflow_flag.data<uint32_t>()[0];
-        if ((attemptFailures & ~knownAttemptFailures) != 0u) {
-            throw std::runtime_error(
-                "GPU intersection attempt reported an unknown failure");
-        }
-        if ((attemptFailures & MSPLAT_TRAINING_OVERFLOW_TILE_CAP) != 0u) {
-            // Layout errors and the bounded per-tile work limit are not fixed
-            // by retaining a larger arena.
-            throw std::length_error(
-                "GPU intersection attempt exceeds the exact-sort work limit");
-        }
-
-        if ((attemptFailures &
-             MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY) != 0u) {
-            const auto retryGrowStart = TelemetryClock::now();
-            const bool needsRadixScratch =
-                msplat::tileIntersectionLayoutNeedsRadixScratch(
-                    completedLayout);
-            bool grew = g_tcache.ensure_intersection_arena(
-                completedLayout.totalCount, needsRadixScratch,
-                !ctx->gather_intersection_attributes, ctx->device);
-
-            const uint32_t requiredChunkCount =
-                msplat::tileRasterChunkCount(
-                    static_cast<uint32_t>(num_tiles),
-                    completedLayout.maximumTileCount, CHUNK_SIZE);
-            const int previousForwardChunkCount =
-                g_tcache.forward_chunk_K_max;
-            const int previousBackwardChunkCount =
-                g_tcache.backward_chunk_K_max;
-            g_tcache.ensure_forward_chunks(
-                requiredChunkCount, img_height, img_width, ctx->device);
-            g_tcache.ensure_backward_chunks(
-                requiredChunkCount, img_height, img_width, ctx->device);
-            grew = grew ||
-                g_tcache.forward_chunk_K_max > previousForwardChunkCount ||
-                g_tcache.backward_chunk_K_max > previousBackwardChunkCount;
-
-            if (!grew) {
-                throw std::runtime_error(
-                    "GPU intersection attempt failed without a growable capacity shortfall");
-            }
-            const auto retryGrowEnd = TelemetryClock::now();
-            if (logicalStep) {
-                logicalStep->recordRecoveredIntersectionRetry(
-                    attemptFailures,
-                    elapsedMilliseconds(retryGrowStart, retryGrowEnd));
-            }
-
-            // The recursive call remains under the public operation's engine
-            // lock and within this logical training step, so neither shared
-            // cache state nor candidate Adam counters can advance between
-            // attempts.
-            return msplat_train_step_locked(
-                num_points, means3d, scales, glob_scale, quats, viewmat,
-                projmat, fx, fy, cx, cy, img_height, img_width, tile_bounds,
-                clip_thresh, degree, degrees_to_use, cam_pos, features_dc,
-                features_rest, opacities, background, gt, coverage_mask,
-                coverage_render_tiles, loss_coverage_units, ssim_weight,
-                loss_inv_n, transparent_mask, alpha_loss_weight,
-                num_adam_groups, adam_params, adam_exp_avg, adam_exp_avg_sq,
-                adam_step_sizes, adam_bc2_sqrts, adam_beta1, adam_beta2,
-                adam_eps, photometric, pose, collect_densification_stats,
-                vis_counts, xys_grad_norm, max_2d_size, inv_max_dim);
-        }
-
-        if (gpuResidentIntersectionAttempt && logicalStep) {
-            logicalStep->recordIntersectionLayout(completedLayout, 0.0);
-        }
     }
 
     // Loss is copied into the step's unique readback and published only after

@@ -92,8 +92,11 @@ require_substring_count("${host_source}"
     "!ctx->gather_intersection_attributes, ctx->device)" 3
     "render, training, and retry arena mode bindings")
 require_substring_count("${host_source}"
-    "if (ctx->gather_intersection_attributes) return;" 2
-    "render and training pack-dispatch skips")
+    "if (ctx->gather_intersection_attributes) return;" 1
+    "render pack-dispatch skip")
+require_contains("${host_source}"
+    "if (ctx->gather_intersection_attributes ||\n            (!gpuResidentIntersectionAttempt && total_intersections == 0u))"
+    "training pack-dispatch skip")
 require_contains("${host_source}"
     "size_t msplat_packed_intersection_attribute_bytes()"
     "runtime packed-attribute accounting")
