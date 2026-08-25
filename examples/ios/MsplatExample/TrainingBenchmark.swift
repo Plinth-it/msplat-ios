@@ -7,13 +7,22 @@ struct TrainingBenchmarkConfiguration: Sendable {
     static let labelKey = "MSPLAT_BENCHMARK_LABEL"
     static let warmupKey = "MSPLAT_BENCHMARK_WARMUP"
     static let measuredKey = "MSPLAT_BENCHMARK_MEASURED"
+    static let growthKey = "MSPLAT_BENCHMARK_GROWTH"
+    static let growthMaximumGaussianCountKey =
+        "MSPLAT_BENCHMARK_GROWTH_MAX_GAUSSIANS"
 
     let label: String
     let warmupIterations: Int
     let measuredIterations: Int
+    let growthEnabled: Bool
+    let growthMaximumGaussianCount: Int?
 
     var totalIterations: Int {
         warmupIterations + measuredIterations
+    }
+
+    var fixedPopulation: Bool {
+        !growthEnabled
     }
 
     static func requested(
@@ -34,16 +43,55 @@ struct TrainingBenchmarkConfiguration: Sendable {
             defaultValue: 300,
             allowsZero: false
         )
+        let growthEnabled = environment[growthKey] == "1"
+        let growthMaximumGaussianCount = growthEnabled
+            ? validGaussianCount(environment[growthMaximumGaussianCountKey])
+            : nil
         let (total, overflowed) = warmup.addingReportingOverflow(measured)
 
         guard !overflowed, total >= 2, total <= 1_000_000 else {
-            return Self(label: label, warmupIterations: 50, measuredIterations: 300)
+            return Self(
+                label: label,
+                warmupIterations: 50,
+                measuredIterations: 300,
+                growthEnabled: growthEnabled,
+                growthMaximumGaussianCount: growthMaximumGaussianCount
+            )
         }
         return Self(
             label: label,
             warmupIterations: warmup,
-            measuredIterations: measured
+            measuredIterations: measured,
+            growthEnabled: growthEnabled,
+            growthMaximumGaussianCount: growthMaximumGaussianCount
         )
+    }
+
+    func validatedGrowthMaximumGaussianCount(
+        initialGaussianCount: Int
+    ) throws -> Int? {
+        guard growthEnabled else { return nil }
+        guard let growthMaximumGaussianCount else {
+            throw MsplatError.invalidArgument(
+                "Growth benchmarks require a positive maximum Gaussian count"
+            )
+        }
+        guard growthMaximumGaussianCount > initialGaussianCount else {
+            throw MsplatError.invalidArgument(
+                "Growth benchmark maximum Gaussian count must exceed the initial population"
+            )
+        }
+        let initialSlack = max(initialGaussianCount / 4, 4_096)
+        let (initialReservedCapacity, overflowed) =
+            initialGaussianCount.addingReportingOverflow(initialSlack)
+        guard !overflowed,
+              growthMaximumGaussianCount > initialReservedCapacity else {
+            throw MsplatError.invalidArgument(
+                "Growth benchmark maximum Gaussian count must exceed the initial " +
+                    "reserved capacity (\(initialReservedCapacity))"
+            )
+        }
+        return growthMaximumGaussianCount
     }
 
     private static func validIterationCount(
@@ -56,6 +104,15 @@ struct TrainingBenchmarkConfiguration: Sendable {
               value <= 1_000_000,
               allowsZero ? value >= 0 : value > 0 else {
             return defaultValue
+        }
+        return value
+    }
+
+    private static func validGaussianCount(_ rawValue: String?) -> Int? {
+        guard let rawValue,
+              let value = Int(rawValue),
+              (1...Int(Int32.max)).contains(value) else {
+            return nil
         }
         return value
     }
@@ -281,10 +338,18 @@ struct TrainingBenchmarkSummary: Codable, Sendable {
     let minimumProcessAvailableBytes: UInt64?
     let peakTrackedNativeBufferBytes: UInt64?
     let highestThermalState: String
+    let requestedGrowthMaximumGaussianCount: Int?
+    let modelCapacityGrowth: TrainingBenchmarkCapacityGrowth?
     let overflowedCompletedSteps: UInt64
     let tileCapacityOverflowedSteps: UInt64
     let packedCapacityOverflowedSteps: UInt64
     let missingMeasuredIterations: [Int]
+}
+
+struct TrainingBenchmarkCapacityGrowth: Codable, Sendable, Equatable {
+    let iteration: Int
+    let previousCapacity: Int
+    let newCapacity: Int
 }
 
 struct TrainingBenchmarkReport: Codable, Sendable {
@@ -306,6 +371,7 @@ struct TrainingBenchmarkReport: Codable, Sendable {
 enum TrainingBenchmarkError: LocalizedError, Sendable {
     case missingFinalDescriptor
     case incompleteMeasurements(captured: Int, requested: Int, finalIteration: Int)
+    case noModelCapacityGrowth
     case couldNotEncodeSummary
 
     var errorDescription: String? {
@@ -315,6 +381,8 @@ enum TrainingBenchmarkError: LocalizedError, Sendable {
         case let .incompleteMeasurements(captured, requested, finalIteration):
             "Benchmark captured \(captured) of \(requested) measured steps " +
                 "and completed iteration \(finalIteration)."
+        case .noModelCapacityGrowth:
+            "Growth benchmark measured no model-capacity increase."
         case .couldNotEncodeSummary:
             "The benchmark summary could not be encoded as UTF-8."
         }
@@ -407,6 +475,13 @@ struct TrainingBenchmarkRecorder {
                 finalIteration: finalDescriptor.iteration
             )
         }
+        let modelCapacityGrowth = Self.firstModelCapacityGrowth(
+            samples.map { (iteration: $0.iteration, capacity: $0.modelCapacity) },
+            within: expectedRange
+        )
+        if !configuration.fixedPopulation, modelCapacityGrowth == nil {
+            throw TrainingBenchmarkError.noModelCapacityGrowth
+        }
         let peakFootprint = samples.compactMap { $0.memory.processPhysicalFootprintBytes }.max()
         let minimumAvailable = samples.compactMap { $0.memory.processAvailableBytes }.min()
         let peakTracked = samples.map { $0.memory.trackedNativeBufferBytes }.max()
@@ -431,13 +506,16 @@ struct TrainingBenchmarkRecorder {
             minimumProcessAvailableBytes: minimumAvailable,
             peakTrackedNativeBufferBytes: peakTracked,
             highestThermalState: Self.highestThermalState(in: samples),
+            requestedGrowthMaximumGaussianCount:
+                configuration.growthMaximumGaussianCount,
+            modelCapacityGrowth: modelCapacityGrowth,
             overflowedCompletedSteps: finalDescriptor.overflowedCompletedSteps,
             tileCapacityOverflowedSteps: finalDescriptor.tileCapacityOverflowedSteps,
             packedCapacityOverflowedSteps: finalDescriptor.packedCapacityOverflowedSteps,
             missingMeasuredIterations: Array(missingIterations)
         )
         let report = TrainingBenchmarkReport(
-            schemaVersion: 3,
+            schemaVersion: 4,
             startedAt: startedAt,
             finishedAt: finishedAt,
             datasetName: datasetName,
@@ -446,7 +524,7 @@ struct TrainingBenchmarkRecorder {
             trainingMasksEnabled: trainingMasksEnabled,
             trainingMaskMode: trainingMaskMode,
             profile: "Preview",
-            fixedPopulation: true,
+            fixedPopulation: configuration.fixedPopulation,
             summary: summary,
             finalDescriptor: finalDescriptor,
             samples: samples
@@ -461,6 +539,22 @@ struct TrainingBenchmarkRecorder {
         return (url, summaryLine)
     }
 
+    static func firstModelCapacityGrowth(
+        _ samples: [(iteration: Int, capacity: Int)],
+        within measuredIterations: ClosedRange<Int>
+    ) -> TrainingBenchmarkCapacityGrowth? {
+        for (previous, current) in zip(samples, samples.dropFirst())
+        where measuredIterations.contains(current.iteration) &&
+            current.capacity > previous.capacity {
+            return TrainingBenchmarkCapacityGrowth(
+                iteration: current.iteration,
+                previousCapacity: previous.capacity,
+                newCapacity: current.capacity
+            )
+        }
+        return nil
+    }
+
     private static func nativeModes(environment: [String: String]) -> [String: String] {
         [
             "MSPLAT_RASTER_VARIANT": environment["MSPLAT_RASTER_VARIANT"] ?? "8x8",
@@ -473,6 +567,8 @@ struct TrainingBenchmarkRecorder {
             "MSPLAT_SSIM_MODE": environment["MSPLAT_SSIM_MODE"] ?? "fused",
             "MSPLAT_DENSIFY_RANDOM_MODE":
                 environment["MSPLAT_DENSIFY_RANDOM_MODE"] ?? "cpu",
+            "MSPLAT_CAPACITY_COPY_MODE":
+                environment["MSPLAT_CAPACITY_COPY_MODE"] ?? "cpu",
             "MSPLAT_IMAGE_CACHE_MB": environment["MSPLAT_IMAGE_CACHE_MB"] ?? "512",
             "MSPLAT_CAMERA_PREFETCH": "1 (enabled by MsplatExample)",
             "PROFILE_STAGES": environment["PROFILE_STAGES"] == nil

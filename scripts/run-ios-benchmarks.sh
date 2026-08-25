@@ -19,6 +19,7 @@ MEASURED_ITERATIONS=300
 RUN_TIMEOUT_SECONDS=1800
 RESULTS_DIR=""
 ONLY_VARIANT=""
+GROWTH_MAX_GAUSSIANS=""
 PROFILE_STAGES_ENABLED=0
 CURRENT_LAUNCH_PID=""
 
@@ -42,7 +43,10 @@ Options:
   --timeout <seconds>      Per-variant launch timeout (default: 1800).
   --results-dir <path>     Output directory. Default:
                            build/ios-benchmarks/<UTC timestamp>.
-  --only <label>           Run one matrix label instead of all eight.
+  --only <label>           Run one matrix label, growth-cpu, or growth-blit.
+  --growth-max-gaussians <count>
+                           Required positive population cap for growth-cpu and
+                           growth-blit.
   --profile-stages         Enable per-stage Metal timestamp logging; requires
                            at least 500 total iterations.
   -h, --help               Show this help.
@@ -59,6 +63,9 @@ Prerequisites:
 The app is built and installed once, then these isolated variants run:
   baseline, difference, arena-retry, difference-retry, packed, staged-ssim,
   raster-16x8, raster-16x16
+
+The dedicated growth-cpu and growth-blit variants are available only through
+--only and do not change the normal eight-run fixed-topology matrix.
 
 Every run writes a console log and devicectl JSON result. Successful benchmark
 summaries are appended to results.jsonl; runs.tsv records every run's status.
@@ -128,6 +135,11 @@ while [[ $# -gt 0 ]]; do
             ONLY_VARIANT="$2"
             shift 2
             ;;
+        --growth-max-gaussians)
+            require_value "$1" "${2:-}"
+            GROWTH_MAX_GAUSSIANS="$2"
+            shift 2
+            ;;
         --profile-stages)
             PROFILE_STAGES_ENABLED=1
             shift
@@ -154,8 +166,16 @@ if (( PROFILE_STAGES_ENABLED &&
 fi
 case "$ONLY_VARIANT" in
     ""|baseline|difference|arena-retry|difference-retry|packed|staged-ssim|raster-16x8|raster-16x16) ;;
+    growth-cpu|growth-blit)
+        [[ "$GROWTH_MAX_GAUSSIANS" =~ ^[1-9][0-9]*$ ]] || die \
+            "--growth-max-gaussians must be a positive integer for $ONLY_VARIANT"
+        ;;
     *) die "unknown benchmark label: $ONLY_VARIANT" ;;
 esac
+if [[ -n "$GROWTH_MAX_GAUSSIANS" && "$ONLY_VARIANT" != growth-cpu && \
+      "$ONLY_VARIANT" != growth-blit ]]; then
+    die "--growth-max-gaussians is only valid with --only growth-cpu or growth-blit"
+fi
 
 command -v xcrun >/dev/null 2>&1 || die "xcrun was not found"
 command -v xcodebuild >/dev/null 2>&1 || die "xcodebuild was not found"
@@ -257,6 +277,7 @@ run_variant() {
     local intersection_attributes="$5"
     local ssim_mode="$6"
     local raster_variant="$7"
+    local capacity_copy_mode="${8:-}"
     local console_log="$RESULTS_DIR/$label.console.log"
     local launch_json="$RESULTS_DIR/$label.devicectl.json"
     local environment_json
@@ -266,13 +287,20 @@ run_variant() {
     local outcome=""
     local launcher_exit=0
     local profile_stages_json=""
+    local growth_environment_json=""
 
     if (( PROFILE_STAGES_ENABLED )); then
         profile_stages_json=',"PROFILE_STAGES":"1"'
     fi
+    if [[ -n "$capacity_copy_mode" ]]; then
+        printf -v growth_environment_json \
+            ',"MSPLAT_BENCHMARK_GROWTH":"1","MSPLAT_BENCHMARK_GROWTH_MAX_GAUSSIANS":"%s","MSPLAT_CAPACITY_COPY_MODE":"%s"' \
+            "$GROWTH_MAX_GAUSSIANS" \
+            "$capacity_copy_mode"
+    fi
 
     printf -v environment_json \
-        '{"MSPLAT_BENCHMARK":"1","MSPLAT_BENCHMARK_LABEL":"%s","MSPLAT_BENCHMARK_WARMUP":"%s","MSPLAT_BENCHMARK_MEASURED":"%s","MSPLAT_BENCHMARK_DATASET":"%s","MSPLAT_TILE_COUNT_MODE":"%s","MSPLAT_TILE_LAYOUT_MODE":"%s","MSPLAT_TRAINING_ARENA_MODE":"%s","MSPLAT_INTERSECTION_ATTRIBUTES":"%s","MSPLAT_SSIM_MODE":"%s","MSPLAT_RASTER_VARIANT":"%s","MSPLAT_DENSIFY_RANDOM_MODE":"cpu"%s}' \
+        '{"MSPLAT_BENCHMARK":"1","MSPLAT_BENCHMARK_LABEL":"%s","MSPLAT_BENCHMARK_WARMUP":"%s","MSPLAT_BENCHMARK_MEASURED":"%s","MSPLAT_BENCHMARK_DATASET":"%s","MSPLAT_TILE_COUNT_MODE":"%s","MSPLAT_TILE_LAYOUT_MODE":"%s","MSPLAT_TRAINING_ARENA_MODE":"%s","MSPLAT_INTERSECTION_ATTRIBUTES":"%s","MSPLAT_SSIM_MODE":"%s","MSPLAT_RASTER_VARIANT":"%s","MSPLAT_DENSIFY_RANDOM_MODE":"cpu"%s%s}' \
         "$(json_escape "$label")" \
         "$WARMUP_ITERATIONS" \
         "$MEASURED_ITERATIONS" \
@@ -283,7 +311,8 @@ run_variant() {
         "$intersection_attributes" \
         "$ssim_mode" \
         "$raster_variant" \
-        "$profile_stages_json"
+        "$profile_stages_json" \
+        "$growth_environment_json"
 
     echo "[$label] launching; console: $console_log"
     : > "$console_log"
@@ -404,17 +433,25 @@ CONFIGURATIONS=(
 )
 
 failures=0
-for configuration in "${CONFIGURATIONS[@]}"; do
-    IFS='|' read -r label tile_count tile_layout arena attributes ssim raster \
-        <<< "$configuration"
-    if [[ -n "$ONLY_VARIANT" && "$label" != "$ONLY_VARIANT" ]]; then
-        continue
-    fi
+if [[ "$ONLY_VARIANT" == growth-cpu || "$ONLY_VARIANT" == growth-blit ]]; then
+    capacity_copy_mode="${ONLY_VARIANT#growth-}"
     if ! run_variant \
-        "$label" "$tile_count" "$tile_layout" "$arena" "$attributes" "$ssim" "$raster"; then
+        "$ONLY_VARIANT" enumerated cpu exact gather fused 8x8 "$capacity_copy_mode"; then
         failures=$((failures + 1))
     fi
-done
+else
+    for configuration in "${CONFIGURATIONS[@]}"; do
+        IFS='|' read -r label tile_count tile_layout arena attributes ssim raster \
+            <<< "$configuration"
+        if [[ -n "$ONLY_VARIANT" && "$label" != "$ONLY_VARIANT" ]]; then
+            continue
+        fi
+        if ! run_variant \
+            "$label" "$tile_count" "$tile_layout" "$arena" "$attributes" "$ssim" "$raster"; then
+            failures=$((failures + 1))
+        fi
+    done
+fi
 
 echo "Benchmark artifacts: $RESULTS_DIR"
 echo "Successful summaries: $RESULTS_JSONL"

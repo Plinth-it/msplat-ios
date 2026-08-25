@@ -231,12 +231,17 @@ final class TrainingSession: ObservableObject {
                 } onCancel: {
                     datasetScan.cancel()
                 }
+            let benchmarkMaximumGaussianCount = try benchmark?
+                .validatedGrowthMaximumGaussianCount(
+                    initialGaussianCount: initialGaussianCount
+                )
             let plan = try Self.makePlan(
                 sourceDimensions: sourceDimensions,
                 initialGaussianCount: initialGaussianCount,
                 steps: steps,
                 profile: profile,
-                includesTrainingMasks: useTrainingMasks
+                includesTrainingMasks: useTrainingMasks,
+                maximumGaussianCountOverride: benchmarkMaximumGaussianCount
             )
             plannedStages = plan.resolvedStages
             let appEstimatedPeakMemory = try Self.appEstimatedPeakMemory(for: plan)
@@ -260,12 +265,10 @@ final class TrainingSession: ObservableObject {
             phase = .loading
             try Task.checkCancellation()
 
-            var baseConfig = TrainingConfig()
-            baseConfig.trainingMaskMode = trainingMaskMode
-            if benchmark != nil {
-                // Benchmark the same fixed topology across every native mode.
-                baseConfig.stopDensifyAt = 0
-            }
+            let baseConfig = try Self.makeTrainingConfig(
+                trainingMaskMode: trainingMaskMode,
+                benchmark: benchmark
+            )
             let activeSession = try await MsplatSession(
                 datasetURL: folder.url,
                 trainingPlan: plan,
@@ -603,7 +606,8 @@ final class TrainingSession: ObservableObject {
         initialGaussianCount: Int,
         steps: Int,
         profile: QualityProfile,
-        includesTrainingMasks: Bool = false
+        includesTrainingMasks: Bool = false,
+        maximumGaussianCountOverride: Int? = nil
     ) throws -> TrainingPlan {
         guard initialGaussianCount > 0 else {
             throw MsplatError.invalidDataset(
@@ -612,6 +616,12 @@ final class TrainingSession: ObservableObject {
         }
         guard let iterationBudget = Int32(exactly: steps) else {
             throw MsplatError.invalidArgument("Iteration budget is outside the native range")
+        }
+        if let maximumGaussianCountOverride,
+           maximumGaussianCountOverride <= initialGaussianCount {
+            throw MsplatError.invalidArgument(
+                "Maximum Gaussian count must exceed the initial population"
+            )
         }
 
         let sourceLongestEdge = max(sourceDimensions.width, sourceDimensions.height)
@@ -654,12 +664,35 @@ final class TrainingSession: ObservableObject {
             iterationBudget: iterationBudget,
             stages: stages,
             targetSHDegree: profile.shDegree,
-            maximumGaussianCount: max(
-                profile.maximumGaussianCount,
-                initialGaussianCount
-            ),
+            maximumGaussianCount: maximumGaussianCountOverride ??
+                max(profile.maximumGaussianCount, initialGaussianCount),
             includesTrainingMasks: includesTrainingMasks
         )
+    }
+
+    nonisolated static func makeTrainingConfig(
+        trainingMaskMode: TrainingMaskMode,
+        benchmark: TrainingBenchmarkConfiguration?
+    ) throws -> TrainingConfig {
+        var config = TrainingConfig()
+        config.trainingMaskMode = trainingMaskMode
+        guard let benchmark else { return config }
+
+        if benchmark.fixedPopulation {
+            config.stopDensifyAt = 0
+            return config
+        }
+
+        guard let stopDensifyAt = Int32(exactly: benchmark.totalIterations + 1) else {
+            throw MsplatError.invalidArgument(
+                "Growth benchmark iteration budget is outside the native range"
+            )
+        }
+        config.warmupLength = 0
+        config.refineEvery = 25
+        config.resetAlphaEvery = 100
+        config.stopDensifyAt = stopDensifyAt
+        return config
     }
 
     private nonisolated static func megabytes(_ bytes: Int64) -> Int {

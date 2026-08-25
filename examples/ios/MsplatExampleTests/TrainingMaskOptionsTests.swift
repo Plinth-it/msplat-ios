@@ -445,6 +445,8 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(defaults.warmupIterations, 50)
         XCTAssertEqual(defaults.measuredIterations, 300)
         XCTAssertEqual(defaults.totalIterations, 350)
+        XCTAssertTrue(defaults.fixedPopulation)
+        XCTAssertNil(defaults.growthMaximumGaussianCount)
 
         let overridden = try XCTUnwrap(
             TrainingBenchmarkConfiguration.requested(environment: [
@@ -468,6 +470,143 @@ final class TrainingMaskOptionsTests: XCTestCase {
         )
         XCTAssertEqual(tooShort.warmupIterations, 50)
         XCTAssertEqual(tooShort.measuredIterations, 300)
+    }
+
+    func testGrowthBenchmarkConfigurationAndPlan() throws {
+        let benchmark = try XCTUnwrap(
+            TrainingBenchmarkConfiguration.requested(environment: [
+                "MSPLAT_BENCHMARK": "1",
+                "MSPLAT_BENCHMARK_LABEL": "growth-blit",
+                "MSPLAT_BENCHMARK_WARMUP": "10",
+                "MSPLAT_BENCHMARK_MEASURED": "90",
+                "MSPLAT_BENCHMARK_GROWTH": "1",
+                "MSPLAT_BENCHMARK_GROWTH_MAX_GAUSSIANS": "400000",
+            ])
+        )
+        XCTAssertFalse(benchmark.fixedPopulation)
+        XCTAssertEqual(benchmark.growthMaximumGaussianCount, 400_000)
+        XCTAssertEqual(
+            try benchmark.validatedGrowthMaximumGaussianCount(
+                initialGaussianCount: 100_000
+            ),
+            400_000
+        )
+
+        let config = try TrainingSession.makeTrainingConfig(
+            trainingMaskMode: .coverage,
+            benchmark: benchmark
+        )
+        XCTAssertEqual(config.warmupLength, 0)
+        XCTAssertEqual(config.refineEvery, 25)
+        XCTAssertEqual(config.resetAlphaEvery, 100)
+        XCTAssertEqual(config.stopDensifyAt, 101)
+
+        let dimensions = try TrainingImageDimensions(width: 1_920, height: 1_440)
+        let configuredPlan = try TrainingSession.makePlan(
+            sourceDimensions: dimensions,
+            initialGaussianCount: 100_000,
+            steps: benchmark.totalIterations,
+            profile: .preview,
+            maximumGaussianCountOverride: benchmark.growthMaximumGaussianCount
+        )
+        XCTAssertEqual(configuredPlan.maximumGaussianCount, 400_000)
+        let exactOverridePlan = try TrainingSession.makePlan(
+            sourceDimensions: dimensions,
+            initialGaussianCount: 100_000,
+            steps: benchmark.totalIterations,
+            profile: .preview,
+            maximumGaussianCountOverride: 200_000
+        )
+        XCTAssertEqual(exactOverridePlan.maximumGaussianCount, 200_000)
+    }
+
+    func testGrowthBenchmarkRejectsMissingOrNonIncreasingCap() throws {
+        let missingCap = try XCTUnwrap(
+            TrainingBenchmarkConfiguration.requested(environment: [
+                "MSPLAT_BENCHMARK": "1",
+                "MSPLAT_BENCHMARK_GROWTH": "1",
+            ])
+        )
+        XCTAssertFalse(missingCap.fixedPopulation)
+        XCTAssertThrowsError(
+            try missingCap.validatedGrowthMaximumGaussianCount(
+                initialGaussianCount: 100_000
+            )
+        )
+
+        let nonIncreasingCap = try XCTUnwrap(
+            TrainingBenchmarkConfiguration.requested(environment: [
+                "MSPLAT_BENCHMARK": "1",
+                "MSPLAT_BENCHMARK_GROWTH": "1",
+                "MSPLAT_BENCHMARK_GROWTH_MAX_GAUSSIANS": "100000",
+            ])
+        )
+        XCTAssertThrowsError(
+            try nonIncreasingCap.validatedGrowthMaximumGaussianCount(
+                initialGaussianCount: 100_000
+            )
+        )
+
+        let noGrowthHeadroom = try XCTUnwrap(
+            TrainingBenchmarkConfiguration.requested(environment: [
+                "MSPLAT_BENCHMARK": "1",
+                "MSPLAT_BENCHMARK_GROWTH": "1",
+                "MSPLAT_BENCHMARK_GROWTH_MAX_GAUSSIANS": "125000",
+            ])
+        )
+        XCTAssertThrowsError(
+            try noGrowthHeadroom.validatedGrowthMaximumGaussianCount(
+                initialGaussianCount: 100_000
+            )
+        )
+    }
+
+    func testFixedPopulationBenchmarkDisablesDensification() throws {
+        let benchmark = try XCTUnwrap(
+            TrainingBenchmarkConfiguration.requested(environment: [
+                "MSPLAT_BENCHMARK": "1",
+            ])
+        )
+
+        let config = try TrainingSession.makeTrainingConfig(
+            trainingMaskMode: .transparent,
+            benchmark: benchmark
+        )
+
+        XCTAssertEqual(config.trainingMaskMode, .transparent)
+        XCTAssertEqual(config.stopDensifyAt, 0)
+        XCTAssertEqual(config.warmupLength, TrainingConfig().warmupLength)
+        XCTAssertEqual(config.refineEvery, TrainingConfig().refineEvery)
+        XCTAssertEqual(config.resetAlphaEvery, TrainingConfig().resetAlphaEvery)
+    }
+
+    func testGrowthBenchmarkRequiresMeasuredCapacityIncrease() {
+        XCTAssertNil(
+            TrainingBenchmarkRecorder.firstModelCapacityGrowth(
+                [
+                    (iteration: 1, capacity: 125_000),
+                    (iteration: 2, capacity: 156_250),
+                ],
+                within: 3...5
+            )
+        )
+        let growth = TrainingBenchmarkRecorder.firstModelCapacityGrowth(
+            [
+                (iteration: 1, capacity: 125_000),
+                (iteration: 2, capacity: 156_250),
+                (iteration: 3, capacity: 156_250),
+                (iteration: 4, capacity: 195_312),
+            ],
+            within: 3...5
+        )
+        XCTAssertEqual(
+            growth,
+            TrainingBenchmarkCapacityGrowth(
+                iteration: 4,
+                previousCapacity: 156_250,
+                newCapacity: 195_312
+            )
+        )
     }
 
     func testBenchmarkDistributionUsesMedianAndNearestRankP90() throws {
