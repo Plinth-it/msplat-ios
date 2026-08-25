@@ -839,6 +839,7 @@ struct MetalContext {
     // Backward pipeline kernels
     id<MTLComputePipelineState> sh_opacity_backward_adam_kernel_cpso = nil;
     id<MTLComputePipelineState> project_backward_adam_kernel_cpso = nil;
+    id<MTLComputePipelineState> reset_opacity_state_kernel_cpso = nil;
     // GPU densification kernels
     id<MTLComputePipelineState> densify_classify_kernel_cpso = nil;
     id<MTLComputePipelineState> densify_append_split_kernel_cpso = nil;
@@ -890,6 +891,7 @@ struct MetalContext {
             camera_pose_adam_kernel_cpso,
             sh_opacity_backward_adam_kernel_cpso,
             project_backward_adam_kernel_cpso,
+            reset_opacity_state_kernel_cpso,
             densify_classify_kernel_cpso,
             densify_append_split_kernel_cpso,
             densify_append_dup_kernel_cpso,
@@ -1203,6 +1205,7 @@ MetalContext* init_msplat_metal_context() {
     // Backward pipeline
     ctx->sh_opacity_backward_adam_kernel_cpso     = load(@"sh_opacity_backward_adam_kernel");
     ctx->project_backward_adam_kernel_cpso        = load(@"project_backward_adam_kernel");
+    ctx->reset_opacity_state_kernel_cpso          = load(@"reset_opacity_state_kernel");
     // GPU densification
     ctx->densify_classify_kernel_cpso             = load(@"densify_classify_kernel");
     ctx->densify_append_split_kernel_cpso         = load(@"densify_append_split_kernel");
@@ -4007,6 +4010,73 @@ MTensor msplat_train_step(
         adam_exp_avg_sq, adam_step_sizes, adam_bc2_sqrts, adam_beta1,
         adam_beta2, adam_eps, photometric, pose, collect_densification_stats,
         vis_counts, xys_grad_norm, max_2d_size, inv_max_dim);
+}
+
+void msplat_reset_opacity_state(
+    MTensor &opacities, MTensor &exp_avg, MTensor &exp_avg_sq,
+    float max_logit
+) {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    if (!opacities.defined() || !exp_avg.defined() ||
+        !exp_avg_sq.defined() || !opacities.isGpu() ||
+        !exp_avg.isGpu() || !exp_avg_sq.isGpu() ||
+        opacities.dtype() != DType::Float32 ||
+        exp_avg.dtype() != DType::Float32 ||
+        exp_avg_sq.dtype() != DType::Float32 ||
+        opacities.numel() <= 0 ||
+        exp_avg.numel() != opacities.numel() ||
+        exp_avg_sq.numel() != opacities.numel()) {
+        throw std::invalid_argument(
+            "Opacity reset requires equally sized non-empty GPU Float32 tensors");
+    }
+    if (!std::isfinite(max_logit)) {
+        throw std::invalid_argument("Opacity reset ceiling must be finite");
+    }
+    if (opacities.numel() > std::numeric_limits<uint32_t>::max()) {
+        throw std::invalid_argument("Opacity reset exceeds the kernel index range");
+    }
+
+    MetalContext* ctx = get_global_context();
+    const uint32_t count = static_cast<uint32_t>(opacities.numel());
+    id<MTLCommandBuffer> commandBuffer = ctx->getCommandBuffer();
+    __block bool encoderCreationFailed = false;
+    dispatch_sync(ctx->d_queue, ^{
+        id<MTLComputeCommandEncoder> encoder =
+            [commandBuffer computeCommandEncoder];
+        if (!encoder) {
+            encoderCreationFailed = true;
+            return;
+        }
+        [encoder setComputePipelineState:ctx->reset_opacity_state_kernel_cpso];
+        ENC_BUF(encoder, opacities, 0);
+        ENC_BUF(encoder, exp_avg, 1);
+        ENC_BUF(encoder, exp_avg_sq, 2);
+        ENC_SCALAR(encoder, count, 3);
+        ENC_SCALAR(encoder, max_logit, 4);
+        const NSUInteger threadsPerThreadgroup = MIN(
+            ctx->reset_opacity_state_kernel_cpso.maxTotalThreadsPerThreadgroup,
+            static_cast<NSUInteger>(count));
+        [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
+            threadsPerThreadgroup:
+                MTLSizeMake(threadsPerThreadgroup, 1, 1)];
+        [encoder endEncoding];
+    });
+
+    if (encoderCreationFailed) {
+        // The completed training update may already have advanced host-side
+        // optimizer counters. Preserve that transaction: finish its GPU work,
+        // then fall back to the established shared-memory maintenance path.
+        ctx->syncCB();
+        float* opacityValues = opacities.data<float>();
+        for (uint32_t index = 0; index < count; ++index) {
+            if (opacityValues[index] > max_logit)
+                opacityValues[index] = max_logit;
+        }
+        std::memset(exp_avg.data_ptr(), 0, exp_avg.nbytes());
+        std::memset(exp_avg_sq.data_ptr(), 0, exp_avg_sq.nbytes());
+        fprintf(stderr,
+                "msplat: opacity reset used the synchronous CPU fallback\n");
+    }
 }
 
 // ============================================================================

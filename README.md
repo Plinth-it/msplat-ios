@@ -30,6 +30,9 @@ canonical, caller-owned dataset directly through a checked deep-copy boundary.
   statistics are released after topology growth stops. They are never
   allocated for a cutoff at the first step, including checkpoint resumes that
   have already crossed the boundary.
+- Periodic opacity resets now clamp the active opacity logits and clear their
+  Adam moments in the ordered Metal command buffer. They no longer synchronize
+  the GPU for a CPU scan and two host-side buffer clears.
 - Depth-chunk buffers were carried to the end of training after chunking turned
   off. They are released.
 - Render-only calls retain just the shared forward cache. Loss, SSIM, and

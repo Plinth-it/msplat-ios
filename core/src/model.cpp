@@ -640,15 +640,11 @@ void Model::afterTrain(int step){
         }
 
         if (step < stopSplitAt && step % resetInterval == refineEvery){
-            msplat_gpu_sync();
             constexpr float resetLogit = -1.3862943611198906f;
-            float *op = opacities.data<float>();
-            for (int64_t i = 0; i < opacities.numel(); i++)
-                if (op[i] > resetLogit) op[i] = resetLogit;
-
-            adam_exp_avg[5].zero();
-            adam_exp_avg_sq[5].zero();
-            fprintf(stderr, "Opacity reset at step %d\n", step);
+            msplat_reset_opacity_state(
+                opacities, adam_exp_avg[5], adam_exp_avg_sq[5],
+                resetLogit);
+            fprintf(stderr, "Opacity reset scheduled at step %d\n", step);
         }
 
         xysGradNorm.reset();

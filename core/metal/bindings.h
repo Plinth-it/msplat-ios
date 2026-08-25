@@ -222,6 +222,13 @@ MTensor msplat_train_step(
     float inv_max_dim
 );
 
+// Normally enqueue the periodic opacity clamp and active Adam-state reset in
+// the current Metal command buffer. If encoder creation fails, the binding
+// finishes preceding work and applies the same operation through shared memory.
+void msplat_reset_opacity_state(
+    MTensor &opacities, MTensor &exp_avg, MTensor &exp_avg_sq,
+    float max_logit);
+
 // Classification and its prefix sums, split out so the caller learns how many
 // gaussians will actually be written before it allocates room for them.
 // A positive max_population keeps the highest-gradient candidates whose

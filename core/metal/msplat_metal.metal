@@ -5279,6 +5279,22 @@ kernel void photometric_adam_kernel(
         -max_abs_log_gain, max_abs_log_gain);
 }
 
+// Periodic training maintenance. Keep NaN behavior identical to the previous
+// CPU comparison: only values strictly above the reset ceiling are replaced.
+kernel void reset_opacity_state_kernel(
+    device float* opacities      [[buffer(0)]],
+    device float* exp_avg        [[buffer(1)]],
+    device float* exp_avg_sq     [[buffer(2)]],
+    constant uint& count         [[buffer(3)]],
+    constant float& max_logit    [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= count) return;
+    if (opacities[idx] > max_logit) opacities[idx] = max_logit;
+    exp_avg[idx] = 0.0f;
+    exp_avg_sq[idx] = 0.0f;
+}
+
 // ============================================================
 // GPU Densification Kernels (Phase 3)
 // ============================================================
