@@ -793,6 +793,8 @@ struct MetalContext {
     id<MTLComputePipelineState> tile_count_diff_horizontal_kernel_cpso = nil;
     id<MTLComputePipelineState> tile_count_diff_vertical_kernel_cpso = nil;
     bool difference_tile_counting = false;
+    id<MTLComputePipelineState> build_tile_intersection_layout_kernel_cpso = nil;
+    bool gpu_tile_layout = false;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso = nil;
     uint32_t monolithic_raster_block_x = 8;
     uint32_t monolithic_raster_block_y = 8;
@@ -846,6 +848,7 @@ struct MetalContext {
             project_and_sh_forward_kernel_cpso,
             tile_count_diff_horizontal_kernel_cpso,
             tile_count_diff_vertical_kernel_cpso,
+            build_tile_intersection_layout_kernel_cpso,
             nd_rasterize_forward_kernel_cpso,
             float_rgb_to_preview_texture_kernel_cpso,
             scatter_to_exact_bins_kernel_cpso,
@@ -1057,6 +1060,19 @@ MetalContext* init_msplat_metal_context() {
         }
     }
 
+    const char* tileLayoutModeOverride =
+        std::getenv("MSPLAT_TILE_LAYOUT_MODE");
+    if (tileLayoutModeOverride) {
+        if (std::strcmp(tileLayoutModeOverride, "cpu") == 0) {
+            // Keep the established synchronized CPU prefix and classification.
+        } else if (std::strcmp(tileLayoutModeOverride, "gpu") == 0) {
+            ctx->gpu_tile_layout = true;
+        } else {
+            throw std::invalid_argument(
+                "msplat: MSPLAT_TILE_LAYOUT_MODE must be cpu or gpu");
+        }
+    }
+
     const char* rasterVariantOverride = std::getenv("MSPLAT_RASTER_VARIANT");
     NSString* monolithicRasterFunctionName = @"nd_rasterize_forward_kernel";
     if (rasterVariantOverride) {
@@ -1083,6 +1099,10 @@ MetalContext* init_msplat_metal_context() {
             load(@"tile_count_diff_horizontal_kernel");
         ctx->tile_count_diff_vertical_kernel_cpso =
             load(@"tile_count_diff_vertical_kernel");
+    }
+    if (ctx->gpu_tile_layout) {
+        ctx->build_tile_intersection_layout_kernel_cpso =
+            load(@"build_tile_intersection_layout_kernel");
     }
     ctx->nd_rasterize_forward_kernel_cpso         = load(monolithicRasterFunctionName);
     ctx->float_rgb_to_preview_texture_kernel_cpso = load(@"float_rgb_to_preview_texture_kernel");
@@ -1140,6 +1160,10 @@ MetalContext* init_msplat_metal_context() {
     if (tileCountModeOverride) {
         fprintf(stderr, "msplat: MSPLAT_TILE_COUNT_MODE=%s\n",
                 tileCountModeOverride);
+    }
+    if (tileLayoutModeOverride) {
+        fprintf(stderr, "msplat: MSPLAT_TILE_LAYOUT_MODE=%s\n",
+                tileLayoutModeOverride);
     }
     if (ctx->small_sort_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup <
         msplat::kExactSmallTileMaximum) {
@@ -1237,6 +1261,31 @@ static void encode_tile_count_difference_scan(
 
 id<MTLDevice> msplat_device() {
     return get_global_context()->device;
+}
+
+static void encode_gpu_tile_intersection_layout(
+    MetalContext* ctx,
+    id<MTLComputeCommandEncoder> encoder,
+    MTensor& tileCounts,
+    MTensor& tileOffsets,
+    MTensor& tileBins,
+    MTensor& sortableTileIndices,
+    MTensor& metadata,
+    uint32_t numTiles
+) {
+    if (!ctx->gpu_tile_layout) return;
+
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [encoder setComputePipelineState:
+        ctx->build_tile_intersection_layout_kernel_cpso];
+    ENC_BUF(encoder, tileCounts, 0);
+    ENC_BUF(encoder, tileOffsets, 1);
+    ENC_BUF(encoder, tileBins, 2);
+    ENC_BUF(encoder, sortableTileIndices, 3);
+    ENC_BUF(encoder, metadata, 4);
+    ENC_SCALAR(encoder, numTiles, 5);
+    [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
 }
 
 MTensor gpu_zeros(std::vector<int64_t> shape, DType dtype) {
@@ -1522,6 +1571,7 @@ struct FusedTensorCache {
     // Exact tile-intersection layout and sorting buffers
     MTensor tile_offsets, tile_scatter_counters, sortable_tile_indices;
     MTensor tile_count_diff;
+    MTensor tile_layout_metadata;
     MTensor intersection_keys_a, intersection_keys_b;
 
     // Defensive invariant check: exact sizing should make this remain zero.
@@ -1548,7 +1598,7 @@ struct FusedTensorCache {
             &packed_xy_opac, &packed_conic, &packed_rgb,
             &out_img, &final_Ts, &final_idx,
             &tile_bins, &tile_offsets, &tile_scatter_counters,
-            &sortable_tile_indices, &tile_count_diff,
+            &sortable_tile_indices, &tile_count_diff, &tile_layout_metadata,
             &intersection_keys_a, &intersection_keys_b, &overflow_flag,
             &chunk_T, &chunk_C, &chunk_final_idx
         };
@@ -1626,6 +1676,19 @@ struct FusedTensorCache {
         }
         tile_count_diff_width = tileWidth;
         tile_count_diff_height = tileHeight;
+    }
+
+    void ensure_tile_layout_metadata(bool enabled, id<MTLDevice> dev) {
+        if (!enabled) {
+            tile_layout_metadata.reset();
+            return;
+        }
+        if (tile_layout_metadata.defined()) return;
+        tile_layout_metadata = mtensor_empty(
+            dev,
+            {static_cast<int64_t>(
+                msplat::kTileIntersectionLayoutMetadataWordCount)},
+            DType::Int32);
     }
 
     void ensure_shared_forward(int np, int ih, int iw, int nt,
@@ -1854,6 +1917,25 @@ struct FusedTensorCache {
 };
 static FusedTensorCache g_tcache;
 
+static msplat::TileIntersectionLayout completed_gpu_tile_intersection_layout(
+    int numTiles) {
+    if (numTiles < 0) {
+        throw std::invalid_argument("Tile count must not be negative");
+    }
+    if (!g_tcache.tile_layout_metadata.defined() ||
+        g_tcache.tile_layout_metadata.numel() <
+            static_cast<int64_t>(
+                msplat::kTileIntersectionLayoutMetadataWordCount)) {
+        throw std::logic_error(
+            "GPU tile-intersection layout metadata is unavailable");
+    }
+    return msplat::tileIntersectionLayoutFromGpuMetadata(
+        g_tcache.tile_layout_metadata.data<uint32_t>(),
+        static_cast<size_t>(g_tcache.tile_layout_metadata.numel()),
+        static_cast<size_t>(numTiles),
+        g_tcache.tile_offsets.data<int32_t>());
+}
+
 size_t msplat_cached_tensor_bytes() {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     return g_tcache.estimatedBytes();
@@ -1914,6 +1996,7 @@ static void render_pipeline(
     g_tcache.ensure_tile_count_diff(
         tile_bounds_x, tile_bounds_y, ctx->difference_tile_counting,
         ctx->device);
+    g_tcache.ensure_tile_layout_metadata(ctx->gpu_tile_layout, ctx->device);
     MTensor& tileCountStorage = ctx->difference_tile_counting
         ? g_tcache.tile_count_diff
         : g_tcache.tile_scatter_counters;
@@ -2014,6 +2097,12 @@ static void render_pipeline(
                 g_tcache.tile_scatter_counters, tile_bounds_arr->data(),
                 g_tcache.overflow_flag,
                 coverageRenderTileStrideDisabled);
+            encode_gpu_tile_intersection_layout(
+                ctx, encoder, g_tcache.tile_scatter_counters,
+                g_tcache.tile_offsets, g_tcache.tile_bins,
+                g_tcache.sortable_tile_indices,
+                g_tcache.tile_layout_metadata,
+                static_cast<uint32_t>(num_tiles));
             [encoder endEncoding];
         });
         if (encodingFailure) {
@@ -2024,12 +2113,14 @@ static void render_pipeline(
     }
 
     const msplat::TileIntersectionLayout intersectionLayout =
-        msplat::buildTileIntersectionLayout(
-            g_tcache.tile_scatter_counters.data<uint32_t>(),
-            g_tcache.tile_offsets.data<int32_t>(),
-            static_cast<size_t>(num_tiles),
-            g_tcache.tile_bins.data<int32_t>(),
-            g_tcache.sortable_tile_indices.data<uint32_t>());
+        ctx->gpu_tile_layout
+            ? completed_gpu_tile_intersection_layout(num_tiles)
+            : msplat::buildTileIntersectionLayout(
+                g_tcache.tile_scatter_counters.data<uint32_t>(),
+                g_tcache.tile_offsets.data<int32_t>(),
+                static_cast<size_t>(num_tiles),
+                g_tcache.tile_bins.data<int32_t>(),
+                g_tcache.sortable_tile_indices.data<uint32_t>());
     msplat::validateTileIntersectionWorkLimit(intersectionLayout);
     const bool needsRadixScratch =
         msplat::tileIntersectionLayoutNeedsRadixScratch(intersectionLayout);
@@ -2560,6 +2651,7 @@ MTensor msplat_train_step(
     g_tcache.ensure_tile_count_diff(
         tile_bounds_x, tile_bounds_y, ctx->difference_tile_counting,
         ctx->device);
+    g_tcache.ensure_tile_layout_metadata(ctx->gpu_tile_layout, ctx->device);
     g_tcache.ensure_training_image(img_height, img_width, ctx->device);
     g_tcache.ensure_backward(num_points, ctx->device);
     if (pose.enabled) g_tcache.ensure_pose_refinement(ctx->device);
@@ -2729,6 +2821,12 @@ MTensor msplat_train_step(
                 ctx, encoder, g_tcache.tile_count_diff,
                 g_tcache.tile_scatter_counters, tile_bounds_arr->data(),
                 coverageRenderTileBuffer, coverageRenderTileStride);
+            encode_gpu_tile_intersection_layout(
+                ctx, encoder, g_tcache.tile_scatter_counters,
+                g_tcache.tile_offsets, g_tcache.tile_bins,
+                g_tcache.sortable_tile_indices,
+                g_tcache.tile_layout_metadata,
+                static_cast<uint32_t>(num_tiles));
             [encoder endEncoding];
         });
         if (encodingFailure) {
@@ -2742,12 +2840,14 @@ MTensor msplat_train_step(
     }
 
     const msplat::TileIntersectionLayout intersectionLayout =
-        msplat::buildTileIntersectionLayout(
-            g_tcache.tile_scatter_counters.data<uint32_t>(),
-            g_tcache.tile_offsets.data<int32_t>(),
-            static_cast<size_t>(num_tiles),
-            g_tcache.tile_bins.data<int32_t>(),
-            g_tcache.sortable_tile_indices.data<uint32_t>());
+        ctx->gpu_tile_layout
+            ? completed_gpu_tile_intersection_layout(num_tiles)
+            : msplat::buildTileIntersectionLayout(
+                g_tcache.tile_scatter_counters.data<uint32_t>(),
+                g_tcache.tile_offsets.data<int32_t>(),
+                static_cast<size_t>(num_tiles),
+                g_tcache.tile_bins.data<int32_t>(),
+                g_tcache.sortable_tile_indices.data<uint32_t>());
     msplat::validateTileIntersectionWorkLimit(intersectionLayout);
     const bool needsRadixScratch =
         msplat::tileIntersectionLayoutNeedsRadixScratch(intersectionLayout);

@@ -55,6 +55,80 @@ int main() {
     CHECK(sortableTileIndices[0] == 1);
     CHECK(sortableTileIndices[1] == 4);
 
+    uint32_t gpuMetadata[msplat::kTileIntersectionLayoutMetadataWordCount] = {
+        8, 4, 4, 3, 2, 3, 2, 0, 0, 0
+    };
+    const auto gpuLayout = msplat::tileIntersectionLayoutFromGpuMetadata(
+        gpuMetadata, msplat::kTileIntersectionLayoutMetadataWordCount,
+        5, offsets);
+    CHECK(gpuLayout.totalCount == layout.totalCount);
+    CHECK(gpuLayout.maximumTileCount == layout.maximumTileCount);
+    CHECK(gpuLayout.maximumTileIndex == layout.maximumTileIndex);
+    CHECK(gpuLayout.activeTileCount == layout.activeTileCount);
+    CHECK(gpuLayout.sortableTileCount == layout.sortableTileCount);
+    CHECK(gpuLayout.trivialTileCount == layout.trivialTileCount);
+    CHECK(gpuLayout.smallTileCount == layout.smallTileCount);
+    CHECK(gpuLayout.mediumTileCount == layout.mediumTileCount);
+    CHECK(gpuLayout.largeTileCount == layout.largeTileCount);
+
+    bool truncatedGpuMetadataRejected = false;
+    try {
+        (void)msplat::tileIntersectionLayoutFromGpuMetadata(
+            gpuMetadata,
+            msplat::kTileIntersectionLayoutMetadataWordCount - 1,
+            5, offsets);
+    } catch (const std::invalid_argument&) {
+        truncatedGpuMetadataRejected = true;
+    }
+    CHECK(truncatedGpuMetadataRejected);
+
+    bool gpuOverflowRejected = false;
+    gpuMetadata[msplat::kTileIntersectionLayoutErrorFlagsWord] =
+        msplat::kTileIntersectionLayoutSignedIndexOverflow;
+    try {
+        (void)msplat::tileIntersectionLayoutFromGpuMetadata(
+            gpuMetadata, msplat::kTileIntersectionLayoutMetadataWordCount,
+            5, offsets);
+    } catch (const std::overflow_error&) {
+        gpuOverflowRejected = true;
+    }
+    CHECK(gpuOverflowRejected);
+
+    bool unknownGpuErrorRejected = false;
+    gpuMetadata[msplat::kTileIntersectionLayoutErrorFlagsWord] = 1u << 1;
+    try {
+        (void)msplat::tileIntersectionLayoutFromGpuMetadata(
+            gpuMetadata, msplat::kTileIntersectionLayoutMetadataWordCount,
+            5, offsets);
+    } catch (const std::runtime_error&) {
+        unknownGpuErrorRejected = true;
+    }
+    CHECK(unknownGpuErrorRejected);
+
+    gpuMetadata[msplat::kTileIntersectionLayoutErrorFlagsWord] = 0;
+    bool inconsistentGpuBucketsRejected = false;
+    ++gpuMetadata[msplat::kTileIntersectionLayoutSmallTileCountWord];
+    try {
+        (void)msplat::tileIntersectionLayoutFromGpuMetadata(
+            gpuMetadata, msplat::kTileIntersectionLayoutMetadataWordCount,
+            5, offsets);
+    } catch (const std::runtime_error&) {
+        inconsistentGpuBucketsRejected = true;
+    }
+    CHECK(inconsistentGpuBucketsRejected);
+    --gpuMetadata[msplat::kTileIntersectionLayoutSmallTileCountWord];
+
+    bool mismatchedGpuOffsetRejected = false;
+    int32_t mismatchedOffsets[5] = {0, 3, 4, 4, 7};
+    try {
+        (void)msplat::tileIntersectionLayoutFromGpuMetadata(
+            gpuMetadata, msplat::kTileIntersectionLayoutMetadataWordCount,
+            5, mismatchedOffsets);
+    } catch (const std::runtime_error&) {
+        mismatchedGpuOffsetRejected = true;
+    }
+    CHECK(mismatchedGpuOffsetRejected);
+
     const uint32_t emptyCounts[] = {0, 0};
     int32_t emptyOffsets[2] = {-1, -1};
     const auto empty = msplat::buildTileIntersectionLayout(

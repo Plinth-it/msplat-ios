@@ -2701,6 +2701,128 @@ kernel void project_backward_adam_kernel(
 #define EXACT_SMALL_SORT_TG_SIZE 32
 #define EXACT_SMALL_TILE_MAX 32
 
+// GPU counterpart of buildTileIntersectionLayout. Keep these metadata indices
+// synchronized with the host ABI; word 9 is a bitmask so later layout checks
+// can be added without changing the fixed buffer shape.
+#define EXACT_LAYOUT_TOTAL_COUNT 0
+#define EXACT_LAYOUT_MAXIMUM_TILE_COUNT 1
+#define EXACT_LAYOUT_MAXIMUM_TILE_INDEX 2
+#define EXACT_LAYOUT_ACTIVE_TILE_COUNT 3
+#define EXACT_LAYOUT_SORTABLE_TILE_COUNT 4
+#define EXACT_LAYOUT_TRIVIAL_TILE_COUNT 5
+#define EXACT_LAYOUT_SMALL_TILE_COUNT 6
+#define EXACT_LAYOUT_MEDIUM_TILE_COUNT 7
+#define EXACT_LAYOUT_LARGE_TILE_COUNT 8
+#define EXACT_LAYOUT_ERROR_FLAGS 9
+#define EXACT_LAYOUT_ERROR_SIGNED_INDEX_OVERFLOW (1u << 0)
+
+// Correctness-first GPU layout builder. Tile grids are small enough that one
+// thread can reproduce the host's stable ordering while avoiding cross-group
+// synchronization and signed scan overflow. Offsets are inclusive; bins are
+// [start, end). Sortable indices are bucketed small, medium, then large, with
+// stable tile order inside each bucket.
+kernel void build_tile_intersection_layout_kernel(
+    device const uint* tile_counts         [[buffer(0)]],
+    device int* inclusive_offsets          [[buffer(1)]],
+    device int* tile_bins                  [[buffer(2)]],
+    device uint* sortable_tile_indices     [[buffer(3)]],
+    device uint* metadata                  [[buffer(4)]],
+    constant uint& num_tiles               [[buffer(5)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index != 0) return;
+
+    uint running = 0;
+    uint maximum_tile_count = 0;
+    uint maximum_tile_index = 0;
+    uint active_tile_count = 0;
+    uint sortable_tile_count = 0;
+    uint trivial_tile_count = 0;
+    uint small_tile_count = 0;
+    uint medium_tile_count = 0;
+    uint large_tile_count = 0;
+    uint error_flags = 0;
+
+    for (uint tile = 0; tile < num_tiles; ++tile) {
+        const uint count = tile_counts[tile];
+
+        // Validate before adding so neither the unsigned accumulator nor the
+        // signed output ABI can wrap. Once invalid, all ranges remain neutral.
+        if ((error_flags & EXACT_LAYOUT_ERROR_SIGNED_INDEX_OVERFLOW) == 0u &&
+            count <= 0x7FFFFFFFu - running) {
+            const int start = (int)running;
+            running += count;
+            const int end = (int)running;
+            inclusive_offsets[tile] = end;
+            tile_bins[tile * 2u] = start;
+            tile_bins[tile * 2u + 1u] = end;
+        } else {
+            error_flags |= EXACT_LAYOUT_ERROR_SIGNED_INDEX_OVERFLOW;
+            inclusive_offsets[tile] = 0;
+            tile_bins[tile * 2u] = 0;
+            tile_bins[tile * 2u + 1u] = 0;
+        }
+
+        if (count > 0u) ++active_tile_count;
+        if (count <= 1u) {
+            ++trivial_tile_count;
+        } else {
+            ++sortable_tile_count;
+            if (count <= EXACT_SMALL_TILE_MAX) {
+                ++small_tile_count;
+            } else if (count <= EXACT_BITONIC_FAST_PATH) {
+                ++medium_tile_count;
+            } else {
+                ++large_tile_count;
+            }
+        }
+        // Match the host's strict comparison so ties retain the first tile.
+        if (count > maximum_tile_count) {
+            maximum_tile_count = count;
+            maximum_tile_index = tile;
+        }
+    }
+
+    if ((error_flags & EXACT_LAYOUT_ERROR_SIGNED_INDEX_OVERFLOW) == 0u) {
+        uint next_small = 0;
+        uint next_medium = small_tile_count;
+        uint next_large = small_tile_count + medium_tile_count;
+        for (uint tile = 0; tile < num_tiles; ++tile) {
+            const uint count = tile_counts[tile];
+            if (count > 1u && count <= EXACT_SMALL_TILE_MAX) {
+                sortable_tile_indices[next_small++] = tile;
+            } else if (count > EXACT_SMALL_TILE_MAX &&
+                       count <= EXACT_BITONIC_FAST_PATH) {
+                sortable_tile_indices[next_medium++] = tile;
+            } else if (count > EXACT_BITONIC_FAST_PATH) {
+                sortable_tile_indices[next_large++] = tile;
+            }
+        }
+    } else {
+        // Earlier valid prefixes may already have been written. Clear every
+        // externally consumed range/list entry before the host observes the
+        // error so no later pass can accidentally use a partial layout.
+        for (uint tile = 0; tile < num_tiles; ++tile) {
+            inclusive_offsets[tile] = 0;
+            tile_bins[tile * 2u] = 0;
+            tile_bins[tile * 2u + 1u] = 0;
+            sortable_tile_indices[tile] = 0;
+        }
+        running = 0;
+    }
+
+    metadata[EXACT_LAYOUT_TOTAL_COUNT] = running;
+    metadata[EXACT_LAYOUT_MAXIMUM_TILE_COUNT] = maximum_tile_count;
+    metadata[EXACT_LAYOUT_MAXIMUM_TILE_INDEX] = maximum_tile_index;
+    metadata[EXACT_LAYOUT_ACTIVE_TILE_COUNT] = active_tile_count;
+    metadata[EXACT_LAYOUT_SORTABLE_TILE_COUNT] = sortable_tile_count;
+    metadata[EXACT_LAYOUT_TRIVIAL_TILE_COUNT] = trivial_tile_count;
+    metadata[EXACT_LAYOUT_SMALL_TILE_COUNT] = small_tile_count;
+    metadata[EXACT_LAYOUT_MEDIUM_TILE_COUNT] = medium_tile_count;
+    metadata[EXACT_LAYOUT_LARGE_TILE_COUNT] = large_tile_count;
+    metadata[EXACT_LAYOUT_ERROR_FLAGS] = error_flags;
+}
+
 // Scatter every Gaussian/tile intersection into the exact compact range that
 // the host built after reading tile_counts. Each tile owns a disjoint range, so
 // only its local cursor is atomic. The capacity check is defensive: with valid

@@ -100,6 +100,17 @@ remove the per-step host wait. Keep `enumerated` as the shipping mode until
 fixed-snapshot physical-device and sustained-thermal measurements justify a
 default change.
 
+Exact tile layout likewise remains on its established CPU implementation by
+default. `MSPLAT_TILE_LAYOUT_MODE=gpu` is a correctness-first experiment that
+builds the same inclusive offsets, tile bins, stable small/medium/large sort
+lists, and checked summary metadata with one GPU thread. It composes with both
+tile-count modes, but the host still waits for completion, validates the final
+offset and metadata, and sizes the arena before submitting rasterization and
+optimizer work. This prerequisite therefore does **not** remove the per-step
+CPU/GPU barrier or claim a throughput improvement. Keep `cpu` as the shipping
+mode until the later high-water arena, overflow-safe no-op, and same-step retry
+work is implemented and validated on physical devices.
+
 ## Correctness
 
 **Rasterizer intersections.** The packed buffers were once sized
@@ -394,6 +405,7 @@ Output: `.ply`, `.splat`, `.spz`.
 | `MSPLAT_IMAGE_CACHE_MB` | Image cache budget. Default 512 on iOS, 2048 elsewhere. |
 | `MSPLAT_CAMERA_PREFETCH` | Set exactly `1` to predecode one upcoming training camera. Default off. |
 | `MSPLAT_TILE_COUNT_MODE` | `enumerated` (default) or experimental exact `difference` counting. Set before first Metal use. |
+| `MSPLAT_TILE_LAYOUT_MODE` | `cpu` (default) or experimental exact `gpu` layout. The GPU mode retains the synchronized host validation and arena-sizing boundary. Set before first Metal use. |
 | `MSPLAT_MEM_LOG_EVERY` | Memory breakdown every N steps. |
 | `MSPLAT_ISECT_LOG` | Intersection count against capacity at each sample. |
 

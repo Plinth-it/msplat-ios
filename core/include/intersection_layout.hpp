@@ -23,6 +23,21 @@ inline constexpr uint32_t kExactTileMetadataBytes =
 // allocation or optimizer submission instead of risking the GPU watchdog.
 inline constexpr uint32_t kMaximumExactIntersectionsPerTile = 65'536;
 
+// GPU layout metadata mirrors TileIntersectionLayout as a compact uint32 array.
+// Keep these word offsets in sync with build_tile_intersection_layout_kernel.
+inline constexpr size_t kTileIntersectionLayoutMetadataWordCount = 10;
+inline constexpr size_t kTileIntersectionLayoutTotalCountWord = 0;
+inline constexpr size_t kTileIntersectionLayoutMaximumTileCountWord = 1;
+inline constexpr size_t kTileIntersectionLayoutMaximumTileIndexWord = 2;
+inline constexpr size_t kTileIntersectionLayoutActiveTileCountWord = 3;
+inline constexpr size_t kTileIntersectionLayoutSortableTileCountWord = 4;
+inline constexpr size_t kTileIntersectionLayoutTrivialTileCountWord = 5;
+inline constexpr size_t kTileIntersectionLayoutSmallTileCountWord = 6;
+inline constexpr size_t kTileIntersectionLayoutMediumTileCountWord = 7;
+inline constexpr size_t kTileIntersectionLayoutLargeTileCountWord = 8;
+inline constexpr size_t kTileIntersectionLayoutErrorFlagsWord = 9;
+inline constexpr uint32_t kTileIntersectionLayoutSignedIndexOverflow = 1u << 0;
+
 struct TileIntersectionLayout {
     uint32_t totalCount = 0;
     uint32_t maximumTileCount = 0;
@@ -34,6 +49,88 @@ struct TileIntersectionLayout {
     uint32_t mediumTileCount = 0;
     uint32_t largeTileCount = 0;
 };
+
+/// Converts completed GPU layout metadata back into the checked host layout.
+/// The final inclusive offset is validated independently so corrupt or stale
+/// metadata cannot determine an arena allocation or dispatch size.
+inline TileIntersectionLayout tileIntersectionLayoutFromGpuMetadata(
+    const uint32_t* metadata, size_t metadataWordCount, size_t tileCount,
+    const int32_t* inclusiveOffsets) {
+    if (!metadata || metadataWordCount < kTileIntersectionLayoutMetadataWordCount) {
+        throw std::invalid_argument(
+            "GPU tile-intersection layout metadata is missing or truncated");
+    }
+    if (tileCount > 0 && !inclusiveOffsets) {
+        throw std::invalid_argument(
+            "GPU tile-intersection offsets must not be null");
+    }
+    if (metadata[kTileIntersectionLayoutErrorFlagsWord] &
+        kTileIntersectionLayoutSignedIndexOverflow) {
+        throw std::overflow_error(
+            "Exact tile-intersection count exceeds the native index range");
+    }
+    if (metadata[kTileIntersectionLayoutErrorFlagsWord] != 0) {
+        throw std::runtime_error(
+            "GPU tile-intersection layout reported an unknown error");
+    }
+
+    TileIntersectionLayout layout;
+    layout.totalCount = metadata[kTileIntersectionLayoutTotalCountWord];
+    layout.maximumTileCount =
+        metadata[kTileIntersectionLayoutMaximumTileCountWord];
+    layout.maximumTileIndex =
+        metadata[kTileIntersectionLayoutMaximumTileIndexWord];
+    layout.activeTileCount =
+        metadata[kTileIntersectionLayoutActiveTileCountWord];
+    layout.sortableTileCount =
+        metadata[kTileIntersectionLayoutSortableTileCountWord];
+    layout.trivialTileCount =
+        metadata[kTileIntersectionLayoutTrivialTileCountWord];
+    layout.smallTileCount =
+        metadata[kTileIntersectionLayoutSmallTileCountWord];
+    layout.mediumTileCount =
+        metadata[kTileIntersectionLayoutMediumTileCountWord];
+    layout.largeTileCount =
+        metadata[kTileIntersectionLayoutLargeTileCountWord];
+
+    if (layout.totalCount >
+        static_cast<uint32_t>(std::numeric_limits<int32_t>::max())) {
+        throw std::overflow_error(
+            "Exact tile-intersection count exceeds the native index range");
+    }
+    const uint64_t classifiedTiles =
+        static_cast<uint64_t>(layout.trivialTileCount) +
+        layout.sortableTileCount;
+    const uint64_t sortableTiles =
+        static_cast<uint64_t>(layout.smallTileCount) +
+        layout.mediumTileCount + layout.largeTileCount;
+    if (classifiedTiles != tileCount ||
+        sortableTiles != layout.sortableTileCount ||
+        layout.activeTileCount > tileCount ||
+        layout.activeTileCount < layout.sortableTileCount ||
+        layout.activeTileCount > layout.totalCount ||
+        (layout.maximumTileCount > 0 &&
+         layout.maximumTileIndex >= tileCount) ||
+        (layout.maximumTileCount == 0 && layout.totalCount != 0) ||
+        (layout.maximumTileCount > layout.totalCount) ||
+        (layout.largeTileCount == 0 &&
+         layout.maximumTileCount > kExactBitonicFastPath) ||
+        (layout.largeTileCount > 0 &&
+         layout.maximumTileCount <= kExactBitonicFastPath)) {
+        throw std::runtime_error(
+            "GPU tile-intersection layout metadata is inconsistent");
+    }
+
+    const int32_t finalOffset = tileCount > 0
+        ? inclusiveOffsets[tileCount - 1]
+        : 0;
+    if (finalOffset < 0 ||
+        static_cast<uint32_t>(finalOffset) != layout.totalCount) {
+        throw std::runtime_error(
+            "GPU tile-intersection layout offset does not match its total");
+    }
+    return layout;
+}
 
 inline bool tileIntersectionLayoutNeedsRadixScratch(
     const TileIntersectionLayout& layout) {

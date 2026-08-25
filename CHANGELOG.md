@@ -106,6 +106,13 @@
   including post-scan coverage-tile masking. Per-intersection enumeration remains
   the default pending physical-device and sustained-thermal results; both modes
   retain the synchronized CPU layout and exact arena-allocation safety boundary.
+- Added an opt-in GPU exact-layout prerequisite that reproduces the CPU
+  inclusive offsets, tile bins, stable sort buckets, and checked ten-word
+  metadata for both enumerated and difference-grid counts. The CPU layout
+  remains the default, and the experimental path deliberately retains the
+  completed-count host wait, metadata validation, work-limit check, and host
+  arena sizing. It is groundwork for—not an implementation of—the planned
+  high-water arena, overflow-safe no-op, and retry design.
 - Fused geometry backward directly into the mean, scale, and quaternion Adam
   updates, and folded opacity plus densification-stat updates into the terminal
   backward stage. The training cache no longer owns or clears the three geometry

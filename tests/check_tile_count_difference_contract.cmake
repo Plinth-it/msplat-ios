@@ -216,7 +216,8 @@ require_contains("${host_source}" "&tile_count_diff,"
 
 # A shared helper encodes horizontal then vertical exactly once, with a buffer
 # barrier before each scan. Render and training both call it immediately after
-# projection, then retain the existing GPU wait and checked CPU layout.
+# projection, may then build the equivalent layout on the GPU, and retain the
+# existing GPU wait and checked host-side arena decision.
 require_count("${host_source}"
     "ENC_SCALAR\\(enc, tileCountMode, 26\\)" 2
     "projection mode bindings")
@@ -300,15 +301,32 @@ foreach(pipeline IN ITEMS render_pipeline training_pipeline)
         "encode_proj_sh(encoder);"
         "encode_tile_count_difference_scan("
         "${pipeline} projection precedes scan helper")
+    require_contains("${${pipeline}}"
+        "encode_gpu_tile_intersection_layout("
+        "${pipeline} optional GPU layout call")
+    require_ordered("${${pipeline}}"
+        "encode_tile_count_difference_scan("
+        "encode_gpu_tile_intersection_layout("
+        "${pipeline} reconstructed counts precede GPU layout")
     require_contains("${${pipeline}}" "ctx->syncCB()"
         "${pipeline} retained GPU-to-CPU wait")
+    require_contains("${${pipeline}}"
+        "? completed_gpu_tile_intersection_layout(num_tiles)"
+        "${pipeline} opt-in checked GPU layout")
     require_contains("${${pipeline}}"
         "msplat::buildTileIntersectionLayout("
         "${pipeline} retained checked CPU layout")
     require_contains("${${pipeline}}"
         "g_tcache.tile_scatter_counters.data<uint32_t>()"
-        "${pipeline} layout reads reconstructed counts")
+        "${pipeline} CPU layout reads reconstructed counts")
     require_contains("${${pipeline}}"
         "g_tcache.ensure_intersection_arena("
         "${pipeline} retained exact arena sizing")
 endforeach()
+
+extract_section("${host_source}"
+    "static msplat::TileIntersectionLayout completed_gpu_tile_intersection_layout("
+    "size_t msplat_cached_tensor_bytes(" completed_layout_helper)
+require_contains("${completed_layout_helper}"
+    "msplat::tileIntersectionLayoutFromGpuMetadata("
+    "opt-in checked GPU metadata conversion")
