@@ -5342,6 +5342,35 @@ kernel void densify_classify_kernel(
     dup_flag[idx]   = do_dup   ? 1 : 0;
 }
 
+inline uint densify_mix_bits(uint value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+constant bool densify_random_on_gpu [[function_constant(0)]];
+
+inline float densify_uniform_open(uint bits) {
+    // Force the least-significant retained bit so the exactly representable
+    // numerator stays in [1, 2^24 - 1], safely away from both endpoints.
+    return float((bits >> 8) | 1u) * (1.0f / 16777216.0f);
+}
+
+inline float2 densify_normal_pair(uint seed, uint pair_index) {
+    uint stream = pair_index + 1u;
+    uint base = seed ^ (stream * 0x9e3779b9u);
+    float u1 = densify_uniform_open(
+        densify_mix_bits(base ^ 0xa511e9b3u));
+    float u2 = densify_uniform_open(
+        densify_mix_bits(base ^ 0x63d83595u));
+    float radius = sqrt(-2.0f * log(u1));
+    float angle = 6.28318530717958647692f * u2;
+    return radius * float2(cos(angle), sin(angle));
+}
+
 // Append split children into backing buffers. One thread per original gaussian.
 // Each split gaussian produces 2 children at [N + 2*(ord)], [N + 2*(ord)+1].
 // Also shrinks parent scale by 1/1.6 and zeros optimizer state for children.
@@ -5370,6 +5399,7 @@ kernel void densify_append_split_kernel(
     device float* adam_es3           [[buffer(21)]],
     device float* adam_es4           [[buffer(22)]],
     device float* adam_es5           [[buffer(23)]],
+    constant uint& random_seed       [[buffer(24)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)N || split_flag[idx] == 0) return;
@@ -5387,15 +5417,40 @@ kernel void densify_append_split_kernel(
     // Parent scale (exp)
     float sx = exp(scales_buf[idx*3]), sy = exp(scales_buf[idx*3+1]), sz = exp(scales_buf[idx*3+2]);
 
+    float2 gpu_pair0, gpu_pair1, gpu_pair2;
+    if (densify_random_on_gpu) {
+        uint first_pair = uint(ord) * 3u;
+        gpu_pair0 = densify_normal_pair(random_seed, first_pair);
+        gpu_pair1 = densify_normal_pair(random_seed, first_pair + 1u);
+        gpu_pair2 = densify_normal_pair(random_seed, first_pair + 2u);
+    }
+
     // For each of 2 children
     for (int k = 0; k < 2; k++) {
         int child = (k == 0) ? c0 : c1;
         int rand_idx = ord * 2 + k;
 
-        // Scale random sample by parent scale
-        float r0 = random_samples[rand_idx*3]   * sx;
-        float r1 = random_samples[rand_idx*3+1] * sy;
-        float r2 = random_samples[rand_idx*3+2] * sz;
+        // GPU mode derives a stateless stream from logical step and split
+        // ordinal. CPU mode reads the exact legacy libc++ sample stream.
+        float r0, r1, r2;
+        if (densify_random_on_gpu) {
+            if (k == 0) {
+                r0 = gpu_pair0.x;
+                r1 = gpu_pair0.y;
+                r2 = gpu_pair1.x;
+            } else {
+                r0 = gpu_pair1.y;
+                r1 = gpu_pair2.x;
+                r2 = gpu_pair2.y;
+            }
+        } else {
+            r0 = random_samples[rand_idx*3];
+            r1 = random_samples[rand_idx*3+1];
+            r2 = random_samples[rand_idx*3+2];
+        }
+        r0 *= sx;
+        r1 *= sy;
+        r2 *= sz;
 
         // Rotate by parent quaternion: v' = R @ v
         float v0 = (1-2*(qy*qy+qz*qz))*r0 + 2*(qx*qy-qw*qz)*r1 + 2*(qx*qz+qw*qy)*r2;

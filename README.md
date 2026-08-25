@@ -147,6 +147,18 @@ fused mode is selected. Keep `staged` as the shipping mode until representative
 physical-device and sustained-thermal A/B results show that the larger halo
 work is a throughput win as well as a memory win.
 
+Densification split offsets keep the established libc++ CPU normal stream by
+default. `MSPLAT_DENSIFY_RANDOM_MODE=gpu` replaces the periodic host fill with
+a stateless counter-based Box-Muller stream generated directly by each split
+thread from the logical step and dense split ordinal. The experimental path
+avoids the sample-buffer write/read traffic but deliberately retains that
+capacity-sized allocation so CPU and GPU modes remain directly comparable.
+Because the random sequence changes the training trajectory, keep `cpu` as the
+shipping mode until fixed-checkpoint quality, densification-step timing, and
+sustained physical-device thermal results justify promotion. Resume with the
+same mode when comparing a continued run; the mode is process configuration,
+not checkpoint metadata.
+
 ## Correctness
 
 **Rasterizer intersections.** The packed buffers were once sized

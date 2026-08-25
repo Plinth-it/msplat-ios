@@ -22,6 +22,7 @@
 #import <memory>
 #import <mutex>
 #import <new>
+#import <random>
 #import <stdexcept>
 #import <string>
 #import <vector>
@@ -841,6 +842,7 @@ struct MetalContext {
     id<MTLComputePipelineState> project_backward_adam_kernel_cpso = nil;
     id<MTLComputePipelineState> reset_opacity_state_kernel_cpso = nil;
     // GPU densification kernels
+    bool gpu_densify_random = false;
     id<MTLComputePipelineState> densify_classify_kernel_cpso = nil;
     id<MTLComputePipelineState> densify_append_split_kernel_cpso = nil;
     id<MTLComputePipelineState> densify_append_dup_kernel_cpso = nil;
@@ -1068,6 +1070,62 @@ MetalContext* init_msplat_metal_context() {
         return pso;
     };
 
+    auto loadBoolSpecialization = [&](NSString* name, NSUInteger index,
+                                      bool value)
+        -> id<MTLComputePipelineState> {
+        MTLFunctionConstantValues* constants =
+            [MTLFunctionConstantValues new];
+        if (!constants) {
+            throw std::bad_alloc();
+        }
+        [constants setConstantValue:&value type:MTLDataTypeBool atIndex:index];
+        NSError* functionError = nil;
+        id<MTLFunction> fn = [metal_library
+            newFunctionWithName:name
+            constantValues:constants
+            error:&functionError];
+        [constants release];
+        if (!fn) {
+            const char* description = functionError
+                ? functionError.localizedDescription.UTF8String
+                : "unknown error";
+            fprintf(stderr, "msplat: failed to specialize kernel %s: %s\n",
+                    name.UTF8String, description);
+            if (!pipelineLoadFailed) {
+                pipelineFailure = "msplat: failed to specialize kernel ";
+                pipelineFailure += name.UTF8String;
+                if (description) {
+                    pipelineFailure += ": ";
+                    pipelineFailure += description;
+                }
+            }
+            pipelineLoadFailed = true;
+            return nil;
+        }
+        NSError* pipelineError = nil;
+        id<MTLComputePipelineState> pso =
+            [ctx->device newComputePipelineStateWithFunction:fn
+                                                       error:&pipelineError];
+        [fn release];
+        if (!pso) {
+            const char* description = pipelineError
+                ? pipelineError.localizedDescription.UTF8String
+                : "unknown error";
+            fprintf(stderr, "msplat: failed to create pipeline for %s: %s\n",
+                    name.UTF8String, description);
+            if (!pipelineLoadFailed) {
+                pipelineFailure = "msplat: failed to create pipeline for ";
+                pipelineFailure += name.UTF8String;
+                if (description) {
+                    pipelineFailure += ": ";
+                    pipelineFailure += description;
+                }
+            }
+            pipelineLoadFailed = true;
+        }
+        return pso;
+    };
+
     const char* tileCountModeOverride =
         std::getenv("MSPLAT_TILE_COUNT_MODE");
     if (tileCountModeOverride) {
@@ -1133,6 +1191,19 @@ MetalContext* init_msplat_metal_context() {
         } else {
             throw std::invalid_argument(
                 "msplat: MSPLAT_INTERSECTION_ATTRIBUTES must be packed or gather");
+        }
+    }
+
+    const char* densifyRandomModeOverride =
+        std::getenv("MSPLAT_DENSIFY_RANDOM_MODE");
+    if (densifyRandomModeOverride) {
+        if (std::strcmp(densifyRandomModeOverride, "cpu") == 0) {
+            // Preserve the established libc++ normal-distribution stream.
+        } else if (std::strcmp(densifyRandomModeOverride, "gpu") == 0) {
+            ctx->gpu_densify_random = true;
+        } else {
+            throw std::invalid_argument(
+                "msplat: MSPLAT_DENSIFY_RANDOM_MODE must be cpu or gpu");
         }
     }
 
@@ -1208,7 +1279,8 @@ MetalContext* init_msplat_metal_context() {
     ctx->reset_opacity_state_kernel_cpso          = load(@"reset_opacity_state_kernel");
     // GPU densification
     ctx->densify_classify_kernel_cpso             = load(@"densify_classify_kernel");
-    ctx->densify_append_split_kernel_cpso         = load(@"densify_append_split_kernel");
+    ctx->densify_append_split_kernel_cpso = loadBoolSpecialization(
+        @"densify_append_split_kernel", 0, ctx->gpu_densify_random);
     ctx->densify_append_dup_kernel_cpso           = load(@"densify_append_dup_kernel");
     ctx->densify_cull_classify_kernel_cpso        = load(@"densify_cull_classify_kernel");
     ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
@@ -1266,6 +1338,10 @@ MetalContext* init_msplat_metal_context() {
     if (intersectionAttributesOverride) {
         fprintf(stderr, "msplat: MSPLAT_INTERSECTION_ATTRIBUTES=%s\n",
                 intersectionAttributesOverride);
+    }
+    if (densifyRandomModeOverride) {
+        fprintf(stderr, "msplat: MSPLAT_DENSIFY_RANDOM_MODE=%s\n",
+                densifyRandomModeOverride);
     }
     if (ctx->small_sort_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup <
         msplat::kExactSmallTileMaximum) {
@@ -4298,7 +4374,7 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    MTensor &random_samples, uint32_t random_seed
 ) {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     if (N <= 0 || population < N || fr_stride < 0)
@@ -4362,6 +4438,17 @@ int msplat_densify(
     }
 
     MetalContext* ctx = get_global_context();
+    const uint32_t generate_random_on_gpu =
+        ctx->gpu_densify_random ? 1u : 0u;
+    if (generate_random_on_gpu == 0u) {
+        // Preserve the legacy libc++ stream exactly in the default mode. The
+        // classification pass has already synchronized shared storage.
+        std::mt19937 generator(random_seed);
+        std::normal_distribution<float> distribution(0.0f, 1.0f);
+        float* samples = random_samples.data<float>();
+        for (int64_t index = 0; index < 6LL * num_splits; ++index)
+            samples[index] = distribution(generator);
+    }
     int worst_case = population;
     float log_size_fac = std::log(1.6f);
 
@@ -4408,6 +4495,7 @@ int msplat_densify(
             ENC_BUF(enc, adam_exp_avg_sq_buf[3], 21);
             ENC_BUF(enc, adam_exp_avg_sq_buf[4], 22);
             ENC_BUF(enc, adam_exp_avg_sq_buf[5], 23);
+            ENC_SCALAR(enc, random_seed, 24);
             [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         }
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];

@@ -246,7 +246,9 @@ void msplat_prepare_densify(
 );
 
 // Runs the prepared grow -> cull -> compact pipeline. `population` is
-// N + 2*splits + dups as reported by msplat_prepare_densify.
+// N + 2*splits + dups as reported by msplat_prepare_densify. `random_seed`
+// is the logical step used by both the legacy CPU stream and the opt-in
+// counter-based GPU stream.
 int msplat_densify(
     int N, int population,
     float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size,
@@ -260,7 +262,7 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    MTensor &random_samples, uint32_t random_seed
 );
 
 #endif

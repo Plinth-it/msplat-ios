@@ -607,14 +607,6 @@ void Model::afterTrain(int step){
             int population = static_cast<int>(population64);
             ensureCapacity(population);
 
-            // Fill random samples for splits (CPU randn, shared memory)
-            {
-                std::mt19937 rng(step);
-                std::normal_distribution<float> dist(0.0f, 1.0f);
-                float *p = densify_random_samples.data<float>();
-                for (int64_t i = 0; i < 2LL * numSplits * 3; i++) p[i] = dist(rng);
-            }
-
             int fr_stride = (int)featuresRest_buf.stride0();
             int densifiedCount = msplat_densify(
                 num_active, population,
@@ -627,7 +619,7 @@ void Model::afterTrain(int step){
                 densify_split_prefix, densify_dup_prefix,
                 densify_keep_flag, densify_keep_prefix,
                 densify_block_totals, densify_compact_scratch,
-                densify_random_samples
+                densify_random_samples, static_cast<uint32_t>(step)
             );
             if (densifiedCount < 0 || densifiedCount > population ||
                 (maxGaussians > 0 && densifiedCount > maxGaussians)) {
