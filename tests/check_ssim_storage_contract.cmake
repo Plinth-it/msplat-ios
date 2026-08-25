@@ -52,14 +52,16 @@ function(require_barrier_between contents before after label)
     endif()
 endfunction()
 
-require_contains("${host_source}" "bool fused_ssim_backward = false;"
-    "staged SSIM remains the default")
+require_contains("${host_source}" "bool fused_ssim_backward = true;"
+    "fused SSIM default")
 require_contains("${host_source}"
     "const char* ssimModeOverride = std::getenv(\"MSPLAT_SSIM_MODE\");"
     "SSIM mode environment override")
 require_contains("${host_source}"
     "std::strcmp(ssimModeOverride, \"staged\") == 0"
     "explicit staged mode")
+require_contains("${host_source}" "ctx->fused_ssim_backward = false;"
+    "staged fallback activation")
 require_contains("${host_source}"
     "std::strcmp(ssimModeOverride, \"fused\") == 0"
     "explicit fused mode")

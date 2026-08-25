@@ -470,7 +470,7 @@ struct TrainingBenchmarkRecorder {
             "MSPLAT_TILE_LAYOUT_MODE": environment["MSPLAT_TILE_LAYOUT_MODE"] ?? "cpu",
             "MSPLAT_TRAINING_ARENA_MODE":
                 environment["MSPLAT_TRAINING_ARENA_MODE"] ?? "exact",
-            "MSPLAT_SSIM_MODE": environment["MSPLAT_SSIM_MODE"] ?? "staged",
+            "MSPLAT_SSIM_MODE": environment["MSPLAT_SSIM_MODE"] ?? "fused",
             "MSPLAT_DENSIFY_RANDOM_MODE":
                 environment["MSPLAT_DENSIFY_RANDOM_MODE"] ?? "cpu",
             "MSPLAT_IMAGE_CACHE_MB": environment["MSPLAT_IMAGE_CACHE_MB"] ?? "512",

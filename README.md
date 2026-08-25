@@ -146,15 +146,16 @@ resource-growth and encoding costs are accumulated into the completed logical
 step's telemetry. Keep `exact` as the shipping mode until physical-device
 throughput, memory, and sustained-thermal measurements justify a default change.
 
-The separable SSIM derivative path likewise keeps its established staged mode
-by default. `MSPLAT_SSIM_MODE=fused` uses a 16x8 terminal threadgroup to retain
-the vertical and horizontal derivative fields in one reusable shared-memory
-tile. It removes the 9-float-per-pixel derivative buffer and the final SSIM
-dispatch, saving 36 bytes per training pixel plus its write/read round trip.
-The public training-plan estimate continues to budget staged storage even when
-fused mode is selected. Keep `staged` as the shipping mode until representative
-physical-device and sustained-thermal A/B results show that the larger halo
-work is a throughput win as well as a memory win.
+The separable SSIM derivative path uses fused processing by default. A 16x8
+terminal threadgroup retains the vertical and horizontal derivative fields in
+one reusable shared-memory tile, removing the 9-float-per-pixel derivative
+buffer and final SSIM dispatch. At 1200x1600 and 313,214 Gaussians, sustained
+iPhone 16 Pro Max profiling measured throughput within one percent of the mean
+of two bracketing baselines while saving about 66 MiB of tracked native buffers
+and 74 MiB of process footprint.
+Set `MSPLAT_SSIM_MODE=staged` before first Metal use to restore the three-stage
+fallback. The public training-plan estimate deliberately continues to budget
+the larger staged storage so admission remains conservative for either mode.
 
 Densification split offsets keep the established libc++ CPU normal stream by
 default. `MSPLAT_DENSIFY_RANDOM_MODE=gpu` replaces the periodic host fill with
@@ -474,7 +475,7 @@ Output: `.ply`, `.splat`, `.spz`.
 | `MSPLAT_TILE_COUNT_MODE` | `enumerated` (default) or experimental exact `difference` counting. Set before first Metal use. |
 | `MSPLAT_TILE_LAYOUT_MODE` | `cpu` (default) or experimental exact `gpu` layout. The GPU mode retains the synchronized host validation and arena-sizing boundary. Set before first Metal use. |
 | `MSPLAT_TRAINING_ARENA_MODE` | `exact` (default) or experimental transactional `retry`. Retry forces GPU tile layout and replaces steady-state mid-step sizing with an end-of-attempt validation/retry boundary. Set before first Metal use. |
-| `MSPLAT_SSIM_MODE` | `staged` (default) or experimental `fused` derivative processing. Fused removes the 36-byte-per-pixel derivative buffer and one dispatch. Set before first Metal use. |
+| `MSPLAT_SSIM_MODE` | Fused derivative processing (default) or `staged` fallback. Staged uses a 36-byte-per-pixel derivative buffer and one additional dispatch. Set before first Metal use. |
 | `MSPLAT_INTERSECTION_ATTRIBUTES` | Key-driven `gather` (default) or `packed` fallback. Packed attributes add three float3 arrays and one pack dispatch, using 36 additional bytes per arena slot. Set before first Metal use. |
 | `MSPLAT_MEM_LOG_EVERY` | Memory breakdown every N steps. |
 | `MSPLAT_ISECT_LOG` | Intersection count against capacity at each sample. |
@@ -528,11 +529,10 @@ Forward:
   CPU checked prefix         exact offsets and grow-only arena sizing
   exact scatter + sort       compact checked tile ranges + optional packing
   nd_rasterize_forward       per-pixel alpha compositing (16×16 tiles)
-  ssim_h_fwd + fused_v_h_bwd default staged 11-tap SSIM + L1 loss
+  ssim_h_fwd + fused_v_bwd   default fused 11-tap SSIM + L1 loss
 
 Backward:
-  ssim_v_bwd                 default staged final SSIM image gradient
-  optional fused SSIM        folds both derivative passes into the loss pass
+  optional staged SSIM       materializes derivatives, then runs ssim_v_bwd
   rasterize_backward         per-pixel backward compositing
   sh_opacity_backward_adam   register SH VJP + SH/opacity Adam update
   project_backward_adam      register geometry VJP + Adam + densify stats

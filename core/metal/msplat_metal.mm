@@ -1028,7 +1028,7 @@ struct MetalContext {
     id<MTLComputePipelineState> ssim_fused_v_fwd_h_bwd_kernel_cpso = nil;
     id<MTLComputePipelineState> ssim_fused_v_fwd_bwd_kernel_cpso = nil;
     id<MTLComputePipelineState> ssim_v_bwd_kernel_cpso = nil;
-    bool fused_ssim_backward = false;
+    bool fused_ssim_backward = true;
     id<MTLComputePipelineState> photometric_adam_kernel_cpso = nil;
     id<MTLComputePipelineState> prepare_camera_pose_kernel_cpso = nil;
     id<MTLComputePipelineState> camera_pose_adam_kernel_cpso = nil;
@@ -1365,7 +1365,7 @@ MetalContext* init_msplat_metal_context() {
     const char* ssimModeOverride = std::getenv("MSPLAT_SSIM_MODE");
     if (ssimModeOverride) {
         if (std::strcmp(ssimModeOverride, "staged") == 0) {
-            // Keep the established three-dispatch derivative path.
+            ctx->fused_ssim_backward = false;
         } else if (std::strcmp(ssimModeOverride, "fused") == 0) {
             ctx->fused_ssim_backward = true;
         } else {
@@ -3649,9 +3649,9 @@ static MTensor msplat_train_step_locked(
     };
 
     // Fused loss: SSIM always begins with a horizontal image convolution.
-    // The staged default materializes compact horizontal derivatives before
-    // its vertical backward pass; the opt-in fused path keeps both derivative
-    // convolutions in one 16x8 threadgroup and writes only the final gradient.
+    // The fused default keeps both derivative convolutions in one 16x8
+    // threadgroup and writes only the final gradient. The staged fallback
+    // materializes compact horizontal derivatives before its vertical pass.
     auto encode_loss_fwd_bwd = [&](id<MTLComputeCommandEncoder> enc) {
         MTLSize threadgroups = MTLSizeMake(
             (img_width + 15) / 16, (img_height + 15) / 16, 1);

@@ -4752,7 +4752,7 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             loss_sum, tg_scratch[0], memory_order_relaxed);
 }
 
-// Opt-in terminal SSIM pass: vertical forward, both derivative convolutions,
+// Default terminal SSIM pass: vertical forward, both derivative convolutions,
 // final rendered-image gradient, and loss/photometric reductions. A 16x8
 // output group keeps the complete 26x28 statistics halo below 16 KiB. Each
 // phase retains its outputs privately, then reuses the same threadgroup tile

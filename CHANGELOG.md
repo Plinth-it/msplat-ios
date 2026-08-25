@@ -134,6 +134,12 @@
   restores the three float3 copies as a device-specific fallback. Swift memory
   planning now budgets the configured 16-byte gather or 52-byte packed arena,
   keeping the app's memory admission gate conservative for either mode.
+- Made fused SSIM derivative processing the default after sustained physical-
+  device profiling found throughput within one percent of the mean of two
+  bracketing baselines while saving about 66 MiB of tracked native buffers and
+  74 MiB of process footprint at 1200x1600. `MSPLAT_SSIM_MODE=staged` restores
+  the three-dispatch fallback, and the public training plan retains its
+  conservative staged-memory estimate.
 - Fused geometry backward directly into the mean, scale, and quaternion Adam
   updates, and folded opacity plus densification-stat updates into the terminal
   backward stage. The training cache no longer owns or clears the three geometry

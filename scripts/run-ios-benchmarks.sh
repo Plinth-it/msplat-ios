@@ -57,7 +57,7 @@ Prerequisites:
     identifies a dataset staged in the app's Documents directory.
 
 The app is built and installed once, then these isolated variants run:
-  baseline, arena-retry, difference-retry, packed, fused-ssim, raster-16x8,
+  baseline, arena-retry, difference-retry, packed, staged-ssim, raster-16x8,
   raster-16x16
 
 Every run writes a console log and devicectl JSON result. Successful benchmark
@@ -153,7 +153,7 @@ if (( PROFILE_STAGES_ENABLED &&
     die "--profile-stages requires at least 500 total iterations"
 fi
 case "$ONLY_VARIANT" in
-    ""|baseline|arena-retry|difference-retry|packed|fused-ssim|raster-16x8|raster-16x16) ;;
+    ""|baseline|arena-retry|difference-retry|packed|staged-ssim|raster-16x8|raster-16x16) ;;
     *) die "unknown benchmark label: $ONLY_VARIANT" ;;
 esac
 
@@ -392,13 +392,13 @@ run_variant() {
 # difference-retry row measures the exact difference-grid counter on that same
 # transactional path.
 CONFIGURATIONS=(
-    'baseline|enumerated|cpu|exact|gather|staged|8x8'
-    'arena-retry|enumerated|gpu|retry|gather|staged|8x8'
-    'difference-retry|difference|gpu|retry|gather|staged|8x8'
-    'packed|enumerated|cpu|exact|packed|staged|8x8'
-    'fused-ssim|enumerated|cpu|exact|gather|fused|8x8'
-    'raster-16x8|enumerated|cpu|exact|gather|staged|16x8'
-    'raster-16x16|enumerated|cpu|exact|gather|staged|16x16'
+    'baseline|enumerated|cpu|exact|gather|fused|8x8'
+    'arena-retry|enumerated|gpu|retry|gather|fused|8x8'
+    'difference-retry|difference|gpu|retry|gather|fused|8x8'
+    'packed|enumerated|cpu|exact|packed|fused|8x8'
+    'staged-ssim|enumerated|cpu|exact|gather|staged|8x8'
+    'raster-16x8|enumerated|cpu|exact|gather|fused|16x8'
+    'raster-16x16|enumerated|cpu|exact|gather|fused|16x16'
 )
 
 failures=0
