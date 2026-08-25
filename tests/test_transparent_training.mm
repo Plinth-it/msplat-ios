@@ -26,6 +26,8 @@ constexpr int kHeight = 32;
 constexpr int kAdamGroups = 6;
 
 struct StepResult {
+    std::array<double, kAdamGroups> firstMomentL1 = {};
+    std::array<int, kAdamGroups> nonfiniteFirstMomentCount = {};
     float opacity = 0.0f;
     float opacityFirstMoment = 0.0f;
     float lastOpacity = 0.0f;
@@ -74,7 +76,8 @@ StepResult runStep(bool transparent, float alphaLossWeight,
                    bool collectStats = false,
                    bool collectTelemetry = false,
                    int width = kWidth,
-                   int height = kHeight) {
+                   int height = kHeight,
+                   bool exerciseAppearance = false) {
     CHECK(gaussianCount > 0);
     std::vector<float> meanValues(static_cast<size_t>(gaussianCount) * 3);
     std::vector<float> scaleValues(static_cast<size_t>(gaussianCount) * 3);
@@ -85,6 +88,11 @@ StepResult runStep(bool transparent, float alphaLossWeight,
     const float logScale = std::log(0.03f);
     constexpr float shC0 = 0.28209479177387814f;
     const float blackDc = -0.5f / shC0;
+    const std::array<float, 3> appearanceDc = {
+        -0.1f / shC0,
+         0.1f / shC0,
+         0.3f / shC0,
+    };
     const float initialOpacity = std::log(initialAlpha / (1.0f - initialAlpha));
     for (int index = 0; index < gaussianCount; ++index) {
         const size_t meanOffset = static_cast<size_t>(index) * 3;
@@ -94,9 +102,11 @@ StepResult runStep(bool transparent, float alphaLossWeight,
         scaleValues[meanOffset + 0] = logScale;
         scaleValues[meanOffset + 1] = logScale;
         scaleValues[meanOffset + 2] = logScale;
-        dcValues[meanOffset + 0] = blackDc;
-        dcValues[meanOffset + 1] = blackDc;
-        dcValues[meanOffset + 2] = blackDc;
+        for (size_t channel = 0; channel < appearanceDc.size(); ++channel) {
+            dcValues[meanOffset + channel] = exerciseAppearance
+                ? appearanceDc[channel]
+                : blackDc;
+        }
         quatValues[static_cast<size_t>(index) * 4] = 1.0f;
         opacityValues[static_cast<size_t>(index)] = initialOpacity;
     }
@@ -172,6 +182,7 @@ StepResult runStep(bool transparent, float alphaLossWeight,
         expAvgSq[group] = gpu_zeros(params[group].shape(), DType::Float32);
     }
     float stepSizes[kAdamGroups] = {};
+    stepSizes[3] = 1.0e-4f;
     stepSizes[5] = 0.5f;
     float biasCorrection2Sqrts[kAdamGroups];
     std::fill_n(biasCorrection2Sqrts, kAdamGroups, std::sqrt(0.001f));
@@ -259,6 +270,16 @@ StepResult runStep(bool transparent, float alphaLossWeight,
     result.visibilityCount = visibility.data<float>()[0];
     result.lastVisibilityCount =
         visibility.data<float>()[gaussianCount - 1];
+    for (int group = 0; group < kAdamGroups; ++group) {
+        const float* moments = expAvg[group].data<float>();
+        for (int64_t index = 0; index < expAvg[group].numel(); ++index) {
+            if (std::isfinite(moments[index])) {
+                result.firstMomentL1[group] += std::abs(moments[index]);
+            } else {
+                ++result.nonfiniteFirstMomentCount[group];
+            }
+        }
+    }
     if (telemetry) {
         const MsplatTrainingTelemetrySnapshot snapshot =
             msplat_training_telemetry_snapshot(telemetry);
@@ -354,7 +375,8 @@ void checkChunkedTransparentAlphaSupervision() {
 
     const StepResult transparent =
         runStep(true, 0.1f, gaussianCount, initialAlpha,
-                false, true);
+                false, true, false, false, false,
+                kWidth, kHeight, true);
     if (!(transparent.opacity < initialOpacity &&
           transparent.lastOpacity < initialOpacity &&
           transparent.opacityFirstMoment > 0.0f &&
@@ -385,6 +407,20 @@ void checkChunkedTransparentAlphaSupervision() {
     CHECK(transparent.positiveOpacityMomentCount == gaussianCount);
     CHECK(transparent.nonfiniteOpacityCount == 0);
     CHECK(transparent.nonfiniteOpacityMomentCount == 0);
+    CHECK(transparent.nonfiniteFirstMomentCount[0] == 0);
+    CHECK(transparent.nonfiniteFirstMomentCount[1] == 0);
+    CHECK(transparent.nonfiniteFirstMomentCount[2] == 0);
+    CHECK(transparent.nonfiniteFirstMomentCount[3] == 0);
+    CHECK(transparent.firstMomentL1[0] > 0.0);
+    CHECK(transparent.firstMomentL1[1] > 0.0);
+    CHECK(transparent.firstMomentL1[3] > 0.0);
+
+    const char* attributes =
+        std::getenv("MSPLAT_INTERSECTION_ATTRIBUTES");
+    const bool gather = attributes && std::string(attributes) == "gather";
+    const size_t packedAttributeBytes =
+        msplat_packed_intersection_attribute_bytes();
+    CHECK(gather ? packedAttributeBytes == 0 : packedAttributeBytes > 0);
 }
 
 void checkPartialSsimThreadgroups() {
@@ -429,6 +465,13 @@ void checkArenaRetryTransaction() {
     CHECK(retried.tileCapOverflowedStepCount == 0u);
     CHECK(retried.packedCapacityOverflowedStepCount == 1u);
     CHECK(retried.lastOverflowIteration == 1);
+
+    const char* attributes =
+        std::getenv("MSPLAT_INTERSECTION_ATTRIBUTES");
+    const bool gather = attributes && std::string(attributes) == "gather";
+    const size_t packedAttributeBytes =
+        msplat_packed_intersection_attribute_bytes();
+    CHECK(gather ? packedAttributeBytes == 0 : packedAttributeBytes > 0);
 }
 
 }  // namespace

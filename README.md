@@ -90,6 +90,17 @@ threadgroups. These experimental overrides do not change chunked forward or
 backward rasterization, which remain 8x8; select a shipping default only from
 representative physical-device performance and thermal results.
 
+Intersection attributes likewise remain packed by default. A benchmark process
+can set `MSPLAT_INTERSECTION_ATTRIBUTES=gather` before the first Metal call to
+skip the three sorted float3 copies and have rasterization gather XY, conic, raw
+color, and the already projected sigmoid opacity through each sorted key's
+Gaussian ID. This reduces the bitonic-only arena from 44 to 8 bytes per slot and
+the radix arena from 52 to 16 bytes per slot, saving 36 bytes per retained
+intersection (about 450 MB at a 12.5-million-slot capacity), and removes the pack
+dispatch. Indirect reads may trade bandwidth capacity for locality, especially
+in the fixed 8x8 backward path, so keep `packed` as the shipping mode until
+physical-device throughput and sustained-thermal A/B results justify a change.
+
 Exact tile counting likewise keeps the established per-intersection enumeration
 as its default. A benchmark process can set
 `MSPLAT_TILE_COUNT_MODE=difference` before the first Metal call to record four
@@ -430,6 +441,7 @@ Output: `.ply`, `.splat`, `.spz`.
 | `MSPLAT_TILE_LAYOUT_MODE` | `cpu` (default) or experimental exact `gpu` layout. The GPU mode retains the synchronized host validation and arena-sizing boundary. Set before first Metal use. |
 | `MSPLAT_TRAINING_ARENA_MODE` | `exact` (default) or experimental transactional `retry`. Retry forces GPU tile layout and replaces steady-state mid-step sizing with an end-of-attempt validation/retry boundary. Set before first Metal use. |
 | `MSPLAT_SSIM_MODE` | `staged` (default) or experimental `fused` derivative processing. Fused removes the 36-byte-per-pixel derivative buffer and one dispatch. Set before first Metal use. |
+| `MSPLAT_INTERSECTION_ATTRIBUTES` | `packed` (default) or experimental key-driven `gather`. Gather removes three float3 arrays and the pack dispatch, saving 36 bytes per arena slot. Set before first Metal use. |
 | `MSPLAT_MEM_LOG_EVERY` | Memory breakdown every N steps. |
 | `MSPLAT_ISECT_LOG` | Intersection count against capacity at each sample. |
 
@@ -480,7 +492,7 @@ Forward:
   project_and_sh_forward     fused projection + SH + exact count contributions
   optional difference scans  exact per-tile counts for the experimental mode
   CPU checked prefix         exact offsets and grow-only arena sizing
-  exact scatter + sort       compact checked tile ranges + packing
+  exact scatter + sort       compact checked tile ranges + optional packing
   nd_rasterize_forward       per-pixel alpha compositing (16×16 tiles)
   ssim_h_fwd + fused_v_h_bwd default staged 11-tap SSIM + L1 loss
 

@@ -140,13 +140,15 @@ require_contains("${metal_source}" "constant uint& exact_count"
 require_contains("${metal_source}"
     "float3(xy.x, xy.y, projected_opacities[gaussian_id])"
     "packing reuses projected opacity")
-string(REGEX MATCHALL
-    "constant uint64_t\\* sorted_keys" backward_key_inputs "${metal_source}")
-list(LENGTH backward_key_inputs backward_key_input_count)
-if(NOT backward_key_input_count EQUAL 3)
-    message(FATAL_ERROR
-        "Expected sorted-key inputs for packing and both backward paths, found ${backward_key_input_count}")
-endif()
+require_contains("${metal_source}"
+    "inline RasterIntersectionAttributes load_raster_intersection_attributes("
+    "shared packed-or-gather attribute loader")
+require_contains("${metal_source}"
+    "sorted_keys[intersection_index] & 0xffffffffu"
+    "gather Gaussian-ID key extract")
+require_contains("${metal_source}"
+    "constant uint64_t* sorted_keys    [[buffer(0)]]"
+    "packing sorted-key input")
 string(REGEX MATCHALL
     "id_batch\\[tr\\] = \\(int32_t\\)\\(sorted_keys\\[idx\\] & 0xFFFFFFFFu\\)"
     backward_id_extracts "${metal_source}")

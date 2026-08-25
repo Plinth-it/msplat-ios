@@ -144,6 +144,9 @@ size_t msplat_cached_tensor_bytes();
 // is sufficient for a cold render; the training side is allocated lazily.
 size_t msplat_shared_cached_tensor_bytes();
 size_t msplat_training_cached_tensor_bytes();
+// Internal diagnostics for verifying that gather mode does not retain the
+// three legacy per-intersection attribute arrays.
+size_t msplat_packed_intersection_attribute_bytes();
 
 // GPU timing — non-invasive, uses completion handlers on committed CBs
 void msplat_enable_gpu_timing(bool enable);

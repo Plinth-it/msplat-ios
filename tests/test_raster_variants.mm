@@ -82,7 +82,10 @@ RasterOutput runVariant(
     id<MTLBuffer> packedXYOpacity,
     id<MTLBuffer> packedConic,
     id<MTLBuffer> packedRGB,
-    id<MTLBuffer> background) {
+    id<MTLBuffer> background,
+    id<MTLBuffer> sortedKeys,
+    id<MTLBuffer> projectedOpacities,
+    uint32_t attributeLayout) {
     NSString* functionName =
         [NSString stringWithUTF8String:variant.functionName];
     CHECK(functionName != nil);
@@ -151,6 +154,11 @@ RasterOutput runVariant(
     [encoder setBytes:blockDim.data()
                 length:sizeof(blockDim)
                atIndex:11];
+    [encoder setBuffer:sortedKeys offset:0 atIndex:12];
+    [encoder setBuffer:projectedOpacities offset:0 atIndex:13];
+    [encoder setBytes:&attributeLayout
+                length:sizeof(attributeLayout)
+               atIndex:14];
 
     const MTLSize threadgroups = MTLSizeMake(
         (imageSize[0] + variant.width - 1) / variant.width,
@@ -224,6 +232,11 @@ void checkRasterVariants(id<MTLDevice> device, const char* metallibPath) {
     std::vector<float> packedXYOpacity(totalCount * 3);
     std::vector<float> packedConic(totalCount * 3);
     std::vector<float> packedRGB(totalCount * 3);
+    std::vector<uint64_t> sortedKeys(totalCount);
+    std::vector<float> gatheredXY(totalCount * 2);
+    std::vector<float> gatheredOpacity(totalCount);
+    std::vector<float> gatheredConic(totalCount * 3);
+    std::vector<float> gatheredRGB(totalCount * 3);
     size_t packedIndex = 0;
     for (uint32_t tile = 0; tile < counts.size(); ++tile) {
         const uint32_t tileX = tile % tileColumns;
@@ -262,6 +275,25 @@ void checkRasterVariants(id<MTLDevice> device, const char* metallibPath) {
                 -0.18f + 0.020f * static_cast<float>(local % 7);
             packedRGB[3 * packedIndex + 2] =
                 0.08f + 0.018f * static_cast<float>(local % 6);
+
+            // Exercise true key-driven gathers instead of an identity mapping.
+            // Five is coprime to 903, so this visits every Gaussian ID once.
+            const uint32_t gaussianID = static_cast<uint32_t>(
+                (5 * packedIndex + 7) % totalCount);
+            sortedKeys[packedIndex] =
+                (static_cast<uint64_t>(packedIndex + 1) << 32) | gaussianID;
+            gatheredXY[2 * gaussianID] =
+                packedXYOpacity[3 * packedIndex];
+            gatheredXY[2 * gaussianID + 1] =
+                packedXYOpacity[3 * packedIndex + 1];
+            gatheredOpacity[gaussianID] =
+                packedXYOpacity[3 * packedIndex + 2];
+            for (size_t channel = 0; channel < 3; ++channel) {
+                gatheredConic[3 * gaussianID + channel] =
+                    packedConic[3 * packedIndex + channel];
+                gatheredRGB[3 * gaussianID + channel] =
+                    packedRGB[3 * packedIndex + channel];
+            }
             ++packedIndex;
         }
     }
@@ -295,6 +327,24 @@ void checkRasterVariants(id<MTLDevice> device, const char* metallibPath) {
         device, backgroundValues.data(),
         backgroundValues.size() * sizeof(backgroundValues[0]));
     ScopedObjCRelease backgroundBufferOwner{backgroundBuffer};
+    id<MTLBuffer> sortedKeysBuffer = makeBuffer(
+        device, sortedKeys.data(), sortedKeys.size() * sizeof(sortedKeys[0]));
+    ScopedObjCRelease sortedKeysBufferOwner{sortedKeysBuffer};
+    id<MTLBuffer> gatheredXYBuffer = makeBuffer(
+        device, gatheredXY.data(), gatheredXY.size() * sizeof(gatheredXY[0]));
+    ScopedObjCRelease gatheredXYBufferOwner{gatheredXYBuffer};
+    id<MTLBuffer> gatheredOpacityBuffer = makeBuffer(
+        device, gatheredOpacity.data(),
+        gatheredOpacity.size() * sizeof(gatheredOpacity[0]));
+    ScopedObjCRelease gatheredOpacityBufferOwner{gatheredOpacityBuffer};
+    id<MTLBuffer> gatheredConicBuffer = makeBuffer(
+        device, gatheredConic.data(),
+        gatheredConic.size() * sizeof(gatheredConic[0]));
+    ScopedObjCRelease gatheredConicBufferOwner{gatheredConicBuffer};
+    id<MTLBuffer> gatheredRGBBuffer = makeBuffer(
+        device, gatheredRGB.data(),
+        gatheredRGB.size() * sizeof(gatheredRGB[0]));
+    ScopedObjCRelease gatheredRGBBufferOwner{gatheredRGBBuffer};
 
     id<MTLCommandQueue> queue = [device newCommandQueue];
     CHECK(queue != nil);
@@ -306,15 +356,21 @@ void checkRasterVariants(id<MTLDevice> device, const char* metallibPath) {
     const std::array<uint32_t, 4> imageSize = {
         imageWidth, imageHeight, 1, 0,
     };
-    std::array<RasterOutput, variants.size()> outputs;
+    std::array<RasterOutput, variants.size()> packedOutputs;
+    std::array<RasterOutput, variants.size()> gatheredOutputs;
     for (size_t index = 0; index < variants.size(); ++index) {
-        outputs[index] = runVariant(
+        packedOutputs[index] = runVariant(
             device, library, queue, variants[index], tileBounds, imageSize,
             binsBuffer, xyOpacityBuffer, conicBuffer, rgbBuffer,
-            backgroundBuffer);
+            backgroundBuffer, sortedKeysBuffer, gatheredOpacityBuffer, 0u);
+        gatheredOutputs[index] = runVariant(
+            device, library, queue, variants[index], tileBounds, imageSize,
+            binsBuffer, gatheredXYBuffer, gatheredConicBuffer,
+            gatheredRGBBuffer, backgroundBuffer, sortedKeysBuffer,
+            gatheredOpacityBuffer, 1u);
     }
 
-    const RasterOutput& baseline = outputs[0];
+    const RasterOutput& baseline = packedOutputs[0];
     for (size_t pixel = 0; pixel < baseline.finalT.size(); ++pixel) {
         const uint32_t x = static_cast<uint32_t>(pixel % imageWidth);
         const uint32_t y = static_cast<uint32_t>(pixel / imageWidth);
@@ -332,17 +388,22 @@ void checkRasterVariants(id<MTLDevice> device, const char* metallibPath) {
         }
     }
 
-    for (size_t variant = 1; variant < outputs.size(); ++variant) {
-        CHECK(outputs[variant].finalIndex == baseline.finalIndex);
-        CHECK(outputs[variant].finalT.size() == baseline.finalT.size());
-        CHECK(outputs[variant].rgb.size() == baseline.rgb.size());
-        for (size_t index = 0; index < baseline.finalT.size(); ++index) {
-            CHECK(nearlyEqual(outputs[variant].finalT[index],
-                              baseline.finalT[index]));
-        }
-        for (size_t index = 0; index < baseline.rgb.size(); ++index) {
-            CHECK(nearlyEqual(outputs[variant].rgb[index],
-                              baseline.rgb[index]));
+    for (size_t variant = 0; variant < variants.size(); ++variant) {
+        const std::array<const RasterOutput*, 2> candidates = {
+            &packedOutputs[variant], &gatheredOutputs[variant],
+        };
+        for (const RasterOutput* output : candidates) {
+            CHECK(output->finalIndex == baseline.finalIndex);
+            CHECK(output->finalT.size() == baseline.finalT.size());
+            CHECK(output->rgb.size() == baseline.rgb.size());
+            for (size_t index = 0; index < baseline.finalT.size(); ++index) {
+                CHECK(nearlyEqual(output->finalT[index],
+                                  baseline.finalT[index]));
+            }
+            for (size_t index = 0; index < baseline.rgb.size(); ++index) {
+                CHECK(nearlyEqual(output->rgb[index],
+                                  baseline.rgb[index]));
+            }
         }
     }
 }

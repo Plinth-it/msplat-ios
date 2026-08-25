@@ -525,6 +525,41 @@ inline void write_packed_float3(device float* arr, int idx, float3 val) {
     arr[3*idx+2] = val.z;
 }
 
+// Attribute layout 0 reads the established sorted per-intersection float3
+// arrays. Layout 1 extracts the Gaussian ID from the sorted key and gathers
+// the same values from the compact per-Gaussian projection arrays.
+struct RasterIntersectionAttributes {
+    float3 xy_opacity;
+    float3 conic;
+    float3 rgb;
+};
+
+inline RasterIntersectionAttributes load_raster_intersection_attributes(
+    constant uint64_t* sorted_keys,
+    constant float* xy_attributes,
+    constant float* conic_attributes,
+    constant float* rgb_attributes,
+    constant float* projected_opacities,
+    uint attribute_layout,
+    int intersection_index
+) {
+    RasterIntersectionAttributes attributes;
+    int source_index = intersection_index;
+    if (attribute_layout != 0u) {
+        source_index = int(uint(
+            sorted_keys[intersection_index] & 0xffffffffu));
+        const float2 xy = read_packed_float2(xy_attributes, source_index);
+        attributes.xy_opacity = float3(
+            xy.x, xy.y, projected_opacities[source_index]);
+    } else {
+        attributes.xy_opacity =
+            read_packed_float3(xy_attributes, source_index);
+    }
+    attributes.conic = read_packed_float3(conic_attributes, source_index);
+    attributes.rgb = read_packed_float3(rgb_attributes, source_index);
+    return attributes;
+}
+
 inline float4 read_packed_float4(constant float* arr, int idx) {
     return float4(arr[4*idx], arr[4*idx+1], arr[4*idx+2], arr[4*idx+3]);
 }
@@ -634,6 +669,9 @@ inline void nd_rasterize_forward_impl(
     device float* out_img,
     constant float* background,
     constant uint2& blockDim,
+    constant uint64_t* sorted_keys,
+    constant float* projected_opacities,
+    constant uint& attribute_layout,
     uint2 blockIdx,
     uint2 threadIdx,
     uint tr,
@@ -673,12 +711,14 @@ inline void nd_rasterize_forward_impl(
         int batch_start = range.x + (int)raster_block_size * b;
         int idx = batch_start + tr;
         if (idx < range.y) {
-            // Sequential reads from packed sorted-order buffers
-            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
-            conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            const RasterIntersectionAttributes attributes =
+                load_raster_intersection_attributes(
+                sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
+                projected_opacities, attribute_layout, idx);
+            xy_opacity_batch[tr] = attributes.xy_opacity;
+            conic_batch[tr] = attributes.conic;
             // packed_rgb has raw SH output — clamp_min(raw + 0.5, 0)
-            const float3 raw_c = read_packed_float3(packed_rgb, idx);
-            rgbs_batch[tr] = max(raw_c + 0.5f, 0.0f);
+            rgbs_batch[tr] = max(attributes.rgb + 0.5f, 0.0f);
         }
         // wait for all threads to finish loading
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -754,6 +794,9 @@ kernel void nd_rasterize_forward_kernel(
     device float* out_img [[buffer(9)]],
     constant float* background [[buffer(10)]],
     constant uint2& blockDim [[buffer(11)]],
+    constant uint64_t* sorted_keys [[buffer(12)]],
+    constant float* projected_opacities [[buffer(13)]],
+    constant uint& attribute_layout [[buffer(14)]],
     uint2 blockIdx [[threadgroup_position_in_grid]],
     uint2 threadIdx [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]]
@@ -764,7 +807,8 @@ kernel void nd_rasterize_forward_kernel(
     nd_rasterize_forward_impl(
         tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
         packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
-        blockDim, blockIdx, threadIdx, tr, 8 * 8,
+        blockDim, sorted_keys, projected_opacities, attribute_layout,
+        blockIdx, threadIdx, tr, 8 * 8,
         xy_opacity_batch, conic_batch, rgbs_batch);
 }
 
@@ -781,6 +825,9 @@ kernel void nd_rasterize_forward_16x8_kernel(
     device float* out_img [[buffer(9)]],
     constant float* background [[buffer(10)]],
     constant uint2& blockDim [[buffer(11)]],
+    constant uint64_t* sorted_keys [[buffer(12)]],
+    constant float* projected_opacities [[buffer(13)]],
+    constant uint& attribute_layout [[buffer(14)]],
     uint2 blockIdx [[threadgroup_position_in_grid]],
     uint2 threadIdx [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]]
@@ -791,7 +838,8 @@ kernel void nd_rasterize_forward_16x8_kernel(
     nd_rasterize_forward_impl(
         tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
         packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
-        blockDim, blockIdx, threadIdx, tr, 16 * 8,
+        blockDim, sorted_keys, projected_opacities, attribute_layout,
+        blockIdx, threadIdx, tr, 16 * 8,
         xy_opacity_batch, conic_batch, rgbs_batch);
 }
 
@@ -808,6 +856,9 @@ kernel void nd_rasterize_forward_16x16_kernel(
     device float* out_img [[buffer(9)]],
     constant float* background [[buffer(10)]],
     constant uint2& blockDim [[buffer(11)]],
+    constant uint64_t* sorted_keys [[buffer(12)]],
+    constant float* projected_opacities [[buffer(13)]],
+    constant uint& attribute_layout [[buffer(14)]],
     uint2 blockIdx [[threadgroup_position_in_grid]],
     uint2 threadIdx [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]]
@@ -818,7 +869,8 @@ kernel void nd_rasterize_forward_16x16_kernel(
     nd_rasterize_forward_impl(
         tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
         packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
-        blockDim, blockIdx, threadIdx, tr, 16 * 16,
+        blockDim, sorted_keys, projected_opacities, attribute_layout,
+        blockIdx, threadIdx, tr, 16 * 16,
         xy_opacity_batch, conic_batch, rgbs_batch);
 }
 
@@ -1168,6 +1220,8 @@ kernel void rasterize_backward_kernel(
     constant uchar* training_mask, // packed alpha or (H, W), disabled by x=0
     constant uint2& alpha_layout,
     constant float& alpha_gradient_scale,
+    constant float* projected_opacities,
+    constant uint& attribute_layout,
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -1251,10 +1305,13 @@ kernel void rasterize_backward_kernel(
         const int idx = batch_end - tr;
         if (idx >= range.x) {
             id_batch[tr] = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
-            // Sequential reads from packed sorted-order buffers
-            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
-            conic_batch[tr] = read_packed_float3(packed_conic, idx);
-            rgbs_batch[tr] = read_packed_float3(packed_rgb, idx);
+            const RasterIntersectionAttributes attributes =
+                load_raster_intersection_attributes(
+                sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
+                projected_opacities, attribute_layout, idx);
+            xy_opacity_batch[tr] = attributes.xy_opacity;
+            conic_batch[tr] = attributes.conic;
+            rgbs_batch[tr] = attributes.rgb;
         }
         // wait for other threads to collect the gaussians in batch
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -3859,6 +3916,9 @@ kernel void rasterize_forward_chunked_kernel(
     constant uint& chunk_size,
     constant uint& K_max,
     constant uint2& blockDim,
+    constant uint64_t* sorted_keys,
+    constant float* projected_opacities,
+    constant uint& attribute_layout,
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]]
 ) {
@@ -3913,10 +3973,13 @@ kernel void rasterize_forward_chunked_kernel(
         int batch_start = chunk_start + RAST_BLOCK_SIZE * b;
         int idx = batch_start + tr;
         if (idx < chunk_end) {
-            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
-            conic_batch[tr] = read_packed_float3(packed_conic, idx);
-            const float3 raw_c = read_packed_float3(packed_rgb, idx);
-            rgbs_batch[tr] = max(raw_c + 0.5f, 0.0f);
+            const RasterIntersectionAttributes attributes =
+                load_raster_intersection_attributes(
+                sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
+                projected_opacities, attribute_layout, idx);
+            xy_opacity_batch[tr] = attributes.xy_opacity;
+            conic_batch[tr] = attributes.conic;
+            rgbs_batch[tr] = max(attributes.rgb + 0.5f, 0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -4080,6 +4143,8 @@ kernel void rasterize_backward_chunked_kernel(
     constant uchar* training_mask, // packed alpha or (H, W), disabled by x=0
     constant uint2& alpha_layout,
     constant float& alpha_gradient_scale,
+    constant float* projected_opacities,
+    constant uint& attribute_layout,
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -4168,9 +4233,13 @@ kernel void rasterize_backward_chunked_kernel(
         const int idx = batch_end - tr;
         if (idx >= chunk_start) {
             id_batch[tr] = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
-            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
-            conic_batch[tr] = read_packed_float3(packed_conic, idx);
-            rgbs_batch[tr] = read_packed_float3(packed_rgb, idx);
+            const RasterIntersectionAttributes attributes =
+                load_raster_intersection_attributes(
+                sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
+                projected_opacities, attribute_layout, idx);
+            xy_opacity_batch[tr] = attributes.xy_opacity;
+            conic_batch[tr] = attributes.conic;
+            rgbs_batch[tr] = attributes.rgb;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 

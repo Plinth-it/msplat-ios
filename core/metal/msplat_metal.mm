@@ -806,6 +806,7 @@ struct MetalContext {
     id<MTLComputePipelineState> build_tile_intersection_layout_kernel_cpso = nil;
     bool gpu_tile_layout = false;
     bool retry_intersection_attempts = false;
+    bool gather_intersection_attributes = false;
     id<MTLComputePipelineState> validate_tile_intersection_attempt_kernel_cpso = nil;
     id<MTLComputePipelineState> finalize_tile_intersection_attempt_kernel_cpso = nil;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso = nil;
@@ -1119,6 +1120,20 @@ MetalContext* init_msplat_metal_context() {
         }
     }
 
+    const char* intersectionAttributesOverride =
+        std::getenv("MSPLAT_INTERSECTION_ATTRIBUTES");
+    if (intersectionAttributesOverride) {
+        if (std::strcmp(intersectionAttributesOverride, "packed") == 0) {
+            // Keep the established per-intersection attribute copies.
+        } else if (std::strcmp(
+                       intersectionAttributesOverride, "gather") == 0) {
+            ctx->gather_intersection_attributes = true;
+        } else {
+            throw std::invalid_argument(
+                "msplat: MSPLAT_INTERSECTION_ATTRIBUTES must be packed or gather");
+        }
+    }
+
     const char* rasterVariantOverride = std::getenv("MSPLAT_RASTER_VARIANT");
     NSString* monolithicRasterFunctionName = @"nd_rasterize_forward_kernel";
     if (rasterVariantOverride) {
@@ -1244,6 +1259,10 @@ MetalContext* init_msplat_metal_context() {
     }
     if (ssimModeOverride) {
         fprintf(stderr, "msplat: MSPLAT_SSIM_MODE=%s\n", ssimModeOverride);
+    }
+    if (intersectionAttributesOverride) {
+        fprintf(stderr, "msplat: MSPLAT_INTERSECTION_ATTRIBUTES=%s\n",
+                intersectionAttributesOverride);
     }
     if (ctx->small_sort_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup <
         msplat::kExactSmallTileMaximum) {
@@ -1886,16 +1905,24 @@ struct FusedTensorCache {
 
     bool ensure_intersection_arena(uint32_t requiredCount,
                                    bool needsRadixScratch,
+                                   bool needsPackedAttributes,
                                    id<MTLDevice> dev) {
+        if (!needsPackedAttributes) {
+            packed_xy_opac.reset();
+            packed_conic.reset();
+            packed_rgb.reset();
+        }
         const uint32_t currentCapacity = capacity > 0
             ? static_cast<uint32_t>(capacity)
             : 0;
         const uint32_t requestedCapacity =
             msplat::tileIntersectionArenaCapacity(
                 requiredCount, currentCapacity, false);
+        const bool packedAttributesReady = !needsPackedAttributes ||
+            (packed_xy_opac.defined() && packed_conic.defined() &&
+             packed_rgb.defined());
         const bool baseArenaReady = requestedCapacity == currentCapacity &&
-            intersection_keys_a.defined() && packed_xy_opac.defined() &&
-            packed_conic.defined() && packed_rgb.defined();
+            intersection_keys_a.defined() && packedAttributesReady;
         if (baseArenaReady) {
             if (!needsRadixScratch || intersection_keys_b.defined()) {
                 return false;
@@ -1905,8 +1932,11 @@ struct FusedTensorCache {
             return true;
         }
 
+        const uint64_t bytesPerLargestBuffer = needsPackedAttributes
+            ? 3u * sizeof(float)
+            : sizeof(uint64_t);
         const uint64_t largestBufferBytes =
-            static_cast<uint64_t>(requestedCapacity) * 3 * sizeof(float);
+            static_cast<uint64_t>(requestedCapacity) * bytesPerLargestBuffer;
         if (largestBufferBytes > static_cast<uint64_t>(dev.maxBufferLength)) {
             throw std::length_error(
                 "Exact tile-intersection arena exceeds Metal's maximum buffer length");
@@ -1916,9 +1946,14 @@ struct FusedTensorCache {
         const int64_t cap = requestedCapacity;
         try {
             intersection_keys_a = mtensor_empty(dev, {cap}, DType::Int64);
-            packed_xy_opac = mtensor_empty(dev, {cap, 3}, DType::Float32);
-            packed_conic = mtensor_empty(dev, {cap, 3}, DType::Float32);
-            packed_rgb = mtensor_empty(dev, {cap, 3}, DType::Float32);
+            if (needsPackedAttributes) {
+                packed_xy_opac =
+                    mtensor_empty(dev, {cap, 3}, DType::Float32);
+                packed_conic =
+                    mtensor_empty(dev, {cap, 3}, DType::Float32);
+                packed_rgb =
+                    mtensor_empty(dev, {cap, 3}, DType::Float32);
+            }
             if (needsRadixScratch) {
                 intersection_keys_b =
                     mtensor_empty(dev, {cap}, DType::Int64);
@@ -2080,6 +2115,20 @@ size_t msplat_shared_cached_tensor_bytes() {
 size_t msplat_training_cached_tensor_bytes() {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     return g_tcache.trainingEstimatedBytes();
+}
+
+size_t msplat_packed_intersection_attribute_bytes() {
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    size_t bytes = 0;
+    const MTensor* tensors[] = {
+        &g_tcache.packed_xy_opac,
+        &g_tcache.packed_conic,
+        &g_tcache.packed_rgb,
+    };
+    for (const MTensor* tensor : tensors) {
+        if (tensor->defined()) bytes += tensor->nbytes();
+    }
+    return bytes;
 }
 
 void cleanup_msplat_metal() {
@@ -2256,7 +2305,8 @@ static void render_pipeline(
     const bool needsRadixScratch =
         msplat::tileIntersectionLayoutNeedsRadixScratch(intersectionLayout);
     g_tcache.ensure_intersection_arena(
-        intersectionLayout.totalCount, needsRadixScratch, ctx->device);
+        intersectionLayout.totalCount, needsRadixScratch,
+        !ctx->gather_intersection_attributes, ctx->device);
     if (needsRadixScratch && !g_tcache.intersection_keys_b.defined()) {
         throw std::logic_error("Exact radix sort requires its scratch arena");
     }
@@ -2264,6 +2314,14 @@ static void render_pipeline(
     MTensor &packed_xy_opac = g_tcache.packed_xy_opac;
     MTensor &packed_conic = g_tcache.packed_conic;
     MTensor &packed_rgb = g_tcache.packed_rgb;
+    MTensor &raster_xy_attributes = ctx->gather_intersection_attributes
+        ? xys : packed_xy_opac;
+    MTensor &raster_conic_attributes = ctx->gather_intersection_attributes
+        ? conics : packed_conic;
+    MTensor &raster_rgb_attributes = ctx->gather_intersection_attributes
+        ? colors : packed_rgb;
+    const uint32_t intersection_attribute_layout =
+        ctx->gather_intersection_attributes ? 1u : 0u;
     MTensor &radix_sort_scratch_keys =
         g_tcache.intersection_keys_b.defined()
             ? g_tcache.intersection_keys_b
@@ -2337,6 +2395,7 @@ static void render_pipeline(
         if (sortable_tile_count > 0) {
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
         }
+        if (ctx->gather_intersection_attributes) return;
         NSUInteger packTpg = MIN(
             ctx->pack_sorted_gaussians_kernel_cpso.maxTotalThreadsPerThreadgroup,
             static_cast<NSUInteger>(total_intersections));
@@ -2398,11 +2457,16 @@ static void render_pipeline(
         [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
         [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
         ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, tile_bins, 3);
-        ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
+        ENC_BUF(enc, raster_xy_attributes, 4);
+        ENC_BUF(enc, raster_conic_attributes, 5);
+        ENC_BUF(enc, raster_rgb_attributes, 6);
         ENC_BUF(enc, final_Ts, 7); ENC_BUF(enc, final_idx, 8); ENC_BUF(enc, out_img, 9);
         ENC_BUF(enc, background, 10);
         [enc setBytes:monolithic_block_size_dim2->data()
                length:sizeof(*monolithic_block_size_dim2) atIndex:11];
+        ENC_BUF(enc, g_tcache.intersection_keys_a, 12);
+        ENC_BUF(enc, projected_opacities, 13);
+        ENC_SCALAR(enc, intersection_attribute_layout, 14);
         [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:tg_size];
     };
 
@@ -2418,11 +2482,16 @@ static void render_pipeline(
         [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
         [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
         ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, tile_bins, 3);
-        ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
+        ENC_BUF(enc, raster_xy_attributes, 4);
+        ENC_BUF(enc, raster_conic_attributes, 5);
+        ENC_BUF(enc, raster_rgb_attributes, 6);
         ENC_BUF(enc, g_tcache.chunk_T, 7); ENC_BUF(enc, g_tcache.chunk_C, 8); ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
         ENC_SCALAR(enc, CHUNK_SIZE, 10); ENC_SCALAR(enc, K_max, 11);
         [enc setBytes:chunked_block_size_dim2->data()
                length:sizeof(*chunked_block_size_dim2) atIndex:12];
+        ENC_BUF(enc, g_tcache.intersection_keys_a, 13);
+        ENC_BUF(enc, projected_opacities, 14);
+        ENC_SCALAR(enc, intersection_attribute_layout, 15);
         [enc dispatchThreadgroups:chunked_tg threadsPerThreadgroup:tg_size];
 
         // Phase 2: merge kernel — one thread per pixel
@@ -3037,7 +3106,8 @@ static MTensor msplat_train_step_locked(
             msplat::tileIntersectionLayoutNeedsRadixScratch(intersectionLayout);
         const auto arenaGrowStart = TelemetryClock::now();
         intersectionArenaGrew = g_tcache.ensure_intersection_arena(
-            intersectionLayout.totalCount, needsRadixScratch, ctx->device);
+            intersectionLayout.totalCount, needsRadixScratch,
+            !ctx->gather_intersection_attributes, ctx->device);
         const auto arenaGrowEnd = TelemetryClock::now();
         if (needsRadixScratch && !g_tcache.intersection_keys_b.defined()) {
             throw std::logic_error("Exact radix sort requires its scratch arena");
@@ -3054,6 +3124,14 @@ static MTensor msplat_train_step_locked(
     MTensor &packed_xy_opac = g_tcache.packed_xy_opac;
     MTensor &packed_conic = g_tcache.packed_conic;
     MTensor &packed_rgb = g_tcache.packed_rgb;
+    MTensor &raster_xy_attributes = ctx->gather_intersection_attributes
+        ? xys : packed_xy_opac;
+    MTensor &raster_conic_attributes = ctx->gather_intersection_attributes
+        ? conics : packed_conic;
+    MTensor &raster_rgb_attributes = ctx->gather_intersection_attributes
+        ? colors : packed_rgb;
+    const uint32_t intersection_attribute_layout =
+        ctx->gather_intersection_attributes ? 1u : 0u;
     MTensor &radix_sort_scratch_keys =
         g_tcache.intersection_keys_b.defined()
             ? g_tcache.intersection_keys_b
@@ -3185,6 +3263,7 @@ static MTensor msplat_train_step_locked(
             }
         }
 
+        if (ctx->gather_intersection_attributes) return;
         const NSUInteger packTpg = gpuResidentIntersectionAttempt
             ? ctx->pack_sorted_gaussians_kernel_cpso
                 .maxTotalThreadsPerThreadgroup
@@ -3227,11 +3306,16 @@ static MTensor msplat_train_step_locked(
             [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
             [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
             ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, tile_bins, 3);
-            ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
+            ENC_BUF(enc, raster_xy_attributes, 4);
+            ENC_BUF(enc, raster_conic_attributes, 5);
+            ENC_BUF(enc, raster_rgb_attributes, 6);
             ENC_BUF(enc, final_Ts, 7); ENC_BUF(enc, final_idx, 8); ENC_BUF(enc, out_img, 9);
             ENC_BUF(enc, background, 10);
             [enc setBytes:monolithic_block_size_dim2->data()
                    length:sizeof(*monolithic_block_size_dim2) atIndex:11];
+            ENC_BUF(enc, g_tcache.intersection_keys_a, 12);
+            ENC_BUF(enc, projected_opacities, 13);
+            ENC_SCALAR(enc, intersection_attribute_layout, 14);
             [enc dispatchThreadgroups:num_tg
                 threadsPerThreadgroup:MTLSizeMake(blockX, blockY, 1)];
         } else {
@@ -3244,11 +3328,16 @@ static MTensor msplat_train_step_locked(
             [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
             [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
             ENC_SCALAR(enc, channels, 2); ENC_BUF(enc, tile_bins, 3);
-            ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
+            ENC_BUF(enc, raster_xy_attributes, 4);
+            ENC_BUF(enc, raster_conic_attributes, 5);
+            ENC_BUF(enc, raster_rgb_attributes, 6);
             ENC_BUF(enc, g_tcache.chunk_T, 7); ENC_BUF(enc, g_tcache.chunk_C, 8); ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
             ENC_SCALAR(enc, CHUNK_SIZE, 10); ENC_SCALAR(enc, K_max, 11);
             [enc setBytes:chunked_block_size_dim2->data()
                    length:sizeof(*chunked_block_size_dim2) atIndex:12];
+            ENC_BUF(enc, g_tcache.intersection_keys_a, 13);
+            ENC_BUF(enc, projected_opacities, 14);
+            ENC_SCALAR(enc, intersection_attribute_layout, 15);
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             // Merge
@@ -3382,8 +3471,9 @@ static MTensor msplat_train_step_locked(
             [enc setBytes:rast_isz->data() length:sizeof(*rast_isz) atIndex:1];
             ENC_BUF(enc, g_tcache.intersection_keys_a, 2);
             ENC_BUF(enc, tile_bins, 3);
-            ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5);
-            ENC_BUF(enc, packed_rgb, 6);
+            ENC_BUF(enc, raster_xy_attributes, 4);
+            ENC_BUF(enc, raster_conic_attributes, 5);
+            ENC_BUF(enc, raster_rgb_attributes, 6);
             ENC_BUF(enc, background, 7); ENC_BUF(enc, final_Ts, 8);
             ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, rendered_gradient, 10);
             ENC_BUF(enc, v_xy, 11); ENC_BUF(enc, v_conic, 12);
@@ -3391,6 +3481,8 @@ static MTensor msplat_train_step_locked(
             ENC_BUF(enc, loss_coverage_buffer, 15);
             ENC_SCALAR(enc, alpha_layout, 16);
             ENC_SCALAR(enc, alpha_gradient_scale, 17);
+            ENC_BUF(enc, projected_opacities, 18);
+            ENC_SCALAR(enc, intersection_attribute_layout, 19);
             [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         } else {
             // Chunked backward
@@ -3413,8 +3505,9 @@ static MTensor msplat_train_step_locked(
             [enc setBytes:rast_isz->data() length:sizeof(*rast_isz) atIndex:1];
             ENC_BUF(enc, g_tcache.intersection_keys_a, 2);
             ENC_BUF(enc, tile_bins, 3);
-            ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5);
-            ENC_BUF(enc, packed_rgb, 6);
+            ENC_BUF(enc, raster_xy_attributes, 4);
+            ENC_BUF(enc, raster_conic_attributes, 5);
+            ENC_BUF(enc, raster_rgb_attributes, 6);
             ENC_BUF(enc, background, 7); ENC_BUF(enc, final_Ts, 8);
             ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
             ENC_BUF(enc, g_tcache.prefix_T, 10); ENC_BUF(enc, g_tcache.chunk_T, 11);
@@ -3426,6 +3519,8 @@ static MTensor msplat_train_step_locked(
             ENC_BUF(enc, loss_coverage_buffer, 20);
             ENC_SCALAR(enc, alpha_layout, 21);
             ENC_SCALAR(enc, alpha_gradient_scale, 22);
+            ENC_BUF(enc, projected_opacities, 23);
+            ENC_SCALAR(enc, intersection_attribute_layout, 24);
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, bwd_K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
         }
     };
@@ -3820,7 +3915,8 @@ static MTensor msplat_train_step_locked(
                 msplat::tileIntersectionLayoutNeedsRadixScratch(
                     completedLayout);
             bool grew = g_tcache.ensure_intersection_arena(
-                completedLayout.totalCount, needsRadixScratch, ctx->device);
+                completedLayout.totalCount, needsRadixScratch,
+                !ctx->gather_intersection_attributes, ctx->device);
 
             const uint32_t requiredChunkCount =
                 msplat::tileRasterChunkCount(

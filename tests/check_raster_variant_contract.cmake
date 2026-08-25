@@ -110,6 +110,9 @@ set(raster_abi_bindings
     "device float* out_img [[buffer(9)]]"
     "constant float* background [[buffer(10)]]"
     "constant uint2& blockDim [[buffer(11)]]"
+    "constant uint64_t* sorted_keys [[buffer(12)]]"
+    "constant float* projected_opacities [[buffer(13)]]"
+    "constant uint& attribute_layout [[buffer(14)]]"
     "uint2 blockIdx [[threadgroup_position_in_grid]]"
     "uint2 threadIdx [[thread_position_in_threadgroup]]"
     "uint tr [[thread_index_in_threadgroup]]")
@@ -133,13 +136,13 @@ foreach(array_name IN ITEMS xy_opacity_batch conic_batch rgbs_batch)
         "16x16 ${array_name} size")
 endforeach()
 require_contains("${raster_8x8}"
-    "blockDim, blockIdx, threadIdx, tr, 8 * 8,"
+    "blockDim, sorted_keys, projected_opacities, attribute_layout,\n        blockIdx, threadIdx, tr, 8 * 8,"
     "8x8 helper batch width")
 require_contains("${raster_16x8}"
-    "blockDim, blockIdx, threadIdx, tr, 16 * 8,"
+    "blockDim, sorted_keys, projected_opacities, attribute_layout,\n        blockIdx, threadIdx, tr, 16 * 8,"
     "16x8 helper batch width")
 require_contains("${raster_16x16}"
-    "blockDim, blockIdx, threadIdx, tr, 16 * 16,"
+    "blockDim, sorted_keys, projected_opacities, attribute_layout,\n        blockIdx, threadIdx, tr, 16 * 16,"
     "16x16 helper batch width")
 
 # The host chooses a Metal function name first, then creates and owns exactly
