@@ -69,6 +69,17 @@
   surfaces in its memory preflight. Fixed-camera submission still performs the
   renderer's existing exact-count synchronization; fully nonblocking preview
   submission depends on the planned GPU count/scan work.
+- Added ABI v14 instance-scoped training-target prefetch enablement. Swift
+  exposes it through `DatasetOptions.prefetchTrainingTargets`, and the iOS
+  sample enables it for both masked and unmasked runs so their timing comparison
+  remains fair. The existing environment opt-in remains available to native
+  clients. The first shuffled target is scheduled when the trainer is created;
+  later targets overlap the preceding Metal step while upload and LRU mutation
+  stay serialized.
+- Added an exact binary-grayscale PNG mask path for discovered Brush-style
+  masks. Eligible 8-bit black/white masks decode into one source byte per pixel
+  before the existing area filter; soft, profiled, alpha, and color masks retain
+  the established RGBA/sRGB fallback and byte-for-byte target semantics.
 - Removed the unused depth cotangent from RGB training, computed projected
   opacity once per visible Gaussian, and recovered backward Gaussian IDs directly
   from sorted keys. Exact-intersection storage drops from 56 to 52 bytes per
@@ -84,12 +95,11 @@
   targets. ImageIO decode, resolution pyramids, and Brown-Conrady correction
   remain byte-native; the SSIM/L1 kernels normalize RGB during their existing
   tile loads, while CPU evaluation accepts the same compact representation.
-  Decoded CPU pixels are released after upload, leaving one four-byte target
-  per pixel in the image cache (plus a separate one-byte mask when present).
-- Added opt-in depth-one CPU camera prefetch across the C/Swift, native CLI,
-  and Python trainers (`MSPLAT_CAMERA_PREFETCH=1`). It prepares the exact next
-  shuffled camera and resolution while the current Metal step runs; GPU upload
-  and cache mutation remain serialized. The default path remains synchronous.
+  Decoded CPU pixels are released after upload. Masked coverage is packed into
+  the existing alpha byte. Coverage-mode targets also cache one UInt8 activity
+  byte per 16x16 render tile, including the exact five-pixel SSIM halo, and use
+  it to prune exact intersections without changing projection, dense loss, or
+  transparent-mode execution.
 - Corrected the image-edge versus array-index conversion in Brown-Conrady
   rectification, including alpha=0 crop endpoints and paired mask sampling.
   The renderer now uses an exact homogeneous divide, propagates the missing

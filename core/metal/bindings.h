@@ -204,6 +204,7 @@ MTensor msplat_train_step(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
     MTensor &gt, const MTensor* coverage_mask,
+    const MTensor* coverage_render_tiles,
     uint64_t loss_coverage_units, float ssim_weight,
     float loss_inv_n, bool transparent_mask,
     float alpha_loss_weight,

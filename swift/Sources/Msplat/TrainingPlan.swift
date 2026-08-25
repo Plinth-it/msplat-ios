@@ -160,7 +160,7 @@ public struct TrainingPlan: Sendable, Equatable {
     /// ``MsplatSession``.
     public let maximumGaussianCount: Int
     /// Whether path-based plan sessions discover mask sidecars and whether
-    /// image-cache and decode estimates include per-frame UInt8 masks.
+    /// decode-transient estimates include their per-frame UInt8 storage.
     public let includesTrainingMasks: Bool
     /// Source dimensions after `inputDecodeScale` is applied.
     public let decodedInputDimensions: TrainingImageDimensions
@@ -243,7 +243,8 @@ public struct TrainingPlan: Sendable, Equatable {
     /// Produces dataset options controlled by this plan.
     public func makeDatasetOptions(
         evalMode: Bool = false,
-        testEvery: Int32 = 8
+        testEvery: Int32 = 8,
+        prefetchTrainingTargets: Bool = false
     ) throws -> DatasetOptions {
         guard testEvery > 0 else {
             throw MsplatError.invalidArgument("testEvery must be greater than zero")
@@ -252,7 +253,8 @@ public struct TrainingPlan: Sendable, Equatable {
             downscaleFactor: inputDecodeScale,
             evalMode: evalMode,
             testEvery: testEvery,
-            discoverTrainingMasks: includesTrainingMasks
+            discoverTrainingMasks: includesTrainingMasks,
+            prefetchTrainingTargets: prefetchTrainingTargets
         )
     }
 
@@ -610,12 +612,16 @@ public struct TrainingPlan: Sendable, Equatable {
             }
 
             // The native cache releases decoded and pyramid pixels after a
-            // successful upload. Its retained stage target is one shared
-            // UInt8 RGBA buffer plus, when present, one UInt8 coverage mask.
-            let imageCacheEntryBytes = try checkedProduct(
-                [includesTrainingMasks ? 5 : 4, pixelCount],
-                component: "compact stage image cache entry"
-            )
+            // successful upload. Its retained stage target is one UInt8 RGBA
+            // buffer. Masked targets also retain one UInt8 activity byte per
+            // 16x16 render tile; coverage itself stays packed in RGBA alpha.
+            let imageCacheEntryBytes = try checkedSum([
+                try checkedProduct(
+                    [4, pixelCount],
+                    component: "compact stage image cache entry"
+                ),
+                includesTrainingMasks ? tileCount : 0,
+            ], component: "compact stage image cache entry")
 
             peakTrainingCacheBytes = max(peakTrainingCacheBytes, trainingCacheBytes)
             largestImageCacheEntryBytes = max(

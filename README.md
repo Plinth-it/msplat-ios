@@ -43,11 +43,16 @@ canonical, caller-owned dataset directly through a checked deep-copy boundary.
   A byte-budgeted LRU now retains one tightly packed UInt8 RGBA GPU target per
   resident camera, releases decoded CPU pixels after upload, and reloads only
   on an eviction or resolution-stage transition. Loss kernels convert the RGB
-  bytes to float during their existing tile loads. Setting exactly
-  `MSPLAT_CAMERA_PREFETCH=1` opts each trainer entry point into preparing one
-  detached CPU target for the next shuffled camera and resolution while the
-  current Metal step runs. GPU upload and LRU mutation remain on the serialized
-  training thread, and prefetch remains off by default.
+  bytes to float during their existing tile loads. Masked targets reuse the
+  alpha byte for soft coverage. Coverage mode additionally caches one activity
+  byte per 16x16 render tile, expanded by the five-pixel SSIM halo, so exact
+  intersection packing omits inactive tiles and leaves their raster bins empty.
+  Transparent mode retains the full-frame path. Swift sessions can opt in with
+  `DatasetOptions.prefetchTrainingTargets`; native clients can use ABI v14 or
+  set exactly `MSPLAT_CAMERA_PREFETCH=1`. One detached CPU target for the next
+  shuffled camera and resolution is prepared while the current Metal step runs.
+  GPU upload and LRU mutation remain on the serialized training thread, and
+  library prefetch remains off by default.
 - `maxGaussians` bounds the active population and its backing buffers. When a
   densification step has more eligible candidates than remaining capacity, the
   highest normalized-gradient candidates are retained; pruning still runs at
@@ -160,6 +165,8 @@ poses.
   query structure; the ABI v4 telemetry layout and entry point remain unchanged.
 - ABI v13 GPU-native preview submission through an immutable BGRA8Unorm Metal
   surface; existing CPU render entry points remain available.
+- ABI v14 instance-scoped training-target prefetch exposed through Swift
+  `DatasetOptions`; the native environment opt-in remains available.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
@@ -302,7 +309,8 @@ cover every lazily decoded image and mask URL; the session releases those
 scopes after its native trainer and dataset are destroyed. Set
 `TrainingPlan.includesTrainingMasks` through its initializer when planning a
 masked dataset so the estimate includes full-source mask decoding and paired
-CPU/GPU mask caches.
+image/mask decode transients; the resident GPU target packs coverage into RGBA
+alpha.
 
 Before creating a session, a canonical descriptor can be checked against its
 sparse correspondences without reading any image or mask and without starting
@@ -420,8 +428,9 @@ Backward:
 ```
 
 The loss target entering `ssim_h_fwd` is a tightly packed UInt8 RGBA buffer;
-only RGB is sampled and converted with `byte / 255`. Training-mask coverage and
-transparent alpha supervision remain in the separate UInt8 mask.
+RGB is sampled and converted with `byte / 255`. For camera masks, alpha carries
+soft coverage and the same buffer drives coverage weighting or transparent
+alpha supervision. Low-level callers may still supply a standalone UInt8 mask.
 
 Upstream's [README](https://github.com/rayanht/msplat) covers the design behind
 this and carries M4 Max benchmarks against gsplat. This fork has not re-run

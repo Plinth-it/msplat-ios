@@ -137,6 +137,88 @@ void writeTIFF(const fs::path &path, int width, int height,
     CHECK(CGImageDestinationFinalize(destination.get()));
 }
 
+void writeGrayscalePNG(const fs::path &path, int width, int height,
+                       const std::vector<uint8_t> &gray) {
+    CHECK(width > 0 && height > 0);
+    CHECK(gray.size() == static_cast<size_t>(width) * height);
+
+    CFHandle<CGDataProviderRef> provider(CGDataProviderCreateWithData(
+        nullptr, gray.data(), gray.size(), nullptr));
+    CHECK(provider);
+    CFHandle<CGColorSpaceRef> colorSpace(CGColorSpaceCreateDeviceGray());
+    CHECK(colorSpace);
+    CFHandle<CGImageRef> image(CGImageCreate(
+        static_cast<size_t>(width), static_cast<size_t>(height), 8, 8,
+        static_cast<size_t>(width), colorSpace.get(), kCGImageAlphaNone,
+        provider.get(), nullptr, false, kCGRenderingIntentDefault));
+    CHECK(image);
+
+    const std::string pathString = path.string();
+    CFHandle<CFURLRef> url(CFURLCreateFromFileSystemRepresentation(
+        nullptr, reinterpret_cast<const UInt8 *>(pathString.data()),
+        static_cast<CFIndex>(pathString.size()), false));
+    CHECK(url);
+    CFHandle<CGImageDestinationRef> destination(
+        CGImageDestinationCreateWithURL(
+            url.get(), CFSTR("public.png"), 1, nullptr));
+    CHECK(destination);
+    CGImageDestinationAddImage(destination.get(), image.get(), nullptr);
+    CHECK(CGImageDestinationFinalize(destination.get()));
+}
+
+void checkBinaryGrayscalePNGFastPathCandidate(
+    const fs::path &path, int width, int height) {
+    const std::string pathString = path.string();
+    CFHandle<CFURLRef> url(CFURLCreateFromFileSystemRepresentation(
+        nullptr, reinterpret_cast<const UInt8 *>(pathString.data()),
+        static_cast<CFIndex>(pathString.size()), false));
+    CHECK(url);
+    CFHandle<CGImageSourceRef> source(
+        CGImageSourceCreateWithURL(url.get(), nullptr));
+    CHECK(source);
+    CFStringRef sourceType = CGImageSourceGetType(source.get());
+    CHECK(sourceType != nullptr);
+    CHECK(CFEqual(sourceType, CFSTR("public.png")));
+
+    const int64_t maximumPixelSize = std::max(width, height);
+    CFHandle<CFNumberRef> maximumPixelSizeNumber(CFNumberCreate(
+        nullptr, kCFNumberSInt64Type, &maximumPixelSize));
+    CHECK(maximumPixelSizeNumber);
+    const void *keys[] = {
+        kCGImageSourceCreateThumbnailFromImageAlways,
+        kCGImageSourceCreateThumbnailWithTransform,
+        kCGImageSourceThumbnailMaxPixelSize,
+        kCGImageSourceShouldCacheImmediately,
+    };
+    const void *values[] = {
+        kCFBooleanTrue,
+        kCFBooleanFalse,
+        maximumPixelSizeNumber.get(),
+        kCFBooleanTrue,
+    };
+    CFHandle<CFDictionaryRef> options(CFDictionaryCreate(
+        nullptr, keys, values, 4,
+        &kCFTypeDictionaryKeyCallBacks,
+        &kCFTypeDictionaryValueCallBacks));
+    CHECK(options);
+    CFHandle<CGImageRef> thumbnail(CGImageSourceCreateThumbnailAtIndex(
+        source.get(), 0, options.get()));
+    CHECK(thumbnail);
+    CHECK(CGImageGetWidth(thumbnail.get()) == static_cast<size_t>(width));
+    CHECK(CGImageGetHeight(thumbnail.get()) == static_cast<size_t>(height));
+
+    CGColorSpaceRef colorSpace = CGImageGetColorSpace(thumbnail.get());
+    CHECK(colorSpace != nullptr);
+    CHECK(CGColorSpaceGetModel(colorSpace) == kCGColorSpaceModelMonochrome);
+    CFStringRef colorSpaceName = CGColorSpaceGetName(colorSpace);
+    CHECK(colorSpaceName != nullptr);
+    CHECK(CFEqual(colorSpaceName, kCGColorSpaceGenericGrayGamma2_2));
+    CHECK(CGImageGetBitsPerComponent(thumbnail.get()) == 8);
+    CHECK(CGImageGetBitsPerPixel(thumbnail.get()) == 8);
+    CHECK(CGImageGetAlphaInfo(thumbnail.get()) == kCGImageAlphaNone);
+    CHECK(CGImageGetDecode(thumbnail.get()) == nullptr);
+}
+
 RGB8 pixel8(const Image &image, int x, int y) {
     CHECK(x >= 0 && x < image.width);
     CHECK(y >= 0 && y < image.height);
@@ -634,6 +716,68 @@ void checkCoverageMaskDecodeAndResize(const TempDirectory &temporary) {
         "no alpha channel");
 }
 
+void checkBinaryGrayscalePNGMaskDecode(const TempDirectory &temporary) {
+    constexpr int width = 7;
+    constexpr int height = 5;
+    const std::vector<uint8_t> binary = {
+        0,   0,   255, 255, 255, 0,   0,
+        0,   255, 255, 255, 0,   0,   255,
+        255, 255, 0,   0,   0,   255, 255,
+        255, 0,   0,   255, 255, 255, 0,
+        0,   0,   255, 0,   255, 0,   255,
+    };
+    const fs::path binaryPath = temporary.path / "binary-gray-mask.png";
+    writeGrayscalePNG(binaryPath, width, height, binary);
+    checkBinaryGrayscalePNGFastPathCandidate(binaryPath, width, height);
+    const ImageSourceInfo binaryInfo = inspectImageSource(binaryPath.string());
+
+    const CoverageMask full = imreadCoverageMask(
+        binaryPath.string(), binaryInfo, width, height, false,
+        TrainingMaskChannel::Automatic);
+    CHECK(full.width == width);
+    CHECK(full.height == height);
+    CHECK(full.data == binary);
+
+    // Requesting orientation normalization deliberately bypasses the fast
+    // path. Orientation 1 should remain byte-identical through the fallback.
+    const CoverageMask transformed = imreadCoverageMask(
+        binaryPath.string(), binaryInfo, width, height, true,
+        TrainingMaskChannel::Automatic);
+    CHECK(transformed.data == binary);
+
+    CoverageMask sourceMask;
+    sourceMask.width = width;
+    sourceMask.height = height;
+    sourceMask.data = binary;
+    const CoverageMask expected = resizeCoverageArea(sourceMask, 4, 3);
+    const CoverageMask scaled = imreadCoverageMask(
+        binaryPath.string(), binaryInfo, 4, 3, false,
+        TrainingMaskChannel::Automatic);
+    CHECK(scaled.width == 4);
+    CHECK(scaled.height == 3);
+    CHECK(scaled.data == expected.data);
+    CHECK(buildCoverageRenderTileMap(scaled).data ==
+          buildCoverageRenderTileMap(expected).data);
+
+    // Explicit luminance deliberately takes the established RGBA fallback.
+    const CoverageMask luminance = imreadCoverageMask(
+        binaryPath.string(), binaryInfo, 4, 3, false,
+        TrainingMaskChannel::Luminance);
+    CHECK(luminance.data == scaled.data);
+
+    const std::vector<uint8_t> soft = {0, 1, 64, 127, 128, 254, 255};
+    const fs::path softPath = temporary.path / "soft-gray-mask.png";
+    writeGrayscalePNG(softPath, 7, 1, soft);
+    const ImageSourceInfo softInfo = inspectImageSource(softPath.string());
+    const CoverageMask automaticSoft = imreadCoverageMask(
+        softPath.string(), softInfo, 7, 1, false,
+        TrainingMaskChannel::Automatic);
+    const CoverageMask luminanceSoft = imreadCoverageMask(
+        softPath.string(), softInfo, 7, 1, false,
+        TrainingMaskChannel::Luminance);
+    CHECK(automaticSoft.data == luminanceSoft.data);
+}
+
 void checkCoverageMaskOrientation(const TempDirectory &temporary) {
     std::vector<uint8_t> rgba(3 * 2 * 4, 0);
     const std::array<uint8_t, 6> values = {16, 32, 48, 64, 80, 96};
@@ -1070,10 +1214,16 @@ struct TrainingTargetSnapshot {
     std::vector<uint8_t> imageBytes;
     std::optional<std::vector<int64_t>> maskShape;
     std::optional<std::vector<uint8_t>> maskBytes;
+    bool maskPackedInImage = false;
+    std::optional<std::vector<int64_t>> coverageRenderTileShape;
+    std::optional<std::vector<uint8_t>> coverageRenderTileBytes;
     uint64_t coverageUnits = 0;
 
     size_t byteCount() const {
-        return imageBytes.size() + (maskBytes ? maskBytes->size() : 0);
+        return imageBytes.size() +
+            (maskBytes && !maskPackedInImage ? maskBytes->size() : 0) +
+            (coverageRenderTileBytes
+                ? coverageRenderTileBytes->size() : 0);
     }
 };
 
@@ -1088,10 +1238,34 @@ TrainingTargetSnapshot snapshotTarget(const CameraTrainingTarget &target) {
         imageBytes, imageBytes + target.image->nbytes());
     if (target.coverageMask) {
         CHECK(target.coverageMask->dtype() == DType::UInt8);
-        result.maskShape = target.coverageMask->shape();
-        const uint8_t *maskBytes = target.coverageMask->data<uint8_t>();
-        result.maskBytes.emplace(
-            maskBytes, maskBytes + target.coverageMask->nbytes());
+        result.maskPackedInImage = target.coverageMask == target.image;
+        if (result.maskPackedInImage) {
+            CHECK(target.image->shape().size() == 3);
+            result.maskShape = std::vector<int64_t>{
+                target.image->size(0), target.image->size(1)};
+            result.maskBytes.emplace();
+            result.maskBytes->reserve(
+                static_cast<size_t>(target.image->size(0) *
+                                    target.image->size(1)));
+            for (size_t pixel = 0;
+                 pixel < target.image->nbytes() / 4u; ++pixel) {
+                result.maskBytes->push_back(imageBytes[pixel * 4u + 3u]);
+            }
+        } else {
+            result.maskShape = target.coverageMask->shape();
+            const uint8_t *maskBytes = target.coverageMask->data<uint8_t>();
+            result.maskBytes.emplace(
+                maskBytes, maskBytes + target.coverageMask->nbytes());
+        }
+    }
+    if (target.coverageRenderTiles) {
+        CHECK(target.coverageRenderTiles->dtype() == DType::UInt8);
+        result.coverageRenderTileShape =
+            target.coverageRenderTiles->shape();
+        const uint8_t *tileBytes =
+            target.coverageRenderTiles->data<uint8_t>();
+        result.coverageRenderTileBytes.emplace(
+            tileBytes, tileBytes + target.coverageRenderTiles->nbytes());
     }
     result.coverageUnits = target.coverageUnits;
     return result;
@@ -1103,7 +1277,44 @@ void checkSameTarget(const TrainingTargetSnapshot &expected,
     CHECK(actual.imageBytes == expected.imageBytes);
     CHECK(actual.maskShape == expected.maskShape);
     CHECK(actual.maskBytes == expected.maskBytes);
+    CHECK(actual.maskPackedInImage == expected.maskPackedInImage);
+    CHECK(actual.coverageRenderTileShape ==
+          expected.coverageRenderTileShape);
+    CHECK(actual.coverageRenderTileBytes ==
+          expected.coverageRenderTileBytes);
     CHECK(actual.coverageUnits == expected.coverageUnits);
+}
+
+void checkCoverageRenderTileMap() {
+    CoverageMask mask;
+    mask.width = 33;
+    mask.height = 17;
+    mask.data.assign(static_cast<size_t>(mask.width) * mask.height, 0);
+
+    // A soft nonzero center at x=20 reaches x=15 through the exact five-pixel
+    // SSIM halo, activating both adjacent 16-pixel tiles.
+    mask.data[8u * mask.width + 20u] = 1;
+    CoverageMask tiles = buildCoverageRenderTileMap(mask);
+    CHECK(tiles.width == 3);
+    CHECK(tiles.height == 2);
+    CHECK(tiles.data == std::vector<uint8_t>({1, 1, 0, 0, 0, 0}));
+
+    // At x=21 the left tile is six pixels away and must remain inactive.
+    std::fill(mask.data.begin(), mask.data.end(), 0);
+    mask.data[8u * mask.width + 21u] = 255;
+    tiles = buildCoverageRenderTileMap(mask);
+    CHECK(tiles.data == std::vector<uint8_t>({0, 1, 0, 0, 0, 0}));
+
+    // A bottom-right edge center clamps safely and reaches four tiles.
+    std::fill(mask.data.begin(), mask.data.end(), 0);
+    mask.data[16u * mask.width + 32u] = 255;
+    tiles = buildCoverageRenderTileMap(mask);
+    CHECK(tiles.data == std::vector<uint8_t>({0, 1, 1, 0, 1, 1}));
+
+    std::fill(mask.data.begin(), mask.data.end(), 255);
+    tiles = buildCoverageRenderTileMap(mask);
+    CHECK(std::all_of(tiles.data.begin(), tiles.data.end(),
+                      [](uint8_t value) { return value == 1; }));
 }
 
 void checkPrefetchEnvironmentOptIn() {
@@ -1130,6 +1341,10 @@ void checkPrefetchEnvironmentOptIn() {
         CHECK(defaulted.prefetchEnabled());
         CameraImageCache explicitlyDisabled(1.0f, 1'024, false);
         CHECK(!explicitlyDisabled.prefetchEnabled());
+        explicitlyDisabled.enablePrefetch();
+        CHECK(explicitlyDisabled.prefetchEnabled());
+        explicitlyDisabled.enablePrefetch();
+        CHECK(explicitlyDisabled.prefetchEnabled());
     }
 
     const char *restoredValue = std::getenv("MSPLAT_CAMERA_PREFETCH");
@@ -1184,7 +1399,6 @@ void checkUnmaskedPrefetchParity(const TempDirectory &temporary) {
     CHECK(live.imagePyramids.empty());
     CHECK(live.coverageMaskPyramids.empty());
     CHECK(live.mtensorImageCache.empty());
-    CHECK(live.mtensorCoverageMaskCache.empty());
     CHECK(live.coverageUnitsByDownscale.empty());
     CHECK(live.cachedImageBytes() == 0);
 
@@ -1225,6 +1439,11 @@ void checkMaskedPrefetchParity(const TempDirectory &temporary) {
         synchronousCache.gpuTrainingTarget(
             synchronousCameras, 0, stageDownscale));
     CHECK(expected.maskBytes.has_value());
+    CHECK(expected.maskPackedInImage);
+    CHECK(expected.coverageRenderTileBytes.has_value());
+    CHECK(expected.byteCount() ==
+          static_cast<size_t>(width / stageDownscale) *
+              (height / stageDownscale) * 4u + 1u);
 
     std::vector<Camera> cameras;
     cameras.push_back(prefetchTestCamera(imagePath, width, height, mask));
@@ -1243,6 +1462,18 @@ void checkMaskedPrefetchParity(const TempDirectory &temporary) {
     CHECK(cache.missCount() == 1);
     CHECK(cache.cachedCpuBytes() == 0);
     CHECK(cache.cachedGpuBytes() == expected.byteCount());
+
+    // A prepared masked target keeps the denominator's source identity after
+    // decoded pixels are released. Removing both files proves the next cache
+    // hit cannot silently re-decode them.
+    CHECK(fs::remove(imagePath));
+    CHECK(fs::remove(maskPath));
+    const TrainingTargetSnapshot residentHit = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 0, stageDownscale));
+    checkSameTarget(expected, residentHit);
+    CHECK(cache.hitCount() == 1);
+    CHECK(cache.missCount() == 1);
+    CHECK(cache.cachedCpuBytes() == 0);
 }
 
 void checkNonmatchingTargetPreservesPrefetch(
@@ -1339,7 +1570,7 @@ void checkImageCacheAccountingCategories() {
     camera.coverageMaskPyramids.emplace(2, std::move(maskPyramid));
     camera.mtensorImageCache.emplace(
         2, MTensor({1, 2, 4}, DType::UInt8));
-    camera.mtensorCoverageMaskCache.emplace(
+    camera.mtensorCoverageRenderTileCache.emplace(
         2, MTensor({1, 2}, DType::UInt8));
 
     const size_t expectedCpuBytes =
@@ -1388,6 +1619,7 @@ void checkCompactGPUTrainingTargetUpload(const TempDirectory &temporary) {
         cache.gpuTrainingTarget(cameras, 0, 1);
     CHECK(first.image != nullptr);
     CHECK(first.coverageMask == nullptr);
+    CHECK(first.coverageRenderTiles == nullptr);
     CHECK(first.coverageUnits == 3u * 2u * 255u);
     CHECK(first.image->isGpu());
     CHECK(first.image->dtype() == DType::UInt8);
@@ -1435,13 +1667,14 @@ void checkCompactTrainingTargetStorageValidation() {
             [&] { (void)camera.getGPUTrainingTarget(1); },
             "Training image storage does not match its dimensions");
         CHECK(camera.mtensorImageCache.empty());
-        CHECK(camera.mtensorCoverageMaskCache.empty());
+        CHECK(camera.mtensorCoverageRenderTileCache.empty());
     }
 
     for (const size_t maskBytes : {size_t{3}, size_t{5}}) {
         Camera camera = makeCamera(16);
         camera.trainingMask = TrainingMaskDescriptor{
             "manual-mask", TrainingMaskChannel::Luminance};
+        camera.decodedTrainingMaskSource = camera.trainingMask;
         camera.coverageMask.width = 2;
         camera.coverageMask.height = 2;
         camera.coverageMask.data.resize(maskBytes, 255);
@@ -1453,7 +1686,7 @@ void checkCompactTrainingTargetStorageValidation() {
             [&] { (void)camera.getGPUTrainingTarget(1); },
             "Training mask storage does not match its dimensions");
         CHECK(camera.mtensorImageCache.empty());
-        CHECK(camera.mtensorCoverageMaskCache.empty());
+        CHECK(camera.mtensorCoverageRenderTileCache.empty());
     }
 }
 
@@ -1462,6 +1695,7 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
     resident.filePath = "unused-on-resident-hit";
     resident.trainingMask = TrainingMaskDescriptor{
         "unused-mask-on-resident-hit", TrainingMaskChannel::Luminance};
+    resident.decodedTrainingMaskSource = resident.trainingMask;
     resident.image.width = 3;
     resident.image.height = 2;
     resident.image.data.resize(3 * 2 * 4, 64);
@@ -1473,8 +1707,15 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
     resident.loadedImageDownscaleFactor = 1.0f;
     resident.mtensorImageCache.emplace(
         1, MTensor({2, 3, 4}, DType::UInt8));
-    resident.mtensorCoverageMaskCache.emplace(
-        1, MTensor({2, 3}, DType::UInt8));
+    resident.mtensorCoverageRenderTileCache.emplace(
+        1, MTensor({1, 1}, DType::UInt8));
+    resident.mtensorCoverageRenderTileCache.at(1).data<uint8_t>()[0] = 1;
+    resident.gpuTrainingMaskSourceByDownscale.emplace(
+        1, resident.trainingMask);
+    resident.coverageUnitsByDownscale.emplace(1, 21);
+    for (size_t pixel = 0; pixel < resident.coverageMask.data.size(); ++pixel)
+        resident.mtensorImageCache.at(1).data<uint8_t>()[pixel * 4u + 3u] =
+            resident.coverageMask.data[pixel];
 
     std::vector<Camera> residentCameras;
     residentCameras.push_back(std::move(resident));
@@ -1484,9 +1725,10 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
     CHECK(target.image != nullptr);
     CHECK(target.image->dtype() == DType::UInt8);
     CHECK(target.image->shape() == std::vector<int64_t>({2, 3, 4}));
-    CHECK(target.coverageMask != nullptr);
-    CHECK(target.coverageMask->dtype() == DType::UInt8);
-    CHECK(target.coverageMask->shape() == std::vector<int64_t>({2, 3}));
+    CHECK(target.coverageMask == target.image);
+    CHECK(target.coverageRenderTiles ==
+          &residentCameras[0].mtensorCoverageRenderTileCache.at(1));
+    CHECK(target.image->nbytes() == 2u * 3u * 4u);
     CHECK(target.coverageUnits == 21);
     CHECK(residentCameras[0].coverageUnitsByDownscale.at(1) == 21);
     CHECK(residentCache.hitCount() == 1);
@@ -1495,6 +1737,14 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
           residentCameras[0].cachedImageBytes());
     CHECK(residentCameras[0].image.empty());
     CHECK(residentCameras[0].coverageMask.empty());
+    CHECK(residentCache.cachedCpuBytes() == 0);
+
+    const CameraTrainingTarget secondTarget =
+        residentCache.gpuTrainingTarget(residentCameras, 0, 1);
+    CHECK(secondTarget.image == target.image);
+    CHECK(secondTarget.coverageRenderTiles == target.coverageRenderTiles);
+    CHECK(residentCache.hitCount() == 2);
+    CHECK(residentCache.missCount() == 0);
     CHECK(residentCache.cachedCpuBytes() == 0);
 
     const fs::path imagePath = temporary.path / "cache-rgb.tiff";
@@ -1528,6 +1778,7 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
     zeroAtCoarse.filePath = "unused-zero-at-coarse";
     zeroAtCoarse.trainingMask = TrainingMaskDescriptor{
         "unused-zero-mask", TrainingMaskChannel::Luminance};
+    zeroAtCoarse.decodedTrainingMaskSource = zeroAtCoarse.trainingMask;
     zeroAtCoarse.image.width = 4;
     zeroAtCoarse.image.height = 4;
     zeroAtCoarse.image.data.resize(4 * 4 * 4, 128);
@@ -1549,9 +1800,86 @@ void checkMaskedCacheHitAndEviction(const TempDirectory &temporary) {
     CHECK(zeroCameras[0].imagePyramids.empty());
     CHECK(zeroCameras[0].coverageMaskPyramids.empty());
     CHECK(zeroCameras[0].mtensorImageCache.empty());
-    CHECK(zeroCameras[0].mtensorCoverageMaskCache.empty());
+    CHECK(zeroCameras[0].mtensorCoverageRenderTileCache.empty());
+    CHECK(zeroCameras[0].gpuTrainingMaskSourceByDownscale.empty());
     CHECK(zeroCameras[0].cachedImageBytes() == 0);
     CHECK(zeroCache.cachedBytes() == 0);
+}
+
+void checkTrainingMaskSourceMutation(const TempDirectory &temporary) {
+    constexpr int width = 33;
+    constexpr int height = 17;
+    const fs::path imagePath = temporary.path / "mask-mutation-image.tiff";
+    const fs::path maskAPath = temporary.path / "mask-mutation-a.tiff";
+    const fs::path maskBPath = temporary.path / "mask-mutation-b.tiff";
+    writeTIFF(imagePath, width, height,
+              solidRGBA(width, height, {80, 120, 160}), 1);
+
+    std::vector<uint8_t> maskA(static_cast<size_t>(width) * height * 4, 0);
+    maskA[3] = 64;
+    writeTIFF(maskAPath, width, height, maskA, 1);
+    std::vector<uint8_t> maskB(static_cast<size_t>(width) * height * 4, 0);
+    const size_t lastPixel = static_cast<size_t>(width) * height - 1;
+    maskB[lastPixel * 4 + 3] = 255;
+    writeTIFF(maskBPath, width, height, maskB, 1);
+
+    // Decode A only on CPU, verify a repeated load is a true cache hit, then
+    // mutate the descriptor before any GPU target has been published. The next
+    // target request must reload B rather than reuse A's bytes or denominator.
+    Camera decoded = prefetchTestCamera(
+        imagePath, width, height,
+        TrainingMaskDescriptor{
+            maskAPath.string(), TrainingMaskChannel::Alpha});
+    decoded.loadImage(1.0f);
+    CHECK(decoded.getCoverageUnits(1) == 64);
+    const uint8_t *decodedImageBytes = decoded.image.data.data();
+    const uint8_t *decodedMaskBytes = decoded.coverageMask.data.data();
+    decoded.loadImage(1.0f);
+    CHECK(decoded.image.data.data() == decodedImageBytes);
+    CHECK(decoded.coverageMask.data.data() == decodedMaskBytes);
+    decoded.trainingMask = TrainingMaskDescriptor{
+        maskBPath.string(), TrainingMaskChannel::Alpha};
+    std::vector<Camera> decodedCameras;
+    decodedCameras.push_back(std::move(decoded));
+    CameraImageCache decodedCache(1.0f, 1'024 * 1'024, false);
+    Camera &reloadedForNewMask = decodedCache.ensureLoaded(
+        decodedCameras, 0);
+    CHECK(reloadedForNewMask.getCoverageUnits(1) == 255);
+    const TrainingTargetSnapshot decodedMutation = snapshotTarget(
+        decodedCache.gpuTrainingTarget(decodedCameras, 0, 1));
+    CHECK(decodedMutation.coverageUnits == 255);
+    CHECK(decodedMutation.coverageRenderTileBytes ==
+          std::optional<std::vector<uint8_t>>(
+              std::vector<uint8_t>({0, 1, 1, 0, 1, 1})));
+
+    std::vector<Camera> cameras;
+    cameras.push_back(prefetchTestCamera(imagePath, width, height));
+    CameraImageCache cache(1.0f, 1'024 * 1'024, false);
+
+    const CameraTrainingTarget unmasked =
+        cache.gpuTrainingTarget(cameras, 0, 1);
+    CHECK(unmasked.coverageMask == nullptr);
+    CHECK(unmasked.coverageRenderTiles == nullptr);
+
+    cameras[0].trainingMask = TrainingMaskDescriptor{
+        maskAPath.string(), TrainingMaskChannel::Alpha};
+    const TrainingTargetSnapshot firstMask = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 0, 1));
+    CHECK(firstMask.coverageUnits == 64);
+    CHECK(firstMask.coverageRenderTileBytes ==
+          std::optional<std::vector<uint8_t>>(
+              std::vector<uint8_t>({1, 0, 0, 0, 0, 0})));
+
+    cameras[0].trainingMask = TrainingMaskDescriptor{
+        maskBPath.string(), TrainingMaskChannel::Alpha};
+    const TrainingTargetSnapshot secondMask = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 0, 1));
+    CHECK(secondMask.coverageUnits == 255);
+    CHECK(secondMask.coverageRenderTileBytes ==
+          std::optional<std::vector<uint8_t>>(
+              std::vector<uint8_t>({0, 1, 1, 0, 1, 1})));
+    CHECK(cache.hitCount() == 0);
+    CHECK(cache.missCount() == 3);
 }
 
 void checkCameraPoseCacheContract() {
@@ -1619,6 +1947,12 @@ int main() {
         checkStage("coverage mask decode and resize", [&] {
             checkCoverageMaskDecodeAndResize(temporary);
         });
+        checkStage("binary grayscale PNG mask decode", [&] {
+            checkBinaryGrayscalePNGMaskDecode(temporary);
+        });
+        checkStage("coverage render-tile halo", [&] {
+            checkCoverageRenderTileMap();
+        });
         checkStage("coverage mask orientation", [&] {
             checkCoverageMaskOrientation(temporary);
         });
@@ -1666,6 +2000,9 @@ int main() {
         });
         checkStage("masked cache hit and eviction", [&] {
             checkMaskedCacheHitAndEviction(temporary);
+        });
+        checkStage("training-mask source mutation", [&] {
+            checkTrainingMaskSourceMutation(temporary);
         });
         checkStage("unmasked camera prefetch parity", [&] {
             checkUnmaskedPrefetchParity(temporary);

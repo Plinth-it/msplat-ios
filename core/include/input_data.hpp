@@ -23,7 +23,8 @@ struct Image {
 
 /// Compact training raster. Bytes are tightly packed RGBA in the same
 /// sRGB-encoded numerical space used by the loss. Loader-produced alpha is 255;
-/// the loss ignores it because training transparency uses a separate mask.
+/// target publication replaces it with soft coverage when a mask is present.
+/// RGB loss sampling never treats alpha as color.
 struct RGBA8Image {
     std::vector<uint8_t> data;  // width * height * 4 bytes, RGBA
     int width = 0, height = 0;
@@ -42,10 +43,26 @@ struct CoverageMask {
     const uint8_t* ptr() const { return data.data(); }
 };
 
+inline constexpr int kTrainingTileSize = 16;
+inline constexpr int kTrainingSsimHalo = 5;
+
+/// Builds a conservative render-tile map for coverage training. A 16x16 tile
+/// is active when it can contribute to any nonzero coverage center through the
+/// 11x11 SSIM window, including its exact five-pixel Chebyshev halo.
+CoverageMask buildCoverageRenderTileMap(const CoverageMask &mask);
+
 struct CameraTrainingTarget {
     MTensor *image = nullptr;
-    MTensor *coverageMask = nullptr;  // null means uniform full coverage
+    /// Null means uniform full coverage. Camera-produced masked targets alias
+    /// `image` here and store coverage in RGBA alpha, preserving the existing
+    /// fields while keeping one four-byte GPU pixel. A distinct pointer remains
+    /// a supported standalone UInt8 (H, W) mask for low-level callers.
+    MTensor *coverageMask = nullptr;
     uint64_t coverageUnits = 0;       // sum(mask), or width * height * 255
+    /// Optional UInt8 [ceil(H/16), ceil(W/16)] render-tile activity. It is
+    /// consumed only by coverage training; transparent and render paths ignore
+    /// it. Trailing placement preserves existing three-field aggregates.
+    MTensor *coverageRenderTiles = nullptr;
 };
 
 struct Camera {
@@ -61,10 +78,16 @@ struct Camera {
 
     RGBA8Image image;
     CoverageMask coverageMask;
+    /// Path/channel identity of CPU coverage state, including decoded masks,
+    /// pyramids, and cached denominators. This is separate from GPU residency
+    /// so descriptor mutations cannot reuse mask A before target publication.
+    std::optional<TrainingMaskDescriptor> decodedTrainingMaskSource;
     std::unordered_map<int, RGBA8Image> imagePyramids;
     std::unordered_map<int, CoverageMask> coverageMaskPyramids;
     std::unordered_map<int, MTensor> mtensorImageCache;
-    std::unordered_map<int, MTensor> mtensorCoverageMaskCache;
+    std::unordered_map<int, MTensor> mtensorCoverageRenderTileCache;
+    std::unordered_map<int, std::optional<TrainingMaskDescriptor>>
+        gpuTrainingMaskSourceByDownscale;
     std::unordered_map<int, uint64_t> coverageUnitsByDownscale;
     float loadedImageDownscaleFactor = 0.0f;
     MTensor cachedViewMat, cachedProjViewMat;
@@ -94,6 +117,7 @@ struct Camera {
     uint64_t getCoverageUnits(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
     CameraTrainingTarget getGPUTrainingTarget(int downscaleFactor);
+    bool hasGPUTrainingTarget(int downscaleFactor) const;
     /// Changes the pose and invalidates every derived render matrix.
     void setCameraToWorld(const float pose[16]);
     /// Direct pose writes remain detectable so legacy/internal callers cannot
@@ -133,8 +157,9 @@ struct DatasetMetadata {
 };
 
 /// Holds compact GPU training targets under a byte budget, evicting the
-/// least-recently-used camera when the budget is exceeded. Decode and pyramid
-/// pixels are released after a target is uploaded.
+/// least-recently-used camera when the budget is exceeded. Masked and unmasked
+/// resident targets both use one RGBA8 buffer; masked coverage occupies alpha.
+/// Decode and pyramid pixels are released after a target is uploaded.
 ///
 /// Every entry point used to decode all images up front and then copy the
 /// camera array, so a dataset occupied twice its decoded size before the first
@@ -145,7 +170,8 @@ class CameraImageCache {
 public:
     /// MSPLAT_IMAGE_CACHE_MB overrides it; otherwise 512MB on iOS, 2GB elsewhere.
     static size_t defaultBudgetBytes();
-    /// Experimental depth-one CPU prefetch is opt-in with the exact value
+    /// Environment fallback for clients that do not explicitly enable the
+    /// instance-scoped depth-one prefetcher. Requires the exact value
     /// MSPLAT_CAMERA_PREFETCH=1.
     static bool defaultPrefetchEnabled() noexcept;
 
@@ -163,8 +189,8 @@ public:
     /// camera being asked for is never the eviction victim.
     MTensor& gpuImage(std::vector<Camera> &cameras, size_t index, int downscaleFactor);
 
-    /// Returns the RGB tensor together with optional soft coverage. A cache hit
-    /// requires every tensor needed by the target to already be resident.
+    /// Returns the RGB tensor together with optional soft coverage. For a
+    /// camera mask, `coverageMask` aliases `image` and alpha stores coverage.
     CameraTrainingTarget gpuTrainingTarget(
         std::vector<Camera> &cameras, size_t index, int downscaleFactor);
 
@@ -192,6 +218,10 @@ public:
     uint64_t hitCount() const { return _hitCount; }
     uint64_t missCount() const { return _missCount; }
     bool prefetchEnabled() const { return _prefetchEnabled; }
+    /// Idempotently enables the existing depth-one worker for this cache.
+    /// Configure it before training starts; cache operations are not otherwise
+    /// designed for concurrent control-plane mutation.
+    void enablePrefetch() noexcept { _prefetchEnabled = true; }
     uint64_t prefetchScheduledCount() const { return _prefetchScheduledCount; }
     uint64_t prefetchUsedCount() const { return _prefetchUsedCount; }
     uint64_t prefetchWaitCount() const { return _prefetchWaitCount; }

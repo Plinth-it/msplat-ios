@@ -43,6 +43,7 @@ final class TrainingSession: ObservableObject {
     @Published private(set) var splatCount = 0
     @Published private(set) var modelCapacity = 0
     @Published private(set) var cpuSubmitMs: Float = 0
+    @Published private(set) var imagePrepareMs: Float = 0
     @Published private(set) var gpuExecutionMs: Float?
     @Published private(set) var endToEndMs: Float?
     @Published private(set) var loss: Float?
@@ -92,6 +93,7 @@ final class TrainingSession: ObservableObject {
         splatCount = 0
         modelCapacity = 0
         cpuSubmitMs = 0
+        imagePrepareMs = 0
         gpuExecutionMs = nil
         endToEndMs = nil
         loss = nil
@@ -205,7 +207,8 @@ final class TrainingSession: ObservableObject {
             let activeSession = try await MsplatSession(
                 datasetURL: folder.url,
                 trainingPlan: plan,
-                baseConfig: baseConfig
+                baseConfig: baseConfig,
+                prefetchTrainingTargets: true
             )
             session = activeSession
             try Task.checkCancellation()
@@ -420,6 +423,7 @@ final class TrainingSession: ObservableObject {
             completedIteration = completed.iteration
             splatCount = completed.splatCount
             modelCapacity = completed.modelCapacity
+            imagePrepareMs = completed.imagePrepareMs
             gpuExecutionMs = completed.gpuExecutionMs
             endToEndMs = completed.endToEndMs
             loss = completed.loss

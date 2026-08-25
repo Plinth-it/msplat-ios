@@ -22,7 +22,7 @@
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
-static_assert(MSPLAT_ABI_VERSION == 13u);
+static_assert(MSPLAT_ABI_VERSION == 14u);
 static_assert(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS == (1u << 0));
 static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS == (1u << 1));
 static_assert((MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS &
@@ -643,6 +643,10 @@ int main() {
     CHECK(copiedPose[10] == 1.0f);
     CHECK(copiedPose[15] == 1.0f);
     CHECK(copiedPose[3] == -1.0f);
+    CHECK(msplat_dataset_enable_training_target_prefetch_v14(
+              copiedDataset, &error) == MSPLAT_STATUS_OK);
+    CHECK(msplat_dataset_enable_training_target_prefetch_v14(
+              copiedDataset, &error) == MSPLAT_STATUS_OK);
     CHECK(msplat_dataset_destroy_v2(copiedDataset, &error) ==
           MSPLAT_STATUS_OK);
 
@@ -1457,6 +1461,8 @@ int main() {
               &maskOptions, sizeof(maskOptions), &trainer,
               &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
     CHECK(trainer == nullptr);
+    CHECK(msplat_dataset_enable_training_target_prefetch_v14(
+              nullptr, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
 
     // Legacy entry points route through the same exception boundary.
     CHECK(msplat_dataset_create(nullptr, 1.0f, false, 8) == nullptr);

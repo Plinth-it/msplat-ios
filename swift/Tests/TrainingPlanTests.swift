@@ -16,15 +16,18 @@ final class TrainingPlanTests: XCTestCase {
         )
 
         XCTAssertFalse(try plan.makeDatasetOptions().discoverTrainingMasks)
+        XCTAssertFalse(try plan.makeDatasetOptions().prefetchTrainingTargets)
         let options = try plan.makeDatasetOptions(
             evalMode: true,
-            testEvery: 10
+            testEvery: 10,
+            prefetchTrainingTargets: true
         )
         XCTAssertEqual(options, DatasetOptions(
             downscaleFactor: 2,
             evalMode: true,
             testEvery: 10,
-            discoverTrainingMasks: false
+            discoverTrainingMasks: false,
+            prefetchTrainingTargets: true
         ))
 
         let config = try plan.makeTrainingConfig()
@@ -102,7 +105,7 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_888_707_620)
     }
 
-    func testMaskAwareMemoryEstimateIncludesCompactTargetAndDecodeStorage() throws {
+    func testMaskAwareMemoryEstimateUsesPackedTargetAndDecodeStorage() throws {
         let plan = try TrainingPlan(
             inputDimensions: TrainingImageDimensions(width: 1_920, height: 1_440),
             inputDecodeScale: 2,
@@ -124,11 +127,12 @@ final class TrainingPlanTests: XCTestCase {
 
         XCTAssertTrue(plan.includesTrainingMasks)
         XCTAssertTrue(try plan.makeDatasetOptions().discoverTrainingMasks)
+        XCTAssertFalse(try plan.makeDatasetOptions().prefetchTrainingTargets)
         let estimate = try plan.memoryEstimate(
             imageCacheBudgetBytes:
                 TrainingMemoryEstimate.defaultIOSImageCacheBudgetBytes
         )
-        XCTAssertEqual(estimate.largestImageCacheEntryBytes, 3_456_000)
+        XCTAssertEqual(estimate.largestImageCacheEntryBytes, 2_767_500)
         XCTAssertEqual(estimate.imageDecodeTransientBytes, 24_883_200)
         XCTAssertEqual(estimate.imageInsertionPeakBytes, 561_754_112)
         XCTAssertEqual(estimate.codeDerivedBytes, 2_051_979_464)
@@ -164,7 +168,7 @@ final class TrainingPlanTests: XCTestCase {
                 imageCacheBudgetBytes:
                     TrainingMemoryEstimate.defaultIOSImageCacheBudgetBytes
             ).largestImageCacheEntryBytes,
-            864_000
+            691_890
         )
     }
 

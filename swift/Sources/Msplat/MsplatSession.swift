@@ -15,17 +15,23 @@ public struct DatasetOptions: Sendable, Equatable {
     public var testEvery: Int32
     /// Whether path-based dataset loaders discover optional mask sidecars.
     public var discoverTrainingMasks: Bool
+    /// Whether the dataset prepares the next training target on a depth-one
+    /// worker while the current Metal step runs. `false` leaves the native
+    /// default unchanged, including its environment-variable opt-in.
+    public var prefetchTrainingTargets: Bool
 
     public init(
         downscaleFactor: Float = 1.0,
         evalMode: Bool = false,
         testEvery: Int32 = 8,
-        discoverTrainingMasks: Bool = false
+        discoverTrainingMasks: Bool = false,
+        prefetchTrainingTargets: Bool = false
     ) {
         self.downscaleFactor = downscaleFactor
         self.evalMode = evalMode
         self.testEvery = testEvery
         self.discoverTrainingMasks = discoverTrainingMasks
+        self.prefetchTrainingTargets = prefetchTrainingTargets
     }
 }
 
@@ -77,13 +83,15 @@ public final class MsplatSession {
         trainingPlan plan: TrainingPlan,
         baseConfig: TrainingConfig = TrainingConfig(),
         evalMode: Bool = false,
-        testEvery: Int32 = 8
+        testEvery: Int32 = 8,
+        prefetchTrainingTargets: Bool = false
     ) throws {
         try self.init(
             datasetURL: datasetURL,
             options: plan.makeDatasetOptions(
                 evalMode: evalMode,
-                testEvery: testEvery
+                testEvery: testEvery,
+                prefetchTrainingTargets: prefetchTrainingTargets
             ),
             config: plan.makeTrainingConfig(startingFrom: baseConfig),
             maximumGaussianCount: plan.maximumGaussianCount
@@ -470,7 +478,8 @@ public final class MsplatSession {
     ) throws -> (dataset: MsplatDataset, trainer: MsplatTrainer) {
         try createHandles(
             config: config,
-            maximumGaussianCount: maximumGaussianCount
+            maximumGaussianCount: maximumGaussianCount,
+            prefetchTrainingTargets: options.prefetchTrainingTargets
         ) {
             var dataset: MsplatDataset?
             var nativeError = MsplatErrorInfo()
@@ -501,7 +510,8 @@ public final class MsplatSession {
     ) throws -> (dataset: MsplatDataset, trainer: MsplatTrainer) {
         try createHandles(
             config: config,
-            maximumGaussianCount: maximumGaussianCount
+            maximumGaussianCount: maximumGaussianCount,
+            prefetchTrainingTargets: options.prefetchTrainingTargets
         ) {
             if descriptor.frames.contains(where: { $0.trainingMask != nil }) {
                 return try withUnsafeNativeDatasetDescriptorV6(descriptor) {
@@ -557,12 +567,22 @@ public final class MsplatSession {
     private static func createHandles(
         config: TrainingConfig,
         maximumGaussianCount: Int?,
+        prefetchTrainingTargets: Bool,
         createDataset: () throws -> MsplatDataset
     ) throws -> (dataset: MsplatDataset, trainer: MsplatTrainer) {
         try withConfiguredNativeEngine(metallibResourceName) {
             let dataset = try createDataset()
 
             do {
+                if prefetchTrainingTargets {
+                    var prefetchError = MsplatErrorInfo()
+                    let prefetchStatus =
+                        msplat_dataset_enable_training_target_prefetch_v14(
+                            dataset,
+                            &prefetchError
+                        )
+                    try checkNativeStatus(prefetchStatus, error: &prefetchError)
+                }
                 var nativeConfig = config.toC()
                 var limits = msplat_default_training_limits()
                 var refinementOptions = config.toRefinementOptionsV8()

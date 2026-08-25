@@ -46,20 +46,26 @@ require_contains("${host_source}"
     "const MTensor& loss_coverage_buffer = coverage_mask ? *coverage_mask : gt;"
     "allocation-free unmasked coverage buffer")
 require_contains("${host_source}"
-    "const uint32_t coverage_stride =\n        coverage_mask && !transparent_mask ? img_width : 0u;"
+    "const std::array<uint32_t, 2> coverage_layout ="
+    "coverage byte-layout contract")
+require_contains("${host_source}"
+    "std::array<uint32_t, 2>{0u, 0u}"
     "zero-stride unmasked or transparent coverage contract")
 require_contains("${host_source}"
     "ENC_BUF(enc, loss_coverage_buffer, 8);"
     "fused forward coverage binding")
 require_contains("${host_source}"
-    "ENC_SCALAR(enc, coverage_stride, 9);"
-    "fused forward coverage stride binding")
+    "ENC_SCALAR(enc, coverage_layout, 9);"
+    "fused forward coverage layout binding")
 require_contains("${host_source}"
     "ENC_BUF(enc, loss_coverage_buffer, 6);"
     "backward coverage binding")
 require_contains("${host_source}"
-    "ENC_SCALAR(enc, coverage_stride, 7);"
-    "backward coverage stride binding")
+    "ENC_SCALAR(enc, coverage_layout, 7);"
+    "backward coverage layout binding")
+require_contains("${metal_source}"
+    "training_mask_coverage("
+    "shared packed and standalone mask reader")
 require_contains("${metal_source}"
     "ssim_weight * (coverage_sum - ssim_sum) / 3.0f"
     "coverage-weighted SSIM center loss")

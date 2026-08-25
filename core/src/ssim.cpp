@@ -15,9 +15,16 @@ struct MetricInput {
     int channels;
     int64_t pixels;
     const uint8_t* coverage;
+    int coveragePixelStride;
+    int coverageChannelOffset;
     uint64_t coverageUnits;
     bool targetIsRGBA8;
 };
+
+uint8_t coverageAt(const MetricInput& input, int64_t pixel) {
+    return input.coverage[
+        pixel * input.coveragePixelStride + input.coverageChannelOffset];
+}
 
 float targetChannel(const MTensor& target, const MetricInput& input,
                     int64_t pixel, int channel) {
@@ -65,7 +72,8 @@ MetricInput validateMetricInput(const MTensor& rendered, const MTensor& gt,
 
     MetricInput input{
         static_cast<int>(height64), static_cast<int>(width64), 3, pixels,
-        nullptr, static_cast<uint64_t>(pixels) * 255u, targetIsRGBA8};
+        nullptr, 0, 0, static_cast<uint64_t>(pixels) * 255u,
+        targetIsRGBA8};
     if (!coverageMask) {
         if (suppliedCoverageUnits != 0 &&
             suppliedCoverageUnits != input.coverageUnits) {
@@ -75,17 +83,24 @@ MetricInput validateMetricInput(const MTensor& rendered, const MTensor& gt,
         return input;
     }
 
-    if (!coverageMask->defined() || coverageMask->dtype() != DType::UInt8 ||
-        coverageMask->ndim() != 2 || coverageMask->size(0) != height64 ||
-        coverageMask->size(1) != width64) {
+    const bool coverageIsPackedAlpha = coverageMask == &gt;
+    const bool standaloneCoverageValid =
+        coverageMask->defined() && coverageMask->dtype() == DType::UInt8 &&
+        coverageMask->ndim() == 2 && coverageMask->size(0) == height64 &&
+        coverageMask->size(1) == width64;
+    if ((!coverageIsPackedAlpha && !standaloneCoverageValid) ||
+        (coverageIsPackedAlpha && !targetIsRGBA8)) {
         throw std::invalid_argument(
-            "Metric coverage mask must be uint8 with shape (height, width)");
+            "Metric coverage must be packed RGBA alpha or uint8 with shape "
+            "(height, width)");
     }
 
     input.coverage = coverageMask->data<uint8_t>();
+    input.coveragePixelStride = coverageIsPackedAlpha ? 4 : 1;
+    input.coverageChannelOffset = coverageIsPackedAlpha ? 3 : 0;
     uint64_t calculatedCoverageUnits = 0;
     for (int64_t index = 0; index < pixels; ++index)
-        calculatedCoverageUnits += input.coverage[index];
+        calculatedCoverageUnits += coverageAt(input, index);
     if (calculatedCoverageUnits == 0)
         throw std::invalid_argument("Metric coverage mask has zero coverage");
     if (suppliedCoverageUnits != 0 &&
@@ -108,7 +123,7 @@ float psnr(const MTensor& rendered, const MTensor& gt,
     double mse = 0.0;
     for (int64_t pixel = 0; pixel < input.pixels; ++pixel) {
         const double coverage = input.coverage
-            ? input.coverage[pixel]
+            ? coverageAt(input, pixel)
             : 1.0;
         for (int channel = 0; channel < input.channels; ++channel) {
             const int64_t index = pixel * input.channels + channel;
@@ -133,7 +148,7 @@ float l1_loss(const MTensor& rendered, const MTensor& gt,
     double sum = 0.0;
     for (int64_t pixel = 0; pixel < input.pixels; ++pixel) {
         const double coverage = input.coverage
-            ? input.coverage[pixel]
+            ? coverageAt(input, pixel)
             : 1.0;
         for (int channel = 0; channel < input.channels; ++channel) {
             const int64_t index = pixel * input.channels + channel;
@@ -268,7 +283,7 @@ float ssim_eval(const MTensor& rendered, const MTensor& gt,
             float den = (m1sq + m2sq + C1) * (sig1sq + sig2sq + C2);
             const double value = num / den;
             ssim_sum += input.coverage
-                ? static_cast<double>(input.coverage[i]) * value
+                ? static_cast<double>(coverageAt(input, i)) * value
                 : value;
             count++;
         }

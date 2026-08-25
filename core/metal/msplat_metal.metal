@@ -1044,6 +1044,20 @@ inline float warpSum(float val, const int warp_size, const uint lane) {
     return simd_sum(val);
 }
 
+// Mask layout is (byte stride per pixel, coverage byte offset). Camera cache
+// targets use packed RGBA alpha (4,3); standalone masks use (1,0).
+inline float training_mask_coverage(
+    constant uchar* training_mask, uint pixel, uint2 layout) {
+    return float(training_mask[pixel * layout.x + layout.y]) / 255.0f;
+}
+
+inline bool training_render_tile_active(
+    constant uchar* coverage_render_tiles, uint stride,
+    uint tile_x, uint tile_y) {
+    return stride == 0 ||
+        coverage_render_tiles[tile_y * stride + tile_x] != 0;
+}
+
 kernel void rasterize_backward_kernel(
     constant uint3& tile_bounds,
     constant uint2& img_size,
@@ -1060,8 +1074,8 @@ kernel void rasterize_backward_kernel(
     device atomic_float* v_conic, // float3
     device atomic_float* v_rgb, // float3
     device atomic_float* v_opacity,
-    constant uchar* training_mask, // (H, W), ignored when stride is zero
-    constant uint& alpha_stride,
+    constant uchar* training_mask, // packed alpha or (H, W), disabled by x=0
+    constant uint2& alpha_layout,
     constant float& alpha_gradient_scale,
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
@@ -1086,9 +1100,9 @@ kernel void rasterize_backward_kernel(
     float T_final = final_Ts[pix_id];
     float T = T_final;
     float v_alpha_pixel = 0.0f;
-    if (inside && alpha_stride != 0) {
-        const float target_alpha =
-            float(training_mask[i * alpha_stride + j]) / 255.0f;
+    if (inside && alpha_layout.x != 0) {
+        const float target_alpha = training_mask_coverage(
+            training_mask, i * img_size.x + j, alpha_layout);
         const float rendered_alpha = 1.0f - T_final;
         v_alpha_pixel = alpha_gradient_scale * (
             rendered_alpha > target_alpha ? 1.0f :
@@ -2040,6 +2054,8 @@ kernel void project_and_sh_forward_kernel(
     device float* colors,
     device float* aabb, // float2: per-axis pixel extents
     constant uint& pose_enabled,
+    constant uchar* coverage_render_tiles,
+    constant uint& coverage_render_tile_stride,
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -2106,6 +2122,11 @@ kernel void project_and_sh_forward_kernel(
     // and allocates enough compact storage before any intersection is written.
     for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
         for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
+            if (!training_render_tile_active(
+                    coverage_render_tiles, coverage_render_tile_stride,
+                    tile_x, tile_y)) {
+                continue;
+            }
             const uint tile_id = tile_y * tile_bounds.x + tile_x;
             atomic_fetch_add_explicit(
                 &tile_counts[tile_id], 1u, memory_order_relaxed);
@@ -2547,6 +2568,8 @@ kernel void scatter_to_exact_bins_kernel(
     device atomic_uint* overflow_flag       [[buffer(10)]],
     constant float* opacities               [[buffer(11)]],
     device float* projected_opacities       [[buffer(12)]],
+    constant uchar* coverage_render_tiles   [[buffer(13)]],
+    constant uint& coverage_render_tile_stride [[buffer(14)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= num_points || radii[idx] <= 0) return;
@@ -2563,6 +2586,11 @@ kernel void scatter_to_exact_bins_kernel(
 
     for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
         for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
+            if (!training_render_tile_active(
+                    coverage_render_tiles, coverage_render_tile_stride,
+                    tile_x, tile_y)) {
+                continue;
+            }
             const uint tile_id = tile_y * tile_bounds.x + tile_x;
             const int start_i = tile_id == 0 ? 0 : tile_offsets[tile_id - 1];
             const int end_i = tile_offsets[tile_id];
@@ -3514,8 +3542,8 @@ kernel void rasterize_backward_chunked_kernel(
     device atomic_float* v_opacity,
     constant uint& chunk_size,
     constant uint& K_max,
-    constant uchar* training_mask, // (H, W), ignored when stride is zero
-    constant uint& alpha_stride,
+    constant uchar* training_mask, // packed alpha or (H, W), disabled by x=0
+    constant uint2& alpha_layout,
     constant float& alpha_gradient_scale,
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
@@ -3550,9 +3578,9 @@ kernel void rasterize_backward_chunked_kernel(
 
     float T_final = final_Ts[pix_id];
     float v_alpha_pixel = 0.0f;
-    if (inside && alpha_stride != 0) {
-        const float target_alpha =
-            float(training_mask[i * alpha_stride + j]) / 255.0f;
+    if (inside && alpha_layout.x != 0) {
+        const float target_alpha = training_mask_coverage(
+            training_mask, i * img_size.x + j, alpha_layout);
         const float rendered_alpha = 1.0f - T_final;
         v_alpha_pixel = alpha_gradient_scale * (
             rendered_alpha > target_alpha ? 1.0f :
@@ -3725,7 +3753,7 @@ inline float photometric_gain(
 inline float training_target_rgb(
     constant float* gt,
     constant uchar* training_mask,
-    uint alpha_stride,
+    uint2 alpha_layout,
     constant float* background,
     uint target_pixel_stride_bytes,
     uint pixel,
@@ -3738,8 +3766,9 @@ inline float training_target_rgb(
     } else {
         source = gt[pixel * 3 + channel];
     }
-    if (alpha_stride == 0) return source;
-    const float target_alpha = float(training_mask[pixel]) / 255.0f;
+    if (alpha_layout.x == 0) return source;
+    const float target_alpha = training_mask_coverage(
+        training_mask, pixel, alpha_layout);
     return fma(source - background[channel], target_alpha,
                background[channel]);
 }
@@ -3756,8 +3785,8 @@ kernel void ssim_h_fwd_kernel(
     constant float* log_rgb_gains,  // (cameraCount, 3)
     constant uint& camera_gain_offset,
     constant uint& photometric_enabled,
-    constant uchar* training_mask,  // (H, W), ignored when stride is zero
-    constant uint& alpha_stride,
+    constant uchar* training_mask,  // packed alpha or (H, W), disabled by x=0
+    constant uint2& alpha_layout,
     constant float* background,
     constant uint& target_pixel_stride_bytes,
     uint2 gid [[thread_position_in_grid]],
@@ -3797,7 +3826,7 @@ kernel void ssim_h_fwd_kernel(
                 uint pixel = gy * W + gx;
                 uint idx = pixel * 3 + c;
                 gv = training_target_rgb(
-                    gt, training_mask, alpha_stride, background,
+                    gt, training_mask, alpha_layout, background,
                     target_pixel_stride_bytes, pixel, c);
                 rv = rendered[idx] * tg_gain[c];
             }
@@ -3841,8 +3870,8 @@ kernel void ssim_v_fwd_kernel(
     constant float& ssim_weight,
     device float* intermediates,    // (H, W, 15)
     device atomic_float* loss_sum,
-    constant uchar* coverage_mask,  // (H, W), ignored when stride is zero
-    constant uint& coverage_stride,
+    constant uchar* coverage_mask,  // packed alpha or (H, W), disabled by x=0
+    constant uint2& coverage_layout,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3921,9 +3950,10 @@ kernel void ssim_v_fwd_kernel(
     // Pixel loss
     float pixel_loss = 0.0f;
     if (px < W && py < H) {
-        const float coverage = coverage_stride == 0
+        const float coverage = coverage_layout.x == 0
             ? 1.0f
-            : float(coverage_mask[py * coverage_stride + px]) / 255.0f;
+            : training_mask_coverage(
+                coverage_mask, py * W + px, coverage_layout);
         pixel_loss = coverage * (
             ssim_weight * (1.0f - ssim_sum / 3.0f) +
             (1.0f - ssim_weight) * l1_sum / 3.0f);
@@ -3953,12 +3983,12 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     constant float& ssim_weight, constant float& inv_n,
     device float* deriv_h_buf, // (H, W, 9): 3 values × 3 channels
     device atomic_float* loss_sum,
-    constant uchar* coverage_mask, // (H, W), ignored when stride is zero
-    constant uint& coverage_stride,
+    constant uchar* coverage_mask, // packed alpha or (H, W), disabled by x=0
+    constant uint2& coverage_layout,
     constant float* log_rgb_gains, // (cameraCount, 3)
     constant uint& camera_gain_offset,
     constant uint& photometric_enabled,
-    constant uint& alpha_stride,
+    constant uint2& alpha_layout,
     constant float* background,
     constant float* final_Ts,
     constant float& alpha_loss_weight,
@@ -4018,9 +4048,10 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             const bool valid_center =
                 gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H;
             const float coverage = !valid_center ? 0.0f :
-                (coverage_stride == 0 ? 1.0f :
-                 float(coverage_mask[
-                    uint(gpy) * coverage_stride + uint(gpx)]) / 255.0f);
+                (coverage_layout.x == 0 ? 1.0f :
+                 training_mask_coverage(
+                    coverage_mask, uint(gpy) * W + uint(gpx),
+                    coverage_layout));
             float sigma_x_sq = sq_x - mu_x*mu_x, sigma_y_sq = sq_y - mu_y*mu_y;
             float sigma_xy = cross_xy - mu_x*mu_y;
             float A = 2.0f*mu_x*mu_y + SSIM_C1, B = 2.0f*sigma_xy + SSIM_C2;
@@ -4037,15 +4068,15 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                     ssim_sum += coverage * (A * B) / (Cd * D);
                     const uint center_pixel = uint(gpy) * W + uint(gpx);
                     const float target = training_target_rgb(
-                        gt, coverage_mask, alpha_stride, background,
+                        gt, coverage_mask, alpha_layout, background,
                         target_pixel_stride_bytes, center_pixel, c);
                     l1_sum += coverage *
                         fabs(target -
                              rendered[(gpy*W+gpx)*3+c] * gain);
                     coverage_sum += coverage;
-                    if (c == 0 && alpha_stride != 0) {
-                        const float target_alpha = float(coverage_mask[
-                            uint(gpy) * alpha_stride + uint(gpx)]) / 255.0f;
+                    if (c == 0 && alpha_layout.x != 0) {
+                        const float target_alpha = training_mask_coverage(
+                            coverage_mask, center_pixel, alpha_layout);
                         alpha_loss_sum += alpha_loss_weight * fabs(
                             (1.0f - final_Ts[center_pixel]) - target_alpha);
                     }
@@ -4091,8 +4122,8 @@ kernel void ssim_h_bwd_kernel(
     constant float* intermediates,  // (H, W, 15) from forward
     constant uint2& img_size,       // (W, H)
     device float* ssim_h_buf,       // (H, W, 15) — reused from forward
-    constant uchar* coverage_mask,  // (H, W), ignored when stride is zero
-    constant uint& coverage_stride,
+    constant uchar* coverage_mask,  // packed alpha or (H, W), disabled by x=0
+    constant uint2& coverage_layout,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -4136,10 +4167,11 @@ kernel void ssim_h_bwd_kernel(
                 float dmu  = 2.0f * B * (mu_x * Cd - A * mu_y) / (Cd * Cd * D);
                 float dsyq = -A * B * iCD / D;
                 float dsxy = 2.0f * A * iCD;
-                const float coverage = coverage_stride == 0
+                const float coverage = coverage_layout.x == 0
                     ? 1.0f
-                    : float(coverage_mask[
-                        uint(gy) * coverage_stride + uint(gx)]) / 255.0f;
+                    : training_mask_coverage(
+                        coverage_mask, uint(gy) * W + uint(gx),
+                        coverage_layout);
 
                 f1 = coverage *
                     (dmu - 2.0f * mu_y * dsyq - mu_x * dsxy);
@@ -4179,13 +4211,13 @@ kernel void ssim_v_bwd_kernel(
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
     constant float& inv_n,          // 255 / (sum(coverage bytes) * 3)
-    constant uchar* coverage_mask,  // (H, W), ignored when stride is zero
-    constant uint& coverage_stride,
+    constant uchar* coverage_mask,  // packed alpha or (H, W), disabled by x=0
+    constant uint2& coverage_layout,
     constant float* log_rgb_gains,  // (cameraCount, 3)
     constant uint& camera_gain_offset,
     device atomic_float* log_gain_gradient, // (3)
     constant uint& photometric_enabled,
-    constant uint& alpha_stride,
+    constant uint2& alpha_layout,
     constant float* background,
     constant uint& target_pixel_stride_bytes,
     uint2 gid [[thread_position_in_grid]],
@@ -4250,13 +4282,14 @@ kernel void ssim_v_bwd_kernel(
             const float raw_rend_val = rendered_gradient[pixel_channel];
             const float rend_val = raw_rend_val * gain;
             float gt_val = training_target_rgb(
-                gt, coverage_mask, alpha_stride, background,
+                gt, coverage_mask, alpha_layout, background,
                 target_pixel_stride_bytes, py * W + px, c);
 
             float v_ssim = conv_f1 + rend_val * conv_f2 + gt_val * conv_f3;
-            const float coverage = coverage_stride == 0
+            const float coverage = coverage_layout.x == 0
                 ? 1.0f
-                : float(coverage_mask[py * coverage_stride + px]) / 255.0f;
+                : training_mask_coverage(
+                    coverage_mask, py * W + px, coverage_layout);
             float v_l1 = coverage * (
                 (gt_val > rend_val) ? -1.0f :
                 ((gt_val < rend_val) ? 1.0f : 0.0f));

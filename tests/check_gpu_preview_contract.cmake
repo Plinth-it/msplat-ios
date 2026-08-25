@@ -41,8 +41,8 @@ function(extract_function source_name start_marker output_name)
     set(${output_name} "${section_contents}" PARENT_SCOPE)
 endfunction()
 
-require_contains("${api_header}" "#define MSPLAT_ABI_VERSION 13u"
-    "ABI v13 declaration")
+require_contains("${api_header}" "#define MSPLAT_ABI_VERSION 14u"
+    "current ABI declaration")
 require_contains("${api_header}" "typedef void* MsplatPreviewFrame;"
     "opaque preview-frame handle")
 foreach(symbol IN ITEMS

@@ -66,19 +66,21 @@ initial Gaussian count, Gaussian ceiling, and a conservative code-derived
 peak-memory estimate. The
 estimate covers native model and training buffers, image-cache insertion,
 target-resolution app-owned decode buffers, and recommended headroom. When mask
-discovery is enabled, it also includes conservative source-mask decoding and
-the retained GPU mask. The app adds space for two BGRA8Unorm preview surfaces:
-one pending submission and the latest completed surface. Training targets remain
-compact UInt8 RGBA buffers and decoded CPU pixels are released after upload. The
-current formula reflects the split cache and removal of dead workspaces. The app
-refuses to start when that estimate exceeds a nonzero
+discovery is enabled, it also includes conservative source-mask decoding.
+Training targets remain compact UInt8 RGBA buffers, with coverage packed into
+alpha, plus one activity byte per 16x16 tile for masked coverage targets; decoded
+CPU pixels are released after upload. The app adds space for two BGRA8Unorm
+preview surfaces: one pending submission and the latest completed surface. The
+current formula reflects that compact cache and removal of dead workspaces. The
+app refuses to start when that estimate exceeds a nonzero
 `os_proc_available_memory` value at preflight (the simulator reports zero and
 skips this comparison).
 
-Depth-one CPU camera prefetch remains off by default. For device A/B testing,
-set exactly `MSPLAT_CAMERA_PREFETCH=1` in the Xcode Run scheme environment. It
-prepares the next training target while the current Metal step runs; compiling
-a new build alone does not enable it.
+The sample enables depth-one CPU camera prefetch for both masked and unmasked
+runs, keeping their timing comparison fair. It prepares the next training
+target while the current Metal step runs. Library clients remain opt-in through
+`DatasetOptions.prefetchTrainingTargets`; existing native clients can still set
+exactly `MSPLAT_CAMERA_PREFETCH=1` in their environment.
 
 This check is a planning aid, not a jetsam guarantee. Metal driver state,
 framework allocations, other process memory, and changing system pressure are

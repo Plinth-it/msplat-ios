@@ -134,6 +134,26 @@ int main() {
                   &mixedMask, mixedCoverageUnits),
         maskedFloatSsim));
 
+    // Camera cache targets carry the same coverage in their RGBA alpha byte
+    // and signal that layout by passing the target itself as the mask.
+    MTensor packedMaskTarget = rgbaTarget;
+    for (int64_t pixel = 0; pixel < height * width; ++pixel) {
+        packedMaskTarget.data<uint8_t>()[pixel * 4 + 3] =
+            mixedMask.data<uint8_t>()[pixel];
+    }
+    CHECK(nearlyEqual(
+        psnr(mixedRendered, packedMaskTarget,
+             &packedMaskTarget, mixedCoverageUnits),
+        maskedFloatPsnr));
+    CHECK(nearlyEqual(
+        l1_loss(mixedRendered, packedMaskTarget,
+                &packedMaskTarget, mixedCoverageUnits),
+        maskedFloatL1));
+    CHECK(nearlyEqual(
+        ssim_eval(mixedRendered, packedMaskTarget,
+                  &packedMaskTarget, mixedCoverageUnits),
+        maskedFloatSsim));
+
     MTensor twoPixelRendered = makeImage(1, 2);
     MTensor twoPixelGt = makeImage(1, 2);
     for (int channel = 0; channel < 3; ++channel) {

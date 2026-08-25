@@ -55,7 +55,10 @@ MTensor gpuFloats(std::initializer_list<int64_t> shape,
 
 StepResult runStep(bool transparent, float alphaLossWeight,
                    int gaussianCount = 1,
-                   float initialAlpha = 0.1f) {
+                   float initialAlpha = 0.1f,
+                   bool packedMask = false,
+                   bool useCoverageRenderTiles = false,
+                   bool allRenderTilesActive = false) {
     CHECK(gaussianCount > 0);
     std::vector<float> meanValues(static_cast<size_t>(gaussianCount) * 3);
     std::vector<float> scaleValues(static_cast<size_t>(gaussianCount) * 3);
@@ -115,8 +118,8 @@ StepResult runStep(bool transparent, float alphaLossWeight,
     for (int pixel = 0; pixel < kWidth * kHeight; ++pixel) {
         const int offset = pixel * 4;
         // Deliberately asymmetric RGB exercises byte normalization in every
-        // loss pass. Alpha is neither opaque nor derived from the mask: compact
-        // training targets must ignore it and use the separate mask instead.
+        // loss pass. The standalone-mask case gives alpha unrelated padding;
+        // the packed case below replaces it with coverage.
         targetBytes[offset + 0] = 23;
         targetBytes[offset + 1] = 91;
         targetBytes[offset + 2] = 207;
@@ -126,6 +129,21 @@ StepResult runStep(bool transparent, float alphaLossWeight,
     for (int y = 0; y < 4; ++y) {
         for (int x = 0; x < 4; ++x)
             mask.data<uint8_t>()[y * kWidth + x] = 255;
+    }
+    if (packedMask) {
+        for (int pixel = 0; pixel < kWidth * kHeight; ++pixel) {
+            targetBytes[pixel * 4 + 3] = mask.data<uint8_t>()[pixel];
+        }
+    }
+    MTensor coverageRenderTiles;
+    const MTensor *coverageRenderTilePointer = nullptr;
+    if (useCoverageRenderTiles) {
+        coverageRenderTiles = gpu_empty({2, 2}, DType::UInt8);
+        std::fill_n(coverageRenderTiles.data<uint8_t>(), 4,
+                    allRenderTilesActive ? uint8_t{1} : uint8_t{0});
+        if (!allRenderTilesActive)
+            coverageRenderTiles.data<uint8_t>()[0] = 1;
+        coverageRenderTilePointer = &coverageRenderTiles;
     }
 
     std::array<MTensor, kAdamGroups> params = {
@@ -166,7 +184,8 @@ StepResult runStep(bool transparent, float alphaLossWeight,
         kHeight, kWidth, std::make_tuple(2, 2, 1), 0.01f,
         0, 0, cameraPosition,
         featuresDc, featuresRest, opacities, background,
-        gt, &mask, coverageUnits, 0.2f, lossInvN,
+        gt, packedMask ? &gt : &mask, coverageRenderTilePointer,
+        coverageUnits, 0.2f, lossInvN,
         transparent, alphaLossWeight,
         kAdamGroups, params.data(), expAvg.data(), expAvgSq.data(),
         stepSizes, biasCorrection2Sqrts,
@@ -214,6 +233,48 @@ void checkTransparentAlphaSupervision() {
     CHECK(transparent.radius > 0);
     CHECK(transparent.opacity < initialOpacity);
     CHECK(transparent.opacityFirstMoment > 0.0f);
+
+    const StepResult packedCoverage =
+        runStep(false, 0.1f, 1, 0.1f, true);
+    CHECK(packedCoverage.opacity == coverage.opacity);
+    CHECK(packedCoverage.opacityFirstMoment == coverage.opacityFirstMoment);
+
+    // The Gaussian projects wholly outside the mask's five-pixel SSIM halo.
+    // Intersection pruning must retain its projection radius while producing
+    // the same zero-gradient coverage update as the dense path.
+    const StepResult prunedCoverage =
+        runStep(false, 0.1f, 1, 0.1f, false, true);
+    CHECK(prunedCoverage.radius == coverage.radius);
+    CHECK(prunedCoverage.opacity == coverage.opacity);
+    CHECK(prunedCoverage.opacityFirstMoment ==
+          coverage.opacityFirstMoment);
+    const StepResult packedPrunedCoverage =
+        runStep(false, 0.1f, 1, 0.1f, true, true);
+    CHECK(packedPrunedCoverage.radius == packedCoverage.radius);
+    CHECK(packedPrunedCoverage.opacity == packedCoverage.opacity);
+    CHECK(packedPrunedCoverage.opacityFirstMoment ==
+          packedCoverage.opacityFirstMoment);
+    const StepResult fullTileCoverage =
+        runStep(false, 0.1f, 1, 0.1f, false, true, true);
+    CHECK(fullTileCoverage.opacity == coverage.opacity);
+    CHECK(fullTileCoverage.opacityFirstMoment ==
+          coverage.opacityFirstMoment);
+    const StepResult packedFullTileCoverage =
+        runStep(false, 0.1f, 1, 0.1f, true, true, true);
+    CHECK(packedFullTileCoverage.opacity == packedCoverage.opacity);
+    CHECK(packedFullTileCoverage.opacityFirstMoment ==
+          packedCoverage.opacityFirstMoment);
+
+    const StepResult packedTransparent =
+        runStep(true, 0.1f, 1, 0.1f, true);
+    CHECK(packedTransparent.opacity == transparent.opacity);
+    CHECK(packedTransparent.opacityFirstMoment ==
+          transparent.opacityFirstMoment);
+    const StepResult transparentWithCoverageTiles =
+        runStep(true, 0.1f, 1, 0.1f, true, true);
+    CHECK(transparentWithCoverageTiles.opacity == transparent.opacity);
+    CHECK(transparentWithCoverageTiles.opacityFirstMoment ==
+          transparent.opacityFirstMoment);
 }
 
 void checkChunkedTransparentAlphaSupervision() {
@@ -226,7 +287,8 @@ void checkChunkedTransparentAlphaSupervision() {
         std::log(initialAlpha / (1.0f - initialAlpha));
 
     const StepResult transparent =
-        runStep(true, 0.1f, gaussianCount, initialAlpha);
+        runStep(true, 0.1f, gaussianCount, initialAlpha,
+                false, true);
     if (!(transparent.opacity < initialOpacity &&
           transparent.lastOpacity < initialOpacity &&
           transparent.opacityFirstMoment > 0.0f &&

@@ -44,6 +44,7 @@ private func runPoseCheckpointRegression() throws {
     do {
         let session = try MsplatSession(
             dataset: descriptor,
+            options: DatasetOptions(prefetchTrainingTargets: true),
             config: config,
             maximumGaussianCount: 5
         )
@@ -62,6 +63,7 @@ private func runPoseCheckpointRegression() throws {
     do {
         let session = try MsplatSession(
             dataset: descriptor,
+            options: DatasetOptions(prefetchTrainingTargets: true),
             config: config,
             maximumGaussianCount: 5
         )
@@ -105,11 +107,13 @@ private func runGPUPreviewRegression() async throws {
     )
     let session = try MsplatSession(
         dataset: descriptor,
+        options: DatasetOptions(prefetchTrainingTargets: true),
         config: makePoseFixtureConfig(),
         maximumGaussianCount: 5
     )
     defer { try? session.close() }
 
+    _ = try session.step()
     let pose = try session.cameraPose(at: 0)
     let legacyFrame = try session.renderRGBA(pose: pose, referenceCamera: 0)
     let surface = try await completedPreview(
