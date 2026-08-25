@@ -77,22 +77,35 @@ int main() {
     msplat::validateTileIntersectionWorkLimit(denseSingleTile);
     CHECK(denseSingleTile.largeTileCount == 1);
 
-    const uint32_t bucketBoundaryCounts[] = {1, 2, 32, 33, 2'048, 2'049};
-    int32_t bucketBoundaryOffsets[6] = {};
-    uint32_t bucketBoundarySortableTiles[6] = {};
+    const uint32_t bucketBoundaryCounts[] = {
+        33, 2, 2'049, 31, 1, 2'048, 3, 32, 0
+    };
+    int32_t bucketBoundaryOffsets[9] = {};
+    uint32_t bucketBoundarySortableTiles[9] = {
+        UINT32_MAX, UINT32_MAX, UINT32_MAX,
+        UINT32_MAX, UINT32_MAX, UINT32_MAX,
+        UINT32_MAX, UINT32_MAX, UINT32_MAX
+    };
     const auto bucketBoundaries = msplat::buildTileIntersectionLayout(
-        bucketBoundaryCounts, bucketBoundaryOffsets, 6, nullptr,
+        bucketBoundaryCounts, bucketBoundaryOffsets, 9, nullptr,
         bucketBoundarySortableTiles);
-    CHECK(bucketBoundaries.activeTileCount == 6);
-    CHECK(bucketBoundaries.sortableTileCount == 5);
-    CHECK(bucketBoundaries.trivialTileCount == 1);
-    CHECK(bucketBoundaries.smallTileCount == 2);
+    CHECK(bucketBoundaries.activeTileCount == 8);
+    CHECK(bucketBoundaries.sortableTileCount == 7);
+    CHECK(bucketBoundaries.trivialTileCount == 2);
+    CHECK(bucketBoundaries.smallTileCount == 4);
     CHECK(bucketBoundaries.mediumTileCount == 2);
     CHECK(bucketBoundaries.largeTileCount == 1);
+    CHECK(bucketBoundaries.sortableTileCount ==
+          bucketBoundaries.smallTileCount +
+              bucketBoundaries.mediumTileCount +
+              bucketBoundaries.largeTileCount);
     CHECK(msplat::tileIntersectionLayoutNeedsRadixScratch(bucketBoundaries));
-    for (uint32_t index = 0; index < 5; ++index) {
-        CHECK(bucketBoundarySortableTiles[index] == index + 1);
+    const uint32_t expectedBucketOrder[] = {1, 3, 6, 7, 0, 5, 2};
+    for (uint32_t index = 0; index < 7; ++index) {
+        CHECK(bucketBoundarySortableTiles[index] == expectedBucketOrder[index]);
     }
+    CHECK(bucketBoundarySortableTiles[7] == UINT32_MAX);
+    CHECK(bucketBoundarySortableTiles[8] == UINT32_MAX);
 
     const uint32_t bitonicBoundaryCounts[] = {2'048};
     int32_t bitonicBoundaryOffsets[1] = {};
@@ -174,6 +187,7 @@ int main() {
     CHECK(arenaOverflowRejected);
 
     CHECK(msplat::kExactBitonicFastPath == 2'048);
+    CHECK(msplat::kExactSmallTileMaximum == 32);
     CHECK(msplat::kExactRadixScratchBytesPerEntry == 8);
     CHECK(msplat::kExactBitonicOnlyIntersectionBytesPerEntry == 44);
     CHECK(msplat::kExactIntersectionBytesPerEntry == 52);

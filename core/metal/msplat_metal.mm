@@ -794,6 +794,7 @@ struct MetalContext {
     id<MTLComputePipelineState> float_rgb_to_preview_texture_kernel_cpso = nil;
     // Exact tile-intersection compaction and sorting
     id<MTLComputePipelineState> scatter_to_exact_bins_kernel_cpso = nil;
+    id<MTLComputePipelineState> small_sort_per_tile_kernel_cpso = nil;
     id<MTLComputePipelineState> radix_sort_per_tile_kernel_cpso = nil;
     id<MTLComputePipelineState> pack_sorted_gaussians_kernel_cpso = nil;
     id<MTLComputePipelineState> block_reduce_kernel_cpso = nil;
@@ -841,6 +842,7 @@ struct MetalContext {
             nd_rasterize_forward_kernel_cpso,
             float_rgb_to_preview_texture_kernel_cpso,
             scatter_to_exact_bins_kernel_cpso,
+            small_sort_per_tile_kernel_cpso,
             radix_sort_per_tile_kernel_cpso,
             pack_sorted_gaussians_kernel_cpso,
             block_reduce_kernel_cpso,
@@ -1041,6 +1043,7 @@ MetalContext* init_msplat_metal_context() {
     ctx->float_rgb_to_preview_texture_kernel_cpso = load(@"float_rgb_to_preview_texture_kernel");
     // Exact tile-intersection compaction and sorting
     ctx->scatter_to_exact_bins_kernel_cpso        = load(@"scatter_to_exact_bins_kernel");
+    ctx->small_sort_per_tile_kernel_cpso          = load(@"small_sort_per_tile_kernel");
     ctx->radix_sort_per_tile_kernel_cpso          = load(@"radix_sort_per_tile_kernel");
     ctx->pack_sorted_gaussians_kernel_cpso        = load(@"pack_sorted_gaussians_kernel");
     ctx->block_reduce_kernel_cpso                 = load(@"block_reduce_kernel");
@@ -1072,6 +1075,11 @@ MetalContext* init_msplat_metal_context() {
 
     if (pipelineLoadFailed) {
         throw std::runtime_error(pipelineFailure);
+    }
+    if (ctx->small_sort_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup <
+        msplat::kExactSmallTileMaximum) {
+        throw std::runtime_error(
+            "msplat: exact small-tile sort requires 32 threads per threadgroup");
     }
     if (ctx->radix_sort_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup <
         256) {
@@ -1872,6 +1880,11 @@ static void render_pipeline(
     const uint32_t num_tiles_u32 = static_cast<uint32_t>(num_tiles);
     const uint32_t sortable_tile_count =
         intersectionLayout.sortableTileCount;
+    const uint32_t small_sort_tile_count =
+        intersectionLayout.smallTileCount;
+    const uint32_t general_sort_tile_count =
+        intersectionLayout.mediumTileCount + intersectionLayout.largeTileCount;
+    const uint32_t general_sort_tile_offset = small_sort_tile_count;
     const uint32_t total_intersections = intersectionLayout.totalCount;
 
     auto encode_sort_pack = [&](id<MTLComputeCommandEncoder> enc) {
@@ -1898,7 +1911,21 @@ static void render_pipeline(
             threadsPerThreadgroup:MTLSizeMake(scatterTpg, 1, 1)];
 
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        if (sortable_tile_count > 0) {
+        if (small_sort_tile_count > 0) {
+            [enc setComputePipelineState:ctx->small_sort_per_tile_kernel_cpso];
+            ENC_BUF(enc, g_tcache.tile_offsets, 0);
+            ENC_BUF(enc, g_tcache.intersection_keys_a, 1);
+            ENC_SCALAR(enc, num_tiles_u32, 2);
+            ENC_BUF(enc, tile_bins, 3);
+            ENC_SCALAR(enc, capacity_u32, 4);
+            ENC_BUF(enc, g_tcache.overflow_flag, 5);
+            ENC_BUF(enc, g_tcache.sortable_tile_indices, 6);
+            ENC_SCALAR(enc, small_sort_tile_count, 7);
+            [enc dispatchThreadgroups:MTLSizeMake(small_sort_tile_count, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(
+                    msplat::kExactSmallTileMaximum, 1, 1)];
+        }
+        if (general_sort_tile_count > 0) {
             [enc setComputePipelineState:ctx->radix_sort_per_tile_kernel_cpso];
             ENC_BUF(enc, g_tcache.tile_offsets, 0);
             ENC_BUF(enc, g_tcache.intersection_keys_a, 1);
@@ -1908,8 +1935,9 @@ static void render_pipeline(
             ENC_SCALAR(enc, capacity_u32, 5);
             ENC_BUF(enc, g_tcache.overflow_flag, 6);
             ENC_BUF(enc, g_tcache.sortable_tile_indices, 7);
-            ENC_SCALAR(enc, sortable_tile_count, 8);
-            [enc dispatchThreadgroups:MTLSizeMake(sortable_tile_count, 1, 1)
+            ENC_SCALAR(enc, general_sort_tile_count, 8);
+            ENC_SCALAR(enc, general_sort_tile_offset, 9);
+            [enc dispatchThreadgroups:MTLSizeMake(general_sort_tile_count, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
 
@@ -1948,9 +1976,11 @@ static void render_pipeline(
                 tile_bounds_x, tile_bounds_y, num_tiles);
         fprintf(stderr, "  SH degree:      %u (bases: %u)\n",
                 degree, (degree + 1) * (degree + 1));
-        fprintf(stderr, "  sort:           tile-local exact %s\n",
-                needsRadixScratch ? "radix" : "bitonic");
-        fprintf(stderr, "  sort tiles:     %u / %u\n",
+        fprintf(stderr,
+                "  sort tiles:     %u small32, %u bitonic, %u radix (%u / %u)\n",
+                intersectionLayout.smallTileCount,
+                intersectionLayout.mediumTileCount,
+                intersectionLayout.largeTileCount,
                 sortable_tile_count, num_tiles_u32);
         fprintf(stderr, "  sort arenas:    %.1f MB\n",
                 static_cast<double>(
@@ -2551,6 +2581,11 @@ MTensor msplat_train_step(
     const uint32_t num_tiles_u32 = static_cast<uint32_t>(num_tiles);
     const uint32_t sortable_tile_count =
         intersectionLayout.sortableTileCount;
+    const uint32_t small_sort_tile_count =
+        intersectionLayout.smallTileCount;
+    const uint32_t general_sort_tile_count =
+        intersectionLayout.mediumTileCount + intersectionLayout.largeTileCount;
+    const uint32_t general_sort_tile_offset = small_sort_tile_count;
     const uint32_t total_intersections = intersectionLayout.totalCount;
 
     uint32_t K_max = 1;
@@ -2587,7 +2622,21 @@ MTensor msplat_train_step(
             threadsPerThreadgroup:MTLSizeMake(scatterTpg, 1, 1)];
 
         [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-        if (sortable_tile_count > 0) {
+        if (small_sort_tile_count > 0) {
+            [enc setComputePipelineState:ctx->small_sort_per_tile_kernel_cpso];
+            ENC_BUF(enc, g_tcache.tile_offsets, 0);
+            ENC_BUF(enc, g_tcache.intersection_keys_a, 1);
+            ENC_SCALAR(enc, num_tiles_u32, 2);
+            ENC_BUF(enc, tile_bins, 3);
+            ENC_SCALAR(enc, capacity_u32, 4);
+            ENC_BUF(enc, overflow_flag, 5);
+            ENC_BUF(enc, g_tcache.sortable_tile_indices, 6);
+            ENC_SCALAR(enc, small_sort_tile_count, 7);
+            [enc dispatchThreadgroups:MTLSizeMake(small_sort_tile_count, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(
+                    msplat::kExactSmallTileMaximum, 1, 1)];
+        }
+        if (general_sort_tile_count > 0) {
             [enc setComputePipelineState:ctx->radix_sort_per_tile_kernel_cpso];
             ENC_BUF(enc, g_tcache.tile_offsets, 0);
             ENC_BUF(enc, g_tcache.intersection_keys_a, 1);
@@ -2597,8 +2646,9 @@ MTensor msplat_train_step(
             ENC_SCALAR(enc, capacity_u32, 5);
             ENC_BUF(enc, overflow_flag, 6);
             ENC_BUF(enc, g_tcache.sortable_tile_indices, 7);
-            ENC_SCALAR(enc, sortable_tile_count, 8);
-            [enc dispatchThreadgroups:MTLSizeMake(sortable_tile_count, 1, 1)
+            ENC_SCALAR(enc, general_sort_tile_count, 8);
+            ENC_SCALAR(enc, general_sort_tile_offset, 9);
+            [enc dispatchThreadgroups:MTLSizeMake(general_sort_tile_count, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
 

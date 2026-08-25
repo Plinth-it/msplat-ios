@@ -10,6 +10,7 @@
 namespace msplat {
 
 inline constexpr uint32_t kExactBitonicFastPath = 2'048;
+inline constexpr uint32_t kExactSmallTileMaximum = 32;
 inline constexpr uint32_t kExactRadixScratchBytesPerEntry = sizeof(uint64_t);
 inline constexpr uint32_t kExactIntersectionBytesPerEntry =
     2 * sizeof(uint64_t) + 3 * 3 * sizeof(float);
@@ -71,12 +72,8 @@ inline TileIntersectionLayout buildTileIntersectionLayout(
         if (count <= 1) {
             ++layout.trivialTileCount;
         } else {
-            if (sortableTileIndices) {
-                sortableTileIndices[layout.sortableTileCount] =
-                    static_cast<uint32_t>(tile);
-            }
             ++layout.sortableTileCount;
-            if (count <= 32) {
+            if (count <= kExactSmallTileMaximum) {
                 ++layout.smallTileCount;
             } else if (count <= kExactBitonicFastPath) {
                 ++layout.mediumTileCount;
@@ -90,6 +87,32 @@ inline TileIntersectionLayout buildTileIntersectionLayout(
         }
     }
     layout.totalCount = static_cast<uint32_t>(running);
+
+    // Stable bucket ordering lets the host dispatch the 2-32 entry prefix with
+    // one 32-thread group per tile and the remaining tiles with 256 threads,
+    // without allocating another compact-index buffer.
+    if (sortableTileIndices) {
+        uint32_t nextSmall = 0;
+        uint32_t nextMedium = layout.smallTileCount;
+        uint32_t nextLarge =
+            layout.smallTileCount + layout.mediumTileCount;
+        for (size_t tile = 0; tile < tileCount; ++tile) {
+            const uint32_t count = counts[tile];
+            uint32_t* next = nullptr;
+            if (count > 1 && count <= kExactSmallTileMaximum) {
+                next = &nextSmall;
+            } else if (count <= kExactBitonicFastPath &&
+                       count > kExactSmallTileMaximum) {
+                next = &nextMedium;
+            } else if (count > kExactBitonicFastPath) {
+                next = &nextLarge;
+            }
+            if (next) {
+                sortableTileIndices[*next] = static_cast<uint32_t>(tile);
+                ++(*next);
+            }
+        }
+    }
     return layout;
 }
 

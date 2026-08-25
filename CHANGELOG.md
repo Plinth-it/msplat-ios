@@ -87,10 +87,10 @@
   stage now allocates the second 8-byte key arena only after a tile exceeds the
   2,048-entry bitonic path, so bitonic-only stages use 44 bytes per arena slot at
   runtime while memory planning retains the 52-byte worst case.
-- Precomputed exact tile ranges and a compact list of tiles with more than one
-  intersection during the existing CPU layout pass. Exact sorting now dispatches
-  256-thread groups only for tiles that have work to sort instead of launching
-  one group for every empty or single-entry tile.
+- Precomputed exact tile ranges and a bucket-ordered compact list of tiles with
+  more than one intersection during the existing CPU layout pass. Exact sorting
+  now skips empty and single-entry tiles, uses 32-thread groups for 2-32-entry
+  ranges, and reserves 256-thread groups for larger tiles.
 - Fused geometry backward directly into the mean, scale, and quaternion Adam
   updates, and folded opacity plus densification-stat updates into the terminal
   backward stage. The training cache no longer owns or clears the three geometry

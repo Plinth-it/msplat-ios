@@ -69,9 +69,11 @@ and sizes each frame exactly. The second 8-byte key arena is allocated only afte
 a tile exceeds the 2,048-entry bitonic path; bitonic-only resolution stages use
 44 rather than 52 runtime bytes per arena slot, while the planner retains the
 52-byte worst case. The synchronized layout pass also precomputes every tile
-range and compacts tiles with more than one entry, so exact sorting skips empty
-and already-sorted single-entry tiles. ImageIO is asked to decode a thumbnail at
-the selected input resolution, and the app-owned decode allowance therefore
+range and bucket-orders tiles with more than one entry. Exact sorting skips
+empty and already-sorted single-entry tiles, uses one 32-thread group for 2-32
+entries, and reserves the 256-thread path for larger ranges. ImageIO is asked
+to decode a thumbnail at the selected input resolution, and the app-owned
+decode allowance therefore
 scales with that target. It is intentionally conservative, but it is not a
 jetsam guarantee: codec-private surfaces, Metal driver state, framework
 allocations, other process memory, and changing system pressure are outside the
@@ -88,9 +90,10 @@ after the densification cutoff.
 could drop intersections or write beyond their useful capacity. The current
 pipeline projects and counts every tile intersection, waits for that count,
 builds checked exact offsets, grows compact arenas, and sorts the complete range
-with a bitonic fast path through 2,048 entries and a deterministic radix path
-through the explicit 65,536-per-tile work limit. Index, allocation, or work-limit
-failures stop the step before rasterization and optimizer work instead of
+with a 32-thread small-range path, a bitonic fast path through 2,048 entries,
+and a deterministic radix path through the explicit 65,536-per-tile work limit.
+Index, allocation, or work-limit failures stop the step before rasterization
+and optimizer work instead of
 training against an incomplete frame.
 
 **Chunk buffers across a resolution change.** The guard compared against a

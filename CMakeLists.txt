@@ -193,6 +193,19 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             ${CMAKE_SOURCE_DIR}/core/include)
         add_test(NAME msplat_intersection_layout
             COMMAND msplat_intersection_layout_tests)
+        add_executable(msplat_exact_sort_tests
+            tests/test_exact_sort.mm)
+        target_include_directories(msplat_exact_sort_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/include)
+        target_link_libraries(msplat_exact_sort_tests PRIVATE
+            ${FOUNDATION_LIBRARY}
+            ${METAL_FRAMEWORK})
+        add_dependencies(msplat_exact_sort_tests metallib)
+        add_test(NAME msplat_exact_sort
+            COMMAND msplat_exact_sort_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_exact_sort PROPERTIES
+            SKIP_RETURN_CODE 77)
         add_executable(msplat_projection_math_tests
             tests/test_projection_math.cpp)
         add_test(NAME msplat_projection_math

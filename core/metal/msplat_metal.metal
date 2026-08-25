@@ -2549,6 +2549,8 @@ kernel void project_backward_adam_kernel(
 #define EXACT_SORT_TG_SIZE 256
 #define EXACT_SORT_RADIX 256
 #define EXACT_BITONIC_FAST_PATH 2048
+#define EXACT_SMALL_SORT_TG_SIZE 32
+#define EXACT_SMALL_TILE_MAX 32
 
 // Scatter every Gaussian/tile intersection into the exact compact range that
 // the host built after reading tile_counts. Each tile owns a disjoint range, so
@@ -2618,6 +2620,100 @@ kernel void scatter_to_exact_bins_kernel(
     }
 }
 
+// Small exact ranges fit in one 32-thread group and only need 256 bytes of
+// threadgroup storage. The compact tile list is bucket-ordered by the host, so
+// this kernel consumes its leading 2-32 entry range.
+kernel void small_sort_per_tile_kernel(
+    constant int* tile_offsets       [[buffer(0)]],
+    device uint64_t* keys_a          [[buffer(1)]],
+    constant uint& num_tiles         [[buffer(2)]],
+    device int* tile_bins            [[buffer(3)]],
+    constant uint& capacity          [[buffer(4)]],
+    device atomic_uint* overflow_flag [[buffer(5)]],
+    constant uint* sortable_tile_indices [[buffer(6)]],
+    constant uint& small_tile_count  [[buffer(7)]],
+    uint sort_index [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (sort_index >= small_tile_count) return;
+    if (sort_index >= num_tiles) {
+        if (tid == 0) {
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
+    const uint tile_id = sortable_tile_indices[sort_index];
+    if (tile_id >= num_tiles) {
+        if (tid == 0) {
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
+
+    const int start_i = tile_id == 0 ? 0 : tile_offsets[tile_id - 1];
+    const int end_i = tile_offsets[tile_id];
+    if (start_i < 0 || end_i < start_i ||
+        (uint64_t)end_i > (uint64_t)capacity) {
+        if (tid == 0) {
+            write_packed_int2(tile_bins, tile_id, int2(0, 0));
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
+
+    const uint start = (uint)start_i;
+    const uint count = (uint)(end_i - start_i);
+    if (count < 2 || count > EXACT_SMALL_TILE_MAX) {
+        if (tid == 0) {
+            write_packed_int2(tile_bins, tile_id, int2(0, 0));
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
+    if (tid == 0) {
+        write_packed_int2(tile_bins, tile_id, int2(start_i, end_i));
+    }
+
+    uint padded_count = 1;
+    while (padded_count < count) padded_count <<= 1;
+    threadgroup uint64_t bitonic_data[EXACT_SMALL_SORT_TG_SIZE];
+    if (tid < padded_count) {
+        bitonic_data[tid] = tid < count
+            ? keys_a[start + tid]
+            : 0xFFFFFFFFFFFFFFFFULL;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint sequence = 2; sequence <= padded_count; sequence <<= 1) {
+        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+            if (tid < (padded_count >> 1)) {
+                const uint position = 2 * tid - (tid & (stride - 1));
+                const uint partner = position ^ stride;
+                const bool ascending = (position & sequence) == 0;
+                const uint64_t a = bitonic_data[position];
+                const uint64_t b = bitonic_data[partner];
+                if ((a > b) == ascending) {
+                    bitonic_data[position] = b;
+                    bitonic_data[partner] = a;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (tid < count) {
+        keys_a[start + tid] = bitonic_data[tid];
+    }
+}
+
 // Exact segmented sort. The common <=2,048-entry case keeps the previous
 // threadgroup bitonic performance, but reads the exact compact range rather than
 // a fixed per-tile allocation. Larger tiles use stable LSD radix passes over
@@ -2639,6 +2735,7 @@ kernel void radix_sort_per_tile_kernel(
     device atomic_uint* overflow_flag [[buffer(6)]],
     constant uint* sortable_tile_indices [[buffer(7)]],
     constant uint& sortable_tile_count [[buffer(8)]],
+    constant uint& sortable_tile_offset [[buffer(9)]],
     uint sort_index [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
@@ -2646,7 +2743,17 @@ kernel void radix_sort_per_tile_kernel(
     uint simd_width [[threads_per_simdgroup]]
 ) {
     if (sort_index >= sortable_tile_count) return;
-    const uint tile_id = sortable_tile_indices[sort_index];
+    if (sortable_tile_offset > num_tiles ||
+        sort_index >= num_tiles - sortable_tile_offset) {
+        if (tid == 0) {
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
+    const uint tile_id =
+        sortable_tile_indices[sortable_tile_offset + sort_index];
     if (tile_id >= num_tiles) {
         if (tid == 0) {
             atomic_fetch_or_explicit(
