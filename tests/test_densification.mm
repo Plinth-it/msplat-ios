@@ -1,5 +1,7 @@
 #include "bindings.h"
+#include "model.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -7,6 +9,7 @@
 #include <cstdlib>
 #include <limits>
 #include <iostream>
+#include <iterator>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -194,6 +197,208 @@ struct DensifyRandomResult {
     std::vector<uint32_t> randomScratchBits;
     std::vector<uint32_t> capacityTailBits;
 };
+
+constexpr int kCapacityGrowthParents = 2'049;
+constexpr int kCapacityGrowthSplits = kCapacityGrowthParents - 1;
+constexpr int kCapacityGrowthPopulation =
+    kCapacityGrowthParents + 2 * kCapacityGrowthSplits + 1;
+
+InputData capacityGrowthInput() {
+    InputData input;
+    input.points.count = kCapacityGrowthParents;
+    input.points.xyz.reserve(3 * kCapacityGrowthParents);
+    input.points.rgb.reserve(3 * kCapacityGrowthParents);
+    for (int index = 0; index < kCapacityGrowthParents; ++index) {
+        input.points.xyz.push_back(0.01f * static_cast<float>(index % 17));
+        input.points.xyz.push_back(
+            0.01f * static_cast<float>((index / 17) % 17));
+        input.points.xyz.push_back(0.01f * static_cast<float>(index / 289));
+        input.points.rgb.push_back(static_cast<uint8_t>(index));
+        input.points.rgb.push_back(static_cast<uint8_t>(index * 3));
+        input.points.rgb.push_back(static_cast<uint8_t>(index * 7));
+    }
+    input.cameras.resize(1);
+    return input;
+}
+
+std::vector<uint32_t> tensorPrefixBits(
+    const MTensor& tensor, int rows) {
+    const int64_t elements = static_cast<int64_t>(rows) * tensor.stride0();
+    std::vector<uint32_t> bits;
+    bits.reserve(static_cast<size_t>(elements));
+    for (int64_t index = 0; index < elements; ++index)
+        bits.push_back(floatBits(tensor.data<float>()[index]));
+    return bits;
+}
+
+void poisonFloatTail(MTensor& tensor, int firstRow, uint32_t poisonBits) {
+    const int64_t firstElement =
+        static_cast<int64_t>(firstRow) * tensor.stride0();
+    const float poison = floatFromBits(poisonBits);
+    for (int64_t index = firstElement; index < tensor.numel(); ++index)
+        tensor.data<float>()[index] = poison;
+}
+
+void checkCapacityGrowthWithoutPreclear(bool gpuMode) {
+    constexpr uint32_t poisonBits = 0x7fc12345u;
+    constexpr int activeCount = kCapacityGrowthParents;
+    constexpr int population = kCapacityGrowthPopulation;
+
+    InputData input = capacityGrowthInput();
+    Model model(
+        input, 1, 0, 1, 1, 100, 100, 0, 1,
+        0.0002f, 0.01f, 100, 0.05f, 1'000, false,
+        nullptr, 500);
+    CHECK(model.num_active == activeCount);
+    model.allocateDensificationScratch();
+
+    for (int index = 0; index < activeCount; ++index) {
+        const bool split = index < kCapacityGrowthSplits;
+        model.densify_split_flag.data<int32_t>()[index] = split ? 1 : 0;
+        model.densify_dup_flag.data<int32_t>()[index] = split ? 0 : 1;
+        model.densify_split_prefix.data<int32_t>()[index] =
+            std::min(index + 1, kCapacityGrowthSplits);
+        model.densify_dup_prefix.data<int32_t>()[index] = split ? 0 : 1;
+    }
+
+    MTensor* preparedIntBuffers[] = {
+        &model.densify_split_flag, &model.densify_dup_flag,
+        &model.densify_split_prefix, &model.densify_dup_prefix,
+    };
+    std::vector<std::vector<int32_t>> preservedPreparedPrefixes;
+    preservedPreparedPrefixes.reserve(std::size(preparedIntBuffers));
+    for (const MTensor* tensor : preparedIntBuffers) {
+        preservedPreparedPrefixes.emplace_back(
+            tensor->data<int32_t>(),
+            tensor->data<int32_t>() + activeCount);
+    }
+
+    MTensor* parameterAndMomentBuffers[] = {
+        &model.means_buf, &model.scales_buf, &model.quats_buf,
+        &model.featuresDc_buf, &model.featuresRest_buf,
+        &model.opacities_buf,
+        &model.adam_exp_avg_buf[0], &model.adam_exp_avg_buf[1],
+        &model.adam_exp_avg_buf[2], &model.adam_exp_avg_buf[3],
+        &model.adam_exp_avg_buf[4], &model.adam_exp_avg_buf[5],
+        &model.adam_exp_avg_sq_buf[0], &model.adam_exp_avg_sq_buf[1],
+        &model.adam_exp_avg_sq_buf[2], &model.adam_exp_avg_sq_buf[3],
+        &model.adam_exp_avg_sq_buf[4], &model.adam_exp_avg_sq_buf[5],
+    };
+    MTensor* publicActiveViews[] = {
+        &model.means, &model.scales, &model.quats,
+        &model.featuresDc, &model.featuresRest, &model.opacities,
+        &model.adam_exp_avg[0], &model.adam_exp_avg[1],
+        &model.adam_exp_avg[2], &model.adam_exp_avg[3],
+        &model.adam_exp_avg[4], &model.adam_exp_avg[5],
+        &model.adam_exp_avg_sq[0], &model.adam_exp_avg_sq[1],
+        &model.adam_exp_avg_sq[2], &model.adam_exp_avg_sq[3],
+        &model.adam_exp_avg_sq[4], &model.adam_exp_avg_sq[5],
+    };
+    static_assert(
+        std::size(publicActiveViews) ==
+        std::size(parameterAndMomentBuffers));
+    std::vector<std::vector<uint32_t>> preservedPrefixes;
+    preservedPrefixes.reserve(std::size(parameterAndMomentBuffers));
+    for (const MTensor* tensor : parameterAndMomentBuffers)
+        preservedPrefixes.push_back(tensorPrefixBits(*tensor, activeCount));
+
+    const int oldCapacity = model.buf_capacity;
+    CHECK(oldCapacity < population);
+    model.ensureCapacity(population);
+    CHECK(model.buf_capacity > oldCapacity);
+    CHECK(model.densify_random_samples.numel() ==
+          (gpuMode ? 1 : 3LL * model.buf_capacity));
+
+    for (size_t index = 0; index < std::size(preparedIntBuffers); ++index) {
+        CHECK(std::vector<int32_t>(
+                  preparedIntBuffers[index]->data<int32_t>(),
+                  preparedIntBuffers[index]->data<int32_t>() + activeCount) ==
+              preservedPreparedPrefixes[index]);
+    }
+
+    for (size_t bufferIndex = 0;
+         bufferIndex < std::size(parameterAndMomentBuffers);
+         ++bufferIndex) {
+        CHECK(publicActiveViews[bufferIndex]->size(0) == activeCount);
+        CHECK(publicActiveViews[bufferIndex]->data_ptr() ==
+              parameterAndMomentBuffers[bufferIndex]->data_ptr());
+        CHECK(tensorPrefixBits(
+                  *publicActiveViews[bufferIndex], activeCount) ==
+              preservedPrefixes[bufferIndex]);
+        CHECK(tensorPrefixBits(
+                  *parameterAndMomentBuffers[bufferIndex], activeCount) ==
+              preservedPrefixes[bufferIndex]);
+        poisonFloatTail(
+            *parameterAndMomentBuffers[bufferIndex], activeCount,
+            poisonBits);
+    }
+
+    constexpr int32_t intPoison = 0x6f123456;
+    for (MTensor* tensor : preparedIntBuffers) {
+        for (int64_t index = activeCount; index < tensor->numel(); ++index)
+            tensor->data<int32_t>()[index] = intPoison;
+    }
+    for (int64_t index = 0; index < model.densify_keep_flag.numel(); ++index) {
+        if (index < population) {
+            // Deliberately opposite the expected cull result, but bounded so
+            // a missed write produces a clean count mismatch rather than an
+            // out-of-range compact destination.
+            model.densify_keep_flag.data<int32_t>()[index] =
+                index < kCapacityGrowthSplits ? 1 : 0;
+            model.densify_keep_prefix.data<int32_t>()[index] = 1;
+        } else {
+            model.densify_keep_flag.data<int32_t>()[index] = intPoison;
+            model.densify_keep_prefix.data<int32_t>()[index] = intPoison;
+        }
+    }
+    for (int64_t index = 0; index < model.densify_block_totals.numel(); ++index)
+        model.densify_block_totals.data<int32_t>()[index] = 2;
+    poisonFloatTail(model.densify_compact_scratch, 0, poisonBits);
+    poisonFloatTail(model.densify_random_samples, 0, poisonBits);
+
+    MTensor max2DSize = gpu_zeros({activeCount}, DType::Float32);
+    const int densifiedCount = msplat_densify(
+        activeCount, population,
+        0.0f, 1.0f, 1.0f, 0, 0,
+        max2DSize,
+        model.means_buf, model.scales_buf, model.quats_buf,
+        model.featuresDc_buf, model.featuresRest_buf, model.opacities_buf,
+        static_cast<int>(model.featuresRest_buf.stride0()),
+        model.adam_exp_avg_buf, model.adam_exp_avg_sq_buf,
+        model.densify_split_flag, model.densify_dup_flag,
+        model.densify_split_prefix, model.densify_dup_prefix,
+        model.densify_keep_flag, model.densify_keep_prefix,
+        model.densify_block_totals, model.densify_compact_scratch,
+        model.densify_random_samples, 700u);
+    CHECK(densifiedCount == 2 * activeCount);
+
+    for (MTensor* tensor : parameterAndMomentBuffers) {
+        const int64_t initializedElements =
+            static_cast<int64_t>(densifiedCount) * tensor->stride0();
+        for (int64_t index = 0; index < initializedElements; ++index) {
+            const float value = tensor->data<float>()[index];
+            CHECK(std::isfinite(value));
+            CHECK(floatBits(value) != poisonBits);
+        }
+        const int64_t untouchedTail =
+            static_cast<int64_t>(population) * tensor->stride0();
+        for (int64_t index = untouchedTail; index < tensor->numel(); ++index)
+            CHECK(floatBits(tensor->data<float>()[index]) == poisonBits);
+    }
+
+    for (int64_t index = population;
+         index < model.densify_keep_flag.numel(); ++index) {
+        CHECK(model.densify_keep_flag.data<int32_t>()[index] == intPoison);
+        CHECK(model.densify_keep_prefix.data<int32_t>()[index] == intPoison);
+    }
+    const int64_t generatedSamples =
+        gpuMode ? 0 : 6LL * kCapacityGrowthSplits;
+    for (int64_t index = generatedSamples;
+         index < model.densify_random_samples.numel(); ++index) {
+        CHECK(floatBits(model.densify_random_samples.data<float>()[index]) ==
+              poisonBits);
+    }
+}
 
 DensifyRandomResult runDensifyRandomFixture(
     uint32_t randomSeed, bool gpuMode,
@@ -469,7 +674,9 @@ int main(int argc, char **argv) {
 
             msplat_set_metallib_path_checked(argv[1]);
             checkOpacityReset();
-            checkDensificationRandomMode(expectedMode == "gpu");
+            const bool gpuRandomMode = expectedMode == "gpu";
+            checkDensificationRandomMode(gpuRandomMode);
+            checkCapacityGrowthWithoutPreclear(gpuRandomMode);
             checkMutuallyExclusiveClassification();
             cleanup_msplat_metal();
             return 0;

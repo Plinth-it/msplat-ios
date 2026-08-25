@@ -501,24 +501,36 @@ void Model::ensureCapacity(int needed){
 
     struct ResizeTask {
         MTensor* tensor;
+        MTensor* activeView;
         std::vector<int64_t> shape;
         bool preserveActive;
     };
     std::vector<ResizeTask> tasks;
-    auto addLeadingCapacityTask = [&](MTensor &tensor, bool preserveActive) {
+    auto addLeadingCapacityTask = [&](
+        MTensor &tensor, bool preserveActive, MTensor* activeView = nullptr) {
         auto shape = tensor.shape();
         shape[0] = new_cap;
-        tasks.push_back({&tensor, std::move(shape), preserveActive});
+        tasks.push_back(
+            {&tensor, activeView, std::move(shape), preserveActive});
     };
 
     MTensor* parameterBuffers[] = {
         &means_buf, &scales_buf, &quats_buf,
         &featuresDc_buf, &featuresRest_buf, &opacities_buf
     };
-    for (MTensor* tensor : parameterBuffers) addLeadingCapacityTask(*tensor, true);
+    MTensor* parameterViews[] = {
+        &means, &scales, &quats,
+        &featuresDc, &featuresRest, &opacities
+    };
+    for (size_t index = 0; index < std::size(parameterBuffers); ++index) {
+        addLeadingCapacityTask(
+            *parameterBuffers[index], true, parameterViews[index]);
+    }
     for (int g = 0; g < N_ADAM_GROUPS; g++) {
-        addLeadingCapacityTask(adam_exp_avg_buf[g], true);
-        addLeadingCapacityTask(adam_exp_avg_sq_buf[g], true);
+        addLeadingCapacityTask(
+            adam_exp_avg_buf[g], true, &adam_exp_avg[g]);
+        addLeadingCapacityTask(
+            adam_exp_avg_sq_buf[g], true, &adam_exp_avg_sq[g]);
     }
 
     // These four already hold this step's classification when the grow happens
@@ -536,11 +548,13 @@ void Model::ensureCapacity(int needed){
         (static_cast<int64_t>(new_cap) + 1023) / 1024);
     int64_t fr_stride = featuresRest_buf.stride0();
     int64_t compact_stride = std::max<int64_t>(fr_stride, 4);
-    tasks.push_back({&densify_block_totals, {max_blocks}, false});
-    tasks.push_back({&densify_compact_scratch,
+    tasks.push_back(
+        {&densify_block_totals, nullptr, {max_blocks}, false});
+    tasks.push_back({&densify_compact_scratch, nullptr,
                      {static_cast<int64_t>(new_cap) * compact_stride}, false});
     if (!msplat_densify_uses_gpu_random()) {
-        tasks.push_back({&densify_random_samples, {new_cap, 3}, false});
+        tasks.push_back(
+            {&densify_random_samples, nullptr, {new_cap, 3}, false});
     }
 
     // Replacing the largest allocations first minimizes the final transient:
@@ -549,17 +563,27 @@ void Model::ensureCapacity(int needed){
         return lhs.tensor->nbytes() > rhs.tensor->nbytes();
     });
     for (const ResizeTask &task : tasks) {
-        MTensor replacement = gpu_zeros(task.shape, task.tensor->dtype());
+        // Densification writes every appended row and every consumed scratch
+        // element before reading it. Preserve only the live prefix instead of
+        // clearing capacity slack that may never become active.
+        MTensor replacement = gpu_empty(task.shape, task.tensor->dtype());
         if (task.preserveActive) {
             size_t copy_bytes = static_cast<size_t>(num_active) *
                 task.tensor->stride0() * task.tensor->elementSize();
             memcpy(replacement.data_ptr(), task.tensor->data_ptr(), copy_bytes);
         }
+        // Build the non-owning view before releasing its previous owner. If
+        // allocation fails later in the loop, every already-replaced owner
+        // still has a valid active view and the model remains destructible.
+        MTensor replacementView;
+        if (task.activeView)
+            replacementView = replacement.view(num_active);
         *task.tensor = std::move(replacement);
+        if (task.activeView)
+            *task.activeView = std::move(replacementView);
     }
 
     buf_capacity = new_cap;
-    refreshViews();
 }
 
 int Model::capacityFor(int needed) const {

@@ -70,6 +70,8 @@ extract_section(cmake_source
     "add_test(NAME msplat_densification_classification"
     "add_executable(msplat_transparent_training_tests"
     densification_ctests)
+extract_section(model_source "void Model::ensureCapacity(int needed){"
+    "int Model::capacityFor(int needed) const" capacity_growth)
 
 require_contains("${classifier}"
     "bool do_dup = !do_split && high_grad;"
@@ -80,6 +82,40 @@ require_absent("${classifier}"
 require_contains("${host_source}"
     "throw std::runtime_error(\"Densification classified one Gaussian twice\")"
     "host overlap invariant")
+
+# Capacity growth preserves only the active prefix. Append, cull, prefix, and
+# compaction stages initialize every logical element they consume, so clearing
+# the much larger capacity slack is unnecessary bandwidth.
+require_contains("${capacity_growth}"
+    "MTensor replacement = gpu_empty(task.shape, task.tensor->dtype());"
+    "uninitialized capacity-growth replacement")
+require_absent("${capacity_growth}"
+    "MTensor replacement = gpu_zeros(task.shape, task.tensor->dtype());"
+    "capacity-growth full clear")
+foreach(token IN ITEMS
+        "MTensor* activeView;"
+        "replacementView = replacement.view(num_active);"
+        "*task.activeView = std::move(replacementView);"
+        "void checkCapacityGrowthWithoutPreclear(bool gpuMode)"
+        "constexpr int kCapacityGrowthSplits = kCapacityGrowthParents - 1;"
+        "model.densify_dup_flag.data<int32_t>()[index] = split ? 0 : 1;"
+        "model.ensureCapacity(population);"
+        "preservedPrefixes[bufferIndex]"
+        "publicActiveViews[bufferIndex]->data_ptr() =="
+        "poisonFloatTail("
+        "CHECK(densifiedCount == 2 * activeCount);"
+        "CHECK(std::isfinite(value));"
+        "floatBits(tensor->data<float>()[index]) == poisonBits"
+        "model.densify_keep_flag.data<int32_t>()[index] == intPoison"
+        "checkCapacityGrowthWithoutPreclear(gpuRandomMode);")
+    if(token MATCHES "activeView|replacementView")
+        require_contains("${capacity_growth}" "${token}"
+            "capacity-growth recovery ${token}")
+    else()
+        require_contains("${test_source}" "${token}"
+            "capacity-growth runtime ${token}")
+    endif()
+endforeach()
 
 # The periodic opacity maintenance stays ordered after Adam in the same command
 # buffer while preserving the prior CPU comparison's NaN and active-view rules.
@@ -283,7 +319,7 @@ foreach(token IN ITEMS
         "if (msplat_densify_uses_gpu_random()) {"
         "scratch.randomSamples = gpu_zeros({1}, DType::Float32);"
         "if (!msplat_densify_uses_gpu_random()) {"
-        "tasks.push_back({&densify_random_samples, {new_cap, 3}, false});")
+        "{&densify_random_samples, nullptr, {new_cap, 3}, false}")
     require_contains("${model_source}" "${token}"
         "densification-random model scratch ${token}")
 endforeach()
