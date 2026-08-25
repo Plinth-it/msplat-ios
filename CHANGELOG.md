@@ -118,6 +118,13 @@
   now measures its synchronized preflight separately from the queued training
   tail, owns timestamp storage per logical step, and converts GPU ticks using
   paired CPU/GPU samples rather than the CPU Mach timebase.
+- Made key-driven intersection-attribute gathers the default after sustained,
+  counterbalanced physical-device profiling found effectively neutral throughput
+  while saving 68.83 MiB at 313,214 Gaussians. The default arena retains only
+  sorted keys and optional radix scratch; `MSPLAT_INTERSECTION_ATTRIBUTES=packed`
+  restores the three float3 copies as a device-specific fallback. Swift memory
+  planning now budgets the configured 16-byte gather or 52-byte packed arena,
+  keeping the app's memory admission gate conservative for either mode.
 - Fused geometry backward directly into the mean, scale, and quaternion Adam
   updates, and folded opacity plus densification-stat updates into the terminal
   backward stage. The training cache no longer owns or clears the three geometry

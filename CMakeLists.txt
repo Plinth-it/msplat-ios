@@ -339,7 +339,7 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         set_tests_properties(msplat_transparent_training PROPERTIES
             ENVIRONMENT
-                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged"
             SKIP_RETURN_CODE 77)
         set_tests_properties(msplat_transparent_training_profile PROPERTIES
             ENVIRONMENT

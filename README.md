@@ -68,10 +68,11 @@ arena, native image cache, and an additional headroom allowance. The
 intersection estimate scales a padded 16-intersections-per-Gaussian baseline
 at 960×720 by tile count. That baseline is above the measured 10.4 at 960×720
 and scales to 64 at 1920×1440, above the measured 43.5. The runtime still counts
-and sizes each frame exactly. The second 8-byte key arena is allocated only after
-a tile exceeds the 2,048-entry bitonic path; bitonic-only resolution stages use
-44 rather than 52 runtime bytes per arena slot, while the planner retains the
-52-byte worst case. The synchronized layout pass also precomputes every tile
+and sizes each frame exactly. Key-driven gathers are the default, so the planner
+budgets both 8-byte key arenas (16 bytes per slot). Runtime allocates the second
+arena only after a tile exceeds the 2,048-entry bitonic path, leaving bitonic-only
+resolution stages at 8 bytes per slot. A plan using the packed fallback budgets
+52 bytes per slot. The synchronized layout pass also precomputes every tile
 range and bucket-orders tiles with more than one entry. Exact sorting skips
 empty and already-sorted single-entry tiles, uses one 32-thread group for 2-32
 entries, and reserves the 256-thread path for larger ranges. ImageIO is asked
@@ -93,16 +94,19 @@ threadgroups. These experimental overrides do not change chunked forward or
 backward rasterization, which remain 8x8; select a shipping default only from
 representative physical-device performance and thermal results.
 
-Intersection attributes likewise remain packed by default. A benchmark process
-can set `MSPLAT_INTERSECTION_ATTRIBUTES=gather` before the first Metal call to
-skip the three sorted float3 copies and have rasterization gather XY, conic, raw
-color, and the already projected sigmoid opacity through each sorted key's
-Gaussian ID. This reduces the bitonic-only arena from 44 to 8 bytes per slot and
-the radix arena from 52 to 16 bytes per slot, saving 36 bytes per retained
-intersection (about 450 MB at a 12.5-million-slot capacity), and removes the pack
-dispatch. Indirect reads may trade bandwidth capacity for locality, especially
-in the fixed 8x8 backward path, so keep `packed` as the shipping mode until
-physical-device throughput and sustained-thermal A/B results justify a change.
+Intersection attributes use key-driven gathers by default. Rasterization extracts
+the Gaussian ID from each sorted key and gathers XY, conic, raw color, and the
+already projected sigmoid opacity from per-Gaussian arrays. This removes three
+sorted float3 copies and the pack dispatch, reducing the bitonic-only arena from
+44 to 8 bytes per slot and the radix arena from 52 to 16 bytes per slot. It saves
+36 bytes per retained intersection (about 450 MB at a 12.5-million-slot capacity).
+A counterbalanced sustained iPhone 16 Pro Max profile found the path effectively
+throughput-neutral while saving 68.83 MiB at 313,214 Gaussians and roughly 1.6
+million live intersections. Set `MSPLAT_INTERSECTION_ATTRIBUTES=packed` before
+the first Metal call to restore sequential packed attributes for device-specific
+fallback testing. `TrainingPlan` mirrors this process override by default, or
+callers can select `TrainingIntersectionAttributeStorage.packed` explicitly, so
+the memory admission estimate includes its additional 36 bytes per arena slot.
 
 Exact tile counting likewise keeps the established per-intersection enumeration
 as its default. A benchmark process can set
@@ -460,7 +464,7 @@ Output: `.ply`, `.splat`, `.spz`.
 | `MSPLAT_TILE_LAYOUT_MODE` | `cpu` (default) or experimental exact `gpu` layout. The GPU mode retains the synchronized host validation and arena-sizing boundary. Set before first Metal use. |
 | `MSPLAT_TRAINING_ARENA_MODE` | `exact` (default) or experimental transactional `retry`. Retry forces GPU tile layout and replaces steady-state mid-step sizing with an end-of-attempt validation/retry boundary. Set before first Metal use. |
 | `MSPLAT_SSIM_MODE` | `staged` (default) or experimental `fused` derivative processing. Fused removes the 36-byte-per-pixel derivative buffer and one dispatch. Set before first Metal use. |
-| `MSPLAT_INTERSECTION_ATTRIBUTES` | `packed` (default) or experimental key-driven `gather`. Gather removes three float3 arrays and the pack dispatch, saving 36 bytes per arena slot. Set before first Metal use. |
+| `MSPLAT_INTERSECTION_ATTRIBUTES` | Key-driven `gather` (default) or `packed` fallback. Packed attributes add three float3 arrays and one pack dispatch, using 36 additional bytes per arena slot. Set before first Metal use. |
 | `MSPLAT_MEM_LOG_EVERY` | Memory breakdown every N steps. |
 | `MSPLAT_ISECT_LOG` | Intersection count against capacity at each sample. |
 

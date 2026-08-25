@@ -15,6 +15,14 @@ function(require_contains contents needle label)
     endif()
 endfunction()
 
+function(require_not_contains contents needle label)
+    string(FIND "${contents}" "${needle}" position)
+    if(NOT position EQUAL -1)
+        message(FATAL_ERROR
+            "Intersection-attribute gather contract retained: ${label}")
+    endif()
+endfunction()
+
 function(require_substring_count contents needle expected label)
     set(remainder "${contents}")
     string(LENGTH "${needle}" needle_length)
@@ -54,14 +62,17 @@ function(extract_test_properties test_name output_name)
     set(${output_name} "${section_contents}" PARENT_SCOPE)
 endfunction()
 
-# Selection is immutable with the Metal context and defaults to the established
-# packed representation unless a strict opt-in value is supplied.
+# Selection is immutable with the Metal context and defaults to key-driven
+# gathers. Packed attributes remain available as a strict fallback override.
 require_contains("${host_source}"
-    "bool gather_intersection_attributes = false;"
-    "default packed context state")
+    "bool gather_intersection_attributes = true;"
+    "default gather context state")
 require_contains("${host_source}"
     "std::getenv(\"MSPLAT_INTERSECTION_ATTRIBUTES\")"
     "mode environment lookup")
+require_contains("${host_source}"
+    "intersectionAttributesOverride, \"packed\") == 0) {\n            ctx->gather_intersection_attributes = false;"
+    "packed fallback selection")
 foreach(mode IN ITEMS packed gather)
     require_contains("${host_source}"
         "intersectionAttributesOverride, \"${mode}\") == 0"
@@ -161,11 +172,15 @@ require_substring_count("${host_source}"
     "MTensor &raster_xy_attributes = ctx->gather_intersection_attributes" 2
     "render and training source aliases")
 
-# Baselines are explicitly pinned, and separate processes cover gather's
-# immutable context selection, chunked training, and retry/finalize behavior.
+# The primary runtime case exercises the unset gather default. Separate
+# processes cover the explicit packed fallback, gather chunking, and retry.
 require_contains("${cmake_source}"
     "MSPLAT_INTERSECTION_ATTRIBUTES=packed"
-    "packed baseline pin")
+    "packed fallback runtime case")
+extract_test_properties("msplat_transparent_training" default_properties)
+require_not_contains("${default_properties}"
+    "MSPLAT_INTERSECTION_ATTRIBUTES="
+    "default runtime attribute override")
 foreach(test_name IN ITEMS
         msplat_transparent_training_gather
         msplat_transparent_training_gather_arena_retry
@@ -183,5 +198,5 @@ require_contains("${retry_properties}"
     "MSPLAT_TRAINING_ARENA_MODE=retry"
     "gather retry environment")
 require_contains("${readme_source}"
-    "`MSPLAT_INTERSECTION_ATTRIBUTES`"
-    "documented experimental control")
+    "`MSPLAT_INTERSECTION_ATTRIBUTES=packed`"
+    "documented packed fallback")

@@ -461,7 +461,7 @@ struct TrainingBenchmarkRecorder {
         [
             "MSPLAT_RASTER_VARIANT": environment["MSPLAT_RASTER_VARIANT"] ?? "8x8",
             "MSPLAT_INTERSECTION_ATTRIBUTES":
-                environment["MSPLAT_INTERSECTION_ATTRIBUTES"] ?? "packed",
+                environment["MSPLAT_INTERSECTION_ATTRIBUTES"] ?? "gather",
             "MSPLAT_TILE_COUNT_MODE": environment["MSPLAT_TILE_COUNT_MODE"] ?? "enumerated",
             "MSPLAT_TILE_LAYOUT_MODE": environment["MSPLAT_TILE_LAYOUT_MODE"] ?? "cpu",
             "MSPLAT_TRAINING_ARENA_MODE":

@@ -87,22 +87,22 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(estimate.stages.map(\.chunkCount), [1, 1])
         XCTAssertEqual(
             estimate.stages.map(\.trainingCacheBytes),
-            [866_058_608, 926_233_208]
+            [326_058_608, 386_233_208]
         )
-        XCTAssertEqual(estimate.peakTrainingCacheBytes, 926_233_208)
+        XCTAssertEqual(estimate.peakTrainingCacheBytes, 386_233_208)
         XCTAssertEqual(estimate.largestImageCacheEntryBytes, 2_764_800)
         XCTAssertEqual(estimate.imageDecodeTransientBytes, 16_588_800)
         XCTAssertEqual(estimate.imageInsertionPeakBytes, 553_459_712)
-        XCTAssertEqual(estimate.codeDerivedBytes, 2_043_695_864)
-        XCTAssertEqual(estimate.recommendedHeadroomBytes, 408_739_173)
-        XCTAssertEqual(estimate.estimatedPeakMemory, 2_452_435_037)
+        XCTAssertEqual(estimate.codeDerivedBytes, 1_503_695_864)
+        XCTAssertEqual(estimate.recommendedHeadroomBytes, 300_739_173)
+        XCTAssertEqual(estimate.estimatedPeakMemory, 1_804_435_037)
         let customEstimate = try plan.memoryEstimate(
             imageCacheBudgetBytes: 64 * 1_024 * 1_024
         )
         XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 83_697_664)
-        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_573_933_816)
-        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 314_786_764)
-        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_888_720_580)
+        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_033_933_816)
+        XCTAssertEqual(customEstimate.recommendedHeadroomBytes, 206_786_764)
+        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_240_720_580)
     }
 
     func testMaskAwareMemoryEstimateUsesPackedTargetAndDecodeStorage() throws {
@@ -135,16 +135,52 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(estimate.largestImageCacheEntryBytes, 2_767_500)
         XCTAssertEqual(estimate.imageDecodeTransientBytes, 24_883_200)
         XCTAssertEqual(estimate.imageInsertionPeakBytes, 561_754_112)
-        XCTAssertEqual(estimate.codeDerivedBytes, 2_051_990_264)
-        XCTAssertEqual(estimate.recommendedHeadroomBytes, 410_398_053)
-        XCTAssertEqual(estimate.estimatedPeakMemory, 2_462_388_317)
+        XCTAssertEqual(estimate.codeDerivedBytes, 1_511_990_264)
+        XCTAssertEqual(estimate.recommendedHeadroomBytes, 302_398_053)
+        XCTAssertEqual(estimate.estimatedPeakMemory, 1_814_388_317)
 
         let customEstimate = try plan.memoryEstimate(
             imageCacheBudgetBytes: 64 * 1_024 * 1_024
         )
         XCTAssertEqual(customEstimate.imageInsertionPeakBytes, 91_992_064)
-        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_582_228_216)
-        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_898_673_860)
+        XCTAssertEqual(customEstimate.codeDerivedBytes, 1_042_228_216)
+        XCTAssertEqual(customEstimate.estimatedPeakMemory, 1_250_673_860)
+    }
+
+    func testPackedIntersectionFallbackIsFullyBudgeted() throws {
+        func makePlan(
+            _ storage: TrainingIntersectionAttributeStorage
+        ) throws -> TrainingPlan {
+            try TrainingPlan(
+                inputDimensions: TrainingImageDimensions(width: 960, height: 720),
+                inputDecodeScale: 1,
+                iterationBudget: 100,
+                stages: [
+                    TrainingResolutionStage(iterations: 1...100, downscaleFactor: 1),
+                ],
+                targetSHDegree: 2,
+                maximumGaussianCount: 10_000,
+                intersectionAttributeStorage: storage
+            )
+        }
+
+        let gather = try makePlan(.gather)
+        let packed = try makePlan(.packed)
+        XCTAssertEqual(gather.intersectionAttributeStorage, .gather)
+        XCTAssertEqual(packed.intersectionAttributeStorage, .packed)
+        XCTAssertEqual(gather.memoryEstimate.intersectionAttributeStorage, .gather)
+        XCTAssertEqual(packed.memoryEstimate.intersectionAttributeStorage, .packed)
+
+        for (gatherStage, packedStage) in zip(
+            gather.memoryEstimate.stages,
+            packed.memoryEstimate.stages
+        ) {
+            XCTAssertEqual(
+                packedStage.trainingCacheBytes - gatherStage.trainingCacheBytes,
+                36 * gatherStage.intersectionCapacity
+            )
+        }
+        XCTAssertGreaterThan(packed.estimatedPeakMemory, gather.estimatedPeakMemory)
     }
 
     func testMaskAwareCoarseOnlyCacheEstimateUsesCompactStageTarget() throws {
@@ -415,7 +451,7 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertEqual(stage.tileCount, 4)
         XCTAssertEqual(stage.intersectionCapacity, 8_096)
         XCTAssertEqual(stage.chunkCount, 8)
-        XCTAssertEqual(stage.trainingCacheBytes, 922_776)
+        XCTAssertEqual(stage.trainingCacheBytes, 631_320)
     }
 
     func testRejectsNativeMemoryIndexOverflows() throws {

@@ -424,7 +424,7 @@ void checkChunkedTransparentAlphaSupervision() {
 
     const char* attributes =
         std::getenv("MSPLAT_INTERSECTION_ATTRIBUTES");
-    const bool gather = attributes && std::string(attributes) == "gather";
+    const bool gather = !attributes || std::string(attributes) != "packed";
     const size_t packedAttributeBytes =
         msplat_packed_intersection_attribute_bytes();
     CHECK(gather ? packedAttributeBytes == 0 : packedAttributeBytes > 0);
@@ -481,7 +481,7 @@ void checkArenaRetryTransaction() {
 
     const char* attributes =
         std::getenv("MSPLAT_INTERSECTION_ATTRIBUTES");
-    const bool gather = attributes && std::string(attributes) == "gather";
+    const bool gather = !attributes || std::string(attributes) != "packed";
     const size_t packedAttributeBytes =
         msplat_packed_intersection_attribute_bytes();
     CHECK(gather ? packedAttributeBytes == 0 : packedAttributeBytes > 0);

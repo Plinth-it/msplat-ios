@@ -868,7 +868,7 @@ struct MetalContext {
     id<MTLComputePipelineState> build_tile_intersection_layout_kernel_cpso = nil;
     bool gpu_tile_layout = false;
     bool retry_intersection_attempts = false;
-    bool gather_intersection_attributes = false;
+    bool gather_intersection_attributes = true;
     id<MTLComputePipelineState> validate_tile_intersection_attempt_kernel_cpso = nil;
     id<MTLComputePipelineState> finalize_tile_intersection_attempt_kernel_cpso = nil;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso = nil;
@@ -1244,7 +1244,7 @@ MetalContext* init_msplat_metal_context() {
         std::getenv("MSPLAT_INTERSECTION_ATTRIBUTES");
     if (intersectionAttributesOverride) {
         if (std::strcmp(intersectionAttributesOverride, "packed") == 0) {
-            // Keep the established per-intersection attribute copies.
+            ctx->gather_intersection_attributes = false;
         } else if (std::strcmp(
                        intersectionAttributesOverride, "gather") == 0) {
             ctx->gather_intersection_attributes = true;
