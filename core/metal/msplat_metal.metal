@@ -4541,6 +4541,13 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     float ssim_sum = 0.0f, l1_sum = 0.0f, coverage_sum = 0.0f;
     float alpha_loss_sum = 0.0f;
     threadgroup float tg_gain[3];
+    // The full horizontal-statistics tile is the largest live value. After all
+    // threads finish reading it, reuse the same storage for the three compact
+    // derivative tiles, and finally for loss reduction. This keeps static
+    // threadgroup memory near 13.5 KiB instead of 19.5 KiB, allowing two
+    // resident groups on 32 KiB Apple GPU cores and shader validation's shadow
+    // allocation to fit.
+    threadgroup float tg_scratch[TILE_PIXELS * 5];
 
     if (tr < 3) {
         tg_gain[tr] = photometric_enabled != 0
@@ -4551,32 +4558,43 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
 
     for (uint c = 0; c < 3; c++) {
         const float gain = tg_gain[c];
-        threadgroup float tg_hp[TILE_DIM][TILE_DIM][5];
-        for (uint i = tr; i < TILE_PIXELS; i += SSIM_TG * SSIM_TG) {
-            uint sy = i / TILE_DIM, sx = i % TILE_DIM;
-            int gy = base_gy + (int)sy, gx = base_gx + (int)sx;
-            if (gx >= 0 && gx < (int)W && gy >= 0 && gy < (int)H) {
-                uint hp = (gy * W + gx) * 15 + c * 5;
-                for (uint f = 0; f < 5; f++) tg_hp[sy][sx][f] = ssim_h_buf[hp + f];
-            } else {
-                for (uint f = 0; f < 5; f++) tg_hp[sy][sx][f] = 0.0f;
+        constexpr uint THREADS_PER_GROUP = SSIM_TG * SSIM_TG;
+        constexpr uint DERIV_PIXELS = SSIM_TG * TILE_DIM;
+        constexpr uint DERIV_VALUES_PER_THREAD =
+            (DERIV_PIXELS + THREADS_PER_GROUP - 1) / THREADS_PER_GROUP;
+        for (uint i = tr; i < TILE_PIXELS; i += THREADS_PER_GROUP) {
+            const uint sy = i / TILE_DIM, sx = i % TILE_DIM;
+            const int gy = base_gy + (int)sy, gx = base_gx + (int)sx;
+            const bool valid_sample =
+                gx >= 0 && gx < (int)W && gy >= 0 && gy < (int)H;
+            const uint hp = valid_sample
+                ? (uint(gy) * W + uint(gx)) * 15 + c * 5
+                : 0;
+            for (uint field = 0; field < 5; ++field) {
+                tg_scratch[i * 5 + field] = valid_sample
+                    ? ssim_h_buf[hp + field]
+                    : 0.0f;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup float tg_f1[SSIM_TG][TILE_DIM], tg_f2[SSIM_TG][TILE_DIM], tg_f3[SSIM_TG][TILE_DIM];
-        constexpr uint DERIV_PIXELS = SSIM_TG * TILE_DIM;
-        for (uint i = tr; i < DERIV_PIXELS; i += SSIM_TG * SSIM_TG) {
-            uint dy = i / TILE_DIM, dx = i % TILE_DIM;
-            uint tile_y = dy + SSIM_HALF_WIN;
-            float mu_x=0, mu_y=0, sq_x=0, sq_y=0, cross_xy=0;
-            for (uint k = 0; k < SSIM_WIN; k++) {
-                float w = GAUSS_1D[k];
-                mu_x += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][0];
-                mu_y += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][1];
-                sq_x += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][2];
-                sq_y += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][3];
-                cross_xy += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][4];
+        float3 derivative_values[DERIV_VALUES_PER_THREAD] = {};
+        for (uint slot = 0; slot < DERIV_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= DERIV_PIXELS) continue;
+            const uint dy = i / TILE_DIM, dx = i % TILE_DIM;
+            const uint tile_y = dy + SSIM_HALF_WIN;
+            float mu_x = 0.0f, mu_y = 0.0f;
+            float sq_x = 0.0f, sq_y = 0.0f, cross_xy = 0.0f;
+            for (uint k = 0; k < SSIM_WIN; ++k) {
+                const float w = GAUSS_1D[k];
+                const uint hp =
+                    ((tile_y - SSIM_HALF_WIN + k) * TILE_DIM + dx) * 5;
+                mu_x += w * tg_scratch[hp + 0];
+                mu_y += w * tg_scratch[hp + 1];
+                sq_x += w * tg_scratch[hp + 2];
+                sq_y += w * tg_scratch[hp + 3];
+                cross_xy += w * tg_scratch[hp + 4];
             }
             int gpx = base_gx + (int)dx;
             int gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
@@ -4594,10 +4612,10 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             float iCD = 1.0f / (Cd * D);
             float dmu = 2.0f*B*(mu_x*Cd - A*mu_y) / (Cd*Cd*D);
             float dsyq = -A*B*iCD/D, dsxy = 2.0f*A*iCD;
-            tg_f1[dy][dx] = coverage *
-                (dmu - 2.0f*mu_y*dsyq - mu_x*dsxy);
-            tg_f2[dy][dx] = coverage * 2.0f*dsyq;
-            tg_f3[dy][dx] = coverage * dsxy;
+            derivative_values[slot] = coverage * float3(
+                dmu - 2.0f*mu_y*dsyq - mu_x*dsxy,
+                2.0f*dsyq,
+                dsxy);
             if (dx >= SSIM_HALF_WIN && dx < SSIM_HALF_WIN + SSIM_TG) {
                 if (valid_center) {
                     ssim_sum += coverage * (A * B) / (Cd * D);
@@ -4618,13 +4636,27 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
                 }
             }
         }
+
+        // No thread may overwrite the statistics tile until every vertical
+        // convolution has finished reading it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint slot = 0; slot < DERIV_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= DERIV_PIXELS) continue;
+            tg_scratch[i] = derivative_values[slot].x;
+            tg_scratch[DERIV_PIXELS + i] = derivative_values[slot].y;
+            tg_scratch[2 * DERIV_PIXELS + i] = derivative_values[slot].z;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (px < W && py < H) {
             float h1=0, h2=0, h3=0;
             for (uint dx = 0; dx < SSIM_WIN; dx++) {
                 float w = GAUSS_1D[SSIM_WIN-1-dx];
-                h1 += w*tg_f1[lid.y][lid.x+dx]; h2 += w*tg_f2[lid.y][lid.x+dx]; h3 += w*tg_f3[lid.y][lid.x+dx];
+                const uint hp = lid.y * TILE_DIM + lid.x + dx;
+                h1 += w * tg_scratch[hp];
+                h2 += w * tg_scratch[DERIV_PIXELS + hp];
+                h3 += w * tg_scratch[2 * DERIV_PIXELS + hp];
             }
             uint out = (py*W+px)*9 + c*3;
             deriv_h_buf[out+0]=h1; deriv_h_buf[out+1]=h2; deriv_h_buf[out+2]=h3;
@@ -4639,15 +4671,16 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
         ssim_weight * (coverage_sum - ssim_sum) / 3.0f +
         (1.0f - ssim_weight) * l1_sum / 3.0f +
         alpha_loss_sum;
-    threadgroup float tg_sum[256];
-    tg_sum[tr] = pixel_loss;
+    tg_scratch[tr] = pixel_loss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint tg_total = tg_size.x * tg_size.y;
     for (uint s = tg_total/2; s > 0; s >>= 1) {
-        if (tr < s) tg_sum[tr] += tg_sum[tr+s];
+        if (tr < s) tg_scratch[tr] += tg_scratch[tr+s];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tr == 0) atomic_fetch_add_explicit(loss_sum, tg_sum[0], memory_order_relaxed);
+    if (tr == 0)
+        atomic_fetch_add_explicit(
+            loss_sum, tg_scratch[0], memory_order_relaxed);
 }
 
 // Backward pass 1: compute derivative fields + horizontal convolution.

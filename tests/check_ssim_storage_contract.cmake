@@ -20,6 +20,23 @@ function(require_absent contents needle label)
     endif()
 endfunction()
 
+function(require_barrier_between contents before after label)
+    string(FIND "${contents}" "${before}" before_position)
+    string(FIND "${contents}" "${after}" after_position)
+    if(before_position EQUAL -1 OR after_position EQUAL -1 OR
+       after_position LESS_EQUAL before_position)
+        message(FATAL_ERROR "Could not order SSIM scratch phases: ${label}")
+    endif()
+    math(EXPR phase_length "${after_position} - ${before_position}")
+    string(SUBSTRING "${contents}" ${before_position}
+        ${phase_length} phase_source)
+    string(FIND "${phase_source}"
+        "threadgroup_barrier(mem_flags::mem_threadgroup);" barrier_position)
+    if(barrier_position EQUAL -1)
+        message(FATAL_ERROR "SSIM scratch phase is missing a barrier: ${label}")
+    endif()
+endfunction()
+
 require_contains("${host_source}" "ssim_deriv_h_buf = mtensor_empty("
     "compact derivative allocation")
 require_contains("${host_source}"
@@ -70,11 +87,48 @@ require_contains("${metal_source}"
     "ssim_weight * (coverage_sum - ssim_sum) / 3.0f"
     "coverage-weighted SSIM center loss")
 require_contains("${metal_source}"
-    "tg_f1[dy][dx] = coverage *"
+    "derivative_values[slot] = coverage *"
     "coverage-weighted SSIM center derivative")
 require_contains("${metal_source}"
     "float v_l1 = coverage *"
     "coverage-weighted direct L1 derivative")
+string(FIND "${metal_source}"
+    "kernel void ssim_fused_v_fwd_h_bwd_kernel(" fused_kernel_start)
+string(FIND "${metal_source}"
+    "kernel void ssim_h_bwd_kernel(" fused_kernel_end)
+if(fused_kernel_start EQUAL -1 OR fused_kernel_end EQUAL -1 OR
+   fused_kernel_end LESS_EQUAL fused_kernel_start)
+    message(FATAL_ERROR "Could not isolate fused SSIM middle pass")
+endif()
+math(EXPR fused_kernel_length "${fused_kernel_end} - ${fused_kernel_start}")
+string(SUBSTRING "${metal_source}" ${fused_kernel_start}
+    ${fused_kernel_length} fused_kernel_source)
+string(FIND "${fused_kernel_source}"
+    "threadgroup float tg_scratch[TILE_PIXELS * 5];" fused_scratch_position)
+string(FIND "${fused_kernel_source}"
+    "for (uint c = 0; c < 3; c++) {" fused_channel_loop_position)
+if(fused_scratch_position EQUAL -1 OR fused_channel_loop_position EQUAL -1 OR
+   fused_scratch_position GREATER fused_channel_loop_position)
+    message(FATAL_ERROR
+        "Fused SSIM scratch must be allocated once outside the channel loop")
+endif()
+string(FIND "${fused_kernel_source}"
+    "threadgroup float tg_f1" separate_derivative_scratch_position)
+string(FIND "${fused_kernel_source}"
+    "threadgroup float tg_sum" separate_loss_scratch_position)
+if(NOT separate_derivative_scratch_position EQUAL -1 OR
+   NOT separate_loss_scratch_position EQUAL -1)
+    message(FATAL_ERROR
+        "Fused SSIM derivatives and loss must reuse the statistics scratch")
+endif()
+require_barrier_between("${fused_kernel_source}"
+    "cross_xy += w * tg_scratch[hp + 4];"
+    "tg_scratch[i] = derivative_values[slot].x;"
+    "statistics read before derivative overwrite")
+require_barrier_between("${fused_kernel_source}"
+    "tg_scratch[2 * DERIV_PIXELS + i] = derivative_values[slot].z;"
+    "h1 += w * tg_scratch[hp];"
+    "derivative write before horizontal read")
 require_contains("${host_source}"
     "static_cast<double>(rawLoss) * 255.0"
     "coverage-unit telemetry normalization")
