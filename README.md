@@ -90,6 +90,16 @@ threadgroups. These experimental overrides do not change chunked forward or
 backward rasterization, which remain 8x8; select a shipping default only from
 representative physical-device performance and thermal results.
 
+Exact tile counting likewise keeps the established per-intersection enumeration
+as its default. A benchmark process can set
+`MSPLAT_TILE_COUNT_MODE=difference` before the first Metal call to record four
+signed corners per visible Gaussian and reconstruct the exact tile counts with
+horizontal and vertical scans. The experimental mode preserves coverage-tile
+masking and the synchronized CPU layout/allocation safety boundary; it does not
+remove the per-step host wait. Keep `enumerated` as the shipping mode until
+fixed-snapshot physical-device and sustained-thermal measurements justify a
+default change.
+
 ## Correctness
 
 **Rasterizer intersections.** The packed buffers were once sized
@@ -383,6 +393,7 @@ Output: `.ply`, `.splat`, `.spz`.
 |---|---|
 | `MSPLAT_IMAGE_CACHE_MB` | Image cache budget. Default 512 on iOS, 2048 elsewhere. |
 | `MSPLAT_CAMERA_PREFETCH` | Set exactly `1` to predecode one upcoming training camera. Default off. |
+| `MSPLAT_TILE_COUNT_MODE` | `enumerated` (default) or experimental exact `difference` counting. Set before first Metal use. |
 | `MSPLAT_MEM_LOG_EVERY` | Memory breakdown every N steps. |
 | `MSPLAT_ISECT_LOG` | Intersection count against capacity at each sample. |
 
@@ -430,7 +441,8 @@ the compact intersection arena:
 
 ```
 Forward:
-  project_and_sh_forward     fused projection + SH + exact per-tile counts
+  project_and_sh_forward     fused projection + SH + exact count contributions
+  optional difference scans  exact per-tile counts for the experimental mode
   CPU checked prefix         exact offsets and grow-only arena sizing
   exact scatter + sort       compact checked tile ranges + packing
   nd_rasterize_forward       per-pixel alpha compositing (16×16 tiles)
@@ -442,6 +454,11 @@ Backward:
   sh_opacity_backward_adam   register SH VJP + SH/opacity Adam update
   project_backward_adam      register geometry VJP + Adam + densify stats
 ```
+
+The optional difference scans only replace how the first command buffer derives
+the per-tile counts. Both modes still synchronize before the checked CPU prefix,
+use the same exact scatter/sort/raster stages, and fail before optimizer work if
+the layout or arena cannot be represented safely.
 
 The loss target entering `ssim_h_fwd` is a tightly packed UInt8 RGBA buffer;
 RGB is sampled and converted with `byte / 255`. For camera masks, alpha carries

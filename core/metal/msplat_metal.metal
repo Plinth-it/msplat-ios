@@ -2130,7 +2130,7 @@ kernel void project_and_sh_forward_kernel(
     device float* depths,
     device int* radii,
     device float* conics,
-    device atomic_uint* tile_counts,
+    device atomic_uint* tile_count_storage,
     // SH args
     constant uint& degree,
     constant uint& degrees_to_use,
@@ -2142,6 +2142,7 @@ kernel void project_and_sh_forward_kernel(
     constant uint& pose_enabled,
     constant uchar* coverage_render_tiles,
     constant uint& coverage_render_tile_stride,
+    constant uint& tile_count_mode,
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -2203,20 +2204,37 @@ kernel void project_and_sh_forward_kernel(
     aabb[idx * 2] = aabb_x;
     aabb[idx * 2 + 1] = aabb_y;
 
-    // Phase one of the exact intersection pipeline. The host waits for this
-    // command buffer, builds checked inclusive tile offsets from these counts,
-    // and allocates enough compact storage before any intersection is written.
-    for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
-        for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
-            if (!training_render_tile_active(
-                    coverage_render_tiles, coverage_render_tile_stride,
-                    tile_x, tile_y)) {
-                continue;
+    // Phase one of the exact intersection pipeline. The established mode
+    // enumerates every covered tile. The difference-grid A/B records four
+    // signed rectangle corners and defers whole-tile coverage masking until
+    // after the horizontal and vertical scans.
+    if (tile_count_mode == 0u) {
+        for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
+            for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
+                if (!training_render_tile_active(
+                        coverage_render_tiles, coverage_render_tile_stride,
+                        tile_x, tile_y)) {
+                    continue;
+                }
+                const uint tile_id = tile_y * tile_bounds.x + tile_x;
+                atomic_fetch_add_explicit(
+                    &tile_count_storage[tile_id], 1u, memory_order_relaxed);
             }
-            const uint tile_id = tile_y * tile_bounds.x + tile_x;
-            atomic_fetch_add_explicit(
-                &tile_counts[tile_id], 1u, memory_order_relaxed);
         }
+    } else {
+        const uint diff_width = tile_bounds.x + 1u;
+        const uint top_left = tile_min.y * diff_width + tile_min.x;
+        const uint top_right = tile_min.y * diff_width + tile_max.x;
+        const uint bottom_left = tile_max.y * diff_width + tile_min.x;
+        const uint bottom_right = tile_max.y * diff_width + tile_max.x;
+        atomic_fetch_add_explicit(
+            &tile_count_storage[top_left], 1u, memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &tile_count_storage[top_right], uint(-1), memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &tile_count_storage[bottom_left], uint(-1), memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &tile_count_storage[bottom_right], 1u, memory_order_relaxed);
     }
 
     // SH: compute colors for non-culled gaussians (reuse p_world from registers)
@@ -2227,6 +2245,51 @@ kernel void project_and_sh_forward_kernel(
     uint rest_idx = (num_bases - 1) * num_channels * idx;
     uint idx_col = num_channels * idx;
     sh_coeffs_to_color(degrees_to_use, viewdir, &(features_dc[dc_idx]), &(features_rest[rest_idx]), &(colors[idx_col]));
+}
+
+// Difference-grid count pass 2a. Each thread owns one complete grid row, so the
+// signed horizontal prefix is safely written in place without synchronization.
+kernel void tile_count_diff_horizontal_kernel(
+    device int* diff                         [[buffer(0)]],
+    constant uint3& tile_bounds              [[buffer(1)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row > tile_bounds.y) return;
+
+    const uint diff_width = tile_bounds.x + 1u;
+    const uint row_start = row * diff_width;
+    int running = 0;
+    for (uint tile_x = 0; tile_x <= tile_bounds.x; ++tile_x) {
+        const uint index = row_start + tile_x;
+        running += diff[index];
+        diff[index] = running;
+    }
+}
+
+// Difference-grid count pass 2b. Each thread owns one tile column and performs
+// its signed vertical prefix. Coverage-only training removes inactive tiles
+// here, after the exact unmasked rectangle counts have been reconstructed.
+kernel void tile_count_diff_vertical_kernel(
+    constant int* horizontal_diff            [[buffer(0)]],
+    device uint* tile_counts                  [[buffer(1)]],
+    constant uint3& tile_bounds               [[buffer(2)]],
+    constant uchar* coverage_render_tiles    [[buffer(3)]],
+    constant uint& coverage_render_tile_stride [[buffer(4)]],
+    uint tile_x [[thread_position_in_grid]]
+) {
+    if (tile_x >= tile_bounds.x) return;
+
+    const uint diff_width = tile_bounds.x + 1u;
+    int running = 0;
+    for (uint tile_y = 0; tile_y < tile_bounds.y; ++tile_y) {
+        running += horizontal_diff[tile_y * diff_width + tile_x];
+        const uint tile_id = tile_y * tile_bounds.x + tile_x;
+        tile_counts[tile_id] = training_render_tile_active(
+            coverage_render_tiles, coverage_render_tile_stride,
+            tile_x, tile_y)
+            ? uint(running)
+            : 0u;
+    }
 }
 
 // Adam update helper — applies one Adam step to a single element.

@@ -95,6 +95,12 @@
   device benchmarking while retaining 8x8 as the default. Chunked forward and
   all backward paths remain 8x8, and a direct Metal fixture checks RGB,
   transmittance, and contributor-index parity across parent-tile boundaries.
+- Added an opt-in exact difference-grid tile-count path for controlled
+  benchmarking. It replaces per-intersection count atomics with four signed
+  corner updates per visible Gaussian plus horizontal and vertical scans,
+  including post-scan coverage-tile masking. Per-intersection enumeration remains
+  the default pending physical-device and sustained-thermal results; both modes
+  retain the synchronized CPU layout and exact arena-allocation safety boundary.
 - Fused geometry backward directly into the mean, scale, and quaternion Adam
   updates, and folded opacity plus densification-stat updates into the terminal
   backward stage. The training cache no longer owns or clears the three geometry

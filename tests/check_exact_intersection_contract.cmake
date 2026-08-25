@@ -35,17 +35,17 @@ foreach(kernel_name IN ITEMS
         "host pipeline load for ${kernel_name}")
 endforeach()
 
-require_contains("${metal_source}" "device atomic_uint* tile_counts"
-    "atomic projection counts")
+require_contains("${metal_source}" "device atomic_uint* tile_count_storage"
+    "selected atomic projection-count storage")
 require_contains("${metal_source}"
     "inline bool training_render_tile_active("
     "shared coverage render-tile predicate")
 string(REGEX MATCHALL
     "training_render_tile_active" active_tile_checks "${metal_source}")
 list(LENGTH active_tile_checks active_tile_check_count)
-if(NOT active_tile_check_count EQUAL 3)
+if(NOT active_tile_check_count EQUAL 4)
     message(FATAL_ERROR
-        "Expected one active-tile helper and two gates, found ${active_tile_check_count}")
+        "Expected one active-tile helper and three gates, found ${active_tile_check_count}")
 endif()
 require_contains("${metal_source}"
     "constant uchar* coverage_render_tiles   [[buffer(13)]]"
@@ -156,8 +156,8 @@ if(NOT backward_id_extract_count EQUAL 2)
         "Expected two backward Gaussian-ID key extracts, found ${backward_id_extract_count}")
 endif()
 require_contains("${host_source}"
-    "ENC_BUF(enc, g_tcache.tile_scatter_counters, 15)"
-    "projection count binding")
+    "ENC_BUF(enc, tileCountStorage, 15)"
+    "selected projection count binding")
 require_contains("${host_source}"
     "ENC_BUF(enc, coverageRenderTileBuffer, 24);\n        ENC_SCALAR(enc, coverageRenderTileStride, 25);"
     "training projection coverage tile bindings")

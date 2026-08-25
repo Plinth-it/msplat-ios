@@ -790,6 +790,9 @@ struct MetalContext {
 
     // Forward pipeline kernels
     id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso = nil;
+    id<MTLComputePipelineState> tile_count_diff_horizontal_kernel_cpso = nil;
+    id<MTLComputePipelineState> tile_count_diff_vertical_kernel_cpso = nil;
+    bool difference_tile_counting = false;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso = nil;
     uint32_t monolithic_raster_block_x = 8;
     uint32_t monolithic_raster_block_y = 8;
@@ -841,6 +844,8 @@ struct MetalContext {
         id resources[] = {
             counterSampleBuffer,
             project_and_sh_forward_kernel_cpso,
+            tile_count_diff_horizontal_kernel_cpso,
+            tile_count_diff_vertical_kernel_cpso,
             nd_rasterize_forward_kernel_cpso,
             float_rgb_to_preview_texture_kernel_cpso,
             scatter_to_exact_bins_kernel_cpso,
@@ -1039,6 +1044,19 @@ MetalContext* init_msplat_metal_context() {
         return pso;
     };
 
+    const char* tileCountModeOverride =
+        std::getenv("MSPLAT_TILE_COUNT_MODE");
+    if (tileCountModeOverride) {
+        if (std::strcmp(tileCountModeOverride, "enumerated") == 0) {
+            // Keep the established per-tile atomic enumeration path.
+        } else if (std::strcmp(tileCountModeOverride, "difference") == 0) {
+            ctx->difference_tile_counting = true;
+        } else {
+            throw std::invalid_argument(
+                "msplat: MSPLAT_TILE_COUNT_MODE must be enumerated or difference");
+        }
+    }
+
     const char* rasterVariantOverride = std::getenv("MSPLAT_RASTER_VARIANT");
     NSString* monolithicRasterFunctionName = @"nd_rasterize_forward_kernel";
     if (rasterVariantOverride) {
@@ -1060,6 +1078,12 @@ MetalContext* init_msplat_metal_context() {
 
     // Forward pipeline
     ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
+    if (ctx->difference_tile_counting) {
+        ctx->tile_count_diff_horizontal_kernel_cpso =
+            load(@"tile_count_diff_horizontal_kernel");
+        ctx->tile_count_diff_vertical_kernel_cpso =
+            load(@"tile_count_diff_vertical_kernel");
+    }
     ctx->nd_rasterize_forward_kernel_cpso         = load(monolithicRasterFunctionName);
     ctx->float_rgb_to_preview_texture_kernel_cpso = load(@"float_rgb_to_preview_texture_kernel");
     // Exact tile-intersection compaction and sorting
@@ -1113,6 +1137,10 @@ MetalContext* init_msplat_metal_context() {
                 "msplat: MSPLAT_RASTER_VARIANT=%s (monolithic forward only)\n",
                 rasterVariantOverride);
     }
+    if (tileCountModeOverride) {
+        fprintf(stderr, "msplat: MSPLAT_TILE_COUNT_MODE=%s\n",
+                tileCountModeOverride);
+    }
     if (ctx->small_sort_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup <
         msplat::kExactSmallTileMaximum) {
         throw std::runtime_error(
@@ -1162,6 +1190,50 @@ MetalContext* get_global_context() {
 #define ENC_SCALAR(encoder, x, i) [encoder setBytes:&x length:sizeof(x) atIndex:i]
 #define ENC_ARRAY(encoder, x, i) [encoder setBytes:x length:sizeof(x) atIndex:i]
 #define ENC_BUF(encoder, x, i) [encoder setBuffer:x.buffer() offset:0 atIndex:i]
+
+static void encode_tile_count_difference_scan(
+    MetalContext* ctx,
+    id<MTLComputeCommandEncoder> encoder,
+    MTensor& tileCountDiff,
+    MTensor& tileCounts,
+    const uint32_t* tileBounds,
+    const MTensor& coverageRenderTiles,
+    uint32_t coverageRenderTileStride
+) {
+    if (!ctx->difference_tile_counting) return;
+
+    const NSUInteger horizontalThreadCount =
+        static_cast<NSUInteger>(tileBounds[1]) + 1;
+    const NSUInteger horizontalThreadsPerGroup = MIN(
+        ctx->tile_count_diff_horizontal_kernel_cpso
+            .maxTotalThreadsPerThreadgroup,
+        horizontalThreadCount);
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [encoder setComputePipelineState:
+        ctx->tile_count_diff_horizontal_kernel_cpso];
+    ENC_BUF(encoder, tileCountDiff, 0);
+    [encoder setBytes:tileBounds length:4 * sizeof(uint32_t) atIndex:1];
+    [encoder dispatchThreads:MTLSizeMake(horizontalThreadCount, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(
+            horizontalThreadsPerGroup, 1, 1)];
+
+    const NSUInteger verticalThreadCount =
+        static_cast<NSUInteger>(tileBounds[0]);
+    const NSUInteger verticalThreadsPerGroup = MIN(
+        ctx->tile_count_diff_vertical_kernel_cpso
+            .maxTotalThreadsPerThreadgroup,
+        verticalThreadCount);
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+    [encoder setComputePipelineState:
+        ctx->tile_count_diff_vertical_kernel_cpso];
+    ENC_BUF(encoder, tileCountDiff, 0);
+    ENC_BUF(encoder, tileCounts, 1);
+    [encoder setBytes:tileBounds length:4 * sizeof(uint32_t) atIndex:2];
+    ENC_BUF(encoder, coverageRenderTiles, 3);
+    ENC_SCALAR(encoder, coverageRenderTileStride, 4);
+    [encoder dispatchThreads:MTLSizeMake(verticalThreadCount, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(verticalThreadsPerGroup, 1, 1)];
+}
 
 id<MTLDevice> msplat_device() {
     return get_global_context()->device;
@@ -1435,6 +1507,7 @@ struct FusedTensorCache {
     // rebuilds it instead of binding buffers that were never allocated.
     int fwd_num_points = -1, shared_img_height = -1, shared_img_width = -1;
     int num_tiles = -1;
+    int tile_count_diff_width = -1, tile_count_diff_height = -1;
     int training_img_height = -1, training_img_width = -1;
     int bwd_num_points = -1;
     int64_t capacity = -1;
@@ -1448,6 +1521,7 @@ struct FusedTensorCache {
 
     // Exact tile-intersection layout and sorting buffers
     MTensor tile_offsets, tile_scatter_counters, sortable_tile_indices;
+    MTensor tile_count_diff;
     MTensor intersection_keys_a, intersection_keys_b;
 
     // Defensive invariant check: exact sizing should make this remain zero.
@@ -1474,7 +1548,7 @@ struct FusedTensorCache {
             &packed_xy_opac, &packed_conic, &packed_rgb,
             &out_img, &final_Ts, &final_idx,
             &tile_bins, &tile_offsets, &tile_scatter_counters,
-            &sortable_tile_indices,
+            &sortable_tile_indices, &tile_count_diff,
             &intersection_keys_a, &intersection_keys_b, &overflow_flag,
             &chunk_T, &chunk_C, &chunk_final_idx
         };
@@ -1515,6 +1589,43 @@ struct FusedTensorCache {
         intersection_keys_a.reset(); intersection_keys_b.reset();
         packed_xy_opac.reset();
         packed_conic.reset(); packed_rgb.reset();
+    }
+
+    void resetTileCountDifference() {
+        tile_count_diff_width = -1;
+        tile_count_diff_height = -1;
+        tile_count_diff.reset();
+    }
+
+    void ensure_tile_count_diff(int tileWidth, int tileHeight,
+                                bool enabled, id<MTLDevice> dev) {
+        if (!enabled) {
+            resetTileCountDifference();
+            return;
+        }
+        if (tileWidth == tile_count_diff_width &&
+            tileHeight == tile_count_diff_height &&
+            tile_count_diff.defined()) {
+            return;
+        }
+        if (tileWidth <= 0 || tileHeight <= 0) {
+            throw std::invalid_argument(
+                "Tile-count difference dimensions must be positive");
+        }
+
+        resetTileCountDifference();
+        try {
+            tile_count_diff = mtensor_empty(
+                dev,
+                {static_cast<int64_t>(tileHeight) + 1,
+                 static_cast<int64_t>(tileWidth) + 1},
+                DType::Int32);
+        } catch (...) {
+            resetTileCountDifference();
+            throw;
+        }
+        tile_count_diff_width = tileWidth;
+        tile_count_diff_height = tileHeight;
     }
 
     void ensure_shared_forward(int np, int ih, int iw, int nt,
@@ -1800,6 +1911,14 @@ static void render_pipeline(
     // per-tile counts.
     g_tcache.ensure_shared_forward(
         num_points, img_height, img_width, num_tiles, ctx->device);
+    g_tcache.ensure_tile_count_diff(
+        tile_bounds_x, tile_bounds_y, ctx->difference_tile_counting,
+        ctx->device);
+    MTensor& tileCountStorage = ctx->difference_tile_counting
+        ? g_tcache.tile_count_diff
+        : g_tcache.tile_scatter_counters;
+    const uint32_t tileCountMode =
+        ctx->difference_tile_counting ? 1u : 0u;
     MTensor &xys = g_tcache.xys;
     MTensor &depths = g_tcache.depths;
     MTensor &radii_out = g_tcache.radii_out;
@@ -1848,7 +1967,7 @@ static void render_pipeline(
         ENC_SCALAR(enc, clip_thresh, 10);
         ENC_BUF(enc, xys, 11); ENC_BUF(enc, depths, 12);
         ENC_BUF(enc, radii_out, 13); ENC_BUF(enc, conics, 14);
-        ENC_BUF(enc, g_tcache.tile_scatter_counters, 15);
+        ENC_BUF(enc, tileCountStorage, 15);
         ENC_SCALAR(enc, degree, 16); ENC_SCALAR(enc, degrees_to_use, 17);
         [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:18];
         ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, features_rest, 20);
@@ -1859,6 +1978,7 @@ static void render_pipeline(
         ENC_BUF(enc, g_tcache.tile_scatter_counters, 24);
         const uint32_t coverageRenderTileStrideDisabled = 0u;
         ENC_SCALAR(enc, coverageRenderTileStrideDisabled, 25);
+        ENC_SCALAR(enc, tileCountMode, 26);
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -1874,9 +1994,9 @@ static void render_pipeline(
                 encodingFailure = "msplat: failed to create a Metal blit encoder";
                 return;
             }
-            [blit fillBuffer:g_tcache.tile_scatter_counters.buffer()
+            [blit fillBuffer:tileCountStorage.buffer()
                        range:NSMakeRange(
-                           0, g_tcache.tile_scatter_counters.nbytes())
+                           0, tileCountStorage.nbytes())
                        value:0];
             [blit endEncoding];
 
@@ -1888,6 +2008,12 @@ static void render_pipeline(
                 return;
             }
             encode_proj_sh(encoder);
+            const uint32_t coverageRenderTileStrideDisabled = 0u;
+            encode_tile_count_difference_scan(
+                ctx, encoder, g_tcache.tile_count_diff,
+                g_tcache.tile_scatter_counters, tile_bounds_arr->data(),
+                g_tcache.overflow_flag,
+                coverageRenderTileStrideDisabled);
             [encoder endEncoding];
         });
         if (encodingFailure) {
@@ -2431,6 +2557,9 @@ MTensor msplat_train_step(
     // --- Cached buffer pool ---
     g_tcache.ensure_shared_forward(
         num_points, img_height, img_width, num_tiles, ctx->device);
+    g_tcache.ensure_tile_count_diff(
+        tile_bounds_x, tile_bounds_y, ctx->difference_tile_counting,
+        ctx->device);
     g_tcache.ensure_training_image(img_height, img_width, ctx->device);
     g_tcache.ensure_backward(num_points, ctx->device);
     if (pose.enabled) g_tcache.ensure_pose_refinement(ctx->device);
@@ -2442,6 +2571,11 @@ MTensor msplat_train_step(
     MTensor &colors = g_tcache.colors;
     MTensor &aabb = g_tcache.aabb;
     MTensor &projected_opacities = g_tcache.projected_opacities;
+    MTensor &tileCountStorage = ctx->difference_tile_counting
+        ? g_tcache.tile_count_diff
+        : g_tcache.tile_scatter_counters;
+    const uint32_t tileCountMode =
+        ctx->difference_tile_counting ? 1u : 0u;
     MTensor &tile_bins = g_tcache.tile_bins;
     MTensor &loss_sum = g_tcache.loss_sum;
     MTensor &overflow_flag = logicalStep
@@ -2533,7 +2667,7 @@ MTensor msplat_train_step(
         ENC_SCALAR(enc, clip_thresh, 10);
         ENC_BUF(enc, xys, 11); ENC_BUF(enc, depths, 12);
         ENC_BUF(enc, radii_out, 13); ENC_BUF(enc, conics, 14);
-        ENC_BUF(enc, g_tcache.tile_scatter_counters, 15);
+        ENC_BUF(enc, tileCountStorage, 15);
         ENC_SCALAR(enc, degree, 16); ENC_SCALAR(enc, degrees_to_use, 17);
         if (pose.enabled) {
             ENC_BUF(enc, g_tcache.pose_cam_pos, 18);
@@ -2546,6 +2680,7 @@ MTensor msplat_train_step(
         ENC_SCALAR(enc, poseEnabled, 23);
         ENC_BUF(enc, coverageRenderTileBuffer, 24);
         ENC_SCALAR(enc, coverageRenderTileStride, 25);
+        ENC_SCALAR(enc, tileCountMode, 26);
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -2562,9 +2697,9 @@ MTensor msplat_train_step(
                 encodingFailure = "msplat: failed to create a Metal blit encoder";
                 return;
             }
-            [blit fillBuffer:g_tcache.tile_scatter_counters.buffer()
+            [blit fillBuffer:tileCountStorage.buffer()
                        range:NSMakeRange(
-                           0, g_tcache.tile_scatter_counters.nbytes())
+                           0, tileCountStorage.nbytes())
                        value:0];
             [blit endEncoding];
 
@@ -2590,6 +2725,10 @@ MTensor msplat_train_step(
             }
             encode_pose_prepare(encoder);
             encode_proj_sh(encoder);
+            encode_tile_count_difference_scan(
+                ctx, encoder, g_tcache.tile_count_diff,
+                g_tcache.tile_scatter_counters, tile_bounds_arr->data(),
+                coverageRenderTileBuffer, coverageRenderTileStride);
             [encoder endEncoding];
         });
         if (encodingFailure) {
