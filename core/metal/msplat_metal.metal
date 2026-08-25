@@ -616,22 +616,26 @@ kernel void project_gaussians_forward_kernel(
     aabb[idx * 2 + 1] = aabb_y;
 }
 
-kernel void nd_rasterize_forward_kernel(
+inline void nd_rasterize_forward_impl(
     constant uint3& tile_bounds,
     constant uint3& img_size,
     constant uint& channels,
-    constant int* tile_bins, // int2
-    constant float* packed_xy_opac, // float3: (x, y, sigmoid(opacity))
-    constant float* packed_conic,   // float3
-    constant float* packed_rgb,     // float3: raw SH (NOT clamped)
+    constant int* tile_bins,
+    constant float* packed_xy_opac,
+    constant float* packed_conic,
+    constant float* packed_rgb,
     device float* final_Ts,
     device int* final_index,
     device float* out_img,
     constant float* background,
     constant uint2& blockDim,
-    uint2 blockIdx [[threadgroup_position_in_grid]],
-    uint2 threadIdx [[thread_position_in_threadgroup]],
-    uint tr [[thread_index_in_threadgroup]]
+    uint2 blockIdx,
+    uint2 threadIdx,
+    uint tr,
+    const uint raster_block_size,
+    threadgroup float3* xy_opacity_batch,
+    threadgroup float3* conic_batch,
+    threadgroup float3* rgbs_batch
 ) {
     // Threadgroup-batched forward rasterization: all threads in a tile
     // cooperatively load Gaussian data into shared memory, then read from it.
@@ -647,12 +651,9 @@ kernel void nd_rasterize_forward_kernel(
 
     // which gaussians to look through in this tile
     int2 range = read_packed_int2(tile_bins, tile_id);
-    const int num_batches = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
-
-    // threadgroup shared memory for batch loading
-    threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
-    threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
-    threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    const int num_batches =
+        (range.y - range.x + (int)raster_block_size - 1) /
+        (int)raster_block_size;
 
     float T = 1.f;
     float3 pix_out = {0.f, 0.f, 0.f};
@@ -664,7 +665,7 @@ kernel void nd_rasterize_forward_kernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // each thread loads one gaussian into shared memory
-        int batch_start = range.x + RAST_BLOCK_SIZE * b;
+        int batch_start = range.x + (int)raster_block_size * b;
         int idx = batch_start + tr;
         if (idx < range.y) {
             // Sequential reads from packed sorted-order buffers
@@ -679,7 +680,7 @@ kernel void nd_rasterize_forward_kernel(
 
         if (done || !inside) continue;
 
-        int batch_size = min(RAST_BLOCK_SIZE, range.y - batch_start);
+        int batch_size = min((int)raster_block_size, range.y - batch_start);
 
         // process gaussians in this batch
         for (int t = 0; t < batch_size; ++t) {
@@ -729,6 +730,91 @@ kernel void nd_rasterize_forward_kernel(
         out_img[CHANNELS * pix_id + 1] = final_rgb.y;
         out_img[CHANNELS * pix_id + 2] = final_rgb.z;
     }
+}
+
+// The exact-intersection bins remain 16x16. These entrypoints vary only the
+// raster threadgroup that cooperatively loads each bin's Gaussian sequence.
+// Their buffer ABI is intentionally identical so the host can A/B the variants
+// without changing any render resources or per-pixel semantics.
+kernel void nd_rasterize_forward_kernel(
+    constant uint3& tile_bounds [[buffer(0)]],
+    constant uint3& img_size [[buffer(1)]],
+    constant uint& channels [[buffer(2)]],
+    constant int* tile_bins [[buffer(3)]],
+    constant float* packed_xy_opac [[buffer(4)]],
+    constant float* packed_conic [[buffer(5)]],
+    constant float* packed_rgb [[buffer(6)]],
+    device float* final_Ts [[buffer(7)]],
+    device int* final_index [[buffer(8)]],
+    device float* out_img [[buffer(9)]],
+    constant float* background [[buffer(10)]],
+    constant uint2& blockDim [[buffer(11)]],
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    threadgroup float3 xy_opacity_batch[8 * 8];
+    threadgroup float3 conic_batch[8 * 8];
+    threadgroup float3 rgbs_batch[8 * 8];
+    nd_rasterize_forward_impl(
+        tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
+        packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
+        blockDim, blockIdx, threadIdx, tr, 8 * 8,
+        xy_opacity_batch, conic_batch, rgbs_batch);
+}
+
+kernel void nd_rasterize_forward_16x8_kernel(
+    constant uint3& tile_bounds [[buffer(0)]],
+    constant uint3& img_size [[buffer(1)]],
+    constant uint& channels [[buffer(2)]],
+    constant int* tile_bins [[buffer(3)]],
+    constant float* packed_xy_opac [[buffer(4)]],
+    constant float* packed_conic [[buffer(5)]],
+    constant float* packed_rgb [[buffer(6)]],
+    device float* final_Ts [[buffer(7)]],
+    device int* final_index [[buffer(8)]],
+    device float* out_img [[buffer(9)]],
+    constant float* background [[buffer(10)]],
+    constant uint2& blockDim [[buffer(11)]],
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    threadgroup float3 xy_opacity_batch[16 * 8];
+    threadgroup float3 conic_batch[16 * 8];
+    threadgroup float3 rgbs_batch[16 * 8];
+    nd_rasterize_forward_impl(
+        tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
+        packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
+        blockDim, blockIdx, threadIdx, tr, 16 * 8,
+        xy_opacity_batch, conic_batch, rgbs_batch);
+}
+
+kernel void nd_rasterize_forward_16x16_kernel(
+    constant uint3& tile_bounds [[buffer(0)]],
+    constant uint3& img_size [[buffer(1)]],
+    constant uint& channels [[buffer(2)]],
+    constant int* tile_bins [[buffer(3)]],
+    constant float* packed_xy_opac [[buffer(4)]],
+    constant float* packed_conic [[buffer(5)]],
+    constant float* packed_rgb [[buffer(6)]],
+    device float* final_Ts [[buffer(7)]],
+    device int* final_index [[buffer(8)]],
+    device float* out_img [[buffer(9)]],
+    constant float* background [[buffer(10)]],
+    constant uint2& blockDim [[buffer(11)]],
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    threadgroup float3 xy_opacity_batch[16 * 16];
+    threadgroup float3 conic_batch[16 * 16];
+    threadgroup float3 rgbs_batch[16 * 16];
+    nd_rasterize_forward_impl(
+        tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
+        packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
+        blockDim, blockIdx, threadIdx, tr, 16 * 16,
+        xy_opacity_batch, conic_batch, rgbs_batch);
 }
 
 void sh_coeffs_to_color(

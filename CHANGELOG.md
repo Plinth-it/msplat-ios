@@ -91,6 +91,10 @@
   more than one intersection during the existing CPU layout pass. Exact sorting
   now skips empty and single-entry tiles, uses 32-thread groups for 2-32-entry
   ranges, and reserves 256-thread groups for larger tiles.
+- Added opt-in 16x8 and 16x16 monolithic forward-raster variants for controlled
+  device benchmarking while retaining 8x8 as the default. Chunked forward and
+  all backward paths remain 8x8, and a direct Metal fixture checks RGB,
+  transmittance, and contributor-index parity across parent-tile boundaries.
 - Fused geometry backward directly into the mean, scale, and quaternion Adam
   updates, and folded opacity plus densification-stat updates into the terminal
   backward stage. The training cache no longer owns or clears the three geometry

@@ -83,6 +83,13 @@ model. A valid
 The model term remains the topology-enabled peak; runtime model storage falls
 after the densification cutoff.
 
+The monolithic forward rasterizer defaults to its established 8x8 threadgroup.
+Native benchmark processes can set `MSPLAT_RASTER_VARIANT=16x8` or
+`MSPLAT_RASTER_VARIANT=16x16` before the first Metal call to compare larger
+threadgroups. These experimental overrides do not change chunked forward or
+backward rasterization, which remain 8x8; select a shipping default only from
+representative physical-device performance and thermal results.
+
 ## Correctness
 
 **Rasterizer intersections.** The packed buffers were once sized

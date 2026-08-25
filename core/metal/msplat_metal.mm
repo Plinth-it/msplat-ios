@@ -791,6 +791,8 @@ struct MetalContext {
     // Forward pipeline kernels
     id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso = nil;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso = nil;
+    uint32_t monolithic_raster_block_x = 8;
+    uint32_t monolithic_raster_block_y = 8;
     id<MTLComputePipelineState> float_rgb_to_preview_texture_kernel_cpso = nil;
     // Exact tile-intersection compaction and sorting
     id<MTLComputePipelineState> scatter_to_exact_bins_kernel_cpso = nil;
@@ -1037,9 +1039,28 @@ MetalContext* init_msplat_metal_context() {
         return pso;
     };
 
+    const char* rasterVariantOverride = std::getenv("MSPLAT_RASTER_VARIANT");
+    NSString* monolithicRasterFunctionName = @"nd_rasterize_forward_kernel";
+    if (rasterVariantOverride) {
+        if (std::strcmp(rasterVariantOverride, "8x8") == 0) {
+            // Keep the default function and dimensions.
+        } else if (std::strcmp(rasterVariantOverride, "16x8") == 0) {
+            monolithicRasterFunctionName = @"nd_rasterize_forward_16x8_kernel";
+            ctx->monolithic_raster_block_x = 16;
+            ctx->monolithic_raster_block_y = 8;
+        } else if (std::strcmp(rasterVariantOverride, "16x16") == 0) {
+            monolithicRasterFunctionName = @"nd_rasterize_forward_16x16_kernel";
+            ctx->monolithic_raster_block_x = 16;
+            ctx->monolithic_raster_block_y = 16;
+        } else {
+            throw std::invalid_argument(
+                "msplat: MSPLAT_RASTER_VARIANT must be 8x8, 16x8, or 16x16");
+        }
+    }
+
     // Forward pipeline
     ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
-    ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
+    ctx->nd_rasterize_forward_kernel_cpso         = load(monolithicRasterFunctionName);
     ctx->float_rgb_to_preview_texture_kernel_cpso = load(@"float_rgb_to_preview_texture_kernel");
     // Exact tile-intersection compaction and sorting
     ctx->scatter_to_exact_bins_kernel_cpso        = load(@"scatter_to_exact_bins_kernel");
@@ -1075,6 +1096,22 @@ MetalContext* init_msplat_metal_context() {
 
     if (pipelineLoadFailed) {
         throw std::runtime_error(pipelineFailure);
+    }
+
+    const NSUInteger monolithicRasterThreads =
+        static_cast<NSUInteger>(ctx->monolithic_raster_block_x) *
+        static_cast<NSUInteger>(ctx->monolithic_raster_block_y);
+    const NSUInteger maximumMonolithicRasterThreads =
+        ctx->nd_rasterize_forward_kernel_cpso.maxTotalThreadsPerThreadgroup;
+    if (maximumMonolithicRasterThreads < monolithicRasterThreads) {
+        throw std::runtime_error(
+            "msplat: selected monolithic raster variant exceeds the Metal "
+            "pipeline threadgroup limit");
+    }
+    if (rasterVariantOverride) {
+        fprintf(stderr,
+                "msplat: MSPLAT_RASTER_VARIANT=%s (monolithic forward only)\n",
+                rasterVariantOverride);
     }
     if (ctx->small_sort_per_tile_kernel_cpso.maxTotalThreadsPerThreadgroup <
         msplat::kExactSmallTileMaximum) {
@@ -1788,7 +1825,14 @@ static void render_pipeline(
         std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
     uint32_t num_points_u32 = (uint32_t)num_points;
     auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
-    auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
+    auto monolithic_block_size_dim2 =
+        std::make_shared<std::array<int32_t, 2>>(
+            std::array<int32_t, 2>{
+                static_cast<int32_t>(ctx->monolithic_raster_block_x),
+                static_cast<int32_t>(ctx->monolithic_raster_block_y)});
+    auto chunked_block_size_dim2 =
+        std::make_shared<std::array<int32_t, 2>>(
+            std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
 
     // Helper lambdas to encode each stage onto a given encoder
     auto encode_proj_sh = [&](id<MTLComputeCommandEncoder> enc) {
@@ -1996,8 +2040,12 @@ static void render_pipeline(
     constexpr uint32_t CHUNK_SIZE = 512;
 
     auto encode_rast_fwd_monolithic = [&](id<MTLComputeCommandEncoder> enc) {
-        MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X, (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
-        MTLSize tg_size = MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1);
+        const uint32_t blockX = ctx->monolithic_raster_block_x;
+        const uint32_t blockY = ctx->monolithic_raster_block_y;
+        MTLSize num_tg = MTLSizeMake(
+            (img_width + blockX - 1) / blockX,
+            (img_height + blockY - 1) / blockY, 1);
+        MTLSize tg_size = MTLSizeMake(blockX, blockY, 1);
         [enc setComputePipelineState:ctx->nd_rasterize_forward_kernel_cpso];
         [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
         [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
@@ -2005,7 +2053,8 @@ static void render_pipeline(
         ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
         ENC_BUF(enc, final_Ts, 7); ENC_BUF(enc, final_idx, 8); ENC_BUF(enc, out_img, 9);
         ENC_BUF(enc, background, 10);
-        [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:11];
+        [enc setBytes:monolithic_block_size_dim2->data()
+               length:sizeof(*monolithic_block_size_dim2) atIndex:11];
         [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:tg_size];
     };
 
@@ -2024,7 +2073,8 @@ static void render_pipeline(
         ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
         ENC_BUF(enc, g_tcache.chunk_T, 7); ENC_BUF(enc, g_tcache.chunk_C, 8); ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
         ENC_SCALAR(enc, CHUNK_SIZE, 10); ENC_SCALAR(enc, K_max, 11);
-        [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:12];
+        [enc setBytes:chunked_block_size_dim2->data()
+               length:sizeof(*chunked_block_size_dim2) atIndex:12];
         [enc dispatchThreadgroups:chunked_tg threadsPerThreadgroup:tg_size];
 
         // Phase 2: merge kernel — one thread per pixel
@@ -2439,7 +2489,14 @@ MTensor msplat_train_step(
         std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f});
     uint32_t num_points_u32 = (uint32_t)num_points;
     auto img_size_dim3 = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{img_width, img_height, 1, 0xDEAD});
-    auto block_size_dim2 = std::make_shared<std::array<int32_t, 2>>(std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
+    auto monolithic_block_size_dim2 =
+        std::make_shared<std::array<int32_t, 2>>(
+            std::array<int32_t, 2>{
+                static_cast<int32_t>(ctx->monolithic_raster_block_x),
+                static_cast<int32_t>(ctx->monolithic_raster_block_y)});
+    auto chunked_block_size_dim2 =
+        std::make_shared<std::array<int32_t, 2>>(
+            std::array<int32_t, 2>{RAST_BLOCK_X, RAST_BLOCK_Y});
     // tile_bounds for rasterize kernels must be 16x16 tile counts (tile_bins granularity)
     auto rast_tb = std::make_shared<std::array<uint32_t, 4>>(std::array<uint32_t, 4>{
         (img_width + 15u) / 16u,
@@ -2673,7 +2730,11 @@ MTensor msplat_train_step(
     auto encode_rast_fwd = [&](id<MTLComputeCommandEncoder> enc) {
         if (K_max <= 1) {
             // Monolithic
-            MTLSize num_tg = MTLSizeMake((img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X, (img_height + RAST_BLOCK_Y - 1) / RAST_BLOCK_Y, 1);
+            const uint32_t blockX = ctx->monolithic_raster_block_x;
+            const uint32_t blockY = ctx->monolithic_raster_block_y;
+            MTLSize num_tg = MTLSizeMake(
+                (img_width + blockX - 1) / blockX,
+                (img_height + blockY - 1) / blockY, 1);
             [enc setComputePipelineState:ctx->nd_rasterize_forward_kernel_cpso];
             [enc setBytes:tile_bounds_arr->data() length:sizeof(*tile_bounds_arr) atIndex:0];
             [enc setBytes:img_size_dim3->data() length:sizeof(*img_size_dim3) atIndex:1];
@@ -2681,8 +2742,10 @@ MTensor msplat_train_step(
             ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
             ENC_BUF(enc, final_Ts, 7); ENC_BUF(enc, final_idx, 8); ENC_BUF(enc, out_img, 9);
             ENC_BUF(enc, background, 10);
-            [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:11];
-            [enc dispatchThreadgroups:num_tg threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
+            [enc setBytes:monolithic_block_size_dim2->data()
+                   length:sizeof(*monolithic_block_size_dim2) atIndex:11];
+            [enc dispatchThreadgroups:num_tg
+                threadsPerThreadgroup:MTLSizeMake(blockX, blockY, 1)];
         } else {
             // Chunked
             uint32_t tile_x = (img_width + RAST_BLOCK_X - 1) / RAST_BLOCK_X;
@@ -2696,7 +2759,8 @@ MTensor msplat_train_step(
             ENC_BUF(enc, packed_xy_opac, 4); ENC_BUF(enc, packed_conic, 5); ENC_BUF(enc, packed_rgb, 6);
             ENC_BUF(enc, g_tcache.chunk_T, 7); ENC_BUF(enc, g_tcache.chunk_C, 8); ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
             ENC_SCALAR(enc, CHUNK_SIZE, 10); ENC_SCALAR(enc, K_max, 11);
-            [enc setBytes:block_size_dim2->data() length:sizeof(*block_size_dim2) atIndex:12];
+            [enc setBytes:chunked_block_size_dim2->data()
+                   length:sizeof(*chunked_block_size_dim2) atIndex:12];
             [enc dispatchThreadgroups:MTLSizeMake(tile_x, tile_y, K_max) threadsPerThreadgroup:MTLSizeMake(RAST_BLOCK_X, RAST_BLOCK_Y, 1)];
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             // Merge
