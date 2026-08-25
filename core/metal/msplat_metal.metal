@@ -43,6 +43,28 @@ constant float SH_C4[] = {
     -1.7701307697799304f,
     0.6258357354491761f};
 
+inline float preview_unorm_channel(const float value) {
+    // Match the existing CPU RGBA path: NaN becomes zero, infinities clamp,
+    // and positive values truncate rather than round before UNorm storage.
+    if (isnan(value)) return 0.0f;
+    const float clamped = clamp(value, 0.0f, 1.0f);
+    return floor(clamped * 255.0f) / 255.0f;
+}
+
+kernel void float_rgb_to_preview_texture_kernel(
+    const device float* rgb [[buffer(0)]],
+    texture2d<float, access::write> output [[texture(0)]],
+    constant uint2& image_size [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= image_size.x || gid.y >= image_size.y) return;
+    const uint offset = (gid.y * image_size.x + gid.x) * 3;
+    output.write(float4(
+        preview_unorm_channel(rgb[offset]),
+        preview_unorm_channel(rgb[offset + 1]),
+        preview_unorm_channel(rgb[offset + 2]),
+        1.0f), gid);
+}
+
 inline uint num_sh_bases(const uint degree) {
     if (degree == 0)
         return 1;

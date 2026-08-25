@@ -12,6 +12,7 @@
 #include "memory_report.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -166,6 +167,68 @@ size_t rgbaCapacityRequired(int width, int height) {
 }
 
 } // namespace
+
+struct PreviewFrame::Impl {
+    enum class Completion : uint8_t { Pending, Ready, Failed };
+
+    Impl(id<MTLTexture> value, int frameWidth, int frameHeight)
+        : texture([value retain]), width(frameWidth), height(frameHeight) {}
+
+    ~Impl() { [texture release]; }
+
+    void complete(bool succeeded, const char* message) noexcept {
+        if (!succeeded) {
+            try {
+                std::lock_guard<std::mutex> lock(errorMutex);
+                error = !message || message[0] == '\0'
+                    ? "msplat: preview command buffer failed"
+                    : message;
+            } catch (...) {
+                // Preserve a deterministic fallback even under allocation
+                // pressure; completion handlers must not throw.
+            }
+        }
+        completion.store(
+            succeeded ? Completion::Ready : Completion::Failed,
+            std::memory_order_release);
+    }
+
+    bool poll() const {
+        const Completion value = completion.load(std::memory_order_acquire);
+        if (value == Completion::Pending) return false;
+        if (value == Completion::Ready) return true;
+
+        std::lock_guard<std::mutex> lock(errorMutex);
+        throw std::runtime_error(error.empty()
+            ? "msplat: preview command buffer failed"
+            : error);
+    }
+
+    id<MTLTexture> texture = nil;
+    int width = 0;
+    int height = 0;
+    std::atomic<Completion> completion{Completion::Pending};
+    mutable std::mutex errorMutex;
+    std::string error;
+};
+
+PreviewFrame::PreviewFrame(std::shared_ptr<Impl> value)
+    : impl(std::move(value)) {}
+
+PreviewFrame::~PreviewFrame() = default;
+
+bool PreviewFrame::poll() const {
+    if (!impl) throw std::logic_error("Preview frame has no state");
+    return impl->poll();
+}
+
+void* PreviewFrame::texture() const {
+    if (!poll()) throw std::logic_error("Preview frame is not ready");
+    return (__bridge void*)impl->texture;
+}
+
+int PreviewFrame::width() const { return impl ? impl->width : 0; }
+int PreviewFrame::height() const { return impl ? impl->height : 0; }
 
 // ── Trainer::Impl ───────────────────────────────────────────────────────────
 
@@ -461,6 +524,61 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
     }
 }
 
+std::unique_ptr<PreviewFrame> Trainer::renderFromPosePreview(
+    const float camToWorld[16], int refCameraIndex) {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    auto& indices = impl->ds->trainIndices;
+    if (refCameraIndex < 0 || refCameraIndex >= (int)indices.size())
+        throw std::invalid_argument("Reference camera index is out of range");
+
+    Camera cam = impl->ds->images.ensureLoaded(
+        impl->ds->data.cameras, indices[refCameraIndex]);
+    const int downscale = impl->model->getDownscaleFactor(impl->currentStep);
+    if (cam.width < downscale || cam.height < downscale)
+        throw std::invalid_argument(
+            "Training downscale produces a zero-sized image; reduce numDownscales");
+    const int width = cam.width / downscale;
+    const int height = cam.height / downscale;
+
+    MTLTextureDescriptor* descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+            MTLPixelFormatBGRA8Unorm
+            width:static_cast<NSUInteger>(width)
+            height:static_cast<NSUInteger>(height)
+            mipmapped:NO];
+    descriptor.textureType = MTLTextureType2D;
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    id<MTLTexture> texture = [msplat_device() newTextureWithDescriptor:descriptor];
+    if (!texture)
+        throw std::bad_alloc();
+    texture.label = @"msplat completed preview";
+
+    std::shared_ptr<PreviewFrame::Impl> frameState;
+    try {
+        frameState = std::make_shared<PreviewFrame::Impl>(
+            texture, width, height);
+    } catch (...) {
+        [texture release];
+        throw;
+    }
+    [texture release];
+
+    cam.setCameraToWorld(camToWorld);
+    MTensor rgb = impl->model->render(cam, impl->currentStep);
+    if (rgb.size(1) != width || rgb.size(0) != height)
+        throw std::runtime_error(
+            "Rendered preview dimensions changed unexpectedly");
+
+    msplat_submit_preview_texture(
+        rgb, (__bridge void*)frameState->texture,
+        [frameState](bool succeeded, const char* error) noexcept {
+            frameState->complete(succeeded, error);
+        });
+    return std::unique_ptr<PreviewFrame>(
+        new PreviewFrame(std::move(frameState)));
+}
+
 void Trainer::exportPly(const std::string& path) {
     std::lock_guard lock(g_trainerTransactionMutex);
     impl->model->savePly(path, impl->currentStep);
@@ -637,6 +755,10 @@ CApiDatasetHandle& datasetHandle(MsplatDataset handle) noexcept {
 
 CApiTrainerHandle& trainerHandle(MsplatTrainer handle) noexcept {
     return *static_cast<CApiTrainerHandle*>(handle);
+}
+
+msplat::PreviewFrame& previewFrameHandle(MsplatPreviewFrame handle) noexcept {
+    return *static_cast<msplat::PreviewFrame*>(handle);
 }
 
 void storeError(MsplatStatus status, const char* message,
@@ -1564,6 +1686,58 @@ MsplatStatus msplat_trainer_render_pose_to_buffer_v2(
             camToWorld, refCameraIndex, outRGBA, outCapacity, outWidth, outHeight);
         require(*outWidth > 0 && *outHeight > 0,
                 "Reference camera index is out of range");
+    });
+}
+
+MsplatStatus msplat_trainer_render_pose_preview_v13(
+    MsplatTrainer t, const float camToWorld[16], int refCameraIndex,
+    MsplatPreviewFrame* outFrame, MsplatErrorInfo* error) {
+    if (outFrame) *outFrame = nullptr;
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        require(outFrame != nullptr, "outFrame must not be null");
+        requirePose(camToWorld);
+        auto frame = trainerHandle(t).trainer->renderFromPosePreview(
+            camToWorld, refCameraIndex);
+        require(frame != nullptr, "Preview frame creation returned no handle");
+        *outFrame = frame.release();
+    });
+}
+
+MsplatStatus msplat_preview_frame_poll_v13(
+    MsplatPreviewFrame frame, bool* outReady, MsplatErrorInfo* error) {
+    if (outReady) *outReady = false;
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(frame != nullptr, "Preview frame must not be null");
+        require(outReady != nullptr, "outReady must not be null");
+        *outReady = previewFrameHandle(frame).poll();
+    });
+}
+
+MsplatStatus msplat_preview_frame_texture_v13(
+    MsplatPreviewFrame frame, MsplatMTLTextureRef* outTexture,
+    int* outWidth, int* outHeight, MsplatErrorInfo* error) {
+    if (outTexture) *outTexture = nil;
+    if (outWidth) *outWidth = 0;
+    if (outHeight) *outHeight = 0;
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(frame != nullptr, "Preview frame must not be null");
+        require(outTexture != nullptr, "outTexture must not be null");
+        require(outWidth != nullptr && outHeight != nullptr,
+                "Output dimensions must not be null");
+        auto& value = previewFrameHandle(frame);
+        require(value.poll(), "Preview frame is not ready");
+        *outTexture = (__bridge id<MTLTexture>)value.texture();
+        *outWidth = value.width();
+        *outHeight = value.height();
+    });
+}
+
+MsplatStatus msplat_preview_frame_destroy_v13(
+    MsplatPreviewFrame frame, MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(frame != nullptr, "Preview frame must not be null");
+        delete static_cast<msplat::PreviewFrame*>(frame);
     });
 }
 

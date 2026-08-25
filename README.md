@@ -158,6 +158,8 @@ poses.
   the locked `MsplatConfig` layout or any earlier entry point.
 - ABI v12 detailed count-barrier and tile-distribution telemetry through a new
   query structure; the ABI v4 telemetry layout and entry point remain unchanged.
+- ABI v13 GPU-native preview submission through an immutable BGRA8Unorm Metal
+  surface; existing CPU render entry points remain available.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
@@ -243,6 +245,23 @@ func train() throws {
 `MsplatSession` is the checked, throwing API and serializes the engine's
 process-global Metal state. The legacy `GaussianDataset` and `GaussianTrainer`
 types remain available for source compatibility.
+
+ABI v13 adds a GPU-native preview path. `MsplatSession.submitPreview(...)`
+returns a `MetalPreviewSubmission`; calling `waitUntilReady()` returns a
+`MetalPreviewSurface` only after its render has completed. The completed surface
+owns an immutable BGRA8Unorm `MTLTexture`, so a Metal-backed view can display it
+without copying pixels to the CPU or uploading them again. The texture's device
+is the source of truth for the consuming Metal view and command queue, and the
+surface must remain alive while the texture is displayed.
+
+`renderRGBA` and the `PixelData` render methods remain available for callers that
+need CPU-owned pixels. MsplatExample uses the Metal surface path, retains at most
+one pending submission and the latest completed surface, and accounts for both
+surfaces in its memory preflight. Submitting a fixed-camera preview still reaches
+the renderer's existing exact-count CPU/GPU synchronization before the remaining
+work is queued. The native surface avoids the later CPU readback and UIImage
+re-upload, but preview submission is not fully nonblocking until tile count and
+scan move entirely onto the GPU.
 
 Path-based COLMAP loading can opt into mask discovery with
 `DatasetOptions.discoverTrainingMasks`; plan-based sessions use

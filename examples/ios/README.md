@@ -67,11 +67,13 @@ peak-memory estimate. The
 estimate covers native model and training buffers, image-cache insertion,
 target-resolution app-owned decode buffers, and recommended headroom. When mask
 discovery is enabled, it also includes conservative source-mask decoding and
-the retained GPU mask. Training targets remain compact UInt8 RGBA buffers and
-decoded CPU pixels are released after upload. The current formula reflects the
-split cache and removal of dead workspaces. The app refuses to start when that
-estimate exceeds a nonzero `os_proc_available_memory` value at preflight (the
-simulator reports zero and skips this comparison).
+the retained GPU mask. The app adds space for two BGRA8Unorm preview surfaces:
+one pending submission and the latest completed surface. Training targets remain
+compact UInt8 RGBA buffers and decoded CPU pixels are released after upload. The
+current formula reflects the split cache and removal of dead workspaces. The app
+refuses to start when that estimate exceeds a nonzero
+`os_proc_available_memory` value at preflight (the simulator reports zero and
+skips this comparison).
 
 Depth-one CPU camera prefetch remains off by default. For device A/B testing,
 set exactly `MSPLAT_CAMERA_PREFETCH=1` in the Xcode Run scheme environment. It
@@ -93,9 +95,20 @@ advances its progress bar only from GPU completion. At each sampled preview it
 polls the matching logical-step GPU execution and end-to-end time, loss,
 effective resolution and SH degree, Gaussian count/capacity, rasterizer
 overflow incidence, categorized native/image-cache memory, `phys_footprint`,
-iOS available memory, cache hit rate, and thermal state. The preview render is
-sampled rather than performed every iteration; because it synchronizes prior
-work, the following telemetry poll is an authoritative completion snapshot.
+iOS available memory, cache hit rate, and thermal state. Preview rendering uses
+ABI v13: `MsplatSession.submitPreview(...)` returns a
+`MetalPreviewSubmission`, and `waitUntilReady()` yields a completed
+`MetalPreviewSurface` that owns an immutable BGRA8Unorm `MTLTexture`. The app
+keeps at most one pending submission and the latest completed surface, displaying
+the texture directly instead of copying pixels to the CPU, building a UIImage,
+and uploading it again.
+
+The preview is sampled rather than submitted every iteration. A fixed-camera
+submission still performs the renderer's existing exact-count synchronization,
+so the GPU-native surface removes the final readback and re-upload but does not
+yet make preview submission fully nonblocking. That remaining stall is addressed
+by the planned GPU count/scan work. `renderRGBA` and `PixelData` remain available
+to integrations that require CPU-owned pixels.
 
 The model/transient/image figures are logical owned buffers. They do not include
 Metal driver state, codec-private surfaces, framework allocations, or allocator

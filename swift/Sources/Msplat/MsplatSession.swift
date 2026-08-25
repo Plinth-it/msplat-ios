@@ -340,6 +340,40 @@ public final class MsplatSession {
         }
     }
 
+    /// Submits a fixed-pose preview into a separately owned BGRA8 Metal
+    /// texture. The returned submission can be awaited without holding this
+    /// runtime actor; keep displaying the latest completed surface meanwhile.
+    ///
+    /// The current renderer still performs its exact-count synchronization
+    /// during submission. Final raster completion and texture conversion do
+    /// not perform a CPU readback or block this method.
+    public func submitPreview(
+        pose: CameraPose,
+        referenceCamera: Int = 0
+    ) throws -> MetalPreviewSubmission {
+        let referenceCamera = try nativeIndex(referenceCamera)
+        return try withTrainer { trainer in
+            var frame: MsplatPreviewFrame?
+            var nativeError = MsplatErrorInfo()
+            let status = pose.elements.withUnsafeBufferPointer { elements in
+                msplat_trainer_render_pose_preview_v13(
+                    trainer,
+                    elements.baseAddress,
+                    referenceCamera,
+                    &frame,
+                    &nativeError
+                )
+            }
+            try checkNativeStatus(status, error: &nativeError)
+            guard let frame else {
+                throw MsplatError.internalFailure(
+                    "Native preview submission returned no frame handle"
+                )
+            }
+            return MetalPreviewSubmission(handle: frame)
+        }
+    }
+
     public func cameraPose(at index: Int) throws -> CameraPose {
         let index = try nativeIndex(index)
         return try withDataset { dataset in

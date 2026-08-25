@@ -161,9 +161,11 @@ struct ContentView: View {
                 Text(message).foregroundStyle(.red)
             default:
                 if let preview = session.preview {
-                    Image(uiImage: preview)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
+                    MetalPreviewView(surface: preview)
+                        .aspectRatio(
+                            CGFloat(preview.width) / CGFloat(max(preview.height, 1)),
+                            contentMode: .fit
+                        )
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                         .listRowInsets(EdgeInsets())
                 }

@@ -1,6 +1,7 @@
 import CoreGraphics
 import Foundation
 import ImageIO
+import Metal
 @testable import Msplat
 import UniformTypeIdentifiers
 import XCTest
@@ -8,6 +9,10 @@ import XCTest
 final class PoseCheckpointTests: XCTestCase {
     func testPoseCheckpointSaveLoadAndResume() async throws {
         try await runPoseCheckpointRegression()
+    }
+
+    func testGPUPreviewMatchesLegacyRenderAndOutlivesSession() async throws {
+        try await runGPUPreviewRegression()
     }
 }
 
@@ -77,6 +82,171 @@ private func runPoseCheckpointRegression() throws {
     XCTAssertNotEqual(resumedSnapshot.deltas, firstSnapshot.deltas)
     XCTAssertNotEqual(resumedSnapshot.firstMoments, firstSnapshot.firstMoments)
     XCTAssertNotEqual(resumedSnapshot.secondMoments, firstSnapshot.secondMoments)
+}
+
+@MsplatRuntimeActor
+private func runGPUPreviewRegression() async throws {
+    let fixtureDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("msplat-preview-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: fixtureDirectory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: fixtureDirectory) }
+
+    let anchorImageURL = fixtureDirectory.appendingPathComponent("anchor.png")
+    let movableImageURL = fixtureDirectory.appendingPathComponent("movable.png")
+    try writePoseFixturePNG(to: anchorImageURL, horizontalShift: 0)
+    try writePoseFixturePNG(to: movableImageURL, horizontalShift: 3)
+
+    let descriptor = try makePoseFixtureDescriptor(
+        anchorImageURL: anchorImageURL,
+        movableImageURL: movableImageURL
+    )
+    let session = try MsplatSession(
+        dataset: descriptor,
+        config: makePoseFixtureConfig(),
+        maximumGaussianCount: 5
+    )
+    defer { try? session.close() }
+
+    let pose = try session.cameraPose(at: 0)
+    let legacyFrame = try session.renderRGBA(pose: pose, referenceCamera: 0)
+    let surface = try await completedPreview(
+        from: session,
+        pose: pose,
+        referenceCamera: 0
+    )
+
+    XCTAssertEqual(surface.width, legacyFrame.width)
+    XCTAssertEqual(surface.height, legacyFrame.height)
+    XCTAssertEqual(surface.texture.width, legacyFrame.width)
+    XCTAssertEqual(surface.texture.height, legacyFrame.height)
+    XCTAssertEqual(surface.texture.pixelFormat, .bgra8Unorm)
+    XCTAssertTrue(surface.texture.usage.contains(.shaderRead))
+
+    try session.close()
+
+    let previewRGBA = try readPreviewRGBA(surface)
+    assertRGBAParity(
+        expected: legacyFrame.data,
+        actual: previewRGBA,
+        tolerance: 1
+    )
+}
+
+@MsplatRuntimeActor
+private func completedPreview(
+    from session: MsplatSession,
+    pose: CameraPose,
+    referenceCamera: Int
+) async throws -> MetalPreviewSurface {
+    let submission = try session.submitPreview(
+        pose: pose,
+        referenceCamera: referenceCamera
+    )
+    let surface = try await submission.waitUntilReady()
+    XCTAssertTrue(try submission.poll())
+    return surface
+}
+
+private func readPreviewRGBA(_ surface: MetalPreviewSurface) throws -> Data {
+    let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+        pixelFormat: .bgra8Unorm,
+        width: surface.width,
+        height: surface.height,
+        mipmapped: false
+    )
+    descriptor.storageMode = .shared
+    descriptor.usage = [.shaderRead]
+
+    let device = surface.texture.device
+    let stagingTexture = try XCTUnwrap(
+        device.makeTexture(descriptor: descriptor),
+        "Could not allocate the preview readback texture"
+    )
+    let commandQueue = try XCTUnwrap(
+        device.makeCommandQueue(),
+        "Could not allocate the preview readback command queue"
+    )
+    let commandBuffer = try XCTUnwrap(
+        commandQueue.makeCommandBuffer(),
+        "Could not allocate the preview readback command buffer"
+    )
+    let blitEncoder = try XCTUnwrap(
+        commandBuffer.makeBlitCommandEncoder(),
+        "Could not allocate the preview readback blit encoder"
+    )
+    blitEncoder.copy(
+        from: surface.texture,
+        sourceSlice: 0,
+        sourceLevel: 0,
+        sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+        sourceSize: MTLSize(width: surface.width, height: surface.height, depth: 1),
+        to: stagingTexture,
+        destinationSlice: 0,
+        destinationLevel: 0,
+        destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0)
+    )
+    blitEncoder.endEncoding()
+    commandBuffer.commit()
+    commandBuffer.waitUntilCompleted()
+
+    if let error = commandBuffer.error {
+        throw PreviewFixtureError.readbackFailed(error.localizedDescription)
+    }
+    guard commandBuffer.status == .completed else {
+        throw PreviewFixtureError.readbackFailed(
+            "Command buffer finished with status \(commandBuffer.status.rawValue)"
+        )
+    }
+
+    let byteCount = surface.width * surface.height * 4
+    var bgra = Data(count: byteCount)
+    try bgra.withUnsafeMutableBytes { bytes in
+        guard let destination = bytes.baseAddress else {
+            throw PreviewFixtureError.inaccessibleReadbackStorage
+        }
+        stagingTexture.getBytes(
+            destination,
+            bytesPerRow: surface.width * 4,
+            from: MTLRegionMake2D(0, 0, surface.width, surface.height),
+            mipmapLevel: 0
+        )
+    }
+
+    var rgba = bgra
+    rgba.withUnsafeMutableBytes { bytes in
+        let channels = bytes.bindMemory(to: UInt8.self)
+        for offset in stride(from: 0, to: channels.count, by: 4) {
+            let blue = channels[offset]
+            channels[offset] = channels[offset + 2]
+            channels[offset + 2] = blue
+        }
+    }
+    return rgba
+}
+
+private func assertRGBAParity(
+    expected: Data,
+    actual: Data,
+    tolerance: Int
+) {
+    let expectedBytes = [UInt8](expected)
+    let actualBytes = [UInt8](actual)
+    XCTAssertEqual(actualBytes.count, expectedBytes.count)
+    guard actualBytes.count == expectedBytes.count else { return }
+
+    for (index, pair) in zip(expectedBytes, actualBytes).enumerated() {
+        let difference = abs(Int(pair.0) - Int(pair.1))
+        guard difference <= tolerance else {
+            XCTFail(
+                "Preview byte \(index) differs by \(difference): "
+                    + "legacy=\(pair.0), preview=\(pair.1)"
+            )
+            return
+        }
+    }
 }
 
 private func makePoseFixtureConfig() -> TrainingConfig {
@@ -415,4 +585,18 @@ private struct PoseCheckpointReader {
 private enum PoseFixtureError: Error {
     case invalidPNG
     case invalidCheckpoint
+}
+
+private enum PreviewFixtureError: LocalizedError, Sendable {
+    case inaccessibleReadbackStorage
+    case readbackFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .inaccessibleReadbackStorage:
+            "Could not access the preview readback storage"
+        case .readbackFailed(let reason):
+            "Preview readback failed: \(reason)"
+        }
+    }
 }

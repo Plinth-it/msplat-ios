@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 import Msplat
 @testable import MsplatExample
@@ -210,6 +211,54 @@ final class TrainingMaskOptionsTests: XCTestCase {
         )
 
         XCTAssertEqual(plan.maximumGaussianCount, 250_000)
+    }
+
+    func testAppPreflightAccountsForTwoRGBA8PreviewSurfaces() throws {
+        let dimensions = try TrainingImageDimensions(width: 1_920, height: 1_440)
+        let plan = try TrainingSession.makePlan(
+            sourceDimensions: dimensions,
+            initialGaussianCount: 100_000,
+            steps: 2_000,
+            profile: .preview
+        )
+
+        let appPeak = try TrainingSession.appEstimatedPeakMemory(for: plan)
+        let largestStage = try XCTUnwrap(
+            plan.resolvedStages.max {
+                $0.dimensions.width * $0.dimensions.height
+                    < $1.dimensions.width * $1.dimensions.height
+            }
+        )
+        let expectedPreviewBytes = Int64(
+            largestStage.dimensions.width * largestStage.dimensions.height * 2 * 4
+        )
+
+        XCTAssertEqual(appPeak - plan.estimatedPeakMemory, expectedPreviewBytes)
+    }
+
+    func testPreviewCadenceHasOneHundredStepFloor() {
+        XCTAssertEqual(TrainingSession.previewInterval(for: 200), 100)
+        XCTAssertEqual(TrainingSession.previewInterval(for: 2_000), 100)
+        XCTAssertEqual(TrainingSession.previewInterval(for: 20_000), 1_000)
+    }
+
+    func testPreviewTextureTransformPreservesExtentAndFlipsVertically() {
+        let width = 120
+        let height = 80
+        let transform = MetalPreviewView.textureToCoreImageTransform(
+            height: height
+        )
+        let extent = CGRect(x: 0, y: 0, width: width, height: height)
+
+        XCTAssertEqual(extent.applying(transform), extent)
+        XCTAssertEqual(
+            CGPoint(x: 12, y: 0).applying(transform),
+            CGPoint(x: 12, y: height)
+        )
+        XCTAssertEqual(
+            CGPoint(x: 12, y: height).applying(transform),
+            CGPoint(x: 12, y: 0)
+        )
     }
 
     private func writeBinaryPointHeader(

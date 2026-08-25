@@ -55,7 +55,7 @@ final class TrainingSession: ObservableObject {
     @Published private(set) var overflowedCompletedSteps: UInt64 = 0
     @Published private(set) var memorySnapshot: TrainingMemorySnapshot?
     @Published private(set) var thermalState = "Nominal"
-    @Published private(set) var preview: UIImage?
+    @Published private(set) var preview: MetalPreviewSurface?
     @Published private(set) var trainingCameras = 0
     @Published private(set) var footprintMB = 0
     @Published private(set) var availableMB = 0
@@ -73,7 +73,16 @@ final class TrainingSession: ObservableObject {
     @Published var trainingMasksEnabled = false
     @Published var trainingMaskMode: TrainingMaskMode = .transparent
 
+    private struct PendingPreview {
+        let id: UInt64
+        let task: Task<Void, Never>
+    }
+
     private var worker: Task<Void, Never>?
+    private var pendingPreview: PendingPreview?
+    private var pendingPreviewFailure: Error?
+    private var nextPreviewID: UInt64 = 0
+    private var previewGeneration: UInt64 = 0
 
     func start(folder: DatasetFolder) {
         guard phase == .idle || phase == .cancelled || phase == .finished || isFailed else { return }
@@ -105,6 +114,8 @@ final class TrainingSession: ObservableObject {
         plannedSHDegree = 0
         plannedInitialGaussians = 0
         plannedMaximumGaussians = 0
+        pendingPreviewFailure = nil
+        previewGeneration &+= 1
 
         let steps = iterations
         let profile = qualityProfile
@@ -123,7 +134,10 @@ final class TrainingSession: ObservableObject {
         }
     }
 
-    func cancel() { worker?.cancel() }
+    func cancel() {
+        worker?.cancel()
+        pendingPreview?.task.cancel()
+    }
 
     private var isFailed: Bool { if case .failed = phase { return true }; return false }
 
@@ -165,14 +179,15 @@ final class TrainingSession: ObservableObject {
                 includesTrainingMasks: useTrainingMasks
             )
             plannedStages = plan.resolvedStages
-            estimatedPeakMB = Self.megabytes(plan.estimatedPeakMemory)
+            let appEstimatedPeakMemory = try Self.appEstimatedPeakMemory(for: plan)
+            estimatedPeakMB = Self.megabytes(appEstimatedPeakMemory)
             plannedSHDegree = Int(plan.targetSHDegree)
             plannedInitialGaussians = initialGaussianCount
             plannedMaximumGaussians = plan.maximumGaussianCount
             availableMB = Self.availableMB()
 
             let availableBytes = Int64(availableMB) * 1_024 * 1_024
-            guard availableBytes == 0 || plan.estimatedPeakMemory <= availableBytes else {
+            guard availableBytes == 0 || appEstimatedPeakMemory <= availableBytes else {
                 throw MsplatError.outOfMemory(
                     "The \(profile.rawValue) plan estimates \(estimatedPeakMB) MB, " +
                     "but iOS currently reports \(availableMB) MB available. " +
@@ -203,58 +218,57 @@ final class TrainingSession: ObservableObject {
             phase = .training
             let previewPose = try await activeSession.cameraPose(at: 0)
 
-            // Rendering a preview costs a full forward pass, so it is sampled
-            // rather than done every step.
-            let previewEvery = max(steps / 40, 10)
+            // Preview submission is asynchronous, but still costs a full
+            // forward pass. Keep one submission in flight and sample it less
+            // frequently than the independent telemetry poll.
+            let previewEvery = Self.previewInterval(for: steps)
+            let telemetryEvery = max(steps / 40, 10)
 
             for i in 0..<steps {
                 try Task.checkCancellation()
+                try throwPendingPreviewFailure()
                 let stats = try await activeSession.step()
+                let isFinalStep = i == steps - 1
 
-                if i % previewEvery == 0 || i == steps - 1 {
-                    let frame = try await activeSession.renderRGBA(
-                        pose: previewPose,
-                        referenceCamera: 0
+                if isFinalStep {
+                    // Preserve the last completed surface while the final one
+                    // finishes, and do not tear down the native session until
+                    // its app-owned texture is ready.
+                    await drainPendingPreview()
+                    try throwPendingPreviewFailure()
+                    try await submitPreviewIfIdle(
+                        session: activeSession,
+                        pose: previewPose
                     )
-                    // Rendering synchronizes all previously submitted training
-                    // work, so this poll can truthfully advance completed
-                    // progress and attach timings to the matching iteration.
-                    let telemetry = try await activeSession.trainingMetrics()
-                    let memory = try await activeSession.memoryMetrics()
-                    submittedIteration = telemetry.submitted?.iteration ?? stats.iteration
-                    cpuSubmitMs = telemetry.submitted?.cpuSubmitMs ?? stats.cpuSubmitMs
-                    if let completed = telemetry.completed {
-                        completedIteration = completed.iteration
-                        splatCount = completed.splatCount
-                        modelCapacity = completed.modelCapacity
-                        gpuExecutionMs = completed.gpuExecutionMs
-                        endToEndMs = completed.endToEndMs
-                        loss = completed.loss
-                        effectiveWidth = completed.effectiveWidth
-                        effectiveHeight = completed.effectiveHeight
-                        activeSHDegree = completed.activeSHDegree
-                        retainedPackedIntersections =
-                            completed.retainedPackedIntersectionCount
-                        packedIntersectionCapacity =
-                            completed.packedIntersectionCapacity
-                        overflowKinds = completed.overflowKinds
-                    }
-                    overflowedCompletedSteps = telemetry.overflowedCompletedSteps
-                    memorySnapshot = memory
-                    preview = Self.image(from: frame)
-                    footprintMB = memory.processPhysicalFootprintBytes.map(Self.megabytes) ?? 0
-                    availableMB = memory.processAvailableBytes.map(Self.megabytes) ?? 0
-                    thermalState = Self.thermalStateDescription()
+                    await drainPendingPreview()
+                    try throwPendingPreviewFailure()
+                } else if i % previewEvery == 0 {
+                    try await submitPreviewIfIdle(
+                        session: activeSession,
+                        pose: previewPose
+                    )
+                }
+
+                // This is a non-blocking snapshot. Submitted and completed
+                // iterations may legitimately differ now that preview display
+                // no longer drains the training queue.
+                if i % telemetryEvery == 0 || isFinalStep {
+                    try await refreshTelemetry(
+                        session: activeSession,
+                        fallback: stats
+                    )
                 }
             }
 
             try Task.checkCancellation()
             let url = URL.documentsDirectory.appending(path: "msplat-scene.ply")
             try await activeSession.exportPLY(to: url)
+            try Task.checkCancellation()
             guard FileManager.default.fileExists(atPath: url.path) else {
                 throw MsplatError.ioFailure("Training finished, but the PLY file was not created.")
             }
             finalSplatCount = try await activeSession.splatCount
+            try Task.checkCancellation()
             resultURL = url
         } catch is CancellationError {
             // A cancelled run deliberately does not export a partial scene.
@@ -263,6 +277,10 @@ final class TrainingSession: ObservableObject {
             failureMessage = error.localizedDescription
         }
 
+        // An in-flight preview owns native GPU resources. Let it finish before
+        // closing the session, even when the training task was cancelled.
+        await drainPendingPreview()
+
         if let session {
             do {
                 try await session.close()
@@ -270,6 +288,11 @@ final class TrainingSession: ObservableObject {
                 let closeMessage = "Could not release the training session: \(error.localizedDescription)"
                 failureMessage = failureMessage.map { "\($0) \(closeMessage)" } ?? closeMessage
             }
+        }
+
+        if Task.isCancelled {
+            wasCancelled = true
+            resultURL = nil
         }
 
         if let failureMessage {
@@ -285,6 +308,134 @@ final class TrainingSession: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    nonisolated static func previewInterval(for steps: Int) -> Int {
+        max(steps / 20, 100)
+    }
+
+    /// Adds the two app-owned RGBA8 preview surfaces to the native plan's peak.
+    nonisolated static func appEstimatedPeakMemory(for plan: TrainingPlan) throws -> Int64 {
+        var largestPixelCount: Int64 = 0
+        for stage in plan.resolvedStages {
+            guard let width = Int64(exactly: stage.dimensions.width),
+                  let height = Int64(exactly: stage.dimensions.height) else {
+                throw MsplatError.outOfMemory("Preview surface dimensions are too large")
+            }
+            let (pixelCount, pixelCountOverflowed) = width.multipliedReportingOverflow(
+                by: height
+            )
+            guard !pixelCountOverflowed else {
+                throw MsplatError.outOfMemory("Preview surface size overflowed")
+            }
+            largestPixelCount = max(largestPixelCount, pixelCount)
+        }
+
+        // Two surfaces at four bytes per pixel let one stay on screen while
+        // the next preview is produced.
+        let (previewBytes, previewBytesOverflowed) = largestPixelCount
+            .multipliedReportingOverflow(by: 2 * 4)
+        guard !previewBytesOverflowed else {
+            throw MsplatError.outOfMemory("Preview surface memory estimate overflowed")
+        }
+        let (total, totalOverflowed) = plan.estimatedPeakMemory.addingReportingOverflow(
+            previewBytes
+        )
+        guard !totalOverflowed else {
+            throw MsplatError.outOfMemory("Training memory estimate overflowed")
+        }
+        return total
+    }
+
+    private func submitPreviewIfIdle(
+        session: MsplatSession,
+        pose: CameraPose
+    ) async throws {
+        try throwPendingPreviewFailure()
+        guard pendingPreview == nil else { return }
+
+        let submission = try await session.submitPreview(
+            pose: pose,
+            referenceCamera: 0
+        )
+        try Task.checkCancellation()
+        nextPreviewID &+= 1
+        let id = nextPreviewID
+        let generation = previewGeneration
+        let task = Task { @MainActor [weak self] in
+            let result: Result<MetalPreviewSurface, Error>
+            do {
+                result = .success(try await submission.waitUntilReady())
+            } catch {
+                result = .failure(error)
+            }
+            self?.completePendingPreview(
+                id: id,
+                generation: generation,
+                result: result
+            )
+        }
+        pendingPreview = PendingPreview(id: id, task: task)
+    }
+
+    private func completePendingPreview(
+        id: UInt64,
+        generation: UInt64,
+        result: Result<MetalPreviewSurface, Error>
+    ) {
+        guard pendingPreview?.id == id else { return }
+        pendingPreview = nil
+        guard generation == previewGeneration else { return }
+
+        switch result {
+        case .success(let surface):
+            preview = surface
+        case .failure(let error):
+            pendingPreviewFailure = error
+        }
+    }
+
+    private func drainPendingPreview() async {
+        guard let pending = pendingPreview else { return }
+        await pending.task.value
+        if pendingPreview?.id == pending.id {
+            pendingPreview = nil
+        }
+    }
+
+    private func throwPendingPreviewFailure() throws {
+        if let pendingPreviewFailure {
+            throw pendingPreviewFailure
+        }
+    }
+
+    private func refreshTelemetry(
+        session: MsplatSession,
+        fallback stats: TrainingStats
+    ) async throws {
+        let telemetry = try await session.trainingMetrics()
+        let memory = try await session.memoryMetrics()
+        submittedIteration = telemetry.submitted?.iteration ?? stats.iteration
+        cpuSubmitMs = telemetry.submitted?.cpuSubmitMs ?? stats.cpuSubmitMs
+        if let completed = telemetry.completed {
+            completedIteration = completed.iteration
+            splatCount = completed.splatCount
+            modelCapacity = completed.modelCapacity
+            gpuExecutionMs = completed.gpuExecutionMs
+            endToEndMs = completed.endToEndMs
+            loss = completed.loss
+            effectiveWidth = completed.effectiveWidth
+            effectiveHeight = completed.effectiveHeight
+            activeSHDegree = completed.activeSHDegree
+            retainedPackedIntersections = completed.retainedPackedIntersectionCount
+            packedIntersectionCapacity = completed.packedIntersectionCapacity
+            overflowKinds = completed.overflowKinds
+        }
+        overflowedCompletedSteps = telemetry.overflowedCompletedSteps
+        memorySnapshot = memory
+        footprintMB = memory.processPhysicalFootprintBytes.map(Self.megabytes) ?? 0
+        availableMB = memory.processAvailableBytes.map(Self.megabytes) ?? 0
+        thermalState = Self.thermalStateDescription()
+    }
 
     nonisolated static func makePlan(
         sourceDimensions: TrainingImageDimensions,
@@ -356,20 +507,6 @@ final class TrainingSession: ObservableObject {
 
     private nonisolated static func megabytes(_ bytes: UInt64) -> Int {
         Int((bytes + 1_048_575) / 1_048_576)
-    }
-
-    private nonisolated static func image(from frame: RGBAFrame) -> UIImage? {
-        guard frame.width > 0, frame.height > 0,
-              let provider = CGDataProvider(data: frame.data as CFData),
-              let cg = CGImage(width: frame.width, height: frame.height,
-                               bitsPerComponent: 8, bitsPerPixel: 32,
-                               bytesPerRow: frame.bytesPerRow,
-                               space: CGColorSpaceCreateDeviceRGB(),
-                               bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-                               provider: provider, decode: nil,
-                               shouldInterpolate: false, intent: .defaultIntent)
-        else { return nil }
-        return UIImage(cgImage: cg)
     }
 
     /// How much more the app may use before it is killed.

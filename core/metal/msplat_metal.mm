@@ -791,6 +791,7 @@ struct MetalContext {
     // Forward pipeline kernels
     id<MTLComputePipelineState> project_and_sh_forward_kernel_cpso = nil;
     id<MTLComputePipelineState> nd_rasterize_forward_kernel_cpso = nil;
+    id<MTLComputePipelineState> float_rgb_to_preview_texture_kernel_cpso = nil;
     // Exact tile-intersection compaction and sorting
     id<MTLComputePipelineState> scatter_to_exact_bins_kernel_cpso = nil;
     id<MTLComputePipelineState> radix_sort_per_tile_kernel_cpso = nil;
@@ -838,6 +839,7 @@ struct MetalContext {
             counterSampleBuffer,
             project_and_sh_forward_kernel_cpso,
             nd_rasterize_forward_kernel_cpso,
+            float_rgb_to_preview_texture_kernel_cpso,
             scatter_to_exact_bins_kernel_cpso,
             radix_sort_per_tile_kernel_cpso,
             pack_sorted_gaussians_kernel_cpso,
@@ -1036,6 +1038,7 @@ MetalContext* init_msplat_metal_context() {
     // Forward pipeline
     ctx->project_and_sh_forward_kernel_cpso       = load(@"project_and_sh_forward_kernel");
     ctx->nd_rasterize_forward_kernel_cpso         = load(@"nd_rasterize_forward_kernel");
+    ctx->float_rgb_to_preview_texture_kernel_cpso = load(@"float_rgb_to_preview_texture_kernel");
     // Exact tile-intersection compaction and sorting
     ctx->scatter_to_exact_bins_kernel_cpso        = load(@"scatter_to_exact_bins_kernel");
     ctx->radix_sort_per_tile_kernel_cpso          = load(@"radix_sort_per_tile_kernel");
@@ -1236,6 +1239,120 @@ void msplat_commit() {
 void msplat_gpu_sync() {
     std::lock_guard<std::mutex> lock(g_engine_mutex);
     get_global_context()->syncCB();
+}
+
+void msplat_submit_preview_texture(
+    MTensor& rgb, void* texture, MsplatPreviewCompletion completion) {
+    if (!completion)
+        throw std::invalid_argument("Preview completion must not be empty");
+    if (!rgb.isGpu() || rgb.dtype() != DType::Float32 || rgb.ndim() != 3 ||
+        rgb.size(0) <= 0 || rgb.size(1) <= 0 || rgb.size(2) != 3) {
+        throw std::invalid_argument(
+            "Preview input must be a non-empty GPU Float32 [H,W,3] tensor");
+    }
+    if (!texture)
+        throw std::invalid_argument("Preview texture must not be null");
+
+    id<MTLTexture> output = (__bridge id<MTLTexture>)texture;
+    std::lock_guard<std::mutex> lock(g_engine_mutex);
+    MetalContext* context = get_global_context();
+    if (context->activeTrainingStep)
+        throw std::logic_error(
+            "Preview submission cannot join an active logical training step");
+    if (output.device.registryID != context->device.registryID)
+        throw std::invalid_argument(
+            "Preview texture must use the msplat Metal device");
+    if (output.textureType != MTLTextureType2D || output.arrayLength != 1 ||
+        output.sampleCount != 1 || output.depth != 1) {
+        throw std::invalid_argument(
+            "Preview texture must be a non-multisampled 2D texture");
+    }
+    if (output.pixelFormat != MTLPixelFormatBGRA8Unorm)
+        throw std::invalid_argument(
+            "Preview texture must use BGRA8Unorm (non-sRGB)");
+    const MTLTextureUsage requiredUsage =
+        MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    if ((output.usage & requiredUsage) != requiredUsage)
+        throw std::invalid_argument(
+            "Preview texture must allow shader read and write access");
+
+    const NSUInteger width = static_cast<NSUInteger>(rgb.size(1));
+    const NSUInteger height = static_cast<NSUInteger>(rgb.size(0));
+    if (output.width != width || output.height != height)
+        throw std::invalid_argument(
+            "Preview texture dimensions must match the rendered image");
+
+    id<MTLCommandBuffer> commandBuffer = context->getCommandBuffer();
+    __block const char* encodingFailure = nullptr;
+    const std::array<uint32_t, 2> imageSize = {
+        static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
+    dispatch_sync(context->d_queue, ^{
+        id<MTLComputeCommandEncoder> encoder =
+            [commandBuffer computeCommandEncoder];
+        if (!encoder) {
+            encodingFailure =
+                "msplat: failed to create the preview conversion encoder";
+            return;
+        }
+        [encoder setComputePipelineState:
+            context->float_rgb_to_preview_texture_kernel_cpso];
+        [encoder setBuffer:rgb.buffer() offset:0 atIndex:0];
+        [encoder setTexture:output atIndex:0];
+        [encoder setBytes:imageSize.data()
+                    length:sizeof(imageSize)
+                   atIndex:1];
+        [encoder dispatchThreads:MTLSizeMake(width, height, 1)
+              threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [encoder endEncoding];
+    });
+    if (encodingFailure) {
+        context->discardCB();
+        throw std::runtime_error(encodingFailure);
+    }
+
+    id<MTLCommandBuffer> rootCommandBuffer =
+        context->_currentCB.rootCommandBuffer;
+    if (!rootCommandBuffer) {
+        context->discardCB();
+        throw std::runtime_error(
+            "msplat: preview command buffer has no root command buffer");
+    }
+    auto completionHolder =
+        std::make_shared<MsplatPreviewCompletion>(std::move(completion));
+    [rootCommandBuffer addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+        @autoreleasepool {
+            try {
+                if (completed.status == MTLCommandBufferStatusCompleted) {
+                    (*completionHolder)(true, nullptr);
+                    return;
+                }
+                NSError* error = completed.error;
+                const char* description = error.localizedDescription.UTF8String;
+                std::string message =
+                    "msplat: preview command buffer failed";
+                if (description) {
+                    message += ": ";
+                    message += description;
+                }
+                (*completionHolder)(false, message.c_str());
+            } catch (...) {
+                // Even allocation pressure while formatting an NSError must
+                // transition the frame out of Pending.
+                try {
+                    (*completionHolder)(
+                        false, "msplat: preview command buffer failed");
+                } catch (...) {
+                    // A C++ exception must never escape a Metal callback.
+                }
+            }
+        }
+    }];
+    try {
+        context->commitCB();
+    } catch (...) {
+        context->discardCB();
+        throw;
+    }
 }
 
 void msplat_enable_gpu_timing(bool enable) {

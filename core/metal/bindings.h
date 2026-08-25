@@ -2,6 +2,7 @@
 #define MSPLAT_BINDINGS_H
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <tuple>
 #include "metal_tensor.hpp"
@@ -29,6 +30,15 @@ void msplat_commit();
 
 // Synchronize (commit + wait for completion)
 void msplat_gpu_sync();
+
+/// Convert one completed Float32 RGB render into a caller-owned BGRA8Unorm
+/// texture and commit the current root command buffer without waiting. The
+/// completion runs on Metal's callback queue after GPU completion and must not
+/// re-enter the engine. `texture` is an id<MTLTexture> in Objective-C++.
+using MsplatPreviewCompletion =
+    std::function<void(bool succeeded, const char* error)>;
+void msplat_submit_preview_texture(
+    MTensor& rgb, void* texture, MsplatPreviewCompletion completion);
 
 // Completion-only training telemetry. A trainer owns one shared state. Each
 // submitted logical step owns a distinct readback buffer until every command

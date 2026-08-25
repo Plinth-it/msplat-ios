@@ -8,6 +8,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// The exported header remains valid C/C++. Objective-C and Swift clients get
+// the typed Metal protocol object used by ABI v13 preview frames.
+#ifdef __OBJC__
+#import <Metal/Metal.h>
+typedef id<MTLTexture> MsplatMTLTextureRef;
+#else
+typedef void* MsplatMTLTextureRef;
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -30,8 +39,10 @@ extern "C" {
 // MsplatConfig or the existing coverage-mask behavior.
 // ABI v12 adds detailed count-barrier and tile-distribution telemetry through
 // a new query structure without changing the ABI v4 telemetry layout.
+// ABI v13 adds separately owned, asynchronously completed Metal preview
+// frames while retaining every CPU render entry point.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 12u
+#define MSPLAT_ABI_VERSION 13u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -318,6 +329,11 @@ typedef struct {
     int width;
     int height;
 } MsplatPixelBuffer;
+
+/// Opaque ABI v13 preview-frame handle. The frame owns a private BGRA8Unorm
+/// Metal texture until destroyed. Its texture is immutable once ready and may
+/// outlive the trainer/session that submitted it.
+typedef void* MsplatPreviewFrame;
 
 // ── Dataset ─────────────────────────────────────────────────────────────────
 
@@ -620,6 +636,25 @@ MsplatStatus msplat_trainer_render_pose_to_buffer_v2(
     MsplatTrainer t, const float camToWorld[16], int refCameraIndex,
     uint8_t* outRGBA, size_t outCapacity, int* outWidth, int* outHeight,
     MsplatErrorInfo* error);
+/// Submit a fixed-pose preview into a separately owned BGRA8Unorm texture.
+/// The returned frame begins pending. Poll until ready before sampling its
+/// texture from another Metal queue. Submission still inherits the renderer's
+/// exact-count synchronization; completion of the final raster/conversion is
+/// asynchronous. Destroying a pending frame is safe.
+MsplatStatus msplat_trainer_render_pose_preview_v13(
+    MsplatTrainer t, const float camToWorld[16], int refCameraIndex,
+    MsplatPreviewFrame* outFrame, MsplatErrorInfo* error);
+/// Returns OK with outReady=false while pending, OK/true when complete, or a
+/// structured GPU error when the submitted command buffer failed.
+MsplatStatus msplat_preview_frame_poll_v13(
+    MsplatPreviewFrame frame, bool* outReady, MsplatErrorInfo* error);
+/// Returns the borrowed texture and dimensions only after successful
+/// completion. Swift/Objective-C clients retain the returned object normally.
+MsplatStatus msplat_preview_frame_texture_v13(
+    MsplatPreviewFrame frame, MsplatMTLTextureRef* outTexture,
+    int* outWidth, int* outHeight, MsplatErrorInfo* error);
+MsplatStatus msplat_preview_frame_destroy_v13(
+    MsplatPreviewFrame frame, MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_export_ply_v2(MsplatTrainer t, const char* path,
                                           MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_export_splat_v2(MsplatTrainer t, const char* path,

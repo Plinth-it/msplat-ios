@@ -22,7 +22,7 @@
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
-static_assert(MSPLAT_ABI_VERSION == 12u);
+static_assert(MSPLAT_ABI_VERSION == 13u);
 static_assert(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS == (1u << 0));
 static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS == (1u << 1));
 static_assert((MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS &
@@ -79,6 +79,28 @@ static_assert(offsetof(MsplatTrainingMemoryMetrics, trainingGpuImageCacheMisses)
 
 static_assert(sizeof(void*) == 8);
 static_assert(sizeof(size_t) == 8);
+static_assert(std::is_same<MsplatPreviewFrame, void*>::value);
+static_assert(std::is_same<MsplatMTLTextureRef, void*>::value);
+static_assert(sizeof(MsplatPreviewFrame) == sizeof(void*));
+static_assert(alignof(MsplatPreviewFrame) == alignof(void*));
+static_assert(sizeof(MsplatMTLTextureRef) == sizeof(void*));
+static_assert(alignof(MsplatMTLTextureRef) == alignof(void*));
+using RenderPreviewV13Function = MsplatStatus (*)(
+    MsplatTrainer, const float*, int, MsplatPreviewFrame*, MsplatErrorInfo*);
+using PollPreviewV13Function = MsplatStatus (*)(
+    MsplatPreviewFrame, bool*, MsplatErrorInfo*);
+using GetPreviewTextureV13Function = MsplatStatus (*)(
+    MsplatPreviewFrame, MsplatMTLTextureRef*, int*, int*, MsplatErrorInfo*);
+using DestroyPreviewV13Function = MsplatStatus (*)(
+    MsplatPreviewFrame, MsplatErrorInfo*);
+static_assert(std::is_same<decltype(&msplat_trainer_render_pose_preview_v13),
+                           RenderPreviewV13Function>::value);
+static_assert(std::is_same<decltype(&msplat_preview_frame_poll_v13),
+                           PollPreviewV13Function>::value);
+static_assert(std::is_same<decltype(&msplat_preview_frame_texture_v13),
+                           GetPreviewTextureV13Function>::value);
+static_assert(std::is_same<decltype(&msplat_preview_frame_destroy_v13),
+                           DestroyPreviewV13Function>::value);
 static_assert(std::is_standard_layout<MsplatStringViewV5>::value);
 static_assert(sizeof(MsplatStringViewV5) == 16);
 static_assert(alignof(MsplatStringViewV5) == 8);
@@ -1161,6 +1183,69 @@ int main() {
     CHECK(stats.iteration == 0);
     CHECK(stats.splatCount == 0);
     CHECK(stats.msPerStep == 0.0f);
+
+    float previewPose[16];
+    setIdentityPose(previewPose, 0.0f);
+    MsplatPreviewFrame previewFrame =
+        reinterpret_cast<MsplatPreviewFrame>(static_cast<uintptr_t>(1));
+    status = msplat_trainer_render_pose_preview_v13(
+        nullptr, previewPose, 0, &previewFrame, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(previewFrame == nullptr);
+    CHECK(error.status == status);
+    status = msplat_trainer_render_pose_preview_v13(
+        nullptr, previewPose, 0, nullptr, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+
+    bool previewReady = true;
+    status = msplat_preview_frame_poll_v13(nullptr, &previewReady, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(!previewReady);
+    CHECK(error.status == status);
+    status = msplat_preview_frame_poll_v13(nullptr, nullptr, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+
+    MsplatMTLTextureRef previewTexture =
+        reinterpret_cast<MsplatMTLTextureRef>(static_cast<uintptr_t>(1));
+    int previewWidth = 123;
+    int previewHeight = 456;
+    status = msplat_preview_frame_texture_v13(
+        nullptr, &previewTexture, &previewWidth, &previewHeight, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(previewTexture == nullptr);
+    CHECK(previewWidth == 0);
+    CHECK(previewHeight == 0);
+    CHECK(error.status == status);
+
+    previewWidth = 123;
+    previewHeight = 456;
+    status = msplat_preview_frame_texture_v13(
+        nullptr, nullptr, &previewWidth, &previewHeight, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(previewWidth == 0);
+    CHECK(previewHeight == 0);
+
+    previewTexture =
+        reinterpret_cast<MsplatMTLTextureRef>(static_cast<uintptr_t>(1));
+    previewHeight = 456;
+    status = msplat_preview_frame_texture_v13(
+        nullptr, &previewTexture, nullptr, &previewHeight, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(previewTexture == nullptr);
+    CHECK(previewHeight == 0);
+
+    previewTexture =
+        reinterpret_cast<MsplatMTLTextureRef>(static_cast<uintptr_t>(1));
+    previewWidth = 123;
+    status = msplat_preview_frame_texture_v13(
+        nullptr, &previewTexture, &previewWidth, nullptr, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(previewTexture == nullptr);
+    CHECK(previewWidth == 0);
+
+    status = msplat_preview_frame_destroy_v13(nullptr, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(error.status == status);
 
     MsplatTrainingMetrics trainingMetrics;
     std::memset(&trainingMetrics, 0x5a, sizeof(trainingMetrics));

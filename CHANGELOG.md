@@ -59,6 +59,16 @@
 - Added ABI v12 completed-step telemetry for image preparation, exact-count GPU
   duration and wall wait, post-count encoding, arena growth, and tile-density
   buckets. The ABI v4 telemetry structure and query remain byte-for-byte stable.
+- Added ABI v13 GPU-native preview submissions. Swift
+  `MsplatSession.submitPreview(...)` returns a `MetalPreviewSubmission`, whose
+  `waitUntilReady()` produces a `MetalPreviewSurface` that owns an immutable
+  BGRA8Unorm `MTLTexture`. Existing `renderRGBA` and `PixelData` APIs remain
+  available. MsplatExample keeps at most one pending submission plus the latest
+  completed surface, displays that texture without a CPU copy or UIImage
+  re-upload, preserves the legacy UIImage display orientation, and includes both
+  surfaces in its memory preflight. Fixed-camera submission still performs the
+  renderer's existing exact-count synchronization; fully nonblocking preview
+  submission depends on the planned GPU count/scan work.
 - Removed the unused depth cotangent from RGB training, computed projected
   opacity once per visible Gaussian, and recovered backward Gaussian IDs directly
   from sorted keys. Exact-intersection storage drops from 56 to 52 bytes per

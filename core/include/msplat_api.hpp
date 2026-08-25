@@ -14,6 +14,8 @@ struct DatasetDescriptor;
 
 namespace msplat {
 
+class PreviewFrame;
+
 // ── Config ──────────────────────────────────────────────────────────────────
 
 enum class TrainingMaskMode : uint32_t {
@@ -230,6 +232,11 @@ public:
                             uint8_t* outRGBA, size_t outCapacity,
                             int* outWidth, int* outHeight);
 
+    /// Submit a separately owned BGRA8 Metal preview texture. The returned
+    /// frame may outlive this trainer; poll it before sampling the texture.
+    std::unique_ptr<PreviewFrame> renderFromPosePreview(
+        const float camToWorld[16], int refCameraIndex);
+
     /// Export scene to PLY format.
     void exportPly(const std::string& path);
 
@@ -255,6 +262,31 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
+};
+
+/// Ownership-safe asynchronous preview result. The borrowed texture pointer is
+/// an id<MTLTexture> in Objective-C++ and remains valid for this object's
+/// lifetime. Pixel contents are immutable after poll() returns true.
+class PreviewFrame {
+public:
+    ~PreviewFrame();
+
+    PreviewFrame(const PreviewFrame&) = delete;
+    PreviewFrame& operator=(const PreviewFrame&) = delete;
+    PreviewFrame(PreviewFrame&&) noexcept = default;
+    PreviewFrame& operator=(PreviewFrame&&) noexcept = default;
+
+    /// False while pending, true when complete, and throws on GPU failure.
+    bool poll() const;
+    void* texture() const;
+    int width() const;
+    int height() const;
+
+    struct Impl;
+private:
+    explicit PreviewFrame(std::shared_ptr<Impl> impl);
+    std::shared_ptr<Impl> impl;
+    friend class Trainer;
 };
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
