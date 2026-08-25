@@ -1,6 +1,7 @@
 # MsplatExample
 
-An iOS app that imports a COLMAP reconstruction, trains it, and hands back a PLY.
+An iOS app that imports a COLMAP or Nerfstudio dataset, trains it, and hands
+back a PLY.
 
 ## Running it
 
@@ -19,7 +20,7 @@ signing.
 
 The app reads the folder you pick in place, so it works with anything the
 Files app can reach — iCloud Drive, an external drive, or the app's own
-folder. For the last one, with the device connected, drag a COLMAP folder
+folder. For the last one, with the device connected, drag a dataset folder
 into `MsplatExample` under Finder's Files tab, then pick it from
 `On My iPhone / MsplatExample`.
 
@@ -27,12 +28,28 @@ A COLMAP folder is one holding `cameras.bin` or `cameras.txt`, either at its
 root or under `sparse/0`, alongside an `images` directory. Optional training
 mask sidecars live below any case-insensitive `masks` path component.
 
-After a folder is selected, the app counts regular files below those
+A Nerfstudio folder has `transforms.json` at its root. Frame `file_path`
+entries may include an image extension or omit it when the image is PNG, JPEG,
+or JPG. The current trainer still needs an initial point cloud: set
+`ply_file_path` to a PLY inside the selected folder, or provide
+`sparse/0/points3D.ply` or `points3D.ply`. The sample accepts pinhole,
+perspective, and OpenCV camera models and rejects `OPENCV_FISHEYE`, because the
+native image path currently implements Brown-Conrady rather than fisheye
+rectification. Automatic mask-sidecar discovery remains COLMAP-only.
+
+This folder contract is also the intended handoff for a future ARKit capture
+mode: ARKit camera-to-world poses can be written as Nerfstudio frames without a
+RealityKit reconstruction pass. Point-free/random initialization or an ARKit
+feature-point initializer is still required before such captures can train and
+is not part of this import sample yet.
+
+After a COLMAP folder is selected, the app counts regular files below those
 directories on a background task and automatically enables **Use discovered
 masks** when that count is nonzero. The switch remains manually available
-during and after the advisory scan, and can disable discovery for a run. The displayed number is a
-candidate-file count, not a matched-frame count: the native COLMAP loader owns
-exact sidecar matching, and frames without a match train with full coverage.
+during and after the advisory scan, and can disable discovery for a run. The
+displayed number is a candidate-file count, not a matched-frame count: the
+native COLMAP loader owns exact sidecar matching, and frames without a match
+train with full coverage.
 For an image such as `images/foo.jpeg`, supported names include
 `masks/foo.png`, `masks/foo.jpeg.mask`, and `masks/foo.mask.png`; matching is
 case-insensitive and supports nested directory suffixes. An alpha-bearing mask
@@ -57,9 +74,9 @@ metadata and builds one of two explicit plans:
   additional 2x downscale before moving to the final resolution, reaches SH
   degree 2, and has a 400,000-Gaussian ceiling.
 
-For either profile, when the selected COLMAP model starts with more sparse
-points, the ceiling rises only enough to preserve the input population and the
-memory estimate is recomputed before training.
+For either profile, when the selected dataset starts with more points, the
+ceiling rises only enough to preserve the input population and the memory
+estimate is recomputed before training.
 
 The plan screen shows each effective resolution stage, target SH degree,
 initial Gaussian count, Gaussian ceiling, and a conservative code-derived
@@ -88,7 +105,7 @@ not fully modeled. The model term intentionally covers the pre-cutoff peak;
 densification-only state is released later. ImageIO now requests the selected
 input resolution directly,
 but a codec may still use private decoder surfaces that the estimate cannot
-observe. COLMAP camera calibration uses encoded raster coordinates, so valid
+observe. Imported camera calibration uses encoded raster coordinates, so valid
 EXIF orientation metadata is checked but intentionally not applied; an oriented
 image provider must transform its calibration and pose together with its pixels.
 

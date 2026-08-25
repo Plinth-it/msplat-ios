@@ -2,32 +2,67 @@ import Foundation
 import ImageIO
 import Msplat
 
-/// A COLMAP reconstruction the user picked from Files.
+/// A COLMAP or Nerfstudio training dataset the user picked from Files.
 ///
 /// The picked folder lives outside the app container, so it is only readable
 /// while its security scope is held. Training reads images lazily from first
 /// step to last — that is the whole point of the byte-budgeted image cache —
 /// so the scope has to stay open for the entire session, not just the load.
 final class DatasetFolder {
+    enum Kind: String, Sendable {
+        case colmap = "COLMAP"
+        case nerfstudio = "Nerfstudio"
+    }
+
+    private struct NerfstudioManifest: Decodable, Sendable {
+        struct Frame: Decodable, Sendable {
+            let filePath: String
+            let cameraModel: String?
+
+            private enum CodingKeys: String, CodingKey {
+                case filePath = "file_path"
+                case cameraModel = "camera_model"
+            }
+        }
+
+        let cameraModel: String?
+        let plyFilePath: String?
+        let frames: [Frame]
+
+        private enum CodingKeys: String, CodingKey {
+            case cameraModel = "camera_model"
+            case plyFilePath = "ply_file_path"
+            case frames
+        }
+    }
+
     private static let pointReadChunkSize = 64 * 1_024
     private static let maximumPointTextLineBytes = 16 * 1_024 * 1_024
     private static let minimumBinaryPointRecordBytes = 51
+    private static let nerfstudioImageExtensions = [
+        ".png", ".jpg", ".jpeg", ".JPG",
+    ]
 
     let id = UUID()
     let url: URL
+    let kind: Kind
     private var scoped = false
 
     /// Filenames that mark a directory as a COLMAP model, in either encoding.
     private static let modelFiles = ["cameras.bin", "cameras.txt"]
 
     init?(picked url: URL) {
-        self.url = url
-        scoped = url.startAccessingSecurityScopedResource()
-        guard !Self.containsHigherPriorityDataset(at: url),
-              Self.modelDirectory(under: url) != nil else {
-            release()
+        let scoped = url.startAccessingSecurityScopedResource()
+        guard let kind = Self.kind(at: url) else {
+            if scoped {
+                url.stopAccessingSecurityScopedResource()
+            }
             return nil
         }
+
+        self.url = url
+        self.kind = kind
+        self.scoped = scoped
     }
 
     deinit { release() }
@@ -41,6 +76,10 @@ final class DatasetFolder {
 
     var name: String { url.lastPathComponent }
 
+    var supportsAutomaticTrainingMaskDiscovery: Bool {
+        kind == .colmap
+    }
+
     /// COLMAP puts the model either at the root or under sparse/0.
     static func modelDirectory(under root: URL) -> URL? {
         let fm = FileManager.default
@@ -52,21 +91,38 @@ final class DatasetFolder {
         return nil
     }
 
-    private static func containsHigherPriorityDataset(at root: URL) -> Bool {
-        FileManager.default.fileExists(
+    private static func kind(at root: URL) -> Kind? {
+        let fileManager = FileManager.default
+        if fileManager.fileExists(
             atPath: root.appending(path: "transforms.json").path
-        )
+        ) {
+            return .nerfstudio
+        }
+        return modelDirectory(under: root) == nil ? nil : .colmap
+    }
+
+    private static func requiredKind(at root: URL) throws -> Kind {
+        guard let kind = kind(at: root) else {
+            throw MsplatError.invalidDataset(
+                "No root transforms.json or COLMAP camera model was found."
+            )
+        }
+        return kind
     }
 
     /// Reads only the sparse-model metadata needed to choose a safe Gaussian
     /// ceiling. Full point and track validation remains in the native loader.
     static func initialSparsePointCount(at root: URL) throws -> Int {
         try Task.checkCancellation()
-        guard !containsHigherPriorityDataset(at: root) else {
-            throw MsplatError.invalidDataset(
-                "This sample expects a COLMAP-only folder without a root transforms.json."
+        if try requiredKind(at: root) == .nerfstudio {
+            let manifest = try nerfstudioManifest(at: root)
+            let pointCloud = try nerfstudioPointCloudURL(
+                at: root,
+                manifest: manifest
             )
+            return try plySparsePointCount(at: pointCloud)
         }
+
         guard let model = modelDirectory(under: root) else {
             throw MsplatError.invalidDataset(
                 "No COLMAP camera model was found in the selected folder."
@@ -182,6 +238,7 @@ final class DatasetFolder {
     }
 
     private static func plySparsePointCount(at url: URL) throws -> Int {
+        let fileName = url.lastPathComponent
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
 
@@ -196,7 +253,9 @@ final class DatasetFolder {
             if isFirstLine {
                 isFirstLine = false
                 guard value == "ply" else {
-                    throw MsplatError.invalidDataset("points3D.ply is not a PLY file.")
+                    throw MsplatError.invalidDataset(
+                        "\(fileName) is not a PLY file."
+                    )
                 }
             }
 
@@ -206,7 +265,7 @@ final class DatasetFolder {
                fields[1] == "vertex" {
                 guard let parsed = UInt64(fields[2]) else {
                     throw MsplatError.invalidDataset(
-                        "points3D.ply has an invalid vertex count."
+                        "\(fileName) has an invalid vertex count."
                     )
                 }
                 pointCount = parsed
@@ -233,7 +292,7 @@ final class DatasetFolder {
                     line.append(byte)
                     guard line.count <= maximumPointTextLineBytes else {
                         throw MsplatError.invalidDataset(
-                            "A points3D.ply header line exceeds the supported length."
+                            "A \(fileName) header line exceeds the supported length."
                         )
                     }
                 }
@@ -245,7 +304,7 @@ final class DatasetFolder {
         }
         guard foundHeaderEnd, let pointCount else {
             throw MsplatError.invalidDataset(
-                "points3D.ply has an incomplete header or no vertex count."
+                "\(fileName) has an incomplete header or no vertex count."
             )
         }
         return try validatedSparsePointCount(pointCount)
@@ -254,15 +313,126 @@ final class DatasetFolder {
     private static func validatedSparsePointCount(_ count: UInt64) throws -> Int {
         guard count > 0 else {
             throw MsplatError.invalidDataset(
-                "The COLMAP model contains no sparse points."
+                "The dataset point cloud contains no points."
             )
         }
         guard count <= UInt64(Int32.max) else {
             throw MsplatError.invalidDataset(
-                "The COLMAP sparse-point count exceeds the supported range."
+                "The dataset point count exceeds the supported range."
             )
         }
         return Int(count)
+    }
+
+    private static func nerfstudioManifest(
+        at root: URL
+    ) throws -> NerfstudioManifest {
+        let manifestURL = root.appending(path: "transforms.json")
+        let manifest: NerfstudioManifest
+        do {
+            let data = try Data(contentsOf: manifestURL)
+            manifest = try JSONDecoder().decode(NerfstudioManifest.self, from: data)
+        } catch {
+            throw MsplatError.invalidDataset(
+                "transforms.json could not be decoded: \(error.localizedDescription)"
+            )
+        }
+
+        guard !manifest.frames.isEmpty else {
+            throw MsplatError.invalidDataset(
+                "transforms.json contains no frames."
+            )
+        }
+        try validateNerfstudioCameraModel(
+            manifest.cameraModel,
+            context: "transforms.json"
+        )
+        for frame in manifest.frames {
+            guard !frame.filePath.isEmpty else {
+                throw MsplatError.invalidDataset(
+                    "transforms.json contains a frame with an empty file_path."
+                )
+            }
+            try validateNerfstudioCameraModel(
+                frame.cameraModel ?? manifest.cameraModel,
+                context: "frame '\(frame.filePath)'"
+            )
+        }
+        try Task.checkCancellation()
+        return manifest
+    }
+
+    private static func validateNerfstudioCameraModel(
+        _ cameraModel: String?,
+        context: String
+    ) throws {
+        guard let cameraModel else { return }
+        switch cameraModel.uppercased() {
+        case "PINHOLE", "PERSPECTIVE", "OPENCV":
+            return
+        case "OPENCV_FISHEYE":
+            throw MsplatError.invalidDataset(
+                "\(context) uses OPENCV_FISHEYE, which this sample does not support."
+            )
+        default:
+            throw MsplatError.invalidDataset(
+                "\(context) uses unsupported camera_model '\(cameraModel)'."
+            )
+        }
+    }
+
+    private static func nerfstudioPointCloudURL(
+        at root: URL,
+        manifest: NerfstudioManifest
+    ) throws -> URL {
+        var candidates: [URL] = []
+        if let path = manifest.plyFilePath, !path.isEmpty {
+            let pointCloud = try datasetURL(
+                for: path,
+                under: root,
+                purpose: "point cloud"
+            )
+            if FileManager.default.fileExists(atPath: pointCloud.path) {
+                guard isRegularFile(pointCloud) else {
+                    throw MsplatError.invalidDataset(
+                        "Nerfstudio ply_file_path must reference a regular file."
+                    )
+                }
+                return pointCloud
+            }
+        }
+        candidates.append(root.appending(path: "sparse/0/points3D.ply"))
+        candidates.append(root.appending(path: "points3D.ply"))
+
+        for candidate in candidates where isRegularFile(candidate) {
+            return candidate
+        }
+        throw MsplatError.invalidDataset(
+            "The Nerfstudio dataset needs a non-empty PLY referenced by " +
+            "ply_file_path, sparse/0/points3D.ply, or points3D.ply."
+        )
+    }
+
+    private static func datasetURL(
+        for path: String,
+        under root: URL,
+        purpose: String
+    ) throws -> URL {
+        let standardizedRoot = root.standardizedFileURL
+        let candidate = URL(fileURLWithPath: path, relativeTo: standardizedRoot)
+            .standardizedFileURL
+        let rootPath = standardizedRoot.path
+        guard candidate.path == rootPath || candidate.path.hasPrefix(rootPath + "/") else {
+            throw MsplatError.invalidDataset(
+                "The Nerfstudio \(purpose) path must stay inside the selected folder."
+            )
+        }
+        return candidate
+    }
+
+    private static func isRegularFile(_ url: URL) -> Bool {
+        (try? url.resourceValues(forKeys: [.isRegularFileKey]))?
+            .isRegularFile == true
     }
 
     /// Counts regular files below any case-insensitive `masks/` path component
@@ -305,12 +475,25 @@ final class DatasetFolder {
 
     /// A short description of what was found, for the picker row.
     var summary: String {
-        guard let model = Self.modelDirectory(under: url) else { return "not a COLMAP folder" }
-        let encoding = FileManager.default.fileExists(atPath: model.appending(path: "cameras.bin").path)
-            ? "binary" : "text"
-        let images = (try? FileManager.default.contentsOfDirectory(
-            at: url.appending(path: "images"), includingPropertiesForKeys: nil).count) ?? 0
-        return images > 0 ? "\(encoding) model, \(images) images" : "\(encoding) model"
+        switch kind {
+        case .nerfstudio:
+            let imageCount = (try? Self.nerfstudioManifest(at: url))?.frames.count
+            return imageCount.map { "Nerfstudio, \($0) images" } ?? "Nerfstudio manifest"
+        case .colmap:
+            guard let model = Self.modelDirectory(under: url) else {
+                return "COLMAP model unavailable"
+            }
+            let encoding = FileManager.default.fileExists(
+                atPath: model.appending(path: "cameras.bin").path
+            ) ? "binary" : "text"
+            let images = (try? FileManager.default.contentsOfDirectory(
+                at: url.appending(path: "images"),
+                includingPropertiesForKeys: nil
+            ).count) ?? 0
+            return images > 0
+                ? "COLMAP \(encoding), \(images) images"
+                : "COLMAP \(encoding)"
+        }
     }
 
     /// Reads image headers only; ImageIO does not decode full pixel buffers.
@@ -318,6 +501,17 @@ final class DatasetFolder {
     /// is validated but intentionally not applied to these dimensions.
     static func maximumSourceDimensions(at datasetURL: URL) throws
         -> TrainingImageDimensions {
+        switch try requiredKind(at: datasetURL) {
+        case .colmap:
+            return try maximumColmapSourceDimensions(at: datasetURL)
+        case .nerfstudio:
+            return try maximumNerfstudioSourceDimensions(at: datasetURL)
+        }
+    }
+
+    private static func maximumColmapSourceDimensions(
+        at datasetURL: URL
+    ) throws -> TrainingImageDimensions {
         let imageDirectory = datasetURL.appending(path: "images")
         var enumerationFailed = false
         guard let enumerator = FileManager.default.enumerator(
@@ -369,5 +563,73 @@ final class DatasetFolder {
             )
         }
         return try TrainingImageDimensions(width: maximumWidth, height: maximumHeight)
+    }
+
+    private static func maximumNerfstudioSourceDimensions(
+        at datasetURL: URL
+    ) throws -> TrainingImageDimensions {
+        let manifest = try nerfstudioManifest(at: datasetURL)
+        var maximumWidth = 0
+        var maximumHeight = 0
+
+        for frame in manifest.frames {
+            try Task.checkCancellation()
+            let imageURL = try nerfstudioImageURL(
+                for: frame.filePath,
+                under: datasetURL
+            )
+            guard let dimensions = try sourceDimensions(at: imageURL) else {
+                throw MsplatError.invalidDataset(
+                    "Nerfstudio image '\(frame.filePath)' could not be inspected."
+                )
+            }
+            maximumWidth = max(maximumWidth, dimensions.width)
+            maximumHeight = max(maximumHeight, dimensions.height)
+        }
+
+        return try TrainingImageDimensions(
+            width: maximumWidth,
+            height: maximumHeight
+        )
+    }
+
+    private static func nerfstudioImageURL(
+        for path: String,
+        under root: URL
+    ) throws -> URL {
+        let imageURL = try datasetURL(for: path, under: root, purpose: "image")
+        if isRegularFile(imageURL) {
+            return imageURL
+        }
+        for suffix in nerfstudioImageExtensions {
+            let candidate = URL(fileURLWithPath: imageURL.path + suffix)
+            if isRegularFile(candidate) {
+                return candidate
+            }
+        }
+        throw MsplatError.invalidDataset(
+            "Nerfstudio image '\(path)' was not found."
+        )
+    }
+
+    private static func sourceDimensions(
+        at imageURL: URL
+    ) throws -> (width: Int, height: Int)? {
+        guard isRegularFile(imageURL),
+              let source = CGImageSourceCreateWithURL(imageURL as CFURL, nil),
+              let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+                as NSDictionary?,
+              let width = properties[kCGImagePropertyPixelWidth] as? NSNumber,
+              let height = properties[kCGImagePropertyPixelHeight] as? NSNumber else {
+            return nil
+        }
+        let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?
+            .intValue ?? 1
+        guard (1...8).contains(orientation) else {
+            throw MsplatError.invalidDataset(
+                "An image has an invalid EXIF orientation value."
+            )
+        }
+        return (width.intValue, height.intValue)
     }
 }

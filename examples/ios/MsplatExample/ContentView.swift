@@ -30,7 +30,7 @@ struct ContentView: View {
                         session.trainingMaskMode = .transparent
                         pickError = nil
                     } else {
-                        pickError = "Choose a COLMAP-only folder with cameras.bin or cameras.txt at its root or in sparse/0."
+                        pickError = "Choose a folder with root transforms.json, or COLMAP cameras.bin/cameras.txt at its root or in sparse/0."
                     }
                 case .failure(let error):
                     pickError = error.localizedDescription
@@ -44,7 +44,7 @@ struct ContentView: View {
     }
 
     private var datasetSection: some View {
-        Section("COLMAP dataset") {
+        Section("Training dataset") {
             Button {
                 picking = true
             } label: {
@@ -70,33 +70,44 @@ struct ContentView: View {
                     Text(profile.rawValue).tag(profile)
                 }
             }
-            Toggle("Use discovered masks", isOn: trainingMasksBinding)
-                .disabled(isBusy || folder == nil)
-            if session.trainingMasksEnabled {
-                Picker("Mask treatment", selection: $session.trainingMaskMode) {
-                    Text("Transparent").tag(TrainingMaskMode.transparent)
-                    Text("Coverage only").tag(TrainingMaskMode.coverage)
+            if folder?.supportsAutomaticTrainingMaskDiscovery == true {
+                Toggle("Use discovered masks", isOn: trainingMasksBinding)
+                    .disabled(isBusy)
+                if session.trainingMasksEnabled {
+                    Picker("Mask treatment", selection: $session.trainingMaskMode) {
+                        Text("Transparent").tag(TrainingMaskMode.transparent)
+                        Text("Coverage only").tag(TrainingMaskMode.coverage)
+                    }
+                    .disabled(isBusy)
                 }
-                .disabled(isBusy)
+                LabeledContent(
+                    "Mask candidates",
+                    value: trainingMaskCandidateCount?.formatted() ?? "Scanning…"
+                )
+            } else if folder?.kind == .nerfstudio {
+                Text("Automatic mask sidecars are not yet available for Nerfstudio imports.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
-            LabeledContent(
-                "Mask candidates",
-                value: trainingMaskCandidateCount?.formatted() ?? "Scanning…"
-            )
 
             Button(trainButtonTitle) {
                 if let folder { session.start(folder: folder) }
             }
             .disabled(
                 isBusy ||
-                (trainingMaskCandidateCount == nil && !trainingMaskSelectionWasEdited)
+                (folder?.supportsAutomaticTrainingMaskDiscovery == true &&
+                 trainingMaskCandidateCount == nil &&
+                 !trainingMaskSelectionWasEdited)
             )
 
             if isBusy {
                 Button("Stop", role: .destructive) { session.cancel() }
             }
         } footer: {
-            Text("Preview targets a 1,600-pixel edge, SH1, and a 250K Gaussian ceiling. Balanced targets 1,920 pixels, SH2, and a 400K ceiling when preflight memory permits. Either ceiling rises only enough to preserve a larger initial sparse model, and the memory estimate is recomputed. Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Coverage only weights RGB loss and can skip off-mask tile work for throughput. Transparent supervises the full frame to suppress exterior floaters and is not expected to be faster.")
+            Text("Preview targets a 1,600-pixel edge, SH1, and a 250K Gaussian ceiling. Balanced targets 1,920 pixels, SH2, and a 400K ceiling when preflight memory permits. Either ceiling rises only enough to preserve a larger initial point cloud, and the memory estimate is recomputed.")
+            if folder?.supportsAutomaticTrainingMaskDiscovery == true {
+                Text("Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Coverage only weights RGB loss and can skip off-mask tile work for throughput. Transparent supervises the full frame to suppress exterior floaters and is not expected to be faster.")
+            }
         }
     }
 
@@ -112,6 +123,12 @@ struct ContentView: View {
 
     @MainActor
     private func scanTrainingMasks(in selectedFolder: DatasetFolder) async {
+        guard selectedFolder.supportsAutomaticTrainingMaskDiscovery else {
+            session.trainingMasksEnabled = false
+            trainingMaskCandidateCount = 0
+            return
+        }
+
         let datasetURL = selectedFolder.url
         let scan = Task.detached(priority: .utility) {
             DatasetFolder.countTrainingMaskCandidates(at: datasetURL)

@@ -1,7 +1,9 @@
 import CoreGraphics
 import Foundation
+import ImageIO
 import Msplat
 @testable import MsplatExample
+import UniformTypeIdentifiers
 import XCTest
 
 final class TrainingMaskOptionsTests: XCTestCase {
@@ -69,14 +71,147 @@ final class TrainingMaskOptionsTests: XCTestCase {
         )
     }
 
-    func testDatasetFolderRejectsHigherPriorityNerfstudioMarker() throws {
+    func testDatasetFolderPrefersNerfstudioOverColmap() throws {
         let directory = try XCTUnwrap(temporaryDirectory)
-        try Data().write(to: directory.appending(path: "transforms.json"))
+        let pointCloud = directory.appending(path: "cloud/sparse.ply")
+        try writePointPLY(count: 4, to: pointCloud)
+        try writeNerfstudioManifest(
+            to: directory,
+            plyFilePath: "cloud/sparse.ply"
+        )
 
-        XCTAssertNil(DatasetFolder(picked: directory))
+        let folder = try XCTUnwrap(DatasetFolder(picked: directory))
+
+        XCTAssertEqual(folder.kind, .nerfstudio)
+        XCTAssertEqual(folder.summary, "Nerfstudio, 1 images")
+        XCTAssertFalse(folder.supportsAutomaticTrainingMaskDiscovery)
+        XCTAssertEqual(
+            try DatasetFolder.initialSparsePointCount(at: directory),
+            4
+        )
+    }
+
+    func testNerfstudioPointCountFallsBackToPoints3DPLY() throws {
+        let directory = try XCTUnwrap(temporaryDirectory)
+        try writePointPLY(
+            count: 3,
+            to: directory.appending(path: "points3D.ply")
+        )
+        try writeNerfstudioManifest(to: directory, plyFilePath: nil)
+
+        XCTAssertEqual(
+            try DatasetFolder.initialSparsePointCount(at: directory),
+            3
+        )
+    }
+
+    func testNerfstudioPreflightReadsOnlyReferencedImageDimensions() throws {
+        let directory = try XCTUnwrap(temporaryDirectory)
+        let images = directory.appending(path: "frames", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: images,
+            withIntermediateDirectories: true
+        )
+        try writePNG(
+            width: 12,
+            height: 7,
+            to: images.appending(path: "first.png")
+        )
+        try writePNG(
+            width: 30,
+            height: 20,
+            to: images.appending(path: "unreferenced.png")
+        )
+        try writePointPLY(
+            count: 2,
+            to: directory.appending(path: "points3D.ply")
+        )
+        try writeNerfstudioManifest(
+            to: directory,
+            plyFilePath: nil,
+            framePaths: ["./frames/first"]
+        )
+
+        let dimensions = try DatasetFolder.maximumSourceDimensions(at: directory)
+
+        XCTAssertEqual(dimensions.width, 12)
+        XCTAssertEqual(dimensions.height, 7)
+    }
+
+    func testNerfstudioFolderCreatesNativeSession() async throws {
+        let directory = try XCTUnwrap(temporaryDirectory)
+        let images = directory.appending(path: "images", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: images,
+            withIntermediateDirectories: true
+        )
+        try writePNG(
+            width: 12,
+            height: 7,
+            to: images.appending(path: "frame.png")
+        )
+        try writePointPLY(
+            count: 4,
+            to: directory.appending(path: "points3D.ply")
+        )
+        try writeNerfstudioManifest(to: directory, plyFilePath: nil)
+
+        let session = try await MsplatSession(
+            datasetURL: directory,
+            maximumGaussianCount: 4
+        )
+        do {
+            let trainingCameraCount = try await session.numTrain
+            XCTAssertEqual(trainingCameraCount, 1)
+            try await session.close()
+        } catch {
+            try? await session.close()
+            throw error
+        }
+    }
+
+    func testNerfstudioPreflightRejectsFisheyeCameraModel() throws {
+        let directory = try XCTUnwrap(temporaryDirectory)
+        try writePointPLY(
+            count: 2,
+            to: directory.appending(path: "points3D.ply")
+        )
+        try writeNerfstudioManifest(
+            to: directory,
+            plyFilePath: nil,
+            cameraModel: "OPENCV_FISHEYE"
+        )
+
         XCTAssertThrowsError(
             try DatasetFolder.initialSparsePointCount(at: directory)
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("OPENCV_FISHEYE"))
+        }
+    }
+
+    func testNerfstudioPreflightRequiresInitialPointCloud() throws {
+        let directory = try XCTUnwrap(temporaryDirectory)
+        try writeNerfstudioManifest(to: directory, plyFilePath: nil)
+
+        XCTAssertThrowsError(
+            try DatasetFolder.initialSparsePointCount(at: directory)
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("needs a non-empty PLY"))
+        }
+    }
+
+    func testNerfstudioPreflightRejectsPointCloudOutsideSelectedFolder() throws {
+        let directory = try XCTUnwrap(temporaryDirectory)
+        try writeNerfstudioManifest(
+            to: directory,
+            plyFilePath: "../outside.ply"
         )
+
+        XCTAssertThrowsError(
+            try DatasetFolder.initialSparsePointCount(at: directory)
+        ) { error in
+            XCTAssertTrue(error.localizedDescription.contains("selected folder"))
+        }
     }
 
     func testTrainingPlanAccountsForSelectedMaskDiscovery() throws {
@@ -275,5 +410,93 @@ final class TrainingMaskOptionsTests: XCTestCase {
             count: (recordCount ?? Int(count)) * 51
         ))
         try data.write(to: directory.appending(path: "points3D.bin"))
+    }
+
+    private func writeNerfstudioManifest(
+        to directory: URL,
+        plyFilePath: String?,
+        cameraModel: String = "OPENCV",
+        framePaths: [String] = ["images/frame.png"]
+    ) throws {
+        let transform: [[Double]] = [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]
+        let frames: [[String: Any]] = framePaths.map { path in
+            [
+                "file_path": path,
+                "transform_matrix": transform,
+            ]
+        }
+        var manifest: [String: Any] = [
+            "camera_model": cameraModel,
+            "w": 12,
+            "h": 7,
+            "fl_x": 10.0,
+            "fl_y": 10.0,
+            "cx": 6.0,
+            "cy": 3.5,
+            "frames": frames,
+        ]
+        if let plyFilePath {
+            manifest["ply_file_path"] = plyFilePath
+        }
+        let data = try JSONSerialization.data(
+            withJSONObject: manifest,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        try data.write(to: directory.appending(path: "transforms.json"))
+    }
+
+    private func writePointPLY(count: Int, to url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        let points = (0..<count)
+            .map { "\($0) 0 0 255 255 255" }
+            .joined(separator: "\n")
+        try """
+        ply
+        format ascii 1.0
+        element vertex \(count)
+        property float x
+        property float y
+        property float z
+        property uchar red
+        property uchar green
+        property uchar blue
+        end_header
+        \(points)
+        """.write(to: url, atomically: true, encoding: .utf8)
+    }
+
+    private func writePNG(width: Int, height: Int, to url: URL) throws {
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        let context = try XCTUnwrap(CGContext(
+            data: nil,
+            width: width,
+            height: height,
+            bitsPerComponent: 8,
+            bytesPerRow: width * 4,
+            space: colorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
+        context.setFillColor(CGColor(
+            colorSpace: colorSpace,
+            components: [0.25, 0.5, 0.75, 1]
+        ) ?? CGColor(gray: 0.5, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let image = try XCTUnwrap(context.makeImage())
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
+            url as CFURL,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ))
+        CGImageDestinationAddImage(destination, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
     }
 }

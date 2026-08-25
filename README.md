@@ -7,7 +7,7 @@ beyond system frameworks.
 
 This fork reduces model and transient growth, adds a byte-budgeted image cache,
 enforces an optional hard Gaussian population limit, fixes correctness bugs,
-and provides an iOS build plus a COLMAP-to-PLY example app. Its Swift
+and provides an iOS build plus a COLMAP/Nerfstudio-to-PLY example app. Its Swift
 `TrainingPlan` also validates resolution stages and derives a conservative
 peak-memory estimate before a session is created. ABI v4 telemetry keeps CPU
 submission progress separate from completed GPU work and exposes categorized

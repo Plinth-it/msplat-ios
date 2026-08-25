@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- MsplatExample now accepts root `transforms.json` Nerfstudio datasets in
+  addition to COLMAP folders. Its device-memory preflight resolves referenced
+  image headers and the manifest PLY (with the native fallback names), preserves
+  Nerfstudio-over-COLMAP dispatch priority, and rejects unsupported fisheye or
+  out-of-folder asset references before training.
 - Added ABI v2 checked C entry points with structured errors, input and buffer
   validation, ABI/config-size checks, and exception containment.
 - Added ABI v3 checked trainer creation with a size-validated

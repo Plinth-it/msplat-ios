@@ -195,7 +195,7 @@ final class TrainingSession: ObservableObject {
                     "but iOS currently reports \(availableMB) MB available. " +
                     (profile == .balanced
                         ? "Choose Preview, turn off masks, or close other apps."
-                        : "Turn off masks, use a sparser COLMAP model, or close other apps.")
+                        : "Turn off masks, use a sparser point cloud, or close other apps.")
                 )
             }
 
@@ -450,7 +450,7 @@ final class TrainingSession: ObservableObject {
     ) throws -> TrainingPlan {
         guard initialGaussianCount > 0 else {
             throw MsplatError.invalidDataset(
-                "The COLMAP model must contain at least one sparse point."
+                "The dataset must contain at least one initial point."
             )
         }
         guard let iterationBudget = Int32(exactly: steps) else {
