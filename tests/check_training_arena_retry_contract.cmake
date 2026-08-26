@@ -805,8 +805,8 @@ require_contains("${benchmark_source}"
     "let queueIdleMs: TrainingBenchmarkDistribution?"
     "queue-idle benchmark distribution")
 require_contains("${benchmark_source}"
-    "schemaVersion: 3"
-    "queue-idle benchmark schema bump")
+    "schemaVersion: 4"
+    "current benchmark schema")
 
 # The macOS Metal fixture deterministically warms a small arena, exercises a
 # direct 5,000-Gaussian retry without telemetry, then submits a 10,000-Gaussian

@@ -43,10 +43,9 @@ Options:
   --timeout <seconds>      Per-variant launch timeout (default: 1800).
   --results-dir <path>     Output directory. Default:
                            build/ios-benchmarks/<UTC timestamp>.
-  --only <label>           Run one matrix label, growth-cpu, or growth-blit.
+  --only <label>           Run one matrix label or the growth benchmark.
   --growth-max-gaussians <count>
-                           Required positive population cap for growth-cpu and
-                           growth-blit.
+                           Required positive population cap for growth.
   --profile-stages         Enable per-stage Metal timestamp logging; requires
                            at least 500 total iterations.
   -h, --help               Show this help.
@@ -64,8 +63,8 @@ The app is built and installed once, then these isolated variants run:
   baseline, difference, arena-retry, difference-retry, packed, staged-ssim,
   raster-16x8, raster-16x16
 
-The dedicated growth-cpu and growth-blit variants are available only through
---only and do not change the normal eight-run fixed-topology matrix.
+The dedicated growth variant is available only through --only and does not
+change the normal eight-run fixed-topology matrix.
 
 Every run writes a console log and devicectl JSON result. Successful benchmark
 summaries are appended to results.jsonl; runs.tsv records every run's status.
@@ -166,15 +165,14 @@ if (( PROFILE_STAGES_ENABLED &&
 fi
 case "$ONLY_VARIANT" in
     ""|baseline|difference|arena-retry|difference-retry|packed|staged-ssim|raster-16x8|raster-16x16) ;;
-    growth-cpu|growth-blit)
+    growth)
         [[ "$GROWTH_MAX_GAUSSIANS" =~ ^[1-9][0-9]*$ ]] || die \
             "--growth-max-gaussians must be a positive integer for $ONLY_VARIANT"
         ;;
     *) die "unknown benchmark label: $ONLY_VARIANT" ;;
 esac
-if [[ -n "$GROWTH_MAX_GAUSSIANS" && "$ONLY_VARIANT" != growth-cpu && \
-      "$ONLY_VARIANT" != growth-blit ]]; then
-    die "--growth-max-gaussians is only valid with --only growth-cpu or growth-blit"
+if [[ -n "$GROWTH_MAX_GAUSSIANS" && "$ONLY_VARIANT" != growth ]]; then
+    die "--growth-max-gaussians is only valid with --only growth"
 fi
 
 command -v xcrun >/dev/null 2>&1 || die "xcrun was not found"
@@ -277,7 +275,6 @@ run_variant() {
     local intersection_attributes="$5"
     local ssim_mode="$6"
     local raster_variant="$7"
-    local capacity_copy_mode="${8:-}"
     local console_log="$RESULTS_DIR/$label.console.log"
     local launch_json="$RESULTS_DIR/$label.devicectl.json"
     local environment_json
@@ -292,11 +289,10 @@ run_variant() {
     if (( PROFILE_STAGES_ENABLED )); then
         profile_stages_json=',"PROFILE_STAGES":"1"'
     fi
-    if [[ -n "$capacity_copy_mode" ]]; then
+    if [[ "$label" == growth ]]; then
         printf -v growth_environment_json \
-            ',"MSPLAT_BENCHMARK_GROWTH":"1","MSPLAT_BENCHMARK_GROWTH_MAX_GAUSSIANS":"%s","MSPLAT_CAPACITY_COPY_MODE":"%s"' \
-            "$GROWTH_MAX_GAUSSIANS" \
-            "$capacity_copy_mode"
+            ',"MSPLAT_BENCHMARK_GROWTH":"1","MSPLAT_BENCHMARK_GROWTH_MAX_GAUSSIANS":"%s"' \
+            "$GROWTH_MAX_GAUSSIANS"
     fi
 
     printf -v environment_json \
@@ -433,10 +429,9 @@ CONFIGURATIONS=(
 )
 
 failures=0
-if [[ "$ONLY_VARIANT" == growth-cpu || "$ONLY_VARIANT" == growth-blit ]]; then
-    capacity_copy_mode="${ONLY_VARIANT#growth-}"
+if [[ "$ONLY_VARIANT" == growth ]]; then
     if ! run_variant \
-        "$ONLY_VARIANT" enumerated cpu exact gather fused 8x8 "$capacity_copy_mode"; then
+        "$ONLY_VARIANT" enumerated cpu exact gather fused 8x8; then
         failures=$((failures + 1))
     fi
 else

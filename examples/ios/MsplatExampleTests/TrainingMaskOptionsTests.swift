@@ -476,7 +476,7 @@ final class TrainingMaskOptionsTests: XCTestCase {
         let benchmark = try XCTUnwrap(
             TrainingBenchmarkConfiguration.requested(environment: [
                 "MSPLAT_BENCHMARK": "1",
-                "MSPLAT_BENCHMARK_LABEL": "growth-blit",
+                "MSPLAT_BENCHMARK_LABEL": "growth",
                 "MSPLAT_BENCHMARK_WARMUP": "10",
                 "MSPLAT_BENCHMARK_MEASURED": "90",
                 "MSPLAT_BENCHMARK_GROWTH": "1",
