@@ -28,6 +28,8 @@ constexpr int kAdamGroups = 6;
 struct StepResult {
     std::array<double, kAdamGroups> firstMomentL1 = {};
     std::array<int, kAdamGroups> nonfiniteFirstMomentCount = {};
+    std::vector<double> colorFirstMomentL1;
+    std::vector<float> opacityFirstMoments;
     float opacity = 0.0f;
     float opacityFirstMoment = 0.0f;
     float lastOpacity = 0.0f;
@@ -89,15 +91,23 @@ StepResult runStep(bool transparent, float alphaLossWeight,
                    int height = kHeight,
                    bool exerciseAppearance = false,
                    MsplatTrainingTelemetryHandle telemetry = {},
-                   int64_t iteration = 1) {
+                   int64_t iteration = 1,
+                   float gaussianScale = 0.03f,
+                   const std::vector<float>& alphaOverrides = {},
+                   const std::vector<float>& depthOverrides = {}) {
     CHECK(gaussianCount > 0);
+    CHECK(gaussianScale > 0.0f);
+    CHECK(alphaOverrides.empty() ||
+          alphaOverrides.size() == static_cast<size_t>(gaussianCount));
+    CHECK(depthOverrides.empty() ||
+          depthOverrides.size() == static_cast<size_t>(gaussianCount));
     std::vector<float> meanValues(static_cast<size_t>(gaussianCount) * 3);
     std::vector<float> scaleValues(static_cast<size_t>(gaussianCount) * 3);
     std::vector<float> quatValues(static_cast<size_t>(gaussianCount) * 4);
     std::vector<float> dcValues(static_cast<size_t>(gaussianCount) * 3);
     std::vector<float> opacityValues(static_cast<size_t>(gaussianCount));
 
-    const float logScale = std::log(0.03f);
+    const float logScale = std::log(gaussianScale);
     constexpr float shC0 = 0.28209479177387814f;
     const float blackDc = -0.5f / shC0;
     const std::array<float, 3> appearanceDc = {
@@ -105,12 +115,13 @@ StepResult runStep(bool transparent, float alphaLossWeight,
          0.1f / shC0,
          0.3f / shC0,
     };
-    const float initialOpacity = std::log(initialAlpha / (1.0f - initialAlpha));
     for (int index = 0; index < gaussianCount; ++index) {
         const size_t meanOffset = static_cast<size_t>(index) * 3;
         meanValues[meanOffset + 0] = 0.25f;
         meanValues[meanOffset + 1] = -0.25f;
-        meanValues[meanOffset + 2] = -1.0f;
+        meanValues[meanOffset + 2] = depthOverrides.empty()
+            ? -1.0f
+            : depthOverrides[static_cast<size_t>(index)];
         scaleValues[meanOffset + 0] = logScale;
         scaleValues[meanOffset + 1] = logScale;
         scaleValues[meanOffset + 2] = logScale;
@@ -120,7 +131,12 @@ StepResult runStep(bool transparent, float alphaLossWeight,
                 : blackDc;
         }
         quatValues[static_cast<size_t>(index) * 4] = 1.0f;
-        opacityValues[static_cast<size_t>(index)] = initialOpacity;
+        const float alpha = alphaOverrides.empty()
+            ? initialAlpha
+            : alphaOverrides[static_cast<size_t>(index)];
+        CHECK(alpha > 0.0f && alpha < 1.0f);
+        opacityValues[static_cast<size_t>(index)] =
+            std::log(alpha / (1.0f - alpha));
     }
 
     MTensor means = gpuFloats({gaussianCount, 3}, meanValues);
@@ -261,6 +277,19 @@ StepResult runStep(bool transparent, float alphaLossWeight,
     }
 
     StepResult result;
+    result.colorFirstMomentL1.resize(static_cast<size_t>(gaussianCount));
+    result.opacityFirstMoments.resize(static_cast<size_t>(gaussianCount));
+    const float* colorMoments = expAvg[3].data<float>();
+    const float* opacityMoments = expAvg[5].data<float>();
+    for (int index = 0; index < gaussianCount; ++index) {
+        const size_t colorOffset = static_cast<size_t>(index) * 3;
+        for (size_t channel = 0; channel < 3; ++channel) {
+            result.colorFirstMomentL1[static_cast<size_t>(index)] +=
+                std::abs(colorMoments[colorOffset + channel]);
+        }
+        result.opacityFirstMoments[static_cast<size_t>(index)] =
+            opacityMoments[index];
+    }
     result.opacity = opacities.data<float>()[0];
     result.opacityFirstMoment = expAvg[5].data<float>()[0];
     result.lastOpacity = opacities.data<float>()[gaussianCount - 1];
@@ -448,6 +477,76 @@ void checkChunkedTransparentAlphaSupervision() {
     CHECK(gather ? packedAttributeBytes == 0 : packedAttributeBytes > 0);
 }
 
+void checkCappedAlphaBackward() {
+    // A very large Gaussian keeps sigma close enough to zero across the image
+    // that opacity * exp(-sigma) always reaches the forward 0.999 alpha cap.
+    // The capped contributor still owns an RGB gradient, while the clamp makes
+    // its conic, position, scale, quaternion, and opacity gradients zero.
+    constexpr float cappedAlpha = 0.9999f;
+    constexpr float fullFrameScale = 100.0f;
+
+    const auto runCapped = [](int gaussianCount) {
+        return runStep(
+            true, 0.1f, gaussianCount, cappedAlpha,
+            false, false, false, false, false,
+            kWidth, kHeight, true, {}, 1, fullFrameScale);
+    };
+
+    const StepResult monolithic = runCapped(1);
+    CHECK(monolithic.radius > 0);
+    CHECK(monolithic.firstMomentL1[3] > 0.0);
+    CHECK(monolithic.firstMomentL1[0] == 0.0);
+    CHECK(monolithic.firstMomentL1[1] == 0.0);
+    CHECK(monolithic.firstMomentL1[2] == 0.0);
+    CHECK(monolithic.firstMomentL1[5] == 0.0);
+
+    // 513 intersections in each covered tile require two 512-entry depth
+    // chunks. This exercises the same cap behavior in the chunked backward
+    // kernel without relying on a source-only assertion.
+    const StepResult chunked = runCapped(513);
+    CHECK(chunked.radius > 0);
+    CHECK(chunked.firstMomentL1[3] > 0.0);
+    CHECK(chunked.firstMomentL1[0] == 0.0);
+    CHECK(chunked.firstMomentL1[1] == 0.0);
+    CHECK(chunked.firstMomentL1[2] == 0.0);
+    CHECK(chunked.firstMomentL1[5] == 0.0);
+
+    // Put an uncapped near Gaussian in front of a capped far Gaussian. The
+    // backward walk encounters the far Gaussian first and must divide T by
+    // (1 - 0.999) before it reaches the near one. Compare against a far alpha
+    // just below the cap; the near RGB gradient should remain the same order
+    // of magnitude rather than being suppressed by roughly 1000x.
+    const auto runLayered = [](int gaussianCount, float farAlpha) {
+        std::vector<float> alphas(
+            static_cast<size_t>(gaussianCount), 0.005f);
+        std::vector<float> depths(
+            static_cast<size_t>(gaussianCount), -2.0f);
+        alphas[0] = 0.5f;
+        alphas[1] = farAlpha;
+        depths[0] = -0.8f;
+        depths[1] = -1.2f;
+        return runStep(
+            true, 0.1f, gaussianCount, 0.1f,
+            false, false, false, false, false,
+            kWidth, kHeight, true, {}, 1, fullFrameScale,
+            alphas, depths);
+    };
+    const auto checkLayered = [&](int gaussianCount) {
+        const StepResult capped = runLayered(gaussianCount, cappedAlpha);
+        const StepResult uncapped = runLayered(gaussianCount, 0.998f);
+        const double nearCapped = capped.colorFirstMomentL1[0];
+        const double nearUncapped = uncapped.colorFirstMomentL1[0];
+        CHECK(nearUncapped > 0.0);
+        CHECK(nearCapped > 0.5 * nearUncapped);
+        CHECK(nearCapped < 2.0 * nearUncapped);
+        CHECK(capped.colorFirstMomentL1[1] > 0.0);
+        CHECK(capped.opacityFirstMoments[1] == 0.0f);
+    };
+
+    checkLayered(2);
+    checkLayered(513);
+}
+
 void checkPartialSsimThreadgroups() {
     const float initialOpacity = std::log(0.1f / 0.9f);
     const StepResult partial = runStep(
@@ -561,6 +660,20 @@ void checkStageProfiling() {
 
     msplat_gpu_sync();
     constexpr int maxStages = 16;
+    // Discard timings from the functional checks above. Profile one known
+    // step so adding a new regression cannot silently change this test's
+    // expected sample count.
+    {
+        std::vector<double> discarded[maxStages];
+        const char* discardedNames[maxStages] = {};
+        int discardedCount = 0;
+        msplat_drain_stage_times(
+            discarded, maxStages, discardedCount, discardedNames);
+    }
+    const StepResult probe = runStep(true, 0.1f);
+    CHECK(probe.radius > 0);
+    msplat_gpu_sync();
+
     std::vector<double> stageTimes[maxStages];
     const char* stageNames[maxStages] = {};
     int stageCount = 0;
@@ -582,9 +695,7 @@ void checkStageProfiling() {
     // Counter sampling is not available on every macOS Metal device. When it
     // is available, every active compute stage must produce a measurement.
     if (profiledStepCount == 0) return;
-    const char* arenaMode = std::getenv("MSPLAT_TRAINING_ARENA_MODE");
-    const bool retry = arenaMode && std::string(arenaMode) == "retry";
-    CHECK(profiledStepCount == (retry ? 16u : 12u));
+    CHECK(profiledStepCount == 1u);
     for (int index = 1; index < stageCount; ++index) {
         CHECK(stageTimes[index].size() == profiledStepCount);
         for (double sampleMs : stageTimes[index]) {
@@ -605,6 +716,7 @@ int main(int argc, char **argv) {
             msplat_set_metallib_path_checked(argv[1]);
             checkTransparentAlphaSupervision();
             checkChunkedTransparentAlphaSupervision();
+            checkCappedAlphaBackward();
             checkRetryReadbackPoolReuse();
             checkArenaRetryTransaction();
             checkPartialSsimThreadgroups();

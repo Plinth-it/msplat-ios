@@ -1369,33 +1369,39 @@ kernel void rasterize_backward_kernel(
             float2 v_xy_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
             //initialize everything to 0, only set if the lane is valid
-            if(valid && alpha<0.999f){
-                // compute the current T for this gaussian
-                // alpha = opac * vis (guaranteed since alpha < 0.99 = min cap)
+            if (valid) {
+                // Recover the transmittance before this Gaussian. Forward uses
+                // the same capped alpha, so this must also run when the 0.999
+                // cap binds or every nearer Gaussian receives a T that is
+                // 1000x too small.
                 float ra = 1.f / (1.f - alpha);
                 T *= ra;
                 const float fac = alpha * T;
-                float v_alpha = 0.f;
                 v_rgb_local = fac * v_out;
 
                 // b_rgb has raw SH output; clamp inline: max(raw + 0.5, 0)
                 const float3 rgb = max(b_rgb + 0.5f, 0.f);
                 // contribution from this pixel + background
-                v_alpha += dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
-                v_alpha += v_alpha_pixel * T_final * ra;
+                const float v_alpha =
+                    dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out) +
+                    v_alpha_pixel * T_final * ra;
                 // update the running sum
                 buffer = fma(rgb, fac, buffer);
 
-                // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
-                const float v_sigma = -alpha * v_alpha;
-                v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
-                                                           delta.x * delta.y,
-                                                           delta.y * delta.y);
-                v_xy_local = v_sigma * float2(
-                    fma(b_conic.x, delta.x, b_conic.y * delta.y),
-                    fma(b_conic.y, delta.x, b_conic.z * delta.y));
-                // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
-                v_opacity_local = -v_sigma * (1.f - opac);
+                // The cap makes alpha locally constant in sigma and opacity,
+                // but it does not remove the color gradient above.
+                if (alpha < 0.999f) {
+                    // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
+                    const float v_sigma = -alpha * v_alpha;
+                    v_conic_local = (0.5f * v_sigma) * float3(
+                        delta.x * delta.x, delta.x * delta.y,
+                        delta.y * delta.y);
+                    v_xy_local = v_sigma * float2(
+                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
+                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
+                    // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
+                    v_opacity_local = -v_sigma * (1.f - opac);
+                }
             }
 
             v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
@@ -4286,26 +4292,30 @@ kernel void rasterize_backward_chunked_kernel(
             float2 v_xy_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
 
-            if (valid && alpha < 0.999f) {
+            if (valid) {
+                // Match the monolithic backward recurrence: the forward pass
+                // multiplied T by (1 - alpha) even when alpha hit its cap.
                 float ra = 1.f / (1.f - alpha);
                 T *= ra;
                 const float fac = alpha * T;
-                float v_alpha = 0.f;
                 v_rgb_local = fac * v_out;
 
                 const float3 rgb = max(b_rgb + 0.5f, 0.f);
-                v_alpha += dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
-                v_alpha += v_alpha_pixel * T_final * ra;
+                const float v_alpha =
+                    dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out) +
+                    v_alpha_pixel * T_final * ra;
                 buffer = fma(rgb, fac, buffer);
 
-                const float v_sigma = -alpha * v_alpha;
-                v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
-                                                           delta.x * delta.y,
-                                                           delta.y * delta.y);
-                v_xy_local = v_sigma * float2(
-                    fma(b_conic.x, delta.x, b_conic.y * delta.y),
-                    fma(b_conic.y, delta.x, b_conic.z * delta.y));
-                v_opacity_local = -v_sigma * (1.f - opac);
+                if (alpha < 0.999f) {
+                    const float v_sigma = -alpha * v_alpha;
+                    v_conic_local = (0.5f * v_sigma) * float3(
+                        delta.x * delta.x, delta.x * delta.y,
+                        delta.y * delta.y);
+                    v_xy_local = v_sigma * float2(
+                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
+                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
+                    v_opacity_local = -v_sigma * (1.f - opac);
+                }
             }
 
             v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
