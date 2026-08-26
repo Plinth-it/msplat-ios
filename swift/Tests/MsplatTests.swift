@@ -68,6 +68,57 @@ final class MsplatTests: XCTestCase {
         )
     }
 
+    func testNativePoseRefinementStateConversion() throws {
+        XCTAssertEqual(MemoryLayout<MsplatPoseRefinementStateV15>.size, 128)
+
+        var native = MsplatPoseRefinementStateV15()
+        native.flags = UInt32(MSPLAT_POSE_REFINEMENT_STATE_ENABLED)
+            | UInt32(MSPLAT_POSE_REFINEMENT_STATE_ANCHOR)
+        native.canonicalCameraIndex = 7
+        native.optimizerStepCount = 11
+        copyFloats(
+            [1, 2, 3, 0.1, 0.2, 0.3],
+            into: &native.poseDelta
+        )
+        native.translationNorm = Float(14).squareRoot()
+        native.rotationNorm = Float(0.14).squareRoot()
+        let correctedPose: [Float] = [
+            1, 0, 0, 4,
+            0, 1, 0, 5,
+            0, 0, 1, 6,
+            0, 0, 0, 1,
+        ]
+        copyFloats(correctedPose, into: &native.correctedCameraToWorld)
+
+        let frameIDBytes = Array("frame_000007".utf8)
+        let state = try frameIDBytes.withUnsafeBufferPointer { bytes in
+            native.frameId = bytes.baseAddress.map {
+                UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self)
+            }
+            native.frameIdLength = UInt64(bytes.count)
+            return try CameraPoseRefinementState(from: native)
+        }
+
+        XCTAssertTrue(state.isEnabled)
+        XCTAssertTrue(state.isAnchor)
+        XCTAssertEqual(state.canonicalCameraIndex, 7)
+        XCTAssertEqual(state.optimizerStepCount, 11)
+        XCTAssertEqual(state.translationDelta, [1, 2, 3])
+        XCTAssertEqual(state.rotationDelta, [0.1, 0.2, 0.3])
+        XCTAssertEqual(
+            state.translationNorm,
+            Float(14).squareRoot(),
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            state.rotationNorm,
+            Float(0.14).squareRoot(),
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(state.correctedCameraToWorld.elements, correctedPose)
+        XCTAssertEqual(state.frameID, "frame_000007")
+    }
+
     func testInvalidConfigIsRejected() {
         var invalidConfigs: [TrainingConfig] = []
 
@@ -384,5 +435,15 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(data[1], 0x8b)
 
         try FileManager.default.removeItem(atPath: tmpPath)
+    }
+}
+
+private func copyFloats<Tuple>(_ values: [Float], into tuple: inout Tuple) {
+    withUnsafeMutableBytes(of: &tuple) { destination in
+        values.withUnsafeBytes { source in
+            XCTAssertEqual(destination.count, source.count)
+            guard destination.count == source.count else { return }
+            destination.copyBytes(from: source)
+        }
     }
 }

@@ -105,6 +105,7 @@ struct ContentView: View {
         trainingMaskSelectionWasEdited = false
         session.trainingMasksEnabled = false
         session.trainingMaskMode = .transparent
+        session.refineCameraPosesEnabled = false
         pickError = nil
 
         guard persistBookmark else { return }
@@ -128,6 +129,7 @@ struct ContentView: View {
         }
         session.trainingMaskMode = capture.manifest.mode == .object
             ? .transparent : .coverage
+        session.refineCameraPosesEnabled = false
         pickError = nil
     }
 
@@ -165,6 +167,11 @@ struct ContentView: View {
                         $0.trainingMask != nil
                     } ? "Included" : "None"
                 )
+                Toggle(
+                    "Refine camera poses",
+                    isOn: $session.refineCameraPosesEnabled
+                )
+                .disabled(isBusy)
             } else if folder?.supportsAutomaticTrainingMaskDiscovery == true {
                 Toggle("Use discovered masks", isOn: trainingMasksBinding)
                     .disabled(isBusy)
@@ -212,7 +219,45 @@ struct ContentView: View {
             if folder?.supportsAutomaticTrainingMaskDiscovery == true {
                 Text("Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Coverage only weights RGB loss and can skip off-mask tile work for throughput. Transparent supervises the full frame to suppress exterior floaters and is not expected to be faster.")
             }
+            if source?.capturedDataset != nil {
+                Text("Refine camera poses is an explicit A/B control for captured datasets. It learns bounded training-time pose corrections without changing the captured transforms.json.")
+                if let requirement = poseRefinementBudgetRequirement {
+                    Text(
+                        "It requires at least \(requirement.minimumIterations) iterations: " +
+                        "\(requirement.warmupIterations) warm-up iterations plus " +
+                        "\(requirement.postWarmupCameraVisits) camera visits to complete " +
+                        "one full post-warm-up shuffled pass."
+                    )
+                    if session.refineCameraPosesEnabled,
+                       session.iterations < requirement.minimumIterations {
+                        Text(
+                            "Increase Iterations to at least " +
+                            "\(requirement.minimumIterations) before training."
+                        )
+                        .foregroundStyle(.orange)
+                    }
+                }
+            }
         }
+    }
+
+    private var poseRefinementBudgetRequirement: PoseRefinementBudgetRequirement? {
+        guard let capture = source?.capturedDataset,
+              var config = try? TrainingSession.makeTrainingConfig(
+                  trainingMaskMode: capture.manifest.mode == .object
+                      ? .transparent : session.trainingMaskMode,
+                  keepCrs: true,
+                  refineCameraPoses: true,
+                  benchmark: nil
+              ),
+              let iterations = Int32(exactly: session.iterations) else {
+            return nil
+        }
+        config.iterations = iterations
+        return try? TrainingSession.poseRefinementBudgetRequirement(
+            config: config,
+            trainingCameraCount: capture.descriptor.frames.count
+        )
     }
 
     private var trainingMasksBinding: Binding<Bool> {
@@ -360,6 +405,17 @@ struct ContentView: View {
                     )
                     .foregroundStyle(.red)
                 }
+                if session.phase == .finished,
+                   let summary = session.poseCorrectionSummary {
+                    LabeledContent(
+                        "Pose translation",
+                        value: summary.translationDescription
+                    )
+                    LabeledContent(
+                        "Pose rotation",
+                        value: summary.rotationDescription
+                    )
+                }
             }
         }
     }
@@ -410,6 +466,14 @@ struct ContentView: View {
         Section("Result") {
             ShareLink(item: ply) {
                 Label("Export \(ply.lastPathComponent)", systemImage: "square.and.arrow.up")
+            }
+            if let refinedTransformsURL = session.refinedTransformsURL {
+                ShareLink(item: refinedTransformsURL) {
+                    Label(
+                        "Export \(refinedTransformsURL.lastPathComponent)",
+                        systemImage: "square.and.arrow.up"
+                    )
+                }
             }
         }
     }

@@ -371,6 +371,19 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(session.trainingMaskMode, .transparent)
     }
 
+    @MainActor
+    func testCameraPoseRefinementDefaultsOff() throws {
+        let session = TrainingSession()
+        let config = try TrainingSession.makeTrainingConfig(
+            trainingMaskMode: .transparent,
+            keepCrs: true,
+            benchmark: nil
+        )
+
+        XCTAssertFalse(session.refineCameraPosesEnabled)
+        XCTAssertFalse(config.refineCameraPoses)
+    }
+
     func testBinarySparsePointCountTakesPriorityOverText() throws {
         let directory = try XCTUnwrap(temporaryDirectory)
         try writeBinaryPointHeader(count: 2, to: directory)
@@ -667,10 +680,12 @@ final class TrainingMaskOptionsTests: XCTestCase {
 
         let config = try TrainingSession.makeTrainingConfig(
             trainingMaskMode: .transparent,
+            refineCameraPoses: true,
             benchmark: benchmark
         )
 
         XCTAssertEqual(config.trainingMaskMode, .transparent)
+        XCTAssertFalse(config.refineCameraPoses)
         XCTAssertEqual(config.stopDensifyAt, 0)
         XCTAssertEqual(config.warmupLength, TrainingConfig().warmupLength)
         XCTAssertEqual(config.refineEvery, TrainingConfig().refineEvery)
@@ -689,6 +704,283 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(config.trainingMaskMode, .transparent)
         XCTAssertFalse(config.refinePhotometricGains)
         XCTAssertFalse(config.refineCameraPoses)
+    }
+
+    func testCapturedTrainingConfigEnablesPoseRefinementWhenOptedIn() throws {
+        let config = try TrainingSession.makeTrainingConfig(
+            trainingMaskMode: .transparent,
+            keepCrs: true,
+            refineCameraPoses: true,
+            benchmark: nil
+        )
+
+        XCTAssertTrue(config.keepCrs)
+        XCTAssertTrue(config.refineCameraPoses)
+    }
+
+    func testPoseRefinementBudgetRejectsInsufficientPostWarmupCameraPass() throws {
+        var config = try TrainingSession.makeTrainingConfig(
+            trainingMaskMode: .transparent,
+            refineCameraPoses: true,
+            benchmark: nil
+        )
+        let cameraCount = 7
+        let requirement = try TrainingSession.poseRefinementBudgetRequirement(
+            config: config,
+            trainingCameraCount: cameraCount
+        )
+        config.iterations = Int32(requirement.minimumIterations - 1)
+
+        XCTAssertEqual(requirement.warmupIterations, 500)
+        XCTAssertEqual(requirement.postWarmupCameraVisits, 11)
+        XCTAssertEqual(requirement.minimumIterations, 511)
+        XCTAssertThrowsError(try TrainingSession.validatePoseRefinementBudget(
+            config: config,
+            trainingCameraCount: cameraCount
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("at least 511 iterations"))
+            XCTAssertTrue(
+                error.localizedDescription.contains("one full post-warm-up shuffled pass")
+            )
+        }
+    }
+
+    func testPoseRefinementBudgetAcceptsWarmupPlusFullCameraPass() throws {
+        var config = try TrainingSession.makeTrainingConfig(
+            trainingMaskMode: .transparent,
+            refineCameraPoses: true,
+            benchmark: nil
+        )
+        let cameraCount = 7
+        let requirement = try TrainingSession.poseRefinementBudgetRequirement(
+            config: config,
+            trainingCameraCount: cameraCount
+        )
+        config.iterations = Int32(requirement.minimumIterations)
+
+        XCTAssertNoThrow(try TrainingSession.validatePoseRefinementBudget(
+            config: config,
+            trainingCameraCount: cameraCount
+        ))
+    }
+
+    func testRefinedCaptureManifestWritesSiblingAndPreservesRawFields() throws {
+        let rootURL = try XCTUnwrap(temporaryDirectory)
+        let pointCloudPath = "pointcloud/lidar_colored.ply"
+        let first = makeCaptureFrameRecord(
+            id: "frame_000001",
+            imagePath: "images/frame_000001.png",
+            maskPath: "masks/frame_000001.png"
+        )
+        let second = makeCaptureFrameRecord(
+            id: "frame_000002",
+            imagePath: "images/frame_000002.png",
+            maskPath: nil
+        )
+        let identity: [[Float]] = [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]
+        let sourceObject: [String: Any] = [
+            "camera_model": "OPENCV",
+            "ply_file_path": pointCloudPath,
+            "capture_note": "preserve me",
+            "frames": [
+                [
+                    "file_path": second.imagePath,
+                    "w": 1_920,
+                    "h": 1_440,
+                    "fl_x": 1_200.0,
+                    "fl_y": 1_210.0,
+                    "cx": 960.0,
+                    "cy": 720.0,
+                    "transform_matrix": identity,
+                ],
+                [
+                    "file_path": first.imagePath,
+                    "mask_path": try XCTUnwrap(first.maskPath),
+                    "w": 1_920,
+                    "h": 1_440,
+                    "fl_x": 1_200.0,
+                    "fl_y": 1_210.0,
+                    "cx": 960.0,
+                    "cy": 720.0,
+                    "transform_matrix": identity,
+                ],
+            ],
+        ]
+        let sourceData = try JSONSerialization.data(
+            withJSONObject: sourceObject,
+            options: [.prettyPrinted, .sortedKeys]
+        )
+        let sourceURL = rootURL.appending(path: "transforms.json")
+        try sourceData.write(to: sourceURL)
+
+        var firstPose = first.cameraToWorld
+        firstPose[3] = 0.25
+        var secondPose = second.cameraToWorld
+        secondPose[7] = -0.5
+        let output = try RefinedCaptureManifestExporter.write(
+            rootURL: rootURL,
+            frames: [first, second],
+            pointCloudPath: pointCloudPath,
+            corrections: [
+                CapturePoseCorrection(
+                    frameID: second.id,
+                    isAnchor: false,
+                    optimizerStepCount: 1,
+                    correctedCameraToWorld: try CameraPose(elements: secondPose),
+                    translationNorm: 0.004,
+                    rotationNorm: 0.02
+                ),
+                CapturePoseCorrection(
+                    frameID: first.id,
+                    isAnchor: true,
+                    optimizerStepCount: 0,
+                    correctedCameraToWorld: try CameraPose(elements: firstPose),
+                    translationNorm: 0.003,
+                    rotationNorm: 0.01
+                ),
+            ]
+        )
+
+        XCTAssertEqual(try Data(contentsOf: sourceURL), sourceData)
+        XCTAssertEqual(output.url.lastPathComponent, "transforms_refined.json")
+        let refinedData = try Data(contentsOf: output.url)
+        let refinedObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: refinedData) as? [String: Any]
+        )
+        XCTAssertEqual(refinedObject["ply_file_path"] as? String, pointCloudPath)
+        XCTAssertEqual(refinedObject["capture_note"] as? String, "preserve me")
+        let sourceFrames = try XCTUnwrap(sourceObject["frames"] as? [[String: Any]])
+        let refinedFrames = try XCTUnwrap(refinedObject["frames"] as? [[String: Any]])
+        let sourceByPath = Dictionary(uniqueKeysWithValues: sourceFrames.compactMap { frame in
+            (frame["file_path"] as? String).map { ($0, frame) }
+        })
+        let refinedByPath = Dictionary(uniqueKeysWithValues: refinedFrames.compactMap { frame in
+            (frame["file_path"] as? String).map { ($0, frame) }
+        })
+        for path in [first.imagePath, second.imagePath] {
+            var sourceFrame = try XCTUnwrap(sourceByPath[path])
+            var refinedFrame = try XCTUnwrap(refinedByPath[path])
+            sourceFrame.removeValue(forKey: "transform_matrix")
+            refinedFrame.removeValue(forKey: "transform_matrix")
+            XCTAssertTrue(
+                NSDictionary(dictionary: sourceFrame).isEqual(
+                    NSDictionary(dictionary: refinedFrame)
+                )
+            )
+        }
+        let firstMatrix = try XCTUnwrap(
+            refinedByPath[first.imagePath]?["transform_matrix"] as? [[NSNumber]]
+        )
+        let secondMatrix = try XCTUnwrap(
+            refinedByPath[second.imagePath]?["transform_matrix"] as? [[NSNumber]]
+        )
+        XCTAssertEqual(firstMatrix[0][3].floatValue, 0.25, accuracy: 1e-6)
+        XCTAssertEqual(secondMatrix[1][3].floatValue, -0.5, accuracy: 1e-6)
+        XCTAssertEqual(output.summary.cameraCount, 2)
+        XCTAssertEqual(output.summary.maximumTranslationMeters, 0.004, accuracy: 1e-6)
+        XCTAssertEqual(
+            output.summary.rmsTranslationMeters,
+            Float(sqrt((0.003 * 0.003 + 0.004 * 0.004) / 2)),
+            accuracy: 1e-6
+        )
+        XCTAssertEqual(output.summary.maximumRotationRadians, 0.02, accuracy: 1e-6)
+        XCTAssertEqual(
+            output.summary.rmsRotationRadians,
+            Float(sqrt((0.01 * 0.01 + 0.02 * 0.02) / 2)),
+            accuracy: 1e-6
+        )
+    }
+
+    func testRefinedCaptureManifestRejectsDuplicateAndMissingFrameIDs() throws {
+        let frame = makeCaptureFrameRecord(
+            id: "frame_000001",
+            imagePath: "images/frame_000001.png",
+            maskPath: nil
+        )
+        let other = makeCaptureFrameRecord(
+            id: "frame_000002",
+            imagePath: "images/frame_000002.png",
+            maskPath: nil
+        )
+        let sourceData = try JSONSerialization.data(withJSONObject: [
+            "ply_file_path": "pointcloud/lidar_colored.ply",
+            "frames": [
+                ["file_path": frame.imagePath, "transform_matrix": identityTransform],
+                ["file_path": other.imagePath, "transform_matrix": identityTransform],
+            ],
+        ])
+        let correction = CapturePoseCorrection(
+            frameID: frame.id,
+            isAnchor: false,
+            optimizerStepCount: 1,
+            correctedCameraToWorld: try CameraPose(elements: frame.cameraToWorld),
+            translationNorm: 0,
+            rotationNorm: 0
+        )
+
+        XCTAssertThrowsError(try RefinedCaptureManifestExporter.makeManifestData(
+            sourceData: sourceData,
+            frames: [frame, other],
+            pointCloudPath: "pointcloud/lidar_colored.ply",
+            corrections: [correction, correction]
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("duplicate frame ID"))
+        }
+        XCTAssertThrowsError(try RefinedCaptureManifestExporter.makeManifestData(
+            sourceData: sourceData,
+            frames: [frame, other],
+            pointCloudPath: "pointcloud/lidar_colored.ply",
+            corrections: [correction]
+        )) { error in
+            XCTAssertTrue(error.localizedDescription.contains("missing frame IDs"))
+        }
+    }
+
+    func testRefinedCaptureManifestRejectsAnyUnvisitedNonAnchorCamera() throws {
+        let pose = try CameraPose(elements: identityTransform.flatMap { $0 })
+        let anchor = CapturePoseCorrection(
+            frameID: "frame_000001",
+            isAnchor: true,
+            optimizerStepCount: 0,
+            correctedCameraToWorld: pose,
+            translationNorm: 0,
+            rotationNorm: 0
+        )
+        let unvisitedCamera = CapturePoseCorrection(
+            frameID: "frame_000002",
+            isAnchor: false,
+            optimizerStepCount: 0,
+            correctedCameraToWorld: pose,
+            translationNorm: 0,
+            rotationNorm: 0
+        )
+        let visitedCamera = CapturePoseCorrection(
+            frameID: "frame_000003",
+            isAnchor: false,
+            optimizerStepCount: 1,
+            correctedCameraToWorld: pose,
+            translationNorm: 0,
+            rotationNorm: 0
+        )
+
+        XCTAssertThrowsError(try RefinedCaptureManifestExporter.validateOptimizerVisits(
+            in: [anchor, visitedCamera, unvisitedCamera]
+        )) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains(
+                    "non-anchor cameras received no optimizer steps: frame_000002"
+                )
+            )
+        }
+
+        XCTAssertNoThrow(try RefinedCaptureManifestExporter.validateOptimizerVisits(
+            in: [anchor, visitedCamera]
+        ))
     }
 
     func testGrowthBenchmarkRequiresMeasuredCapacityIncrease() {
@@ -1276,6 +1568,43 @@ final class TrainingMaskOptionsTests: XCTestCase {
             }
         }
         return result
+    }
+
+    private var identityTransform: [[Float]] {
+        [
+            [1, 0, 0, 0],
+            [0, 1, 0, 0],
+            [0, 0, 1, 0],
+            [0, 0, 0, 1],
+        ]
+    }
+
+    private func makeCaptureFrameRecord(
+        id: String,
+        imagePath: String,
+        maskPath: String?
+    ) -> CaptureFrameRecord {
+        CaptureFrameRecord(
+            id: id,
+            imagePath: imagePath,
+            maskPath: maskPath,
+            softMaskPath: nil,
+            displayOrientation: .up,
+            calibration: CaptureCalibrationRecord(
+                width: 1_920,
+                height: 1_440,
+                fx: 1_200,
+                fy: 1_210,
+                cx: 960,
+                cy: 720
+            ),
+            cameraToWorld: identityTransform.flatMap { $0 },
+            timestamp: 0,
+            exposureDurationSeconds: 0.01,
+            trackingState: "normal",
+            maskConfidence: nil,
+            fusedPointCount: 1
+        )
     }
 
     private func topLeftRGBABytes(from image: CGImage) throws -> [UInt8] {

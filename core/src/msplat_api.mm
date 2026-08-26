@@ -745,6 +745,43 @@ TrainingMemoryMetrics Trainer::memoryMetrics() const {
     return metrics;
 }
 
+uint32_t Trainer::poseRefinementStateCount() const {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    return impl->model->poseRefinementStateCount();
+}
+
+PoseRefinementState Trainer::poseRefinementState(
+    uint32_t canonicalCameraIndex) const {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    if (canonicalCameraIndex >= impl->model->poseRefinementStateCount()) {
+        throw std::invalid_argument(
+            "Pose-refinement camera index is out of range");
+    }
+
+    // Pose deltas are updated by the training command buffer in shared Metal
+    // storage. Keep this readback in the trainer transaction and wait before
+    // dereferencing that storage on the CPU.
+    msplat_gpu_sync();
+    const ModelPoseRefinementState source =
+        impl->model->poseRefinementState(canonicalCameraIndex);
+
+    PoseRefinementState state;
+    state.enabled = true;
+    state.anchor = source.anchor;
+    state.canonicalCameraIndex = canonicalCameraIndex;
+    state.optimizerStepCount = source.optimizerStepCount;
+    std::copy(source.geometry.poseDelta.begin(),
+              source.geometry.poseDelta.end(), state.poseDelta);
+    state.translationNorm = source.geometry.translationNorm;
+    state.rotationNorm = source.geometry.rotationNorm;
+    std::copy(source.geometry.correctedCameraToWorld.begin(),
+              source.geometry.correctedCameraToWorld.end(),
+              state.correctedCameraToWorld);
+    state.frameId = source.frameId;
+    state.frameIdLength = source.frameIdLength;
+    return state;
+}
+
 // ── Lifecycle ───────────────────────────────────────────────────────────────
 
 void sync() {
@@ -2038,6 +2075,51 @@ MsplatStatus msplat_trainer_memory_metrics_v4(
             metrics.trainingGpuImageCacheHits;
         outMetrics->trainingGpuImageCacheMisses =
             metrics.trainingGpuImageCacheMisses;
+    });
+}
+
+MsplatStatus msplat_trainer_pose_refinement_count_v15(
+    MsplatTrainer t, uint32_t* outCount, MsplatErrorInfo* error) {
+    if (outCount) *outCount = 0u;
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        require(outCount != nullptr,
+                "Pose-refinement count output must not be null");
+        *outCount = trainerHandle(t).trainer->poseRefinementStateCount();
+    });
+}
+
+MsplatStatus msplat_trainer_pose_refinement_state_v15(
+    MsplatTrainer t, uint32_t canonicalCameraIndex,
+    MsplatPoseRefinementStateV15* outState, size_t outputSize,
+    MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(outputSize == sizeof(MsplatPoseRefinementStateV15),
+                "Pose-refinement state size does not match this msplat ABI");
+        require(outState != nullptr,
+                "Pose-refinement state output must not be null");
+        *outState = {};
+        require(t != nullptr, "Trainer handle must not be null");
+
+        const msplat::PoseRefinementState state =
+            trainerHandle(t).trainer->poseRefinementState(
+                canonicalCameraIndex);
+        if (state.enabled)
+            outState->flags |= MSPLAT_POSE_REFINEMENT_STATE_ENABLED;
+        if (state.anchor)
+            outState->flags |= MSPLAT_POSE_REFINEMENT_STATE_ANCHOR;
+        outState->canonicalCameraIndex = state.canonicalCameraIndex;
+        outState->optimizerStepCount = state.optimizerStepCount;
+        std::memcpy(outState->poseDelta, state.poseDelta,
+                    sizeof(outState->poseDelta));
+        outState->translationNorm = state.translationNorm;
+        outState->rotationNorm = state.rotationNorm;
+        std::memcpy(outState->correctedCameraToWorld,
+                    state.correctedCameraToWorld,
+                    sizeof(outState->correctedCameraToWorld));
+        outState->frameId = state.frameId;
+        outState->frameIdLength =
+            static_cast<uint64_t>(state.frameIdLength);
     });
 }
 

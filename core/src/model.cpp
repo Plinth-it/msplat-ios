@@ -489,6 +489,81 @@ size_t Model::estimatedGpuBytes() const {
     return bytes;
 }
 
+uint32_t Model::poseRefinementStateCount() const {
+    return msplat::detail::poseRefinementStateCount(
+        refineCameraPoses, datasetCameraCount);
+}
+
+ModelPoseRefinementState Model::poseRefinementState(
+    uint32_t canonicalCameraIndex) const {
+    const uint32_t count = poseRefinementStateCount();
+    if (canonicalCameraIndex >= count) {
+        throw std::invalid_argument(
+            "Pose-refinement camera index is out of range");
+    }
+    if (!cameraPoseDeltas.defined() || !cameraPoseDeltas.isGpu() ||
+        cameraPoseDeltas.dtype() != DType::Float32 ||
+        cameraPoseDeltas.ndim() != 2 ||
+        cameraPoseDeltas.size(0) != datasetCameraCount ||
+        cameraPoseDeltas.size(1) != 6 ||
+        cameraPoseStepCounts.size() != static_cast<size_t>(datasetCameraCount) ||
+        cameraBasePoses.size() !=
+            static_cast<size_t>(datasetCameraCount) * 16 ||
+        cameraFrameIds.size() != static_cast<size_t>(datasetCameraCount)) {
+        throw std::runtime_error(
+            "Pose-refinement query state is inconsistent");
+    }
+
+    const size_t camera = static_cast<size_t>(canonicalCameraIndex);
+    const size_t deltaOffset = camera * 6;
+    const size_t poseOffset = camera * 16;
+    const float* deltas = cameraPoseDeltas.data<float>() + deltaOffset;
+    float translationNorm2 = 0.0f;
+    float rotationNorm2 = 0.0f;
+    for (int component = 0; component < 6; ++component) {
+        if (!std::isfinite(deltas[component])) {
+            throw std::runtime_error(
+                "Pose-refinement query contains a non-finite delta");
+        }
+        if (component < 3)
+            translationNorm2 += deltas[component] * deltas[component];
+        else
+            rotationNorm2 += deltas[component] * deltas[component];
+    }
+    if (translationNorm2 >
+            (kPoseMaxTranslation + 1.0e-6f) *
+                (kPoseMaxTranslation + 1.0e-6f) ||
+        rotationNorm2 >
+            (kPoseMaxRotation + 1.0e-6f) *
+                (kPoseMaxRotation + 1.0e-6f)) {
+        throw std::runtime_error(
+            "Pose-refinement query delta is outside its bounds");
+    }
+
+    ModelPoseRefinementState state;
+    state.anchor = canonicalCameraIndex ==
+        static_cast<uint32_t>(poseAnchorCameraIndex);
+    state.optimizerStepCount = cameraPoseStepCounts[camera];
+    if (state.anchor) {
+        if (state.optimizerStepCount != 0u) {
+            throw std::runtime_error(
+                "Pose-refinement anchor step count is not zero");
+        }
+        for (int component = 0; component < 6; ++component) {
+            if (deltas[component] != 0.0f) {
+                throw std::runtime_error(
+                    "Pose-refinement anchor delta is not zero");
+            }
+        }
+    }
+    state.geometry = msplat::detail::makePoseRefinementGeometry(
+        cameraBasePoses.data() + poseOffset, deltas, scale, translation);
+    const std::string& frameId = cameraFrameIds[camera];
+    state.frameId = frameId.data();
+    state.frameIdLength = frameId.size();
+    return state;
+}
+
 void Model::ensureCapacity(int needed){
     if (!hasDensificationScratch())
         throw std::logic_error(

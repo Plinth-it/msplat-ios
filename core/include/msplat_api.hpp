@@ -129,6 +129,23 @@ struct TrainingMemoryMetrics {
     bool hasProcessAvailableBytes = false;
 };
 
+/// Read-only snapshot of one canonical camera's opt-in pose refinement.
+/// Translation deltas and the corrected matrix translation use the dataset's
+/// original pre-normalization length units; rotation deltas use radians.
+/// `frameId` is borrowed and remains valid for the owning Trainer's lifetime.
+struct PoseRefinementState {
+    bool enabled = false;
+    bool anchor = false;
+    uint32_t canonicalCameraIndex = 0;
+    uint32_t optimizerStepCount = 0;
+    float poseDelta[6] = {};
+    float translationNorm = 0.0f;
+    float rotationNorm = 0.0f;
+    float correctedCameraToWorld[16] = {};
+    const char* frameId = nullptr;
+    size_t frameIdLength = 0;
+};
+
 struct EvalMetrics {
     float psnr = 0.0f;
     float ssim = 0.0f;
@@ -263,6 +280,11 @@ public:
     TrainingMetrics metrics() const;
     /// Live buffer ownership, cache, and process-memory measurements.
     TrainingMemoryMetrics memoryMetrics() const;
+    /// Returns zero when camera-pose refinement was not enabled.
+    uint32_t poseRefinementStateCount() const;
+    /// Synchronizes pending Metal work before reading the selected pose row.
+    PoseRefinementState poseRefinementState(
+        uint32_t canonicalCameraIndex) const;
 
 private:
     struct Impl;

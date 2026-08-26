@@ -7,6 +7,8 @@ file(READ "${MSPLAT_SOURCE_DIR}/core/metal/msplat_metal.mm" host_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/src/model.cpp" model_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/src/msplat_api.mm" api_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/include/msplat_c_api.h" c_api_header)
+file(READ "${MSPLAT_SOURCE_DIR}/core/include/pose_refinement_state.hpp"
+    pose_state_header)
 file(READ "${MSPLAT_SOURCE_DIR}/cli/msplat.cpp" cli_source)
 file(READ "${MSPLAT_SOURCE_DIR}/python/bindings.cpp" python_source)
 
@@ -254,6 +256,52 @@ require_contains("${c_api_header}"
 require_contains("${api_source}"
     "cfg.refineCameraPoses =\n            (refinementOptions->flags &\n             MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) != 0u;"
     "C API camera-pose option mapping")
+
+# ABI v15 reads only the public pose row after serializing and synchronizing.
+extract_section(api_source
+    "PoseRefinementState Trainer::poseRefinementState("
+    "// ── Lifecycle" pose_state_trainer_query)
+require_contains("${pose_state_trainer_query}"
+    "std::lock_guard lock(g_trainerTransactionMutex);"
+    "pose-state trainer transaction lock")
+require_contains("${pose_state_trainer_query}"
+    "msplat_gpu_sync();"
+    "pose-state GPU synchronization")
+
+extract_section(model_source
+    "uint32_t Model::poseRefinementStateCount() const"
+    "void Model::ensureCapacity(" pose_state_model_query)
+require_contains("${pose_state_model_query}"
+    "cameraPoseDeltas.data<float>()"
+    "pose-state delta read")
+require_contains("${pose_state_model_query}"
+    "Pose-refinement anchor delta is not zero"
+    "pose-state zero anchor invariant")
+require_absent("${pose_state_model_query}" "cameraPoseExpAvg"
+    "pose-state model query")
+require_absent("${pose_state_model_query}" "cameraPoseExpAvgSq"
+    "pose-state model query")
+require_contains("${pose_state_header}"
+    "correctionRotation[row * 3 + inner] *\n                    declaredViewRotation[inner * 3 + column]"
+    "pose-state left view correction")
+require_contains("${pose_state_header}"
+    "correctedNormalizedPosition[row] / normalizationScale +\n            normalizationTranslation[row]"
+    "pose-state normalization reversal")
+require_contains("${c_api_header}"
+    "#define MSPLAT_POSE_REFINEMENT_STATE_ENABLED (1u << 0)"
+    "pose-state enabled flag")
+require_contains("${c_api_header}"
+    "#define MSPLAT_POSE_REFINEMENT_STATE_ANCHOR  (1u << 1)"
+    "pose-state anchor flag")
+require_contains("${c_api_header}"
+    "msplat_trainer_pose_refinement_count_v15("
+    "pose-state count query")
+require_contains("${c_api_header}"
+    "msplat_trainer_pose_refinement_state_v15("
+    "pose-state checked query")
+require_contains("${api_source}"
+    "require(outputSize == sizeof(MsplatPoseRefinementStateV15)"
+    "pose-state output size validation")
 
 # Selecting the fixed anchor must not dereference an empty training split
 # before the normal model validation can return a recoverable error.

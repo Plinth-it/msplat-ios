@@ -42,8 +42,10 @@ extern "C" {
 // ABI v13 adds separately owned, asynchronously completed Metal preview
 // frames while retaining every CPU render entry point.
 // ABI v14 adds instance-scoped, opt-in depth-one training-target prefetch.
+// ABI v15 adds read-only, size-checked camera-pose refinement state without
+// changing any existing structure or entry point.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 14u
+#define MSPLAT_ABI_VERSION 15u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -315,6 +317,29 @@ typedef struct {
     uint64_t trainingGpuImageCacheHits;
     uint64_t trainingGpuImageCacheMisses;
 } MsplatTrainingMemoryMetrics;
+
+#define MSPLAT_POSE_REFINEMENT_STATE_ENABLED (1u << 0)
+#define MSPLAT_POSE_REFINEMENT_STATE_ANCHOR  (1u << 1)
+
+/// ABI v15 read-only state for one canonical dataset camera. `poseDelta[0...2]`
+/// is the left-view translation correction expressed in the dataset's original
+/// pre-normalization length units; `poseDelta[3...5]` is axis-angle radians.
+/// `correctedCameraToWorld` is row-major OpenGL camera-to-world in that same
+/// original coordinate system. `frameId` is length-delimited, not necessarily
+/// NUL-terminated, and remains valid only for the owning trainer's lifetime.
+/// The reserved field is always zero.
+typedef struct {
+    uint32_t flags;
+    uint32_t canonicalCameraIndex;
+    uint32_t optimizerStepCount;
+    uint32_t reserved;
+    float poseDelta[6];
+    float translationNorm;
+    float rotationNorm;
+    float correctedCameraToWorld[16];
+    const char* frameId;
+    uint64_t frameIdLength;
+} MsplatPoseRefinementStateV15;
 
 typedef struct {
     float psnr;
@@ -691,6 +716,19 @@ MsplatStatus msplat_trainer_metrics_v12(
 MsplatStatus msplat_trainer_memory_metrics_v4(
     MsplatTrainer t, MsplatTrainingMemoryMetrics* outMetrics,
     size_t outputSize, MsplatErrorInfo* error);
+/// Returns the canonical dataset-camera count when pose refinement is enabled,
+/// or zero when disabled. The count includes the fixed anchor and any held-out
+/// cameras because state rows use canonical dataset indices.
+MsplatStatus msplat_trainer_pose_refinement_count_v15(
+    MsplatTrainer t, uint32_t* outCount, MsplatErrorInfo* error);
+/// Reads one canonical pose row. `outputSize` must exactly equal
+/// sizeof(MsplatPoseRefinementStateV15). A size mismatch leaves output
+/// untouched; other failures clear it. Pending trainer GPU work is synchronized
+/// before pose tensors are read. No optimizer moment tensor is exposed.
+MsplatStatus msplat_trainer_pose_refinement_state_v15(
+    MsplatTrainer t, uint32_t canonicalCameraIndex,
+    MsplatPoseRefinementStateV15* outState, size_t outputSize,
+    MsplatErrorInfo* error);
 void msplat_pixel_buffer_free(MsplatPixelBuffer* buffer);
 
 MsplatTrainer msplat_trainer_create(MsplatDataset ds, MsplatConfig config);

@@ -3,6 +3,257 @@ import Msplat
 import SwiftUI
 import os
 
+struct CapturePoseCorrection: Sendable, Equatable {
+    let frameID: String
+    let isAnchor: Bool
+    let optimizerStepCount: Int
+    let correctedCameraToWorld: CameraPose
+    let translationNorm: Float
+    let rotationNorm: Float
+}
+
+struct PoseRefinementBudgetRequirement: Sendable, Equatable {
+    let warmupIterations: Int
+    let postWarmupCameraVisits: Int
+    let minimumIterations: Int
+}
+
+struct CapturePoseCorrectionSummary: Sendable, Equatable {
+    let cameraCount: Int
+    let maximumTranslationMeters: Float
+    let rmsTranslationMeters: Float
+    let maximumRotationRadians: Float
+    let rmsRotationRadians: Float
+
+    var translationDescription: String {
+        String(
+            format: "max %.1f mm, RMS %.1f mm",
+            maximumTranslationMeters * 1_000,
+            rmsTranslationMeters * 1_000
+        )
+    }
+
+    var rotationDescription: String {
+        String(
+            format: "max %.2f°, RMS %.2f°",
+            maximumRotationRadians * 180 / .pi,
+            rmsRotationRadians * 180 / .pi
+        )
+    }
+}
+
+enum RefinedCaptureManifestError: LocalizedError, Sendable {
+    case invalidSource(String)
+    case invalidCorrections(String)
+    case persistence(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidSource(let message):
+            "The captured transforms.json is invalid: \(message)"
+        case .invalidCorrections(let message):
+            "The refined camera poses are invalid: \(message)"
+        case .persistence(let message):
+            "The refined camera poses could not be saved: \(message)"
+        }
+    }
+}
+
+enum RefinedCaptureManifestExporter {
+    struct Output: Sendable, Equatable {
+        let url: URL
+        let summary: CapturePoseCorrectionSummary
+    }
+
+    static func write(
+        rootURL: URL,
+        frames: [CaptureFrameRecord],
+        pointCloudPath: String,
+        corrections: [CapturePoseCorrection]
+    ) throws -> Output {
+        let sourceURL = rootURL.appending(path: "transforms.json")
+        let destinationURL = rootURL.appending(path: "transforms_refined.json")
+        let sourceData: Data
+        do {
+            sourceData = try Data(contentsOf: sourceURL)
+        } catch {
+            throw RefinedCaptureManifestError.invalidSource(error.localizedDescription)
+        }
+        let result = try makeManifestData(
+            sourceData: sourceData,
+            frames: frames,
+            pointCloudPath: pointCloudPath,
+            corrections: corrections
+        )
+        do {
+            try result.data.write(to: destinationURL, options: .atomic)
+        } catch {
+            throw RefinedCaptureManifestError.persistence(error.localizedDescription)
+        }
+        return Output(url: destinationURL, summary: result.summary)
+    }
+
+    static func makeManifestData(
+        sourceData: Data,
+        frames: [CaptureFrameRecord],
+        pointCloudPath: String,
+        corrections: [CapturePoseCorrection]
+    ) throws -> (data: Data, summary: CapturePoseCorrectionSummary) {
+        guard !frames.isEmpty else {
+            throw RefinedCaptureManifestError.invalidSource("it contains no capture frames")
+        }
+        try validateOptimizerVisits(in: corrections)
+
+        let frameIDs = frames.map(\.id)
+        guard Set(frameIDs).count == frameIDs.count else {
+            throw RefinedCaptureManifestError.invalidSource(
+                "capture frame IDs are not unique"
+            )
+        }
+        let imagePaths = frames.map(\.imagePath)
+        guard Set(imagePaths).count == imagePaths.count else {
+            throw RefinedCaptureManifestError.invalidSource(
+                "capture image paths are not unique"
+            )
+        }
+
+        let expectedFrameIDs = Set(frameIDs)
+        var correctionByFrameID: [String: CapturePoseCorrection] = [:]
+        correctionByFrameID.reserveCapacity(corrections.count)
+        for correction in corrections {
+            guard correction.translationNorm.isFinite,
+                  correction.translationNorm >= 0,
+                  correction.rotationNorm.isFinite,
+                  correction.rotationNorm >= 0 else {
+                throw RefinedCaptureManifestError.invalidCorrections(
+                    "frame '\(correction.frameID)' has a non-finite or negative correction"
+                )
+            }
+            guard expectedFrameIDs.contains(correction.frameID) else {
+                throw RefinedCaptureManifestError.invalidCorrections(
+                    "unexpected frame ID '\(correction.frameID)'"
+                )
+            }
+            guard correctionByFrameID.updateValue(
+                correction,
+                forKey: correction.frameID
+            ) == nil else {
+                throw RefinedCaptureManifestError.invalidCorrections(
+                    "duplicate frame ID '\(correction.frameID)'"
+                )
+            }
+        }
+        let missingFrameIDs = expectedFrameIDs.subtracting(Set(correctionByFrameID.keys))
+        guard missingFrameIDs.isEmpty else {
+            throw RefinedCaptureManifestError.invalidCorrections(
+                "missing frame IDs: \(missingFrameIDs.sorted().joined(separator: ", "))"
+            )
+        }
+
+        let object: Any
+        do {
+            object = try JSONSerialization.jsonObject(with: sourceData)
+        } catch {
+            throw RefinedCaptureManifestError.invalidSource(error.localizedDescription)
+        }
+        guard var manifest = object as? [String: Any],
+              manifest["ply_file_path"] as? String == pointCloudPath,
+              var encodedFrames = manifest["frames"] as? [[String: Any]],
+              encodedFrames.count == frames.count else {
+            throw RefinedCaptureManifestError.invalidSource(
+                "frame count or point-cloud path does not match capture_metadata.json"
+            )
+        }
+
+        var encodedIndexByImagePath: [String: Int] = [:]
+        encodedIndexByImagePath.reserveCapacity(encodedFrames.count)
+        for (index, encodedFrame) in encodedFrames.enumerated() {
+            guard let imagePath = encodedFrame["file_path"] as? String,
+                  !imagePath.isEmpty else {
+                throw RefinedCaptureManifestError.invalidSource(
+                    "a frame has no file_path"
+                )
+            }
+            guard encodedIndexByImagePath.updateValue(index, forKey: imagePath) == nil else {
+                throw RefinedCaptureManifestError.invalidSource(
+                    "duplicate file_path '\(imagePath)'"
+                )
+            }
+        }
+
+        for frame in frames {
+            guard let correction = correctionByFrameID[frame.id],
+                  let encodedIndex = encodedIndexByImagePath[frame.imagePath] else {
+                throw RefinedCaptureManifestError.invalidSource(
+                    "missing file_path for frame ID '\(frame.id)'"
+                )
+            }
+            let elements = correction.correctedCameraToWorld.elements
+            let matrix = stride(from: 0, to: CameraPose.elementCount, by: 4).map {
+                Array(elements[$0..<($0 + 4)])
+            }
+            encodedFrames[encodedIndex]["transform_matrix"] = matrix
+        }
+
+        manifest["frames"] = encodedFrames
+        let data: Data
+        do {
+            data = try JSONSerialization.data(
+                withJSONObject: manifest,
+                options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+            )
+        } catch {
+            throw RefinedCaptureManifestError.persistence(error.localizedDescription)
+        }
+        return (data, try summary(for: corrections))
+    }
+
+    static func validateOptimizerVisits(
+        in corrections: [CapturePoseCorrection]
+    ) throws {
+        let nonAnchorCorrections = corrections.filter { !$0.isAnchor }
+        guard !nonAnchorCorrections.isEmpty else {
+            throw RefinedCaptureManifestError.invalidCorrections(
+                "no non-anchor camera states were returned"
+            )
+        }
+        let unvisitedFrameIDs = nonAnchorCorrections
+            .filter { $0.optimizerStepCount <= 0 }
+            .map(\.frameID)
+            .sorted()
+        guard unvisitedFrameIDs.isEmpty else {
+            throw RefinedCaptureManifestError.invalidCorrections(
+                "non-anchor cameras received no optimizer steps: " +
+                unvisitedFrameIDs.joined(separator: ", ")
+            )
+        }
+    }
+
+    private static func summary(
+        for corrections: [CapturePoseCorrection]
+    ) throws -> CapturePoseCorrectionSummary {
+        guard !corrections.isEmpty else {
+            throw RefinedCaptureManifestError.invalidCorrections(
+                "no camera states were returned"
+            )
+        }
+        let count = Double(corrections.count)
+        let translationSquares = corrections.reduce(0.0) {
+            $0 + Double($1.translationNorm) * Double($1.translationNorm)
+        }
+        let rotationSquares = corrections.reduce(0.0) {
+            $0 + Double($1.rotationNorm) * Double($1.rotationNorm)
+        }
+        return CapturePoseCorrectionSummary(
+            cameraCount: corrections.count,
+            maximumTranslationMeters: corrections.map(\.translationNorm).max() ?? 0,
+            rmsTranslationMeters: Float(sqrt(translationSquares / count)),
+            maximumRotationRadians: corrections.map(\.rotationNorm).max() ?? 0,
+            rmsRotationRadians: Float(sqrt(rotationSquares / count))
+        )
+    }
+}
+
 @MainActor
 final class TrainingSession: ObservableObject {
     enum QualityProfile: String, CaseIterable, Identifiable {
@@ -69,6 +320,8 @@ final class TrainingSession: ObservableObject {
     @Published private(set) var plannedMaximumGaussians = 0
     @Published private(set) var benchmarkResultURL: URL?
     @Published private(set) var benchmarkSummary: String?
+    @Published private(set) var refinedTransformsURL: URL?
+    @Published private(set) var poseCorrectionSummary: CapturePoseCorrectionSummary?
 
     /// Total steps. Kept modest by default: on a phone this is a battery and
     /// thermal budget as much as a quality one.
@@ -76,6 +329,7 @@ final class TrainingSession: ObservableObject {
     @Published var qualityProfile: QualityProfile = .preview
     @Published var trainingMasksEnabled = false
     @Published var trainingMaskMode: TrainingMaskMode = .transparent
+    @Published var refineCameraPosesEnabled = false
 
     private struct PendingPreview {
         let id: UInt64
@@ -120,6 +374,7 @@ final class TrainingSession: ObservableObject {
         benchmarkRequestHandled = true
         iterations = benchmark.totalIterations
         qualityProfile = .preview
+        refineCameraPosesEnabled = false
         start(
             source: .importedFolder(folder),
             benchmark: benchmark,
@@ -165,6 +420,8 @@ final class TrainingSession: ObservableObject {
         plannedMaximumGaussians = 0
         benchmarkResultURL = nil
         benchmarkSummary = nil
+        refinedTransformsURL = nil
+        poseCorrectionSummary = nil
         pendingPreviewFailure = nil
         previewGeneration &+= 1
 
@@ -176,6 +433,9 @@ final class TrainingSession: ObservableObject {
               trainingMasksEnabled)
         let selectedTrainingMaskMode = source.capturedDataset?.manifest.mode == .object
             ? TrainingMaskMode.transparent : trainingMaskMode
+        let refineCameraPoses = benchmark == nil &&
+            source.capturedDataset != nil &&
+            refineCameraPosesEnabled
 
         worker = Task { [weak self] in
             guard let self else { return }
@@ -185,6 +445,7 @@ final class TrainingSession: ObservableObject {
                 profile: profile,
                 useTrainingMasks: useTrainingMasks,
                 trainingMaskMode: selectedTrainingMaskMode,
+                refineCameraPoses: refineCameraPoses,
                 benchmark: benchmark,
                 trainingMaskCandidateCount: trainingMaskCandidateCount
             )
@@ -204,6 +465,7 @@ final class TrainingSession: ObservableObject {
         profile: QualityProfile,
         useTrainingMasks: Bool,
         trainingMaskMode: TrainingMaskMode,
+        refineCameraPoses: Bool,
         benchmark: TrainingBenchmarkConfiguration?,
         trainingMaskCandidateCount: Int?
     ) async {
@@ -212,6 +474,7 @@ final class TrainingSession: ObservableObject {
         var finalSplatCount = 0
         var failureMessage: String?
         var wasCancelled = false
+        var refinedManifestOutput: RefinedCaptureManifestExporter.Output?
         var benchmarkRecorder: TrainingBenchmarkRecorder?
         if let benchmark, let folder = source.importedFolder {
             benchmarkRecorder = TrainingBenchmarkRecorder(
@@ -239,6 +502,24 @@ final class TrainingSession: ObservableObject {
                 includesTrainingMasks: useTrainingMasks,
                 maximumGaussianCountOverride: benchmarkMaximumGaussianCount
             )
+            let baseConfig = try Self.makeTrainingConfig(
+                trainingMaskMode: trainingMaskMode,
+                keepCrs: source.capturedDataset != nil,
+                refineCameraPoses: refineCameraPoses,
+                benchmark: benchmark
+            )
+            let trainingConfig = try plan.makeTrainingConfig(startingFrom: baseConfig)
+            if refineCameraPoses {
+                guard let capture = source.capturedDataset else {
+                    throw MsplatError.internalFailure(
+                        "Camera-pose refinement was enabled for a non-captured dataset"
+                    )
+                }
+                try Self.validatePoseRefinementBudget(
+                    config: trainingConfig,
+                    trainingCameraCount: capture.descriptor.frames.count
+                )
+            }
             plannedStages = plan.resolvedStages
             let appEstimatedPeakMemory = try Self.appEstimatedPeakMemory(for: plan)
             estimatedPeakMB = Self.megabytes(appEstimatedPeakMemory)
@@ -261,11 +542,6 @@ final class TrainingSession: ObservableObject {
             phase = .loading
             try Task.checkCancellation()
 
-            let baseConfig = try Self.makeTrainingConfig(
-                trainingMaskMode: trainingMaskMode,
-                keepCrs: source.capturedDataset != nil,
-                benchmark: benchmark
-            )
             let activeSession: MsplatSession
             switch source {
             case .importedFolder(let folder):
@@ -281,7 +557,7 @@ final class TrainingSession: ObservableObject {
                     options: plan.makeDatasetOptions(
                         prefetchTrainingTargets: true
                     ),
-                    config: plan.makeTrainingConfig(startingFrom: baseConfig),
+                    config: trainingConfig,
                     maximumGaussianCount: plan.maximumGaussianCount
                 )
             }
@@ -406,6 +682,37 @@ final class TrainingSession: ObservableObject {
                 }
                 resultURL = url
             }
+            if refineCameraPoses {
+                guard let capture = source.capturedDataset else {
+                    throw MsplatError.internalFailure(
+                        "Camera-pose refinement was enabled for a non-captured dataset"
+                    )
+                }
+                // The wrapper synchronizes all pending trainer GPU work before
+                // copying these stable-ID correction states.
+                let states = try await activeSession.cameraPoseRefinementStates()
+                guard states.allSatisfy(\.isEnabled) else {
+                    throw MsplatError.internalFailure(
+                        "Camera-pose refinement returned a disabled camera state"
+                    )
+                }
+                refinedManifestOutput = try RefinedCaptureManifestExporter.write(
+                    rootURL: capture.rootURL,
+                    frames: capture.manifest.frames,
+                    pointCloudPath: capture.manifest.pointCloudPath,
+                    corrections: states.map {
+                        CapturePoseCorrection(
+                            frameID: $0.frameID,
+                            isAnchor: $0.isAnchor,
+                            optimizerStepCount: $0.optimizerStepCount,
+                            correctedCameraToWorld: $0.correctedCameraToWorld,
+                            translationNorm: $0.translationNorm,
+                            rotationNorm: $0.rotationNorm
+                        )
+                    }
+                )
+                try Task.checkCancellation()
+            }
             finalSplatCount = try await activeSession.splatCount
             if benchmarkRecorder != nil {
                 guard let latestStats else {
@@ -480,6 +787,8 @@ final class TrainingSession: ObservableObject {
         } else {
             splatCount = finalSplatCount
             exportedPly = resultURL
+            refinedTransformsURL = refinedManifestOutput?.url
+            poseCorrectionSummary = refinedManifestOutput?.summary
             phase = .finished
         }
         worker = nil
@@ -745,11 +1054,13 @@ final class TrainingSession: ObservableObject {
     nonisolated static func makeTrainingConfig(
         trainingMaskMode: TrainingMaskMode,
         keepCrs: Bool = false,
+        refineCameraPoses: Bool = false,
         benchmark: TrainingBenchmarkConfiguration?
     ) throws -> TrainingConfig {
         var config = TrainingConfig()
         config.trainingMaskMode = trainingMaskMode
         config.keepCrs = keepCrs
+        config.refineCameraPoses = refineCameraPoses && benchmark == nil
         guard let benchmark else { return config }
 
         if benchmark.fixedPopulation {
@@ -770,6 +1081,68 @@ final class TrainingSession: ObservableObject {
         config.densifyGradThresh = 0
         config.stopDensifyAt = stopDensifyAt
         return config
+    }
+
+    nonisolated static func poseRefinementBudgetRequirement(
+        config: TrainingConfig,
+        trainingCameraCount: Int
+    ) throws -> PoseRefinementBudgetRequirement {
+        guard config.refineCameraPoses else {
+            throw MsplatError.invalidArgument(
+                "Camera-pose refinement is not enabled in the training configuration"
+            )
+        }
+        guard trainingCameraCount > 1 else {
+            throw MsplatError.invalidArgument(
+                "Camera-pose refinement needs at least two training cameras"
+            )
+        }
+        guard config.warmupLength >= 0 else {
+            throw MsplatError.invalidArgument(
+                "Camera-pose refinement warm-up must not be negative"
+            )
+        }
+
+        let warmupIterations = Int(config.warmupLength)
+        let warmupRemainder = warmupIterations % trainingCameraCount
+        let visitsToNextShuffle = warmupRemainder == 0
+            ? 0 : trainingCameraCount - warmupRemainder
+        let (postWarmupCameraVisits, visitOverflow) = visitsToNextShuffle
+            .addingReportingOverflow(trainingCameraCount)
+        let (minimumIterations, iterationOverflow) = warmupIterations
+            .addingReportingOverflow(postWarmupCameraVisits)
+        guard !visitOverflow, !iterationOverflow else {
+            throw MsplatError.invalidArgument(
+                "Camera-pose refinement iteration requirement is outside the native range"
+            )
+        }
+        return PoseRefinementBudgetRequirement(
+            warmupIterations: warmupIterations,
+            postWarmupCameraVisits: postWarmupCameraVisits,
+            minimumIterations: minimumIterations
+        )
+    }
+
+    @discardableResult
+    nonisolated static func validatePoseRefinementBudget(
+        config: TrainingConfig,
+        trainingCameraCount: Int
+    ) throws -> PoseRefinementBudgetRequirement {
+        let requirement = try poseRefinementBudgetRequirement(
+            config: config,
+            trainingCameraCount: trainingCameraCount
+        )
+        guard Int(config.iterations) >= requirement.minimumIterations else {
+            throw MsplatError.invalidArgument(
+                "Camera-pose refinement needs at least " +
+                "\(requirement.minimumIterations) iterations for " +
+                "\(trainingCameraCount) captured cameras: " +
+                "\(requirement.warmupIterations) warm-up iterations plus " +
+                "\(requirement.postWarmupCameraVisits) camera visits to complete one full " +
+                "post-warm-up shuffled pass. Increase Iterations or turn refinement off."
+            )
+        }
+        return requirement
     }
 
     nonisolated static func isDensificationStep(

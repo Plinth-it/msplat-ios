@@ -265,6 +265,13 @@ poses.
   surface; existing CPU render entry points remain available.
 - ABI v14 instance-scoped training-target prefetch exposed through Swift
   `DatasetOptions`; the native environment opt-in remains available.
+- ABI v15 size-checked camera-pose refinement state queries. They return zero
+  cameras when refinement is disabled; otherwise each canonical camera exposes
+  bounded six-component deltas, its optimizer visit count, anchor status,
+  corrected row-major OpenGL camera-to-world geometry in the dataset's original
+  pre-normalization coordinates, and a frame ID borrowed for the trainer
+  lifetime. Adam moments remain private and pending Metal work is synchronized
+  before pose rows are read.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,

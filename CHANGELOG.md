@@ -81,6 +81,13 @@
   clients. The first shuffled target is scheduled when the trainer is created;
   later targets overlap the preceding Metal step while upload and LRU mutation
   stay serialized.
+- Added ABI v15 read-only camera-pose refinement state. Checked count and
+  per-canonical-camera queries expose only the six bounded deltas, optimizer
+  visit count, fixed-anchor identity, corrected row-major OpenGL
+  camera-to-world matrix, and stable frame ID; Adam moment tensors remain
+  private. Translation values and corrected positions are returned in the
+  dataset's original pre-normalization units, rotations are radians, and pose
+  tensor reads synchronize pending Metal work under the trainer transaction.
 - Added an exact binary-grayscale PNG mask path for discovered Brush-style
   masks. Eligible 8-bit black/white masks decode into one source byte per pixel
   before the existing area filter; soft, profiled, alpha, and color masks retain

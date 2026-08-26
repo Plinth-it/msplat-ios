@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <string>
 
+#include "../core/include/pose_refinement_state.hpp"
+
 namespace {
 
 using Vec2 = std::array<double, 2>;
@@ -221,6 +223,19 @@ Rigid viewFromOpenGLCameraToWorld(const Rigid& cameraToWorld) {
     const Mat3 rotation = multiply(flip, transpose(cameraToWorld.rotation));
     return {rotation,
             scale(multiply(rotation, cameraToWorld.translation), -1.0)};
+}
+
+Rigid openGLCameraToWorldFromView(const Rigid& view) {
+    const Mat3 flip = {
+        1.0, 0.0, 0.0,
+        0.0, -1.0, 0.0,
+        0.0, 0.0, -1.0,
+    };
+    const Rigid openCVCameraToWorld = inverse(view);
+    return {
+        multiply(openCVCameraToWorld.rotation, flip),
+        openCVCameraToWorld.translation,
+    };
 }
 
 Vec3 cameraPosition(const Rigid& view) {
@@ -643,6 +658,117 @@ void testDescentSignAndCanonicalIndexIsolation() {
     }
 }
 
+void testPoseStateReadbackGeometry() {
+    CHECK(msplat::detail::poseRefinementStateCount(false, 3) == 0u);
+    CHECK(msplat::detail::poseRefinementStateCount(true, 3) == 3u);
+    bool invalidCountRejected = false;
+    try {
+        (void)msplat::detail::poseRefinementStateCount(true, 0);
+    } catch (const std::invalid_argument&) {
+        invalidCountRejected = true;
+    }
+    CHECK(invalidCountRejected);
+
+    constexpr float normalizationScale = 2.5f;
+    const float normalizationTranslation[3] = {10.0f, -4.0f, 3.0f};
+    const Vec3 originalPosition{11.2, -3.5, 4.1};
+    const Vec3 normalizedPosition{
+        (originalPosition[0] - normalizationTranslation[0]) *
+            normalizationScale,
+        (originalPosition[1] - normalizationTranslation[1]) *
+            normalizationScale,
+        (originalPosition[2] - normalizationTranslation[2]) *
+            normalizationScale,
+    };
+    const Mat3 baseRotation = so3Exp({0.1, -0.05, 0.02});
+    float baseCameraToWorld[16] = {
+        static_cast<float>(baseRotation[0]),
+        static_cast<float>(baseRotation[1]),
+        static_cast<float>(baseRotation[2]),
+        static_cast<float>(normalizedPosition[0]),
+        static_cast<float>(baseRotation[3]),
+        static_cast<float>(baseRotation[4]),
+        static_cast<float>(baseRotation[5]),
+        static_cast<float>(normalizedPosition[1]),
+        static_cast<float>(baseRotation[6]),
+        static_cast<float>(baseRotation[7]),
+        static_cast<float>(baseRotation[8]),
+        static_cast<float>(normalizedPosition[2]),
+        0.0f, 0.0f, 0.0f, 1.0f,
+    };
+
+    const float anchorDelta[6] = {};
+    const auto anchor = msplat::detail::makePoseRefinementGeometry(
+        baseCameraToWorld, anchorDelta, normalizationScale,
+        normalizationTranslation);
+    CHECK(anchor.translationNorm == 0.0f);
+    CHECK(anchor.rotationNorm == 0.0f);
+    for (float value : anchor.poseDelta) CHECK(value == 0.0f);
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t columnIndex = 0; columnIndex < 3; ++columnIndex) {
+            CHECK(near(
+                anchor.correctedCameraToWorld[row * 4 + columnIndex],
+                baseRotation[row * 3 + columnIndex], 2.0e-6, 2.0e-6));
+        }
+        CHECK(near(anchor.correctedCameraToWorld[row * 4 + 3],
+                   originalPosition[row], 2.0e-6, 2.0e-6));
+    }
+    CHECK(anchor.correctedCameraToWorld[12] == 0.0f);
+    CHECK(anchor.correctedCameraToWorld[13] == 0.0f);
+    CHECK(anchor.correctedCameraToWorld[14] == 0.0f);
+    CHECK(anchor.correctedCameraToWorld[15] == 1.0f);
+
+    const float normalizedDelta[6] = {
+        0.025f, -0.0125f, 0.005f,
+        0.02f, -0.01f, 0.03f,
+    };
+    const auto corrected = msplat::detail::makePoseRefinementGeometry(
+        baseCameraToWorld, normalizedDelta, normalizationScale,
+        normalizationTranslation);
+    const Rigid baseCameraToWorldRigid{baseRotation, normalizedPosition};
+    const Rigid declaredView =
+        viewFromOpenGLCameraToWorld(baseCameraToWorldRigid);
+    const Rigid correction{
+        so3Exp({normalizedDelta[3], normalizedDelta[4], normalizedDelta[5]}),
+        {normalizedDelta[0], normalizedDelta[1], normalizedDelta[2]},
+    };
+    Rigid expected = openGLCameraToWorldFromView(
+        compose(correction, declaredView));
+    for (size_t axis = 0; axis < 3; ++axis) {
+        expected.translation[axis] =
+            expected.translation[axis] / normalizationScale +
+            normalizationTranslation[axis];
+    }
+
+    for (size_t row = 0; row < 3; ++row) {
+        for (size_t columnIndex = 0; columnIndex < 3; ++columnIndex) {
+            CHECK(near(
+                corrected.correctedCameraToWorld[row * 4 + columnIndex],
+                expected.rotation[row * 3 + columnIndex],
+                2.0e-6, 2.0e-6));
+        }
+        CHECK(near(corrected.correctedCameraToWorld[row * 4 + 3],
+                   expected.translation[row], 2.0e-6, 2.0e-6));
+        CHECK(near(corrected.poseDelta[row],
+                   normalizedDelta[row] / normalizationScale,
+                   1.0e-7, 1.0e-7));
+        CHECK(near(corrected.poseDelta[row + 3], normalizedDelta[row + 3],
+                   1.0e-7, 1.0e-7));
+    }
+    CHECK(near(corrected.translationNorm,
+               std::sqrt(
+                   corrected.poseDelta[0] * corrected.poseDelta[0] +
+                   corrected.poseDelta[1] * corrected.poseDelta[1] +
+                   corrected.poseDelta[2] * corrected.poseDelta[2]),
+               1.0e-7, 1.0e-7));
+    CHECK(near(corrected.rotationNorm,
+               std::sqrt(
+                   normalizedDelta[3] * normalizedDelta[3] +
+                   normalizedDelta[4] * normalizedDelta[4] +
+                   normalizedDelta[5] * normalizedDelta[5]),
+               1.0e-7, 1.0e-7));
+}
+
 } // namespace
 
 int main() {
@@ -653,6 +779,7 @@ int main() {
         testCovarianceGradient();
         testRegularizationAndBounds();
         testDescentSignAndCanonicalIndexIsolation();
+        testPoseStateReadbackGeometry();
         std::cout << "Pose refinement math tests passed\n";
         return 0;
     } catch (const std::exception& error) {

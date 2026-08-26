@@ -40,7 +40,20 @@ private func runPoseCheckpointRegression() throws {
     let reloadedCheckpointURL = fixtureDirectory.appendingPathComponent("reloaded.msplat")
     let resumedCheckpointURL = fixtureDirectory.appendingPathComponent("resumed.msplat")
 
+    do {
+        var disabledConfig = config
+        disabledConfig.refineCameraPoses = false
+        let session = try MsplatSession(
+            dataset: descriptor,
+            config: disabledConfig,
+            maximumGaussianCount: 5
+        )
+        defer { try? session.close() }
+        XCTAssertEqual(try session.cameraPoseRefinementStates(), [])
+    }
+
     let firstSnapshot: PoseCheckpointSnapshot
+    let firstStates: [CameraPoseRefinementState]
     do {
         let session = try MsplatSession(
             dataset: descriptor,
@@ -52,11 +65,17 @@ private func runPoseCheckpointRegression() throws {
 
         _ = try session.step()
         _ = try session.step()
+        firstStates = try session.cameraPoseRefinementStates()
         try session.saveCheckpoint(to: firstCheckpointURL)
         firstSnapshot = try readPoseCheckpoint(at: firstCheckpointURL)
     }
 
     assertPoseSnapshot(firstSnapshot, iteration: 2, expectedMovableSteps: 1)
+    assertPoseStates(
+        firstStates,
+        checkpoint: firstSnapshot,
+        expectedMovableSteps: 1
+    )
 
     let reloadedSnapshot: PoseCheckpointSnapshot
     let resumedSnapshot: PoseCheckpointSnapshot
@@ -399,12 +418,7 @@ private func assertPoseSnapshot(
     XCTAssertEqual(snapshot.frameIDs, ["anchor", "movable"])
     XCTAssertEqual(snapshot.anchorIndex, 0)
     XCTAssertEqual(snapshot.stepCounts, [0, expectedMovableSteps])
-    let identityPose: [Float] = [
-        1, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 0, 0, 1,
-    ]
+    let identityPose = poseFixtureIdentity()
     XCTAssertEqual(snapshot.basePoses, identityPose + identityPose)
     XCTAssertEqual(Array(snapshot.deltas.prefix(6)), [Float](repeating: 0, count: 6))
     XCTAssertEqual(
@@ -428,6 +442,133 @@ private func assertPoseSnapshot(
     XCTAssertTrue(movableSecondMoment.contains { $0 > 0 })
     XCTAssertLessThanOrEqual(vectorNorm(movableDelta[0..<3]), 0.050_001)
     XCTAssertLessThanOrEqual(vectorNorm(movableDelta[3..<6]), 0.052_361)
+}
+
+private func assertPoseStates(
+    _ states: [CameraPoseRefinementState],
+    checkpoint: PoseCheckpointSnapshot,
+    expectedMovableSteps: Int
+) {
+    XCTAssertEqual(states.map(\.canonicalCameraIndex), [0, 1])
+    XCTAssertEqual(states.map(\.frameID), ["anchor", "movable"])
+    XCTAssertEqual(states.map(\.isEnabled), [true, true])
+    XCTAssertEqual(states.map(\.isAnchor), [true, false])
+    XCTAssertEqual(states.map(\.optimizerStepCount), [0, expectedMovableSteps])
+    guard states.count == 2 else { return }
+    let anchor = states[0]
+    let movable = states[1]
+    XCTAssertEqual(anchor.translationDelta, [Float](repeating: 0, count: 3))
+    XCTAssertEqual(anchor.rotationDelta, [Float](repeating: 0, count: 3))
+    XCTAssertEqual(anchor.translationNorm, 0)
+    XCTAssertEqual(anchor.rotationNorm, 0)
+    assertFloatElementsEqual(
+        anchor.correctedCameraToWorld.elements,
+        poseFixtureIdentity(),
+        accuracy: 0.000_001
+    )
+    XCTAssertTrue(movable.translationDelta.allSatisfy(\.isFinite))
+    XCTAssertTrue(movable.rotationDelta.allSatisfy(\.isFinite))
+    XCTAssertTrue(movable.translationNorm.isFinite)
+    XCTAssertTrue(movable.rotationNorm.isFinite)
+    XCTAssertEqual(
+        movable.translationNorm,
+        vectorNorm(movable.translationDelta[...]),
+        accuracy: 0.000_001
+    )
+    XCTAssertEqual(
+        movable.rotationNorm,
+        vectorNorm(movable.rotationDelta[...]),
+        accuracy: 0.000_001
+    )
+
+    let checkpointDelta = Array(checkpoint.deltas[6..<12])
+    assertFloatElementsEqual(
+        movable.translationDelta + movable.rotationDelta,
+        checkpointDelta,
+        accuracy: 0.000_001
+    )
+    assertFloatElementsEqual(
+        movable.correctedCameraToWorld.elements,
+        correctedIdentityFixturePose(delta: checkpointDelta),
+        accuracy: 0.000_01
+    )
+}
+
+private func correctedIdentityFixturePose(delta: [Float]) -> [Float] {
+    XCTAssertEqual(delta.count, 6)
+    guard delta.count == 6 else { return [] }
+
+    // Both fixture cameras are identity at the origin, so auto-centering has
+    // zero translation and unit scale. With F = diag(1, -1, -1), a left-view
+    // correction [R, t] produces OpenGL C2W rotation F * R^T * F and position
+    // -F * R^T * t.
+    let correction = so3Rotation(axisAngle: Array(delta[3..<6]))
+    let axisFlip: [Float] = [1, -1, -1]
+    var cameraToWorld = [Float](repeating: 0, count: 16)
+    for row in 0..<3 {
+        for column in 0..<3 {
+            let transposedCorrection = correction[column * 3 + row]
+            cameraToWorld[row * 4 + column] =
+                axisFlip[row] * transposedCorrection * axisFlip[column]
+            cameraToWorld[row * 4 + 3] -=
+                axisFlip[row] * transposedCorrection * delta[column]
+        }
+    }
+    cameraToWorld[15] = 1
+    return cameraToWorld
+}
+
+private func so3Rotation(axisAngle: [Float]) -> [Float] {
+    XCTAssertEqual(axisAngle.count, 3)
+    guard axisAngle.count == 3 else { return [] }
+
+    let x = axisAngle[0]
+    let y = axisAngle[1]
+    let z = axisAngle[2]
+    let thetaSquared = x * x + y * y + z * z
+    let a: Float
+    let b: Float
+    if thetaSquared < 0.000_000_01 {
+        let thetaFourth = thetaSquared * thetaSquared
+        a = 1 - thetaSquared / 6 + thetaFourth / 120
+        b = 0.5 - thetaSquared / 24 + thetaFourth / 720
+    } else {
+        let theta = thetaSquared.squareRoot()
+        a = sin(theta) / theta
+        b = (1 - cos(theta)) / thetaSquared
+    }
+
+    return [
+        1 - b * (y * y + z * z), b * x * y - a * z, b * x * z + a * y,
+        b * x * y + a * z, 1 - b * (x * x + z * z), b * y * z - a * x,
+        b * x * z - a * y, b * y * z + a * x, 1 - b * (x * x + y * y),
+    ]
+}
+
+private func poseFixtureIdentity() -> [Float] {
+    [
+        1, 0, 0, 0,
+        0, 1, 0, 0,
+        0, 0, 1, 0,
+        0, 0, 0, 1,
+    ]
+}
+
+private func assertFloatElementsEqual(
+    _ actual: [Float],
+    _ expected: [Float],
+    accuracy: Float
+) {
+    XCTAssertEqual(actual.count, expected.count)
+    guard actual.count == expected.count else { return }
+    for index in actual.indices {
+        XCTAssertEqual(
+            actual[index],
+            expected[index],
+            accuracy: accuracy,
+            "Element \(index) differs"
+        )
+    }
 }
 
 private func vectorNorm(_ values: ArraySlice<Float>) -> Float {

@@ -51,6 +51,18 @@ same screen-oriented raster geometry. Scene capture can fall
 back to ARKit feature points on a non-LiDAR device. After stopping, the review
 screen can share the package or pass its in-memory descriptor directly to the
 trainer; captured exports preserve the metric ARKit coordinate system.
+Captured datasets expose a default-off **Refine camera poses** switch as an
+explicit A/B control. When enabled, training learns the existing bounded pose
+corrections in memory; the raw `transforms.json` remains immutable. The app
+requires an iteration budget covering the configured 500-step warm-up, any
+remaining visits in that camera shuffle, and one complete post-warm-up shuffle;
+it reports the exact minimum beside the switch. After GPU
+completion, the app writes only the corrected camera matrices to the sibling
+`transforms_refined.json`, retaining the captured intrinsics, image and mask
+paths, and point-cloud path. It refuses to write that sibling unless every
+non-anchor camera actually received a pose-optimizer step. The finished view
+reports maximum and RMS translation and rotation corrections. Imported folders
+and benchmark runs do not expose or enable this setting.
 
 After a COLMAP folder is selected, the app counts regular files below those
 directories on a background task and automatically enables **Use discovered

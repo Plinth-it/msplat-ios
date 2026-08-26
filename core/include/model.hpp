@@ -4,6 +4,7 @@
 #include "metal_tensor.hpp"
 #include "ssim.hpp"
 #include "input_data.hpp"
+#include "pose_refinement_state.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -13,6 +14,14 @@ int numShBases(int degree);
 /// Validate checkpoint structure and tensor metadata without allocating Metal
 /// buffers or changing model state. Throws std::runtime_error when invalid.
 void validateCheckpointFile(const std::string &filename);
+
+struct ModelPoseRefinementState {
+  bool anchor = false;
+  uint32_t optimizerStepCount = 0;
+  msplat::detail::PoseRefinementGeometry geometry;
+  const char* frameId = nullptr;
+  size_t frameIdLength = 0;
+};
 
 struct Model{
   Model(const InputData &inputData, int numCameras,
@@ -82,6 +91,11 @@ struct Model{
   /// Bytes held by the model's own GPU buffers — parameters, Adam state,
   /// and the densification scratch. Sized by capacity, not active count.
   size_t estimatedGpuBytes() const;
+  uint32_t poseRefinementStateCount() const;
+  /// The caller must synchronize Metal before reading the returned tensor
+  /// values. The borrowed frame ID remains valid for this Model's lifetime.
+  ModelPoseRefinementState poseRefinementState(
+      uint32_t canonicalCameraIndex) const;
   void allocateDensificationScratch();
   void resetDensificationScratch();
   void retireDensificationState();
