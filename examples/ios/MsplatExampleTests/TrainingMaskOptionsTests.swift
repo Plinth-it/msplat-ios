@@ -1492,6 +1492,37 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertTrue(controller.complete(next, committed: false))
     }
 
+    func testCaptureFrameAdmissionAbortInvalidatesAndCancelsActiveWork() async throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let store = try CaptureStore(
+            mode: .scene,
+            baseDirectory: temporaryDirectory
+        )
+        let controller = CaptureFrameAdmissionController()
+        controller.start(store: store, subjectWorldPosition: nil)
+        controller.updateDisplayOrientation(.right)
+        let active = try XCTUnwrap(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 1
+        ))
+        let activeTask = Task<Void, Never> {
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+        }
+        controller.register(task: activeTask, for: active)
+
+        controller.abort()
+        await activeTask.value
+
+        XCTAssertTrue(activeTask.isCancelled)
+        XCTAssertFalse(controller.complete(active, committed: true))
+        XCTAssertNil(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 2
+        ))
+    }
+
     func testCaptureFrameAdmissionRequiresAndSnapshotsDisplayOrientation() throws {
         let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
         let store = try CaptureStore(
@@ -1522,6 +1553,104 @@ final class TrainingMaskOptionsTests: XCTestCase {
         ))
         XCTAssertEqual(upsideDown.displayOrientation, .left)
         XCTAssertTrue(controller.complete(upsideDown, committed: false))
+    }
+
+    func testCaptureHighResolutionRequestGateAllowsOnlyOneInFlightRequest() {
+        let gate = CaptureHighResolutionRequestGate()
+
+        XCTAssertTrue(gate.reserve())
+        XCTAssertFalse(gate.reserve())
+        gate.release()
+        XCTAssertTrue(gate.reserve())
+        gate.release()
+    }
+
+    func testCaptureGeometryFallbackRequirementsForSceneAndObject() throws {
+        let pixelBuffer = try makeBGRAPixelBuffer(width: 2, height: 2)
+        let calibration = CaptureCalibrationRecord(
+            width: 2,
+            height: 2,
+            fx: 2,
+            fy: 2,
+            cx: 1,
+            cy: 1
+        )
+        func candidate(
+            hasDepth: Bool,
+            rawFeaturePoints: [SIMD3<Float>],
+            subjectWorldPosition: SIMD3<Float>?
+        ) -> CaptureFrameCandidate {
+            CaptureFrameCandidate(
+                image: OwnedPixelBuffer(pixelBuffer),
+                depth: hasDepth ? OwnedPixelBuffer(pixelBuffer) : nil,
+                confidence: nil,
+                displayOrientation: .right,
+                calibration: calibration,
+                cameraToWorld: matrix_identity_float4x4,
+                timestamp: 1,
+                exposureDuration: 0.01,
+                trackingState: "normal",
+                rawFeaturePoints: rawFeaturePoints,
+                subjectWorldPosition: subjectWorldPosition
+            )
+        }
+
+        XCTAssertFalse(captureCandidateHasUsableGeometry(candidate(
+            hasDepth: false,
+            rawFeaturePoints: [],
+            subjectWorldPosition: nil
+        )))
+        XCTAssertTrue(captureCandidateHasUsableGeometry(candidate(
+            hasDepth: false,
+            rawFeaturePoints: [SIMD3<Float>(0, 0, -1)],
+            subjectWorldPosition: nil
+        )))
+        XCTAssertFalse(captureCandidateHasUsableGeometry(candidate(
+            hasDepth: false,
+            rawFeaturePoints: [SIMD3<Float>(0, 0, -1)],
+            subjectWorldPosition: SIMD3<Float>(0, 0, -1)
+        )))
+        XCTAssertTrue(captureCandidateHasUsableGeometry(candidate(
+            hasDepth: true,
+            rawFeaturePoints: [],
+            subjectWorldPosition: SIMD3<Float>(0, 0, -1)
+        )))
+    }
+
+    func testCaptureAdmissionUsesReturnedHighResolutionFrameAsBaseline() throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let store = try CaptureStore(
+            mode: .scene,
+            baseDirectory: temporaryDirectory
+        )
+        let controller = CaptureFrameAdmissionController()
+        controller.start(store: store, subjectWorldPosition: nil)
+        controller.updateDisplayOrientation(.right)
+        defer { controller.finish() }
+
+        let triggerTransform = matrix_identity_float4x4
+        let first = try XCTUnwrap(controller.begin(
+            cameraToWorld: triggerTransform,
+            timestamp: 1
+        ))
+        var capturedTransform = triggerTransform
+        capturedTransform.columns.3.x = 0.04
+        XCTAssertTrue(controller.complete(
+            first,
+            committed: true,
+            acceptedCameraToWorld: capturedTransform,
+            acceptedTimestamp: 1.1
+        ))
+
+        XCTAssertNil(controller.begin(
+            cameraToWorld: capturedTransform,
+            timestamp: 1.5
+        ))
+        let next = try XCTUnwrap(controller.begin(
+            cameraToWorld: triggerTransform,
+            timestamp: 1.5
+        ))
+        XCTAssertTrue(controller.complete(next, committed: false))
     }
 
     private func writeBinaryPointHeader(

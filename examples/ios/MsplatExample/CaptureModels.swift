@@ -147,6 +147,7 @@ struct CaptureReviewSnapshot: Equatable, Sendable {
 
 enum CaptureFailure: LocalizedError, Sendable {
     case unsupportedDevice
+    case highResolutionCaptureUnavailable
     case cameraPermissionDenied
     case noCurrentFrame
     case subjectDepthUnavailable
@@ -159,6 +160,8 @@ enum CaptureFailure: LocalizedError, Sendable {
         switch self {
         case .unsupportedDevice:
             "AR world tracking is not available on this device."
+        case .highResolutionCaptureUnavailable:
+            "This device cannot provide ARKit high-resolution still frames."
         case .cameraPermissionDenied:
             "Camera access is required to capture a training dataset."
         case .noCurrentFrame:

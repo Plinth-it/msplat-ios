@@ -30,7 +30,7 @@ final class CaptureViewModel: ObservableObject {
             latestRejection = nil
             statusMessage = mode == .object
                 ? "Tap the object to select it."
-                : "Move slowly, then start automatic capture."
+                : "Move slowly, then start high-resolution capture."
         }
     }
 
@@ -74,7 +74,7 @@ final class CaptureViewModel: ObservableObject {
                 state = .preflight
                 statusMessage = mode == .object
                     ? "Tap the object to select it."
-                    : "Move slowly, then start automatic capture."
+                    : "Move slowly, then start high-resolution capture."
             } catch is CancellationError {
                 return
             } catch {
@@ -98,7 +98,7 @@ final class CaptureViewModel: ObservableObject {
                 guard case .preflight = state, mode == .object else { return }
                 subjectSelected = true
                 latestRejection = nil
-                statusMessage = "Subject selected. Walk around it slowly."
+                statusMessage = "Subject selected. Move slowly around it."
             } catch is CancellationError {
                 return
             } catch {
@@ -121,7 +121,8 @@ final class CaptureViewModel: ObservableObject {
             frames = []
             pointCount = 0
             latestRejection = nil
-            statusMessage = "Move slowly; frames are captured automatically."
+            statusMessage = "Move slowly; high-resolution frames are captured " +
+                "automatically."
             state = .capturing
         } catch {
             latestRejection = error.localizedDescription
@@ -160,6 +161,8 @@ final class CaptureViewModel: ObservableObject {
             pointCount = commit.totalPointCount
             latestRejection = nil
             statusMessage = "Captured \(frames.count) frame\(frames.count == 1 ? "" : "s")."
+        case .frameQualityFallback(let message):
+            latestRejection = message
         case .frameRejected(let message):
             latestRejection = message
         case .failed(let message):
