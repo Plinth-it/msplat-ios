@@ -119,12 +119,19 @@ std::array<float, 24> degreeFourBasis(float x, float y, float z) {
     };
 }
 
-std::array<float, 4> checkTerminalStep(
+struct TerminalStepGradients {
+    std::array<float, 3> logScale;
+    std::array<float, 4> quaternion;
+};
+
+TerminalStepGradients checkTerminalStep(
     bool collectStats,
     int degreesToUse,
     const std::array<float, 4>& visibleQuat = {1.0f, 0.0f, 0.0f, 0.0f},
-    bool verifyCapturedGoldens = true) {
-    const float logScale = std::log(0.03f);
+    bool verifyCapturedGoldens = true,
+    float globalScale = 1.0f) {
+    CHECK(globalScale > 0.0f);
+    const float logScale = std::log(0.03f / globalScale);
     constexpr float shC0 = 0.28209479177387814f;
     constexpr int shDegree = 4;
     constexpr int restBasisCount = 24;
@@ -279,7 +286,7 @@ std::array<float, 4> checkTerminalStep(
         255.0 / (static_cast<double>(coverageUnits) * 3.0));
 
     MTensor radii = msplat_train_step(
-        kGaussianCount, means, scales, 1.0f,
+        kGaussianCount, means, scales, globalScale,
         quats, viewmat, projmat,
         32.0f, 32.0f, 16.0f, 16.0f,
         kHeight, kWidth, std::make_tuple(2, 2, 1), 0.01f,
@@ -491,12 +498,155 @@ std::array<float, 4> checkTerminalStep(
         CHECK(max2DSize.data<float>()[1] == initialInvisibleMaxSize);
     }
 
-    std::array<float, 4> quaternionGradient;
+    TerminalStepGradients gradients;
+    for (int element = 0; element < 3; ++element) {
+        gradients.logScale[element] =
+            expAvg[1].data<float>()[element] / (1.0f - kBeta1);
+    }
     for (int element = 0; element < 4; ++element) {
-        quaternionGradient[element] =
+        gradients.quaternion[element] =
             expAvg[2].data<float>()[element] / (1.0f - kBeta1);
     }
-    return quaternionGradient;
+    return gradients;
+}
+
+void checkMinimumFootprintAndScaleGradient() {
+    constexpr int width = 32;
+    constexpr int height = 32;
+    constexpr float focalLength = 32.0f;
+    constexpr float principalPoint = 16.5f;
+    constexpr float physicalScale = 0.01f;
+    constexpr float finiteDifferenceStep = 0.01f;
+    constexpr int adamGroups = 6;
+    const float baseLogScale = std::log(physicalScale);
+
+    MTensor means = gpuFloats({1, 3}, {0.0f, 0.0f, -1.0f});
+    MTensor scales = gpuFloats({1, 3}, {
+        baseLogScale, baseLogScale, baseLogScale,
+    });
+    MTensor quats = gpuFloats({1, 4}, {1.0f, 0.0f, 0.0f, 0.0f});
+    MTensor featuresDc = gpuFloats({1, 3}, {0.0f, 0.0f, 0.0f});
+    MTensor featuresRest = gpu_zeros({1, 3, 3}, DType::Float32);
+    MTensor opacities = gpuFloats({1, 1}, {0.0f});
+    MTensor background = gpu_zeros({3}, DType::Float32);
+    MTensor viewmat = gpuFloats({4, 4}, {
+        1, 0, 0, 0,
+        0, -1, 0, 0,
+        0, 0, -1, 0,
+        0, 0, 0, 1,
+    });
+    constexpr float nearPlane = 0.001f;
+    constexpr float farPlane = 1000.0f;
+    const float depthScale = (farPlane + nearPlane) / (farPlane - nearPlane);
+    const float depthOffset = -farPlane * nearPlane / (farPlane - nearPlane);
+    MTensor projmat = gpuFloats({4, 4}, {
+        2, 0, 0, 0,
+        0, -2, 0, 0,
+        0, 0, -depthScale, depthOffset,
+        0, 0, -1, 0,
+    });
+    float cameraPosition[3] = {0.0f, 0.0f, 0.0f};
+
+    struct RenderEvaluation {
+        double objective;
+        int support;
+        float center;
+        float neighbor;
+    };
+    auto evaluate = [&](float xLogScale) {
+        scales.data<float>()[0] = xLogScale;
+        MTensor rendered = msplat_render(
+            1, means, scales, 1.0f, quats, viewmat, projmat,
+            focalLength, focalLength, principalPoint, principalPoint,
+            height, width, std::make_tuple(2, 2, 1), 0.01f,
+            1, 1, cameraPosition, featuresDc, featuresRest,
+            opacities, background);
+        msplat_gpu_sync();
+
+        RenderEvaluation result = {0.0, 0, 0.0f, 0.0f};
+        const float* pixels = rendered.data<float>();
+        for (int pixel = 0; pixel < width * height; ++pixel) {
+            result.support += pixels[pixel * 3] > 0.0f ? 1 : 0;
+            for (int channel = 0; channel < 3; ++channel) {
+                result.objective += std::abs(
+                    static_cast<double>(pixels[pixel * 3 + channel]));
+            }
+        }
+        result.objective /= static_cast<double>(width * height * 3);
+        result.center = pixels[(16 * width + 16) * 3];
+        result.neighbor = pixels[(16 * width + 17) * 3];
+        return result;
+    };
+
+    const RenderEvaluation base = evaluate(baseLogScale);
+    CHECK(std::abs(base.center - 0.25f) <= 2.0e-6f);
+    CHECK(base.neighbor > 0.0f && base.neighbor < base.center);
+    const double observedVariance =
+        -0.5 / std::log(static_cast<double>(base.neighbor / base.center));
+    const double expectedVariance =
+        focalLength * focalLength * physicalScale * physicalScale + 0.3;
+    CHECK(std::abs(observedVariance - expectedVariance) <= 5.0e-4);
+
+    const RenderEvaluation before =
+        evaluate(baseLogScale - finiteDifferenceStep);
+    const RenderEvaluation after =
+        evaluate(baseLogScale + finiteDifferenceStep);
+    CHECK(before.support == after.support);
+    CHECK(before.support > 0);
+    const double finiteDifference =
+        (after.objective - before.objective) /
+        (2.0 * finiteDifferenceStep);
+
+    scales.data<float>()[0] = baseLogScale;
+    std::array<MTensor, adamGroups> params = {
+        means, scales, quats, featuresDc, featuresRest, opacities,
+    };
+    std::array<MTensor, adamGroups> expAvg;
+    std::array<MTensor, adamGroups> expAvgSq;
+    for (int group = 0; group < adamGroups; ++group) {
+        expAvg[group] = gpu_zeros(params[group].shape(), DType::Float32);
+        expAvgSq[group] = gpu_zeros(params[group].shape(), DType::Float32);
+    }
+    float stepSizes[adamGroups] = {};
+    float biasCorrection2Sqrts[adamGroups];
+    std::fill(
+        std::begin(biasCorrection2Sqrts),
+        std::end(biasCorrection2Sqrts), std::sqrt(1.0f - kBeta2));
+
+    MTensor target = gpu_zeros({height, width, 3}, DType::Float32);
+    MTensor logRgbGains = gpu_zeros({1, 3}, DType::Float32);
+    MsplatPhotometricRefinementStep photometric;
+    photometric.logRgbGains = &logRgbGains;
+    MTensor poseDeltas = gpu_zeros({1, 6}, DType::Float32);
+    MsplatPoseRefinementStep pose;
+    pose.deltas = &poseDeltas;
+    MTensor visibility = gpu_zeros({1}, DType::Float32);
+    MTensor xyGradientNorm = gpu_zeros({1}, DType::Float32);
+    MTensor max2DSize = gpu_zeros({1}, DType::Float32);
+    const uint64_t coverageUnits =
+        static_cast<uint64_t>(width) * height * 255u;
+    const float lossInvN = static_cast<float>(
+        255.0 / (static_cast<double>(coverageUnits) * 3.0));
+
+    MTensor radii = msplat_train_step(
+        1, means, scales, 1.0f, quats, viewmat, projmat,
+        focalLength, focalLength, principalPoint, principalPoint,
+        height, width, std::make_tuple(2, 2, 1), 0.01f,
+        1, 1, cameraPosition, featuresDc, featuresRest,
+        opacities, background, target, nullptr, nullptr, coverageUnits,
+        0.0f, lossInvN, false, 0.0f,
+        adamGroups, params.data(), expAvg.data(), expAvgSq.data(),
+        stepSizes, biasCorrection2Sqrts, kBeta1, kBeta2, kEpsilon,
+        photometric, pose, false,
+        visibility, xyGradientNorm, max2DSize, 1.0f / width);
+    msplat_gpu_sync();
+
+    CHECK(radii.data<int32_t>()[0] > 0);
+    const double analytic =
+        expAvg[1].data<float>()[0] / (1.0f - kBeta1);
+    CHECK(std::abs(analytic) > 1.0e-7);
+    CHECK(std::abs(analytic - finiteDifference) <=
+        std::max(3.0e-6, 0.03 * std::abs(finiteDifference)));
 }
 
 }  // namespace
@@ -507,6 +657,7 @@ int main(int argc, char **argv) {
             if (argc != 2)
                 throw std::invalid_argument("Expected the metallib path");
             msplat_set_metallib_path_checked(argv[1]);
+            checkMinimumFootprintAndScaleGradient();
             checkTerminalStep(false, 1);
             checkTerminalStep(true, 4);
 
@@ -519,10 +670,11 @@ int main(int argc, char **argv) {
             std::array<float, 4> scaledQuaternion;
             for (int element = 0; element < 4; ++element)
                 scaledQuaternion[element] = scale * quaternion[element];
-            const auto gradient =
+            const auto unitQuaternionStep =
                 checkTerminalStep(false, 1, quaternion, false);
+            const auto gradient = unitQuaternionStep.quaternion;
             const auto scaledGradient =
-                checkTerminalStep(false, 1, scaledQuaternion, false);
+                checkTerminalStep(false, 1, scaledQuaternion, false).quaternion;
 
             float gradientNormSquared = 0.0f;
             float scaleErrorSquared = 0.0f;
@@ -543,6 +695,20 @@ int main(int argc, char **argv) {
             CHECK(std::abs(radialGradient) <= 5.0e-3f * gradientNorm);
             CHECK(std::abs(scaledRadialGradient) <=
                 5.0e-3f * scale * gradientNorm);
+
+            // Compensating log-scales for a global scale preserves the exact
+            // forward covariance, so its log-scale gradient must also remain
+            // unchanged. This exercises the active fused Metal backward path.
+            constexpr float compensatedGlobalScale = 2.0f;
+            const auto compensatedScale = checkTerminalStep(
+                false, 1, quaternion, false, compensatedGlobalScale).logScale;
+            for (int element = 0; element < 3; ++element) {
+                CHECK(std::abs(unitQuaternionStep.logScale[element]) > 1.0e-6f);
+                CHECK(std::abs(
+                    unitQuaternionStep.logScale[element] -
+                    compensatedScale[element]) <=
+                    5.0e-3f * std::abs(unitQuaternionStep.logScale[element]));
+            }
             cleanup_msplat_metal();
             return 0;
         } catch (const std::exception &error) {

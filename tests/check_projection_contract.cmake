@@ -61,6 +61,26 @@ if(NOT clamp_use_count EQUAL 5)
         "Expected two forward and three backward EWA clamp uses, found ${clamp_use_count}")
 endif()
 
+string(REGEX MATCHALL
+    "return float3\\(dot\\(tv0, t0\\) \\+ 0\\.3f, dot\\(tv0, t1\\), dot\\(tv1, t1\\) \\+ 0\\.3f\\)"
+    minimum_footprints "${metal_source}")
+list(LENGTH minimum_footprints minimum_footprint_count)
+if(NOT minimum_footprint_count EQUAL 2)
+    message(FATAL_ERROR
+        "Expected both EWA forward paths to retain the 0.3 minimum footprint, found ${minimum_footprint_count}")
+endif()
+
+foreach(component RANGE 0 2)
+    string(REGEX MATCHALL
+        "v_scale\\[${component}\\] = glob_scale \\* \\(float\\)dot\\(R\\[${component}\\], v_M\\[${component}\\]\\)"
+        global_scale_cotangents "${metal_source}")
+    list(LENGTH global_scale_cotangents global_scale_cotangent_count)
+    if(NOT global_scale_cotangent_count EQUAL 2)
+        message(FATAL_ERROR
+            "Expected both covariance VJPs to chain global scale for component ${component}, found ${global_scale_cotangent_count}")
+    endif()
+endforeach()
+
 foreach(axis IN ITEMS x y)
     if(axis STREQUAL "x")
         set(focal "fx")

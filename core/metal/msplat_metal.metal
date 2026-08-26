@@ -1895,9 +1895,9 @@ void scale_rot_to_cov3d_vjp(
     // for D = W * X, G = df/dD
     // df/dW = G * XT, df/dX = WT * G
     float3x3 v_M = 2.f * v_V * M;
-    v_scale[0] = (float)dot(R[0], v_M[0]);
-    v_scale[1] = (float)dot(R[1], v_M[1]);
-    v_scale[2] = (float)dot(R[2], v_M[2]);
+    v_scale[0] = glob_scale * (float)dot(R[0], v_M[0]);
+    v_scale[1] = glob_scale * (float)dot(R[1], v_M[1]);
+    v_scale[2] = glob_scale * (float)dot(R[2], v_M[2]);
 
     float3x3 v_R = v_M * S;
     float4 out_v_quat = quat_to_rotmat_vjp(quat, v_R);
@@ -1931,9 +1931,9 @@ void scale_rot_to_cov3d_vjp(
     float3x3 S = scale_to_mat(scale, glob_scale);
     float3x3 M = R * S;
     float3x3 v_M = 2.f * v_V * M;
-    v_scale[0] = (float)dot(R[0], v_M[0]);
-    v_scale[1] = (float)dot(R[1], v_M[1]);
-    v_scale[2] = (float)dot(R[2], v_M[2]);
+    v_scale[0] = glob_scale * (float)dot(R[0], v_M[0]);
+    v_scale[1] = glob_scale * (float)dot(R[1], v_M[1]);
+    v_scale[2] = glob_scale * (float)dot(R[2], v_M[2]);
 
     float3x3 v_R = v_M * S;
     float4 out_v_quat = quat_to_rotmat_vjp(quat, v_R);
