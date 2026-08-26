@@ -1,5 +1,6 @@
 #include "loaders.hpp"
 #include <nlohmann/json.hpp>
+#include <cctype>
 #include <fstream>
 #include <filesystem>
 #include <algorithm>
@@ -24,6 +25,33 @@ static bool isInside(const fs::path &root, const fs::path &candidate) {
         if (*rootComponent != *candidateComponent) return false;
     }
     return rootComponent == root.end();
+}
+
+static void validateCameraModel(const json &container,
+                                const std::string &context) {
+    const auto modelJson = container.find("camera_model");
+    if (modelJson == container.end() || modelJson->is_null()) return;
+    if (!modelJson->is_string()) {
+        throw std::runtime_error(
+            context + " camera_model must be a string");
+    }
+
+    const std::string declaredModel = modelJson->get<std::string>();
+    std::string normalizedModel = declaredModel;
+    std::transform(
+        normalizedModel.begin(), normalizedModel.end(), normalizedModel.begin(),
+        [](unsigned char character) {
+            return static_cast<char>(std::toupper(character));
+        });
+    if (normalizedModel == "PINHOLE" ||
+        normalizedModel == "PERSPECTIVE" ||
+        normalizedModel == "OPENCV") {
+        return;
+    }
+
+    throw std::runtime_error(
+        context + " uses unsupported camera_model '" + declaredModel +
+        "'; supported models are PINHOLE, PERSPECTIVE, and OPENCV");
 }
 
 static fs::path resolveMaskPath(const fs::path &projectRoot,
@@ -53,6 +81,7 @@ static fs::path resolveMaskPath(const fs::path &projectRoot,
 DatasetDescriptor loaders::loadNerfstudio(const std::string &projectRoot) {
     std::ifstream f((fs::path(projectRoot) / "transforms.json").string());
     json j = json::parse(f);
+    validateCameraModel(j, "Nerfstudio dataset");
 
     // Global defaults (overridden per-frame if present)
     int gW = j.value("w", 0), gH = j.value("h", 0);
@@ -67,6 +96,11 @@ DatasetDescriptor loaders::loadNerfstudio(const std::string &projectRoot) {
 
     size_t maskedFrameCount = 0;
     for (auto &frameJson : j["frames"]) {
+        std::string fp = frameJson["file_path"].get<std::string>();
+        if (fp.empty())
+            throw std::runtime_error("Nerfstudio frame has an empty file_path");
+        validateCameraModel(frameJson, "Nerfstudio frame '" + fp + "'");
+
         DatasetFrameDescriptor frame;
         frame.calibration.width = frameJson.value("w", gW);
         frame.calibration.height = frameJson.value("h", gH);
@@ -80,9 +114,6 @@ DatasetDescriptor loaders::loadNerfstudio(const std::string &projectRoot) {
         frame.calibration.p1 = frameJson.value("p1", gP1);
         frame.calibration.p2 = frameJson.value("p2", gP2);
 
-        std::string fp = frameJson["file_path"].get<std::string>();
-        if (fp.empty())
-            throw std::runtime_error("Nerfstudio frame has an empty file_path");
         frame.id = fp;
         frame.calibrationId = fp;
         fs::path imagePath(fp);

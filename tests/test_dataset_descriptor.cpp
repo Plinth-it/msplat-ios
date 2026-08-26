@@ -110,6 +110,39 @@ bool writePointPly(const fs::path &path) {
     return static_cast<bool>(points);
 }
 
+bool writeNerfstudioCameraModelDataset(
+    const fs::path &path,
+    const char *globalCameraModel,
+    const char *frameCameraModel = nullptr) {
+    std::ofstream transforms(path / "transforms.json");
+    transforms << "{\n";
+    if (globalCameraModel) {
+        transforms << "  \"camera_model\": \"" << globalCameraModel
+                   << "\",\n";
+    }
+    transforms << R"(  "w": 4,
+  "h": 3,
+  "fl_x": 2.0,
+  "fl_y": 2.5,
+  "cx": 2.0,
+  "cy": 1.5,
+  "ply_file_path": "points3D.ply",
+  "frames": [{
+)";
+    if (frameCameraModel) {
+        transforms << "    \"camera_model\": \"" << frameCameraModel
+                   << "\",\n";
+    }
+    transforms << R"(    "file_path": "./images/a.png",
+    "transform_matrix":
+      [[1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,0,1]]
+  }]
+})";
+    transforms.close();
+    return static_cast<bool>(transforms) &&
+           writePointPly(path / "points3D.ply");
+}
+
 template <typename T>
 void writeBinary(std::ofstream &stream, T value) {
     stream.write(reinterpret_cast<const char *>(&value), sizeof(value));
@@ -252,6 +285,58 @@ bool checkNerfstudioAdapter() {
            materialized.metadata.provenance.adapter == "nerfstudio" &&
            materialized.points.count == 2 &&
            std::abs(materialized.scale - 0.5f) < 1e-6f;
+}
+
+bool checkNerfstudioSupportedCameraModels() {
+    for (const char *cameraModel : {
+             "PINHOLE", "PERSPECTIVE", "OPENCV", "opencv"}) {
+        TempDirectory temporary;
+        if (!writeNerfstudioCameraModelDataset(
+                temporary.path, cameraModel)) {
+            return false;
+        }
+        try {
+            const DatasetDescriptor descriptor =
+                datasetDescriptorFromX(temporary.path.string());
+            if (descriptor.frames.size() != 1) return false;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    TempDirectory perFrameOverride;
+    if (!writeNerfstudioCameraModelDataset(
+            perFrameOverride.path, "PINHOLE", "OPENCV")) {
+        return false;
+    }
+    try {
+        return datasetDescriptorFromX(
+                   perFrameOverride.path.string()).frames.size() == 1;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool checkNerfstudioCameraModelRejected(
+    const char *globalCameraModel,
+    const char *frameCameraModel,
+    const std::string &expectedContext,
+    const std::string &expectedModel) {
+    TempDirectory temporary;
+    if (!writeNerfstudioCameraModelDataset(
+            temporary.path, globalCameraModel, frameCameraModel)) {
+        return false;
+    }
+
+    try {
+        (void)datasetDescriptorFromX(temporary.path.string());
+    } catch (const std::runtime_error &error) {
+        const std::string message = error.what();
+        return message.find(expectedContext) != std::string::npos &&
+               message.find("unsupported camera_model") != std::string::npos &&
+               message.find(expectedModel) != std::string::npos;
+    }
+    return false;
 }
 
 bool checkNerfstudioMaskAdapter() {
@@ -632,6 +717,13 @@ int main() {
     CHECK(checkColmapTextAdapter());
     CHECK(checkColmapBinaryAdapter());
     CHECK(checkNerfstudioAdapter());
+    CHECK(checkNerfstudioSupportedCameraModels());
+    CHECK(checkNerfstudioCameraModelRejected(
+        "OPENCV_FISHEYE", nullptr, "dataset", "OPENCV_FISHEYE"));
+    CHECK(checkNerfstudioCameraModelRejected(
+        "OPENCV", "OPENCV_FISHEYE", "frame", "OPENCV_FISHEYE"));
+    CHECK(checkNerfstudioCameraModelRejected(
+        "OPENCV", "EQUIRECTANGULAR", "frame", "EQUIRECTANGULAR"));
     CHECK(checkNerfstudioMaskAdapter());
     CHECK(checkNerfstudioPartialMasksRejected());
     CHECK(checkNerfstudioMaskSymlinkEscapeRejected());
