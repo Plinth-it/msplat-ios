@@ -466,7 +466,7 @@ retry preflight cost is not folded into the asynchronous training tail.
 
 ### Command-line GPU capture
 
-macOS 27's `gpucapture` and `gpudebug` can capture and rank the headless Metal
+macOS 27's `gpucapture` and `gpudebug` can capture and profile the headless Metal
 training workload without Xcode's UI. The helper launches the target with the
 required capture environment, records a bounded command-buffer window, then
 embeds a representative default-state, overlapping replay profile:
@@ -479,7 +479,8 @@ embeds a representative default-state, overlapping replay profile:
 
 The output directory is required to be new so traces and reports are never
 silently overwritten. The default eight-command-buffer window covers four
-current training steps and is long enough for sampled command-cost rankings.
+current training steps. The report includes the replay summary, encoder
+timeline, and occupancy/ALU counters exposed by the current command-line tools.
 That ratio is an implementation detail of the MPS command-buffer split; adjust
 `--count` when the pipeline changes. Use
 `--gpu-state high --execution serial` only for secondary kernel-isolation

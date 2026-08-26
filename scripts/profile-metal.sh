@@ -25,7 +25,7 @@ Options:
 The target is launched with MTL_CAPTURE_ENABLED=1 and
 MTLCAPTURE_WAIT_FOR_SIGNAL=1. It pauses at MTLDevice creation until gpucapture
 attaches. gpudebug then replays the trace, embeds a profile, and writes an NDJSON
-report containing the command ranking and key occupancy/ALU counters.
+report containing the encoder timeline and key occupancy/ALU counters.
 
 Example:
   ./scripts/profile-metal.sh --output-dir /private/tmp/msplat-gpu -- \
@@ -176,16 +176,18 @@ gpudebug --oneshot --json \
 gpudebug --oneshot --json \
     --gputrace "$TRACE_PATH" \
     -c "profile load" \
-    -c "go performance/commands" \
     -c "go /performance/timeline" \
     -c "info" \
+    -c "go /performance/timeline/encoders" \
     -c "go /performance/timeline/counters/occupancy" \
     -c "info --all" \
     -c "go /performance/timeline/counters/alu" \
     -c "info --all" > "$PROFILE_REPORT"
 
-rg -q '"type":"percentage"' "$PROFILE_REPORT" || \
-    die "gpudebug produced no command-cost ranking; increase --count"
+rg -q '"Commands"[[:space:]]*:[[:space:]]*"[1-9][0-9]*"' \
+    "$PROFILE_REPORT" || die "gpudebug produced no profile summary"
+rg -q '"name":"asc[0-9]+"' "$PROFILE_REPORT" || \
+    die "gpudebug produced no encoder timeline"
 
 trap - EXIT
 echo "Trace:   $TRACE_PATH"
