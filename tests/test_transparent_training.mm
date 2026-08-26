@@ -29,6 +29,7 @@ struct StepResult {
     std::array<double, kAdamGroups> firstMomentL1 = {};
     std::array<int, kAdamGroups> nonfiniteFirstMomentCount = {};
     std::vector<double> colorFirstMomentL1;
+    std::vector<std::array<float, 3>> colorFirstMoments;
     std::vector<float> opacityFirstMoments;
     float opacity = 0.0f;
     float opacityFirstMoment = 0.0f;
@@ -94,7 +95,9 @@ StepResult runStep(bool transparent, float alphaLossWeight,
                    int64_t iteration = 1,
                    float gaussianScale = 0.03f,
                    const std::vector<float>& alphaOverrides = {},
-                   const std::vector<float>& depthOverrides = {}) {
+                   const std::vector<float>& depthOverrides = {},
+                   std::array<float, 3> appearanceColors = {
+                       0.4f, 0.6f, 0.8f}) {
     CHECK(gaussianCount > 0);
     CHECK(gaussianScale > 0.0f);
     CHECK(alphaOverrides.empty() ||
@@ -111,9 +114,9 @@ StepResult runStep(bool transparent, float alphaLossWeight,
     constexpr float shC0 = 0.28209479177387814f;
     const float blackDc = -0.5f / shC0;
     const std::array<float, 3> appearanceDc = {
-        -0.1f / shC0,
-         0.1f / shC0,
-         0.3f / shC0,
+        (appearanceColors[0] - 0.5f) / shC0,
+        (appearanceColors[1] - 0.5f) / shC0,
+        (appearanceColors[2] - 0.5f) / shC0,
     };
     for (int index = 0; index < gaussianCount; ++index) {
         const size_t meanOffset = static_cast<size_t>(index) * 3;
@@ -278,12 +281,15 @@ StepResult runStep(bool transparent, float alphaLossWeight,
 
     StepResult result;
     result.colorFirstMomentL1.resize(static_cast<size_t>(gaussianCount));
+    result.colorFirstMoments.resize(static_cast<size_t>(gaussianCount));
     result.opacityFirstMoments.resize(static_cast<size_t>(gaussianCount));
     const float* colorMoments = expAvg[3].data<float>();
     const float* opacityMoments = expAvg[5].data<float>();
     for (int index = 0; index < gaussianCount; ++index) {
         const size_t colorOffset = static_cast<size_t>(index) * 3;
         for (size_t channel = 0; channel < 3; ++channel) {
+            result.colorFirstMoments[static_cast<size_t>(index)][channel] =
+                colorMoments[colorOffset + channel];
             result.colorFirstMomentL1[static_cast<size_t>(index)] +=
                 std::abs(colorMoments[colorOffset + channel]);
         }
@@ -547,6 +553,44 @@ void checkCappedAlphaBackward() {
     checkLayered(513);
 }
 
+void checkFinalColorSaturationBackward() {
+    // The renderer clamps the final composite to one. A saturated channel is
+    // therefore locally constant and must not reach the raster/SH backward,
+    // while neighboring channels below the clamp must retain their gradients.
+    constexpr std::array<float, 3> appearance = {1.5f, 0.8f, 0.25f};
+    constexpr float fullFrameScale = 100.0f;
+
+    const StepResult monolithic = runStep(
+        true, 0.0f, 1, 0.9f,
+        false, false, false, false, false,
+        kWidth, kHeight, true, {}, 1, fullFrameScale,
+        {}, {}, appearance);
+    CHECK(monolithic.radius > 0);
+    CHECK(monolithic.nonfiniteFirstMomentCount[3] == 0);
+    CHECK(monolithic.colorFirstMoments[0][0] == 0.0f);
+    CHECK(monolithic.colorFirstMoments[0][1] != 0.0f);
+    CHECK(monolithic.colorFirstMoments[0][2] != 0.0f);
+
+    // 513 contributors force the chunked forward merge and backward path.
+    // Saturate a different channel so the fixture also rejects a channel-
+    // specific gate rather than only proving that some gradient was removed.
+    constexpr int gaussianCount = 513;
+    constexpr std::array<float, 3> chunkedAppearance = {
+        0.8f, 1.5f, 0.25f,
+    };
+    const StepResult chunked = runStep(
+        true, 0.0f, gaussianCount, 0.005f,
+        false, false, false, false, false,
+        kWidth, kHeight, true, {}, 1, fullFrameScale,
+        {}, {}, chunkedAppearance);
+    CHECK(chunked.nonfiniteFirstMomentCount[3] == 0);
+    for (int index : {0, gaussianCount - 1}) {
+        CHECK(chunked.colorFirstMoments[index][0] != 0.0f);
+        CHECK(chunked.colorFirstMoments[index][1] == 0.0f);
+        CHECK(chunked.colorFirstMoments[index][2] != 0.0f);
+    }
+}
+
 void checkPartialSsimThreadgroups() {
     const float initialOpacity = std::log(0.1f / 0.9f);
     const StepResult partial = runStep(
@@ -717,6 +761,7 @@ int main(int argc, char **argv) {
             checkTransparentAlphaSupervision();
             checkChunkedTransparentAlphaSupervision();
             checkCappedAlphaBackward();
+            checkFinalColorSaturationBackward();
             checkRetryReadbackPoolReuse();
             checkArenaRetryTransaction();
             checkPartialSsimThreadgroups();

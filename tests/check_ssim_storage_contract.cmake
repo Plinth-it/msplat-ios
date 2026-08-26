@@ -207,8 +207,8 @@ require_contains("${fused_terminal}" "const float v_l1 = coverage * ("
 require_contains("${fused_terminal}" "const float adjusted_gradient = inv_n * ("
     "fused final loss gradient")
 require_contains("${fused_terminal}"
-    "rendered_gradient[pixel_channel] = adjusted_gradient * gain;"
-    "fused in-place render gradient")
+    "rendered_gradient[pixel_channel] = rendered_value < 1.0f"
+    "fused upper-clamp render gradient")
 require_contains("${fused_terminal}"
     "local_log_gain_gradient[c] = adjusted_gradient * rend_val;"
     "fused photometric chain rule")
@@ -235,10 +235,10 @@ require_barrier_between("${fused_terminal}"
     "fused horizontal write before vertical read")
 require_barrier_between("${fused_terminal}"
     "l1_sum += coverage * fabs("
-    "const float raw_rend_val = rendered_gradient[pixel_channel];"
+    "const float rendered_value = rendered_gradient[pixel_channel];"
     "fused loss reads before in-place gradient writes")
 require_barrier_between("${fused_terminal}"
-    "rendered_gradient[pixel_channel] = adjusted_gradient * gain;"
+    "rendered_gradient[pixel_channel] = rendered_value < 1.0f"
     "const float loss_contribution ="
     "fused in-place output before next-channel input")
 require_barrier_between("${fused_terminal}"

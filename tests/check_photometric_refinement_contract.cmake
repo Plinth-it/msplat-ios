@@ -61,8 +61,8 @@ require_contains("${staged_middle}"
     "rendered[(gpy*W+gpx)*3+c] * gain"
     "staged-middle L1 adjustment")
 require_contains("${v_backward}"
-    "rendered_gradient[pixel_channel] = adjusted_gradient * gain;"
-    "staged raw-render gradient chain rule")
+    "rendered_gradient[pixel_channel] = rendered_value < 1.0f"
+    "staged upper-clamp render gradient chain rule")
 require_contains("${v_backward}"
     "local_log_gain_gradient[c] = adjusted_gradient * rend_val;"
     "staged log-gain gradient chain rule")
@@ -74,14 +74,14 @@ require_contains("${v_backward}" "if (photometric_enabled != 0)"
     "staged disabled-path gain-gradient bypass")
 
 require_contains("${fused_terminal}"
-    "const float raw_rend_val = rendered_gradient[pixel_channel];"
-    "fused terminal preserves raw rendered value")
+    "const float rendered_value = rendered_gradient[pixel_channel];"
+    "fused terminal preserves saturated rendered value")
 require_contains("${fused_terminal}"
-    "const float rend_val = raw_rend_val * gain;"
+    "const float rend_val = rendered_value * gain;"
     "fused terminal applies the photometric gain")
 require_contains("${fused_terminal}"
-    "rendered_gradient[pixel_channel] = adjusted_gradient * gain;"
-    "fused terminal raw-render gradient chain rule")
+    "rendered_gradient[pixel_channel] = rendered_value < 1.0f"
+    "fused terminal upper-clamp render gradient chain rule")
 require_contains("${fused_terminal}"
     "local_log_gain_gradient[c] = adjusted_gradient * rend_val;"
     "fused terminal log-gain gradient chain rule")

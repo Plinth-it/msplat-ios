@@ -239,6 +239,216 @@ void poisonFloatTail(MTensor& tensor, int firstRow, uint32_t poisonBits) {
         tensor.data<float>()[index] = poison;
 }
 
+void checkRowMatchesSnapshot(
+    const MTensor& tensor, int actualRow,
+    const std::vector<uint32_t>& snapshot, int sourceRow) {
+    const int64_t stride = tensor.stride0();
+    CHECK(snapshot.size() >=
+          static_cast<size_t>(sourceRow + 1) * static_cast<size_t>(stride));
+    for (int64_t component = 0; component < stride; ++component) {
+        CHECK(floatBits(tensor.data<float>()[actualRow * stride + component]) ==
+              snapshot[sourceRow * stride + component]);
+    }
+}
+
+void checkZeroRow(const MTensor& tensor, int row) {
+    const int64_t stride = tensor.stride0();
+    for (int64_t component = 0; component < stride; ++component)
+        CHECK(floatBits(tensor.data<float>()[row * stride + component]) == 0u);
+}
+
+void checkExactDensificationIdentity(bool gpuMode) {
+    constexpr int sourceCount = 5;
+    constexpr int population = 8;
+    constexpr int featuresRestStride = 5;
+    constexpr int parameterStrides[] = {
+        3, 3, 4, 3, featuresRestStride, 1,
+    };
+    constexpr uint32_t poisonBits = 0x7fc12345u;
+    const float poison = floatFromBits(poisonBits);
+
+    MTensor means = gpu_empty({population, 3}, DType::Float32);
+    MTensor scales = gpu_empty({population, 3}, DType::Float32);
+    MTensor quaternions = gpu_empty({population, 4}, DType::Float32);
+    MTensor featuresDc = gpu_empty({population, 3}, DType::Float32);
+    MTensor featuresRest = gpu_empty(
+        {population, featuresRestStride}, DType::Float32);
+    MTensor opacities = gpu_empty({population, 1}, DType::Float32);
+    std::array<MTensor*, 6> parameterBuffers = {
+        &means, &scales, &quaternions,
+        &featuresDc, &featuresRest, &opacities,
+    };
+
+    MTensor firstMoments[6];
+    MTensor secondMoments[6];
+    for (int group = 0; group < 6; ++group) {
+        firstMoments[group] = gpu_empty(
+            {population, parameterStrides[group]}, DType::Float32);
+        secondMoments[group] = gpu_empty(
+            {population, parameterStrides[group]}, DType::Float32);
+
+        MTensor* buffers[] = {
+            parameterBuffers[group],
+            &firstMoments[group],
+            &secondMoments[group],
+        };
+        for (MTensor* buffer : buffers) {
+            for (int64_t index = 0; index < buffer->numel(); ++index)
+                buffer->data<float>()[index] = poison;
+        }
+        for (int row = 0; row < sourceCount; ++row) {
+            for (int component = 0;
+                 component < parameterStrides[group]; ++component) {
+                const int64_t index =
+                    static_cast<int64_t>(row) * parameterStrides[group] +
+                    component;
+                parameterBuffers[group]->data<float>()[index] =
+                    static_cast<float>(1000 * (group + 1) + 100 * row +
+                                       component + 1);
+                firstMoments[group].data<float>()[index] =
+                    static_cast<float>(7000 + 1000 * group + 100 * row +
+                                       component + 1);
+                secondMoments[group].data<float>()[index] =
+                    static_cast<float>(14000 + 1000 * group + 100 * row +
+                                       component + 1);
+            }
+        }
+    }
+
+    // Row 1 splits with an identity rotation but distinctive raw quaternion.
+    const float splitScales[] = {
+        0.0f, std::log(2.0f), std::log(4.0f),
+    };
+    for (int component = 0; component < 3; ++component)
+        scales.data<float>()[3 + component] = splitScales[component];
+    for (int row = 0; row < sourceCount; ++row) {
+        for (int component = 0; component < 4; ++component) {
+            quaternions.data<float>()[row * 4 + component] =
+                component == 0 ? static_cast<float>(row + 1) : 0.0f;
+        }
+    }
+    const float opacityValues[] = {0.1f, 0.2f, 0.3f, -10.0f, 0.4f};
+    std::copy(
+        std::begin(opacityValues), std::end(opacityValues),
+        opacities.data<float>());
+
+    std::array<std::vector<uint32_t>, 6> parameterSnapshots;
+    std::array<std::vector<uint32_t>, 6> firstMomentSnapshots;
+    std::array<std::vector<uint32_t>, 6> secondMomentSnapshots;
+    for (int group = 0; group < 6; ++group) {
+        parameterSnapshots[group] =
+            tensorPrefixBits(*parameterBuffers[group], sourceCount);
+        firstMomentSnapshots[group] =
+            tensorPrefixBits(firstMoments[group], sourceCount);
+        secondMomentSnapshots[group] =
+            tensorPrefixBits(secondMoments[group], sourceCount);
+    }
+
+    MTensor max2DSize = gpu_zeros({sourceCount}, DType::Float32);
+    MTensor splitFlag = gpu_zeros({sourceCount}, DType::Int32);
+    MTensor duplicateFlag = gpu_zeros({sourceCount}, DType::Int32);
+    MTensor splitPrefix = gpu_zeros({sourceCount}, DType::Int32);
+    MTensor duplicatePrefix = gpu_zeros({sourceCount}, DType::Int32);
+    splitFlag.data<int32_t>()[1] = 1;
+    duplicateFlag.data<int32_t>()[2] = 1;
+    for (int row = 1; row < sourceCount; ++row)
+        splitPrefix.data<int32_t>()[row] = 1;
+    for (int row = 2; row < sourceCount; ++row)
+        duplicatePrefix.data<int32_t>()[row] = 1;
+
+    MTensor keepFlag = gpu_zeros({population}, DType::Int32);
+    MTensor keepPrefix = gpu_zeros({population}, DType::Int32);
+    MTensor blockTotals = gpu_zeros({1}, DType::Int32);
+    MTensor compactScratch = gpu_empty(
+        {population * featuresRestStride}, DType::Float32);
+    for (int64_t index = 0; index < compactScratch.numel(); ++index)
+        compactScratch.data<float>()[index] = poison;
+    MTensor randomSamples = gpu_empty(
+        gpuMode ? std::vector<int64_t>{1} : std::vector<int64_t>{2, 3},
+        DType::Float32);
+    for (int64_t index = 0; index < randomSamples.numel(); ++index)
+        randomSamples.data<float>()[index] = poison;
+
+    constexpr uint32_t randomSeed = 901u;
+    const int densifiedCount = msplat_densify(
+        sourceCount, population,
+        0.1f, 0.5f, 0.15f, 0, 0,
+        max2DSize,
+        means, scales, quaternions,
+        featuresDc, featuresRest, opacities, featuresRestStride,
+        firstMoments, secondMoments,
+        splitFlag, duplicateFlag,
+        splitPrefix, duplicatePrefix,
+        keepFlag, keepPrefix,
+        blockTotals, compactScratch,
+        randomSamples, randomSeed);
+    CHECK(densifiedCount == 6);
+
+    // Stable compaction produces P0, P2, P4, S1.0, S1.1, D2.
+    constexpr int survivorSources[] = {0, 2, 4};
+    for (int group = 0; group < 6; ++group) {
+        for (int outputRow = 0; outputRow < 3; ++outputRow) {
+            const int sourceRow = survivorSources[outputRow];
+            checkRowMatchesSnapshot(
+                *parameterBuffers[group], outputRow,
+                parameterSnapshots[group], sourceRow);
+            checkRowMatchesSnapshot(
+                firstMoments[group], outputRow,
+                firstMomentSnapshots[group], sourceRow);
+            checkRowMatchesSnapshot(
+                secondMoments[group], outputRow,
+                secondMomentSnapshots[group], sourceRow);
+        }
+
+        checkRowMatchesSnapshot(
+            *parameterBuffers[group], 5,
+            parameterSnapshots[group], 2);
+        for (int childRow = 3; childRow <= 5; ++childRow) {
+            checkZeroRow(firstMoments[group], childRow);
+            checkZeroRow(secondMoments[group], childRow);
+        }
+    }
+
+    // Split children retain all non-geometric parent parameters exactly.
+    for (int group : {2, 3, 4, 5}) {
+        checkRowMatchesSnapshot(
+            *parameterBuffers[group], 3,
+            parameterSnapshots[group], 1);
+        checkRowMatchesSnapshot(
+            *parameterBuffers[group], 4,
+            parameterSnapshots[group], 1);
+    }
+
+    std::array<float, 6> splitSamples;
+    if (gpuMode) {
+        splitSamples = expectedGpuDensifySamples(randomSeed, 0);
+    } else {
+        std::copy_n(randomSamples.data<float>(), 6, splitSamples.begin());
+    }
+    for (int child = 0; child < 2; ++child) {
+        const int outputRow = 3 + child;
+        for (int component = 0; component < 3; ++component) {
+            const float sourceMean = floatFromBits(
+                parameterSnapshots[0][3 + component]);
+            const float sourceScale = floatFromBits(
+                parameterSnapshots[1][3 + component]);
+            const float expectedMean = sourceMean +
+                std::exp(sourceScale) * splitSamples[child * 3 + component];
+            const float actualMean =
+                means.data<float>()[outputRow * 3 + component];
+            CHECK(std::abs(actualMean - expectedMean) <=
+                  2.0e-4f * (1.0f + std::abs(expectedMean)));
+
+            const float expectedScale =
+                sourceScale - std::log(1.6f);
+            const float actualScale =
+                scales.data<float>()[outputRow * 3 + component];
+            CHECK(std::abs(actualScale - expectedScale) <=
+                  2.0e-6f * (1.0f + std::abs(expectedScale)));
+        }
+    }
+}
+
 void checkCapacityGrowthWithoutPreclear(bool gpuMode) {
     constexpr uint32_t poisonBits = 0x7fc12345u;
     constexpr int activeCount = kCapacityGrowthParents;
@@ -676,6 +886,7 @@ int main(int argc, char **argv) {
             checkOpacityReset();
             const bool gpuRandomMode = expectedMode == "gpu";
             checkDensificationRandomMode(gpuRandomMode);
+            checkExactDensificationIdentity(gpuRandomMode);
             checkCapacityGrowthWithoutPreclear(gpuRandomMode);
             checkMutuallyExclusiveClassification();
             cleanup_msplat_metal();

@@ -5039,8 +5039,8 @@ kernel void ssim_fused_v_fwd_bwd_kernel(
 
             const uint pixel = py * W + px;
             const uint pixel_channel = pixel * 3 + c;
-            const float raw_rend_val = rendered_gradient[pixel_channel];
-            const float rend_val = raw_rend_val * gain;
+            const float rendered_value = rendered_gradient[pixel_channel];
+            const float rend_val = rendered_value * gain;
             const float gt_val = training_target_rgb(
                 gt, coverage_mask, alpha_layout, background,
                 target_pixel_stride_bytes, pixel, c);
@@ -5056,7 +5056,11 @@ kernel void ssim_fused_v_fwd_bwd_kernel(
             const float adjusted_gradient = inv_n * (
                 -ssim_weight * v_ssim +
                 (1.0f - ssim_weight) * v_l1);
-            rendered_gradient[pixel_channel] = adjusted_gradient * gain;
+            // The raster forward clamps the final composite to one. Only the
+            // renderer cotangent crosses that clamp; gain is applied after it.
+            rendered_gradient[pixel_channel] = rendered_value < 1.0f
+                ? adjusted_gradient * gain
+                : 0.0f;
             local_log_gain_gradient[c] = adjusted_gradient * rend_val;
         }
 
@@ -5267,8 +5271,8 @@ kernel void ssim_v_bwd_kernel(
             }
 
             uint pixel_channel = (py * W + px) * 3 + c;
-            const float raw_rend_val = rendered_gradient[pixel_channel];
-            const float rend_val = raw_rend_val * gain;
+            const float rendered_value = rendered_gradient[pixel_channel];
+            const float rend_val = rendered_value * gain;
             float gt_val = training_target_rgb(
                 gt, coverage_mask, alpha_layout, background,
                 target_pixel_stride_bytes, py * W + px, c);
@@ -5285,7 +5289,11 @@ kernel void ssim_v_bwd_kernel(
             const float adjusted_gradient = inv_n * (
                 -ssim_weight * v_ssim + (1.0f - ssim_weight) * v_l1
             );
-            rendered_gradient[pixel_channel] = adjusted_gradient * gain;
+            // Match the final upper clamp while leaving post-clamp
+            // photometric-gain learning active.
+            rendered_gradient[pixel_channel] = rendered_value < 1.0f
+                ? adjusted_gradient * gain
+                : 0.0f;
             local_log_gain_gradient[c] = adjusted_gradient * rend_val;
         }
     }
