@@ -598,7 +598,7 @@ kernel void project_gaussians_forward_kernel(
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
-    if (idx >= num_points) {
+    if (idx >= (uint)num_points) {
         return;
     }
     radii[idx] = 0;
@@ -1100,7 +1100,7 @@ kernel void map_gaussian_to_intersects_kernel(
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
-    if (idx >= num_points)
+    if (idx >= (uint)num_points)
         return;
     if (radii[idx] <= 0)
         return;
@@ -1115,8 +1115,8 @@ kernel void map_gaussian_to_intersects_kernel(
     // Upper 16 bits of positive float preserve ordering (sign+exponent+7 mantissa bits).
     // Reduces effective key width from ~48 to ~28 bits → 4 radix passes instead of 6.
     int64_t depth_16 = ((int64_t) * (constant int32_t *)&(depths[idx])) >> 16;
-    for (int i = tile_min.y; i < tile_max.y; ++i) {
-        for (int j = tile_min.x; j < tile_max.x; ++j) {
+    for (uint i = tile_min.y; i < tile_max.y; ++i) {
+        for (uint j = tile_min.x; j < tile_max.x; ++j) {
             if ((uint)cur_idx >= capacity) {
                 atomic_fetch_or_explicit(
                     overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
@@ -1322,8 +1322,10 @@ kernel void rasterize_backward_kernel(
             // Broadcast batch data from lane 0 → all lanes in SIMD group.
             // All threads read the same index t, so one threadgroup read +
             // simd_broadcast replaces 32 redundant threadgroup reads.
-            float3 b_conic, b_xy_opac, b_rgb;
-            int32_t b_id;
+            float3 b_conic = float3(0.f);
+            float3 b_xy_opac = float3(0.f);
+            float3 b_rgb = float3(0.f);
+            int32_t b_id = 0;
             if (wr == 0) {
                 b_conic = conic_batch[t];
                 b_xy_opac = xy_opacity_batch[t];
@@ -1512,7 +1514,7 @@ kernel void nd_rasterize_backward_kernel(
         // update v_rgb for this gaussian
         const float fac = alpha * T;
         float v_alpha = 0.f;
-        for (int c = 0; c < channels; ++c) {
+        for (uint c = 0; c < channels; ++c) {
             // gradient wrt rgb
             atomic_fetch_add_explicit(v_rgb + channels * g + c, fac * v_out[c], memory_order_relaxed);
             // contribution from this pixel
@@ -1958,7 +1960,7 @@ kernel void project_gaussians_backward_kernel(
     device float* v_quat, // float4
     uint idx [[thread_position_in_grid]]
 ) {
-    if (idx >= num_points || radii[idx] <= 0) {
+    if (idx >= (uint)num_points || radii[idx] <= 0) {
         return;
     }
     float3 p_world = read_packed_float3(means3d, idx);
@@ -4310,8 +4312,10 @@ kernel void rasterize_backward_chunked_kernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (int t = max(0, batch_end - warp_bin_final); t < batch_size; ++t) {
-            float3 b_conic, b_xy_opac, b_rgb;
-            int32_t b_id;
+            float3 b_conic = float3(0.f);
+            float3 b_xy_opac = float3(0.f);
+            float3 b_rgb = float3(0.f);
+            int32_t b_id = 0;
             if (wr == 0) {
                 b_conic = conic_batch[t];
                 b_xy_opac = xy_opacity_batch[t];

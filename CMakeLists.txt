@@ -46,6 +46,7 @@ FetchContent_Declare(nanoflann
 FetchContent_Declare(cli11
     URL https://github.com/CLIUtils/CLI11/archive/refs/tags/v2.4.2.zip
     URL_HASH SHA256=43e650d5e1a3acaaf419d1e61a81f77b408d0696f472be0599ddf877d40984b0)
+set(CMAKE_POLICY_VERSION_MINIMUM 3.10)
 FetchContent_MakeAvailable(nlohmann_json nanoflann cli11)
 
 # Metal frameworks
