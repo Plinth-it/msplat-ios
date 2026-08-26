@@ -84,6 +84,24 @@ bool accepts(const DatasetDescriptor &descriptor) {
     return true;
 }
 
+bool sameCalibration(const CameraCalibration &lhs,
+                     const CameraCalibration &rhs) {
+    return lhs.width == rhs.width && lhs.height == rhs.height &&
+           lhs.fx == rhs.fx && lhs.fy == rhs.fy &&
+           lhs.cx == rhs.cx && lhs.cy == rhs.cy &&
+           lhs.k1 == rhs.k1 && lhs.k2 == rhs.k2 && lhs.k3 == rhs.k3 &&
+           lhs.p1 == rhs.p1 && lhs.p2 == rhs.p2;
+}
+
+bool sameCalibration(const Camera::DeclaredIntrinsics &lhs,
+                     const CameraCalibration &rhs) {
+    return lhs.captured && lhs.width == rhs.width && lhs.height == rhs.height &&
+           lhs.fx == rhs.fx && lhs.fy == rhs.fy &&
+           lhs.cx == rhs.cx && lhs.cy == rhs.cy &&
+           lhs.k1 == rhs.k1 && lhs.k2 == rhs.k2 && lhs.k3 == rhs.k3 &&
+           lhs.p1 == rhs.p1 && lhs.p2 == rhs.p2;
+}
+
 bool rejectsMaterialization(DatasetDescriptor descriptor) {
     try {
         (void)inputDataFromDescriptor(std::move(descriptor));
@@ -257,9 +275,19 @@ bool checkNerfstudioAdapter() {
   "fl_y": 2.5,
   "cx": 2.0,
   "cy": 1.5,
+  "k1": 0.125,
+  "k2": -0.25,
+  "k3": 0.5,
+  "p1": -0.125,
+  "p2": 0.25,
   "ply_file_path": "points3D.ply",
   "frames": [
-    {"file_path": "./images/b.png", "transform_matrix":
+    {"file_path": "./images/b.png",
+     "w": 8, "h": 6,
+     "fl_x": 4.0, "fl_y": 5.0, "cx": 3.5, "cy": 2.5,
+     "k1": -0.5, "k2": 0.75, "k3": -0.25,
+     "p1": 0.125, "p2": -0.375,
+     "transform_matrix":
       [[1,0,0,2], [0,1,0,0], [0,0,1,0], [0,0,0,1]]},
     {"file_path": "./images/a.png", "transform_matrix":
       [[1,0,0,-2], [0,1,0,0], [0,0,1,0], [0,0,0,1]]}
@@ -275,7 +303,13 @@ bool checkNerfstudioAdapter() {
         descriptor.frames[0].id != "./images/a.png" ||
         descriptor.frames[1].id != "./images/b.png" ||
         descriptor.frames[0].imagePath !=
-            (temporary.path / "images/a.png").string()) {
+            (temporary.path / "images/a.png").string() ||
+        !sameCalibration(descriptor.frames[0].calibration, CameraCalibration{
+            4, 3, 2.0f, 2.5f, 2.0f, 1.5f,
+            0.125f, -0.25f, 0.5f, -0.125f, 0.25f}) ||
+        !sameCalibration(descriptor.frames[1].calibration, CameraCalibration{
+            8, 6, 4.0f, 5.0f, 3.5f, 2.5f,
+            -0.5f, 0.75f, -0.25f, 0.125f, -0.375f})) {
         return false;
     }
 
@@ -284,6 +318,12 @@ bool checkNerfstudioAdapter() {
                std::vector<std::string>({"./images/a.png", "./images/b.png"}) &&
            materialized.metadata.provenance.adapter == "nerfstudio" &&
            materialized.points.count == 2 &&
+           sameCalibration(
+               materialized.cameras[0].declared,
+               descriptor.frames[0].calibration) &&
+           sameCalibration(
+               materialized.cameras[1].declared,
+               descriptor.frames[1].calibration) &&
            std::abs(materialized.scale - 0.5f) < 1e-6f;
 }
 

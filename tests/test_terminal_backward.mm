@@ -119,7 +119,11 @@ std::array<float, 24> degreeFourBasis(float x, float y, float z) {
     };
 }
 
-void checkTerminalStep(bool collectStats, int degreesToUse) {
+std::array<float, 4> checkTerminalStep(
+    bool collectStats,
+    int degreesToUse,
+    const std::array<float, 4>& visibleQuat = {1.0f, 0.0f, 0.0f, 0.0f},
+    bool verifyCapturedGoldens = true) {
     const float logScale = std::log(0.03f);
     constexpr float shC0 = 0.28209479177387814f;
     constexpr int shDegree = 4;
@@ -143,7 +147,7 @@ void checkTerminalStep(bool collectStats, int degreesToUse) {
         logScale + 0.2f, logScale - 0.2f, logScale,
     });
     MTensor quats = gpuFloats({kGaussianCount, 4}, {
-        1.0f, 0.0f, 0.0f, 0.0f,
+        visibleQuat[0], visibleQuat[1], visibleQuat[2], visibleQuat[3],
         0.9f, 0.1f, -0.2f, 0.3f,
     });
     MTensor featuresDc = gpuFloats({kGaussianCount, 3}, {
@@ -304,8 +308,10 @@ void checkTerminalStep(bool collectStats, int degreesToUse) {
         CHECK(std::isfinite(parameter));
         CHECK(std::isfinite(firstMoment));
         CHECK(std::isfinite(secondMoment));
-        CHECK(std::abs(firstMoment -
-            expectedPhotometricFirstMoments[channel]) <= 1.0e-9f);
+        if (verifyCapturedGoldens) {
+            CHECK(std::abs(firstMoment -
+                expectedPhotometricFirstMoments[channel]) <= 1.0e-9f);
+        }
         const float gradient = firstMoment / (1.0f - kBeta1);
         const float expectedSecondMoment =
             (1.0f - kBeta2) * gradient * gradient;
@@ -340,25 +346,27 @@ void checkTerminalStep(bool collectStats, int degreesToUse) {
             ++element;
         }
     };
-    checkVisibleGolden(0, {
-        {0.250999361f, -1.54147745e-6f, 2.37612122e-13f},
-        {-0.250999331f, 1.49219454e-6f, 2.22661462e-13f},
-        {-0.999000013f, -4.97649307e-5f, 2.47651538e-10f},
-    });
-    checkVisibleGolden(1, {
-        {-3.50535798f, -2.32320835e-5f, 5.39722537e-11f},
-        {-3.60535789f, -2.23245897e-5f, 4.98380608e-11f},
-        {-3.40535831f, -3.44983891e-6f, 1.19012298e-12f},
-    });
-    checkVisibleGolden(2, {
-        {1.0f, 0.0f, 0.0f},
-        {0.00139972696f, -4.95558697e-6f, 2.45575153e-12f},
-        {0.00139939517f, -2.27804594e-6f, 5.18942419e-13f},
-        {0.00139855593f, -9.62098056e-7f, 9.2562019e-14f},
-    });
-    checkVisibleGolden(5, {
-        {-2.19522476f, -3.3709206e-5f, 1.13629536e-10f},
-    });
+    if (verifyCapturedGoldens) {
+        checkVisibleGolden(0, {
+            {0.250999361f, -1.54147745e-6f, 2.37612122e-13f},
+            {-0.250999331f, 1.49219454e-6f, 2.22661462e-13f},
+            {-0.999000013f, -4.97649307e-5f, 2.47651538e-10f},
+        });
+        checkVisibleGolden(1, {
+            {-3.50535798f, -2.32320835e-5f, 5.39722537e-11f},
+            {-3.60535789f, -2.23245897e-5f, 4.98380608e-11f},
+            {-3.40535831f, -3.44983891e-6f, 1.19012298e-12f},
+        });
+        checkVisibleGolden(2, {
+            {1.0f, 0.0f, 0.0f},
+            {0.00139972696f, -4.95558697e-6f, 2.45575153e-12f},
+            {0.00139939517f, -2.27804594e-6f, 5.18942419e-13f},
+            {0.00139855593f, -9.62098056e-7f, 9.2562019e-14f},
+        });
+        checkVisibleGolden(5, {
+            {-2.19522476f, -3.3709206e-5f, 1.13629536e-10f},
+        });
+    }
 
     for (int group = 0; group < kAdamGroups; ++group) {
         bool visibleGradientIsNonzero = false;
@@ -482,6 +490,13 @@ void checkTerminalStep(bool collectStats, int degreesToUse) {
         CHECK(max2DSize.data<float>()[0] == initialVisibleMaxSize);
         CHECK(max2DSize.data<float>()[1] == initialInvisibleMaxSize);
     }
+
+    std::array<float, 4> quaternionGradient;
+    for (int element = 0; element < 4; ++element) {
+        quaternionGradient[element] =
+            expAvg[2].data<float>()[element] / (1.0f - kBeta1);
+    }
+    return quaternionGradient;
 }
 
 }  // namespace
@@ -494,6 +509,40 @@ int main(int argc, char **argv) {
             msplat_set_metallib_path_checked(argv[1]);
             checkTerminalStep(false, 1);
             checkTerminalStep(true, 4);
+
+            // Rotation is invariant under positive quaternion scaling. Its raw
+            // gradient must be tangent and transform inversely with that scale.
+            constexpr std::array<float, 4> quaternion = {
+                0.8f, 0.2f, -0.4f, 0.4f,
+            };
+            constexpr float scale = 3.0f;
+            std::array<float, 4> scaledQuaternion;
+            for (int element = 0; element < 4; ++element)
+                scaledQuaternion[element] = scale * quaternion[element];
+            const auto gradient =
+                checkTerminalStep(false, 1, quaternion, false);
+            const auto scaledGradient =
+                checkTerminalStep(false, 1, scaledQuaternion, false);
+
+            float gradientNormSquared = 0.0f;
+            float scaleErrorSquared = 0.0f;
+            float radialGradient = 0.0f;
+            float scaledRadialGradient = 0.0f;
+            for (int element = 0; element < 4; ++element) {
+                gradientNormSquared += gradient[element] * gradient[element];
+                const float scaleError =
+                    gradient[element] - scale * scaledGradient[element];
+                scaleErrorSquared += scaleError * scaleError;
+                radialGradient += quaternion[element] * gradient[element];
+                scaledRadialGradient +=
+                    scaledQuaternion[element] * scaledGradient[element];
+            }
+            const float gradientNorm = std::sqrt(gradientNormSquared);
+            CHECK(gradientNorm > 1.0e-8f);
+            CHECK(std::sqrt(scaleErrorSquared) <= 5.0e-3f * gradientNorm);
+            CHECK(std::abs(radialGradient) <= 5.0e-3f * gradientNorm);
+            CHECK(std::abs(scaledRadialGradient) <=
+                5.0e-3f * scale * gradientNorm);
             cleanup_msplat_metal();
             return 0;
         } catch (const std::exception &error) {

@@ -1818,6 +1818,7 @@ inline float4 quat_to_rotmat_vjp(const float4 quat, const float3x3 v_R) {
     float s = rsqrt(
         quat.w * quat.w + quat.x * quat.x + quat.y * quat.y + quat.z * quat.z
     );
+    const float4 normalized_quat = quat * s;
     float w = quat.x * s;
     float x = quat.y * s;
     float y = quat.z * s;
@@ -1856,7 +1857,11 @@ inline float4 quat_to_rotmat_vjp(const float4 quat, const float3x3 v_R) {
             x * (v_R[0][2] + v_R[2][0]) + y * (v_R[1][2] + v_R[2][1]) -
             2.f * z * (v_R[0][0] + v_R[1][1]) + w * (v_R[0][1] - v_R[1][0])
         );
-    return v_quat;
+    // Chain q / ||q|| so the raw gradient stays tangent to the quaternion
+    // sphere and scales inversely for equivalent scaled quaternions.
+    return s * (
+        v_quat - normalized_quat * dot(normalized_quat, v_quat)
+    );
 }
 
 // given cotangent v in output space (e.g. d_L/d_cov3d) in R(6)
