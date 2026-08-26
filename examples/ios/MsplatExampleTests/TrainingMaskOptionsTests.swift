@@ -1,8 +1,10 @@
 import CoreGraphics
+import CoreVideo
 import Foundation
-import ImageIO
 import Msplat
 @testable import MsplatExample
+import simd
+import UIKit
 import UniformTypeIdentifiers
 import XCTest
 
@@ -191,6 +193,78 @@ final class TrainingMaskOptionsTests: XCTestCase {
 
         XCTAssertEqual(dimensions.width, 12)
         XCTAssertEqual(dimensions.height, 7)
+    }
+
+    func testNerfstudioPreflightRejectsPartialMaskCoverage() throws {
+        let directory = try XCTUnwrap(temporaryDirectory)
+        let images = directory.appending(path: "images", directoryHint: .isDirectory)
+        let masks = directory.appending(path: "masks", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: images,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: masks,
+            withIntermediateDirectories: true
+        )
+        try writePNG(width: 12, height: 7, to: images.appending(path: "a.png"))
+        try writePNG(width: 12, height: 7, to: images.appending(path: "b.png"))
+        try writePNG(width: 12, height: 7, to: masks.appending(path: "a.png"))
+        try writeNerfstudioManifest(
+            to: directory,
+            plyFilePath: nil,
+            framePaths: ["images/a.png", "images/b.png"],
+            maskPaths: ["masks/a.png", nil]
+        )
+
+        XCTAssertThrowsError(
+            try DatasetFolder.maximumSourceDimensions(at: directory)
+        ) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains(
+                    "present for every frame or no frames"
+                )
+            )
+        }
+    }
+
+    func testNerfstudioPreflightRejectsMaskDimensionMismatch() throws {
+        let directory = try XCTUnwrap(temporaryDirectory)
+        let images = directory.appending(path: "images", directoryHint: .isDirectory)
+        let masks = directory.appending(path: "masks", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: images,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.createDirectory(
+            at: masks,
+            withIntermediateDirectories: true
+        )
+        try writePNG(
+            width: 12,
+            height: 7,
+            to: images.appending(path: "frame.png")
+        )
+        try writePNG(
+            width: 11,
+            height: 7,
+            to: masks.appending(path: "frame.png")
+        )
+        try writeNerfstudioManifest(
+            to: directory,
+            plyFilePath: nil,
+            maskPaths: ["masks/frame.png"]
+        )
+        let folder = try XCTUnwrap(DatasetFolder(picked: directory))
+
+        XCTAssertTrue(folder.hasNerfstudioTrainingMasks)
+        XCTAssertThrowsError(
+            try DatasetFolder.maximumSourceDimensions(at: directory)
+        ) { error in
+            XCTAssertTrue(
+                error.localizedDescription.contains("dimensions do not match")
+            )
+        }
     }
 
     func testNerfstudioFolderCreatesNativeSession() async throws {
@@ -604,6 +678,19 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(benchmark.maximumMissingMeasuredIterations, 0)
     }
 
+    func testCapturedTrainingConfigPreservesMetricCoordinates() throws {
+        let config = try TrainingSession.makeTrainingConfig(
+            trainingMaskMode: .transparent,
+            keepCrs: true,
+            benchmark: nil
+        )
+
+        XCTAssertTrue(config.keepCrs)
+        XCTAssertEqual(config.trainingMaskMode, .transparent)
+        XCTAssertFalse(config.refinePhotometricGains)
+        XCTAssertFalse(config.refineCameraPoses)
+    }
+
     func testGrowthBenchmarkRequiresMeasuredCapacityIncrease() {
         XCTAssertNil(
             TrainingBenchmarkRecorder.firstModelCapacityGrowth(
@@ -671,6 +758,475 @@ final class TrainingMaskOptionsTests: XCTestCase {
         )
     }
 
+    func testCaptureGeometryRoundTripsRowMajorCameraTransform() throws {
+        let matrix = simd_float4x4(
+            SIMD4<Float>(1, 5, 9, 13),
+            SIMD4<Float>(2, 6, 10, 14),
+            SIMD4<Float>(3, 7, 11, 15),
+            SIMD4<Float>(4, 8, 12, 16)
+        )
+
+        let rowMajor = CaptureGeometry.rowMajorCameraToWorld(matrix)
+        XCTAssertEqual(rowMajor, (1...16).map(Float.init))
+
+        let restored = try CaptureGeometry.cameraToWorld(fromRowMajor: rowMajor)
+        for column in 0..<4 {
+            XCTAssertEqual(restored[column], matrix[column])
+        }
+    }
+
+    func testCaptureGeometryBackprojectsAndProjectsNativeRasterPoint() throws {
+        let calibration = CaptureCalibrationRecord(
+            width: 640,
+            height: 480,
+            fx: 500,
+            fy: 520,
+            cx: 320,
+            cy: 240
+        )
+        var cameraToWorld = matrix_identity_float4x4
+        cameraToWorld.columns.0 = SIMD4<Float>(0, 1, 0, 0)
+        cameraToWorld.columns.1 = SIMD4<Float>(-1, 0, 0, 0)
+        cameraToWorld.columns.3 = SIMD4<Float>(1, -2, 3, 1)
+        let depthPixel = SIMD2<Float>(200, 90)
+
+        let worldPoint = try XCTUnwrap(CaptureGeometry.worldPoint(
+            depth: 2,
+            depthPixel: depthPixel,
+            depthWidth: 320,
+            depthHeight: 240,
+            calibration: calibration,
+            cameraToWorld: cameraToWorld
+        ))
+        let normalizedPoint = try XCTUnwrap(
+            CaptureGeometry.normalizedImagePoint(
+                worldPoint: worldPoint,
+                calibration: calibration,
+                cameraToWorld: cameraToWorld
+            )
+        )
+
+        XCTAssertEqual(
+            normalizedPoint.x,
+            CGFloat(depthPixel.x / 320),
+            accuracy: 1e-6
+        )
+        XCTAssertEqual(
+            normalizedPoint.y,
+            CGFloat(depthPixel.y / 240),
+            accuracy: 1e-6
+        )
+    }
+
+    func testCaptureDisplayOrientationMapsFromInterfaceOrientation() {
+        XCTAssertEqual(
+            CaptureDisplayOrientation(interfaceOrientation: .portrait),
+            .right
+        )
+        XCTAssertEqual(
+            CaptureDisplayOrientation(interfaceOrientation: .portraitUpsideDown),
+            .left
+        )
+        XCTAssertEqual(
+            CaptureDisplayOrientation(interfaceOrientation: .landscapeLeft),
+            .down
+        )
+        XCTAssertEqual(
+            CaptureDisplayOrientation(interfaceOrientation: .landscapeRight),
+            .up
+        )
+        XCTAssertNil(
+            CaptureDisplayOrientation(interfaceOrientation: .unknown)
+        )
+    }
+
+    func testCaptureOrientationTransformsCalibrationAndPreservesRays() throws {
+        let calibration = CaptureCalibrationRecord(
+            width: 6,
+            height: 4,
+            fx: 10,
+            fy: 12,
+            cx: 2.5,
+            cy: 1.5
+        )
+        var cameraToWorld = matrix_identity_float4x4
+        cameraToWorld.columns.0 = SIMD4<Float>(0, 1, 0, 0)
+        cameraToWorld.columns.1 = SIMD4<Float>(-1, 0, 0, 0)
+        cameraToWorld.columns.3 = SIMD4<Float>(1, -2, 3, 1)
+        let sourcePixel = SIMD2<Float>(1.25, 2.75)
+        let worldPoint = try XCTUnwrap(CaptureGeometry.worldPoint(
+            depth: 2,
+            depthPixel: sourcePixel,
+            depthWidth: calibration.width,
+            depthHeight: calibration.height,
+            calibration: calibration,
+            cameraToWorld: cameraToWorld
+        ))
+        let sourceNormalized = CGPoint(
+            x: CGFloat(sourcePixel.x / Float(calibration.width)),
+            y: CGFloat(sourcePixel.y / Float(calibration.height))
+        )
+        let expected: [CaptureDisplayOrientation: (
+            calibration: CaptureCalibrationRecord,
+            normalizedPoint: CGPoint
+        )] = [
+            .up: (
+                calibration,
+                sourceNormalized
+            ),
+            .right: (
+                CaptureCalibrationRecord(
+                    width: 4,
+                    height: 6,
+                    fx: 12,
+                    fy: 10,
+                    cx: 2.5,
+                    cy: 2.5
+                ),
+                CGPoint(x: 1 - sourceNormalized.y, y: sourceNormalized.x)
+            ),
+            .down: (
+                CaptureCalibrationRecord(
+                    width: 6,
+                    height: 4,
+                    fx: 10,
+                    fy: 12,
+                    cx: 3.5,
+                    cy: 2.5
+                ),
+                CGPoint(x: 1 - sourceNormalized.x, y: 1 - sourceNormalized.y)
+            ),
+            .left: (
+                CaptureCalibrationRecord(
+                    width: 4,
+                    height: 6,
+                    fx: 12,
+                    fy: 10,
+                    cx: 1.5,
+                    cy: 3.5
+                ),
+                CGPoint(x: sourceNormalized.y, y: 1 - sourceNormalized.x)
+            ),
+        ]
+
+        for orientation in [
+            CaptureDisplayOrientation.up,
+            .right,
+            .down,
+            .left,
+        ] {
+            let oriented = CaptureGeometry.orientedGeometry(
+                calibration: calibration,
+                cameraToWorld: cameraToWorld,
+                orientation: orientation
+            )
+            XCTAssertEqual(oriented.calibration, expected[orientation]?.calibration)
+            let projected = try XCTUnwrap(CaptureGeometry.normalizedImagePoint(
+                worldPoint: worldPoint,
+                calibration: oriented.calibration,
+                cameraToWorld: oriented.cameraToWorld
+            ))
+            let expectedPoint = try XCTUnwrap(expected[orientation]?.normalizedPoint)
+            XCTAssertEqual(projected.x, expectedPoint.x, accuracy: 1e-6)
+            XCTAssertEqual(projected.y, expectedPoint.y, accuracy: 1e-6)
+        }
+    }
+
+    func testCaptureOrientationRotatesInterleavedRasterBytes() throws {
+        let source: [UInt8] = [
+            1, 2, 3,
+            4, 5, 6,
+        ]
+        let expected: [CaptureDisplayOrientation: (
+            bytes: [UInt8],
+            width: Int,
+            height: Int
+        )] = [
+            .up: ([1, 2, 3, 4, 5, 6], 3, 2),
+            .right: ([4, 1, 5, 2, 6, 3], 2, 3),
+            .down: ([6, 5, 4, 3, 2, 1], 3, 2),
+            .left: ([3, 6, 2, 5, 1, 4], 2, 3),
+        ]
+
+        for orientation in [
+            CaptureDisplayOrientation.up,
+            .right,
+            .down,
+            .left,
+        ] {
+            let result = try CaptureGeometry.orientedInterleavedBytes(
+                source,
+                width: 3,
+                height: 2,
+                components: 1,
+                orientation: orientation
+            )
+            XCTAssertEqual(result.bytes, expected[orientation]?.bytes)
+            XCTAssertEqual(result.width, expected[orientation]?.width)
+            XCTAssertEqual(result.height, expected[orientation]?.height)
+        }
+
+        XCTAssertThrowsError(try CaptureGeometry.orientedInterleavedBytes(
+            [1],
+            width: 3,
+            height: 2,
+            components: 1,
+            orientation: .right
+        ))
+    }
+
+    func testCaptureFrameRecordOrientationRoundTripsAndDecodesLegacyJSON() throws {
+        let record = CaptureFrameRecord(
+            id: "frame_000001",
+            imagePath: "images/frame_000001.png",
+            maskPath: nil,
+            softMaskPath: nil,
+            displayOrientation: .right,
+            calibration: CaptureCalibrationRecord(
+                width: 1920,
+                height: 1440,
+                fx: 1_200,
+                fy: 1_200,
+                cx: 960,
+                cy: 720
+            ),
+            cameraToWorld: Array(repeating: 0, count: 16),
+            timestamp: 1,
+            exposureDurationSeconds: 0.01,
+            trackingState: "normal",
+            maskConfidence: nil,
+            fusedPointCount: 12
+        )
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let encoded = try encoder.encode(record)
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+
+        XCTAssertEqual(
+            try decoder.decode(CaptureFrameRecord.self, from: encoded)
+                .displayOrientation,
+            .right
+        )
+
+        var legacyObject = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: encoded) as? [String: Any]
+        )
+        legacyObject.removeValue(forKey: "display_orientation")
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        XCTAssertNil(
+            try decoder.decode(CaptureFrameRecord.self, from: legacyData)
+                .displayOrientation
+        )
+        XCTAssertEqual(CaptureManifest.currentFormatVersion, 2)
+    }
+
+    func testCaptureStorePersistsPortraitRasterAndMatchingGeometry() async throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let pixelBuffer = try makeBGRAPixelBuffer(width: 3, height: 2)
+        let calibration = CaptureCalibrationRecord(
+            width: 3,
+            height: 2,
+            fx: 10,
+            fy: 12,
+            cx: 1.5,
+            cy: 1
+        )
+        let store = try CaptureStore(
+            mode: .scene,
+            baseDirectory: temporaryDirectory
+        )
+        for index in 0..<3 {
+            let candidate = CaptureFrameCandidate(
+                image: OwnedPixelBuffer(pixelBuffer),
+                depth: nil,
+                confidence: nil,
+                displayOrientation: .right,
+                calibration: calibration,
+                cameraToWorld: matrix_identity_float4x4,
+                timestamp: Double(index),
+                exposureDuration: 0.01,
+                trackingState: "normal",
+                rawFeaturePoints: [SIMD3<Float>(0, 0, -1)],
+                subjectWorldPosition: nil
+            )
+            _ = try await store.accept(candidate)
+        }
+
+        let capture = try await store.finalize()
+        let frame = try XCTUnwrap(capture.manifest.frames.first)
+        let image = try XCTUnwrap(UIImage(
+            contentsOfFile: frame.imageURL(under: capture.rootURL).path
+        )).cgImage
+        let cgImage = try XCTUnwrap(image)
+
+        XCTAssertEqual(cgImage.width, 2)
+        XCTAssertEqual(cgImage.height, 3)
+        XCTAssertEqual(
+            try topLeftRGBABytes(from: cgImage).enumerated().compactMap {
+                $0.offset.isMultiple(of: 4) ? $0.element : nil
+            },
+            [112, 16, 144, 48, 176, 80]
+        )
+        XCTAssertEqual(frame.displayOrientation, .right)
+        XCTAssertEqual(frame.calibration, CaptureCalibrationRecord(
+            width: 2,
+            height: 3,
+            fx: 12,
+            fy: 10,
+            cx: 1,
+            cy: 1.5
+        ))
+        XCTAssertEqual(capture.descriptor.frames.first?.calibration.width, 2)
+        XCTAssertEqual(capture.descriptor.frames.first?.calibration.height, 3)
+
+        let transformsData = try Data(contentsOf: capture.rootURL.appending(
+            path: "transforms.json"
+        ))
+        let transforms = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: transformsData) as? [String: Any]
+        )
+        let frames = try XCTUnwrap(transforms["frames"] as? [[String: Any]])
+        XCTAssertEqual(frames.first?["w"] as? Int, 2)
+        XCTAssertEqual(frames.first?["h"] as? Int, 3)
+        XCTAssertEqual(frames.first?["cx"] as? Double, 1)
+        XCTAssertEqual(frames.first?["cy"] as? Double, 1.5)
+    }
+
+    func testCaptureFrameAdmissionStaysBoundedAndReleasesAfterCompletion() throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let store = try CaptureStore(
+            mode: .scene,
+            baseDirectory: temporaryDirectory
+        )
+        let controller = CaptureFrameAdmissionController()
+        controller.start(store: store, subjectWorldPosition: nil)
+        controller.updateDisplayOrientation(.right)
+        defer { controller.finish() }
+
+        let first = try XCTUnwrap(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 1
+        ))
+        for index in 1...100 {
+            XCTAssertNil(controller.begin(
+                cameraToWorld: matrix_identity_float4x4,
+                timestamp: 1 + Double(index)
+            ))
+        }
+
+        controller.complete(first, committed: true)
+        var moved = matrix_identity_float4x4
+        moved.columns.3.x = 0.04
+        XCTAssertNil(controller.begin(
+            cameraToWorld: moved,
+            timestamp: 1.2
+        ))
+        XCTAssertNil(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 1.5
+        ))
+
+        let rejected = try XCTUnwrap(controller.begin(
+            cameraToWorld: moved,
+            timestamp: 1.5
+        ))
+        controller.complete(rejected, committed: false)
+        let retry = try XCTUnwrap(controller.begin(
+            cameraToWorld: moved,
+            timestamp: 1.6
+        ))
+        controller.complete(retry, committed: true)
+
+        controller.stop()
+        var movedAgain = moved
+        movedAgain.columns.3.x = 0.08
+        XCTAssertNil(controller.begin(
+            cameraToWorld: movedAgain,
+            timestamp: 2
+        ))
+    }
+
+    func testCaptureFrameAdmissionRejectsStaleGenerationWork() async throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let controller = CaptureFrameAdmissionController()
+        let firstStore = try CaptureStore(
+            mode: .scene,
+            baseDirectory: temporaryDirectory
+        )
+        controller.start(store: firstStore, subjectWorldPosition: nil)
+        controller.updateDisplayOrientation(.right)
+        let stale = try XCTUnwrap(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 1
+        ))
+
+        let secondStore = try CaptureStore(
+            mode: .scene,
+            baseDirectory: temporaryDirectory
+        )
+        controller.start(store: secondStore, subjectWorldPosition: nil)
+        defer { controller.finish() }
+        let current = try XCTUnwrap(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 2
+        ))
+
+        XCTAssertFalse(controller.complete(stale, committed: true))
+        XCTAssertNil(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 3
+        ))
+
+        let staleTask = Task<Void, Never> {
+            while !Task.isCancelled {
+                await Task.yield()
+            }
+        }
+        controller.register(task: staleTask, for: stale)
+        await staleTask.value
+        XCTAssertTrue(staleTask.isCancelled)
+
+        XCTAssertTrue(controller.complete(current, committed: false))
+        let next = try XCTUnwrap(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 3
+        ))
+        XCTAssertTrue(controller.complete(next, committed: false))
+    }
+
+    func testCaptureFrameAdmissionRequiresAndSnapshotsDisplayOrientation() throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let store = try CaptureStore(
+            mode: .scene,
+            baseDirectory: temporaryDirectory
+        )
+        let controller = CaptureFrameAdmissionController()
+        controller.start(store: store, subjectWorldPosition: nil)
+        defer { controller.finish() }
+
+        XCTAssertNil(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 1
+        ))
+
+        controller.updateDisplayOrientation(.right)
+        let portrait = try XCTUnwrap(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 1
+        ))
+        controller.updateDisplayOrientation(.left)
+        XCTAssertEqual(portrait.displayOrientation, .right)
+        XCTAssertTrue(controller.complete(portrait, committed: false))
+
+        let upsideDown = try XCTUnwrap(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 2
+        ))
+        XCTAssertEqual(upsideDown.displayOrientation, .left)
+        XCTAssertTrue(controller.complete(upsideDown, committed: false))
+    }
+
     private func writeBinaryPointHeader(
         count: UInt64,
         to directory: URL,
@@ -687,11 +1243,70 @@ final class TrainingMaskOptionsTests: XCTestCase {
         try data.write(to: directory.appending(path: "points3D.bin"))
     }
 
+    private func makeBGRAPixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {
+        var pixelBuffer: CVPixelBuffer?
+        let attributes: [CFString: Any] = [
+            kCVPixelBufferIOSurfacePropertiesKey: [:],
+        ]
+        XCTAssertEqual(
+            CVPixelBufferCreate(
+                kCFAllocatorDefault,
+                width,
+                height,
+                kCVPixelFormatType_32BGRA,
+                attributes as CFDictionary,
+                &pixelBuffer
+            ),
+            kCVReturnSuccess
+        )
+        let result = try XCTUnwrap(pixelBuffer)
+        CVPixelBufferLockBaseAddress(result, [])
+        defer { CVPixelBufferUnlockBaseAddress(result, []) }
+        let rowBytes = CVPixelBufferGetBytesPerRow(result)
+        let storage = try XCTUnwrap(CVPixelBufferGetBaseAddress(result))
+            .assumingMemoryBound(to: UInt8.self)
+        for y in 0..<height {
+            for x in 0..<width {
+                let offset = y * rowBytes + x * 4
+                let value = UInt8(16 + (y * width + x) * 32)
+                storage[offset] = value
+                storage[offset + 1] = value
+                storage[offset + 2] = value
+                storage[offset + 3] = .max
+            }
+        }
+        return result
+    }
+
+    private func topLeftRGBABytes(from image: CGImage) throws -> [UInt8] {
+        var bytes = [UInt8](
+            repeating: 0,
+            count: image.width * image.height * 4
+        )
+        let context = try XCTUnwrap(CGContext(
+            data: &bytes,
+            width: image.width,
+            height: image.height,
+            bitsPerComponent: 8,
+            bytesPerRow: image.width * 4,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue |
+                CGBitmapInfo.byteOrder32Big.rawValue
+        ))
+        context.interpolationQuality = .none
+        context.draw(
+            image,
+            in: CGRect(x: 0, y: 0, width: image.width, height: image.height)
+        )
+        return bytes
+    }
+
     private func writeNerfstudioManifest(
         to directory: URL,
         plyFilePath: String?,
         cameraModel: String = "OPENCV",
-        framePaths: [String] = ["images/frame.png"]
+        framePaths: [String] = ["images/frame.png"],
+        maskPaths: [String?]? = nil
     ) throws {
         let transform: [[Double]] = [
             [1, 0, 0, 0],
@@ -699,11 +1314,17 @@ final class TrainingMaskOptionsTests: XCTestCase {
             [0, 0, 1, 0],
             [0, 0, 0, 1],
         ]
-        let frames: [[String: Any]] = framePaths.map { path in
-            [
+        let frames: [[String: Any]] = framePaths.enumerated().map { index, path in
+            var frame: [String: Any] = [
                 "file_path": path,
                 "transform_matrix": transform,
             ]
+            if let maskPaths,
+               maskPaths.indices.contains(index),
+               let maskPath = maskPaths[index] {
+                frame["mask_path"] = maskPath
+            }
+            return frame
         }
         var manifest: [String: Any] = [
             "camera_model": cameraModel,

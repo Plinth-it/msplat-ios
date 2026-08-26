@@ -254,6 +254,134 @@ bool checkNerfstudioAdapter() {
            std::abs(materialized.scale - 0.5f) < 1e-6f;
 }
 
+bool checkNerfstudioMaskAdapter() {
+    TempDirectory temporary;
+    fs::create_directories(temporary.path / "masks");
+    std::ofstream(temporary.path / "masks/a.png").close();
+    std::ofstream(temporary.path / "masks/b.png").close();
+    {
+        std::ofstream transforms(temporary.path / "transforms.json");
+        transforms << R"({
+  "w": 4,
+  "h": 3,
+  "fl_x": 2.0,
+  "fl_y": 2.5,
+  "cx": 2.0,
+  "cy": 1.5,
+  "ply_file_path": "points3D.ply",
+  "frames": [
+    {"file_path": "./images/b.png", "mask_path": "masks/b.png",
+     "transform_matrix": [[1,0,0,2], [0,1,0,0], [0,0,1,0], [0,0,0,1]]},
+    {"file_path": "./images/a.png", "mask_path": "masks/a.png",
+     "transform_matrix": [[1,0,0,-2], [0,1,0,0], [0,0,1,0], [0,0,0,1]]}
+  ]
+})";
+        if (!transforms) return false;
+    }
+    if (!writePointPly(temporary.path / "points3D.ply")) return false;
+
+    const DatasetDescriptor descriptor =
+        datasetDescriptorFromX(temporary.path.string());
+    const fs::path expectedMaskA =
+        fs::canonical(temporary.path / "masks/a.png");
+    const fs::path expectedMaskB =
+        fs::canonical(temporary.path / "masks/b.png");
+    if (descriptor.frames.size() != 2 ||
+        !descriptor.frames[0].trainingMask ||
+        !descriptor.frames[1].trainingMask ||
+        descriptor.frames[0].trainingMask->path !=
+            expectedMaskA.string() ||
+        descriptor.frames[1].trainingMask->path !=
+            expectedMaskB.string() ||
+        descriptor.frames[0].trainingMask->channel !=
+            TrainingMaskChannel::Automatic ||
+        descriptor.frames[1].trainingMask->channel !=
+            TrainingMaskChannel::Automatic) {
+        return false;
+    }
+
+    InputData materialized = inputDataFromX(temporary.path.string());
+    return materialized.cameras.size() == 2 &&
+           materialized.cameras[0].trainingMask &&
+           materialized.cameras[1].trainingMask &&
+           materialized.cameras[0].trainingMask->path ==
+               expectedMaskA.string() &&
+           materialized.cameras[1].trainingMask->path ==
+               expectedMaskB.string() &&
+           materialized.cameras[0].trainingMask->channel ==
+               TrainingMaskChannel::Automatic &&
+           materialized.cameras[1].trainingMask->channel ==
+               TrainingMaskChannel::Automatic;
+}
+
+bool checkNerfstudioPartialMasksRejected() {
+    TempDirectory temporary;
+    fs::create_directories(temporary.path / "masks");
+    std::ofstream(temporary.path / "masks/a.png").close();
+    {
+        std::ofstream transforms(temporary.path / "transforms.json");
+        transforms << R"({
+  "w": 4,
+  "h": 3,
+  "fl_x": 2.0,
+  "fl_y": 2.5,
+  "cx": 2.0,
+  "cy": 1.5,
+  "frames": [
+    {"file_path": "./images/a.png", "mask_path": "masks/a.png",
+     "transform_matrix": [[1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,0,1]]},
+    {"file_path": "./images/b.png",
+     "transform_matrix": [[1,0,0,1], [0,1,0,0], [0,0,1,0], [0,0,0,1]]}
+  ]
+})";
+        if (!transforms) return false;
+    }
+
+    try {
+        (void)datasetDescriptorFromX(temporary.path.string());
+    } catch (const std::runtime_error &error) {
+        return std::string(error.what()).find(
+                   "present for every frame or no frames") != std::string::npos;
+    }
+    return false;
+}
+
+bool checkNerfstudioMaskSymlinkEscapeRejected() {
+    TempDirectory temporary;
+    TempDirectory outside;
+    const fs::path outsideMask = outside.path / "mask.png";
+    std::ofstream(outsideMask).close();
+    fs::create_directories(temporary.path / "masks");
+    std::error_code error;
+    fs::create_symlink(
+        outsideMask, temporary.path / "masks/escaped.png", error);
+    if (error) return false;
+    {
+        std::ofstream transforms(temporary.path / "transforms.json");
+        transforms << R"({
+  "w": 4,
+  "h": 3,
+  "fl_x": 2.0,
+  "fl_y": 2.5,
+  "cx": 2.0,
+  "cy": 1.5,
+  "frames": [
+    {"file_path": "./images/a.png", "mask_path": "masks/escaped.png",
+     "transform_matrix": [[1,0,0,0], [0,1,0,0], [0,0,1,0], [0,0,0,1]]}
+  ]
+})";
+        if (!transforms) return false;
+    }
+
+    try {
+        (void)datasetDescriptorFromX(temporary.path.string());
+    } catch (const std::runtime_error &exception) {
+        return std::string(exception.what()).find(
+                   "stay inside the dataset root") != std::string::npos;
+    }
+    return false;
+}
+
 bool checkPolycamLayout1Adapter() {
     TempDirectory temporary;
     const fs::path cameraDirectory =
@@ -504,6 +632,9 @@ int main() {
     CHECK(checkColmapTextAdapter());
     CHECK(checkColmapBinaryAdapter());
     CHECK(checkNerfstudioAdapter());
+    CHECK(checkNerfstudioMaskAdapter());
+    CHECK(checkNerfstudioPartialMasksRejected());
+    CHECK(checkNerfstudioMaskSymlinkEscapeRejected());
     CHECK(checkPolycamLayout1Adapter());
     CHECK(checkPolycamRawLayoutFallback());
     CHECK(checkPolycamLayout1MissingImageRejected());

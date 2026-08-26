@@ -16,6 +16,40 @@ static std::string resolveImagePath(const std::string &path) {
     return path;
 }
 
+static bool isInside(const fs::path &root, const fs::path &candidate) {
+    auto rootComponent = root.begin();
+    auto candidateComponent = candidate.begin();
+    for (; rootComponent != root.end() && candidateComponent != candidate.end();
+         ++rootComponent, ++candidateComponent) {
+        if (*rootComponent != *candidateComponent) return false;
+    }
+    return rootComponent == root.end();
+}
+
+static fs::path resolveMaskPath(const fs::path &projectRoot,
+                                const std::string &path) {
+    if (path.empty())
+        throw std::runtime_error("Nerfstudio frame has an empty mask_path");
+
+    std::error_code error;
+    const fs::path canonicalRoot = fs::canonical(projectRoot, error);
+    if (error)
+        throw std::runtime_error("Nerfstudio dataset root could not be resolved");
+
+    fs::path candidate(path);
+    if (!candidate.is_absolute()) candidate = projectRoot / candidate;
+    const fs::path canonicalCandidate = fs::canonical(candidate, error);
+    if (error || !fs::is_regular_file(canonicalCandidate)) {
+        throw std::runtime_error(
+            "Nerfstudio mask_path must reference a regular file: " + path);
+    }
+    if (!isInside(canonicalRoot, canonicalCandidate)) {
+        throw std::runtime_error(
+            "Nerfstudio mask_path must stay inside the dataset root: " + path);
+    }
+    return canonicalCandidate;
+}
+
 DatasetDescriptor loaders::loadNerfstudio(const std::string &projectRoot) {
     std::ifstream f((fs::path(projectRoot) / "transforms.json").string());
     json j = json::parse(f);
@@ -31,6 +65,7 @@ DatasetDescriptor loaders::loadNerfstudio(const std::string &projectRoot) {
     data.provenance.adapter = "nerfstudio";
     data.provenance.source = projectRoot;
 
+    size_t maskedFrameCount = 0;
     for (auto &frameJson : j["frames"]) {
         DatasetFrameDescriptor frame;
         frame.calibration.width = frameJson.value("w", gW);
@@ -55,6 +90,19 @@ DatasetDescriptor loaders::loadNerfstudio(const std::string &projectRoot) {
         frame.imagePath = resolveImagePath(imagePath.lexically_normal().string());
         frame.rasterOrientation = RasterOrientation::EncodedPixels;
 
+        if (frameJson.contains("mask_path")) {
+            if (!frameJson["mask_path"].is_string()) {
+                throw std::runtime_error(
+                    "Nerfstudio frame mask_path must be a string");
+            }
+            const std::string maskPath =
+                frameJson["mask_path"].get<std::string>();
+            frame.trainingMask = TrainingMaskDescriptor{
+                resolveMaskPath(fs::path(projectRoot), maskPath).string(),
+                TrainingMaskChannel::Automatic};
+            ++maskedFrameCount;
+        }
+
         // transform_matrix is 4x4 c2w (OpenGL convention)
         auto &tm = frameJson["transform_matrix"];
         for (int r = 0; r < 4; r++)
@@ -62,6 +110,11 @@ DatasetDescriptor loaders::loadNerfstudio(const std::string &projectRoot) {
                 frame.cameraToWorld[r*4+c] = tm[r][c].get<float>();
 
         data.frames.push_back(std::move(frame));
+    }
+
+    if (maskedFrameCount != 0 && maskedFrameCount != data.frames.size()) {
+        throw std::runtime_error(
+            "Nerfstudio mask_path must be present for every frame or no frames");
     }
 
     std::sort(data.frames.begin(), data.frames.end(),

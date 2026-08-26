@@ -89,12 +89,16 @@ final class TrainingSession: ObservableObject {
     private var previewGeneration: UInt64 = 0
     private var benchmarkRequestHandled = false
 
-    func start(folder: DatasetFolder) {
+    func start(source: TrainingDatasetSource) {
         start(
-            folder: folder,
+            source: source,
             benchmark: nil,
             trainingMaskCandidateCount: nil
         )
+    }
+
+    func start(folder: DatasetFolder) {
+        start(source: .importedFolder(folder))
     }
 
     /// Starts one launch-configured physical-device benchmark after dataset
@@ -117,14 +121,14 @@ final class TrainingSession: ObservableObject {
         iterations = benchmark.totalIterations
         qualityProfile = .preview
         start(
-            folder: folder,
+            source: .importedFolder(folder),
             benchmark: benchmark,
             trainingMaskCandidateCount: maskCandidateCount
         )
     }
 
     private func start(
-        folder: DatasetFolder,
+        source: TrainingDatasetSource,
         benchmark: TrainingBenchmarkConfiguration?,
         trainingMaskCandidateCount: Int?
     ) {
@@ -166,13 +170,17 @@ final class TrainingSession: ObservableObject {
 
         let steps = benchmark?.totalIterations ?? iterations
         let profile: QualityProfile = benchmark == nil ? qualityProfile : .preview
-        let useTrainingMasks = trainingMasksEnabled
-        let selectedTrainingMaskMode = trainingMaskMode
+        let useTrainingMasks = source.capturedDataset?.descriptor.frames.contains {
+            $0.trainingMask != nil
+        } ?? (source.importedFolder?.hasNerfstudioTrainingMasks == true ||
+              trainingMasksEnabled)
+        let selectedTrainingMaskMode = source.capturedDataset?.manifest.mode == .object
+            ? TrainingMaskMode.transparent : trainingMaskMode
 
         worker = Task { [weak self] in
             guard let self else { return }
             await self.run(
-                folder: folder,
+                source: source,
                 steps: steps,
                 profile: profile,
                 useTrainingMasks: useTrainingMasks,
@@ -191,7 +199,7 @@ final class TrainingSession: ObservableObject {
     private var isFailed: Bool { if case .failed = phase { return true }; return false }
 
     private func run(
-        folder: DatasetFolder,
+        source: TrainingDatasetSource,
         steps: Int,
         profile: QualityProfile,
         useTrainingMasks: Bool,
@@ -204,9 +212,10 @@ final class TrainingSession: ObservableObject {
         var finalSplatCount = 0
         var failureMessage: String?
         var wasCancelled = false
-        var benchmarkRecorder = benchmark.map {
-            TrainingBenchmarkRecorder(
-                configuration: $0,
+        var benchmarkRecorder: TrainingBenchmarkRecorder?
+        if let benchmark, let folder = source.importedFolder {
+            benchmarkRecorder = TrainingBenchmarkRecorder(
+                configuration: benchmark,
                 folder: folder,
                 trainingMaskCandidateCount: trainingMaskCandidateCount,
                 trainingMasksEnabled: useTrainingMasks,
@@ -215,22 +224,9 @@ final class TrainingSession: ObservableObject {
         }
 
         do {
-            let datasetURL = folder.url
-            let datasetScan = Task.detached(priority: .userInitiated) {
-                let dimensions = try DatasetFolder.maximumSourceDimensions(
-                    at: datasetURL
-                )
-                let initialGaussianCount = try DatasetFolder.initialSparsePointCount(
-                    at: datasetURL
-                )
-                return (dimensions, initialGaussianCount)
-            }
-            let (sourceDimensions, initialGaussianCount) =
-                try await withTaskCancellationHandler {
-                    try await datasetScan.value
-                } onCancel: {
-                    datasetScan.cancel()
-                }
+            let (sourceDimensions, initialGaussianCount) = try await Self.scan(
+                source: source
+            )
             let benchmarkMaximumGaussianCount = try benchmark?
                 .validatedGrowthMaximumGaussianCount(
                     initialGaussianCount: initialGaussianCount
@@ -267,14 +263,28 @@ final class TrainingSession: ObservableObject {
 
             let baseConfig = try Self.makeTrainingConfig(
                 trainingMaskMode: trainingMaskMode,
+                keepCrs: source.capturedDataset != nil,
                 benchmark: benchmark
             )
-            let activeSession = try await MsplatSession(
-                datasetURL: folder.url,
-                trainingPlan: plan,
-                baseConfig: baseConfig,
-                prefetchTrainingTargets: true
-            )
+            let activeSession: MsplatSession
+            switch source {
+            case .importedFolder(let folder):
+                activeSession = try await MsplatSession(
+                    datasetURL: folder.url,
+                    trainingPlan: plan,
+                    baseConfig: baseConfig,
+                    prefetchTrainingTargets: true
+                )
+            case .captured(let capture):
+                activeSession = try await MsplatSession(
+                    dataset: capture.descriptor,
+                    options: plan.makeDatasetOptions(
+                        prefetchTrainingTargets: true
+                    ),
+                    config: plan.makeTrainingConfig(startingFrom: baseConfig),
+                    maximumGaussianCount: plan.maximumGaussianCount
+                )
+            }
             session = activeSession
             try Task.checkCancellation()
 
@@ -384,7 +394,9 @@ final class TrainingSession: ObservableObject {
                 measuredElapsedSeconds = nil
             }
             if benchmark == nil {
-                let url = URL.documentsDirectory.appending(path: "msplat-scene.ply")
+                let url = source.capturedDataset?.rootURL.appending(
+                    path: "trained-scene.ply"
+                ) ?? URL.documentsDirectory.appending(path: "msplat-scene.ply")
                 try await activeSession.exportPLY(to: url)
                 try Task.checkCancellation()
                 guard FileManager.default.fileExists(atPath: url.path) else {
@@ -474,6 +486,43 @@ final class TrainingSession: ObservableObject {
     }
 
     // MARK: - Helpers
+
+    private static func scan(
+        source: TrainingDatasetSource
+    ) async throws -> (TrainingImageDimensions, Int) {
+        switch source {
+        case .importedFolder(let folder):
+            let datasetURL = folder.url
+            let datasetScan = Task.detached(priority: .userInitiated) {
+                let dimensions = try DatasetFolder.maximumSourceDimensions(
+                    at: datasetURL
+                )
+                let initialGaussianCount = try DatasetFolder.initialSparsePointCount(
+                    at: datasetURL
+                )
+                return (dimensions, initialGaussianCount)
+            }
+            return try await withTaskCancellationHandler {
+                try await datasetScan.value
+            } onCancel: {
+                datasetScan.cancel()
+            }
+        case .captured(let capture):
+            let maximumWidth = capture.descriptor.frames
+                .map(\.calibration.width)
+                .max() ?? 0
+            let maximumHeight = capture.descriptor.frames
+                .map(\.calibration.height)
+                .max() ?? 0
+            return (
+                try TrainingImageDimensions(
+                    width: maximumWidth,
+                    height: maximumHeight
+                ),
+                capture.descriptor.points.count
+            )
+        }
+    }
 
     nonisolated static func previewInterval(for steps: Int) -> Int {
         max(steps / 20, 100)
@@ -695,10 +744,12 @@ final class TrainingSession: ObservableObject {
 
     nonisolated static func makeTrainingConfig(
         trainingMaskMode: TrainingMaskMode,
+        keepCrs: Bool = false,
         benchmark: TrainingBenchmarkConfiguration?
     ) throws -> TrainingConfig {
         var config = TrainingConfig()
         config.trainingMaskMode = trainingMaskMode
+        config.keepCrs = keepCrs
         guard let benchmark else { return config }
 
         if benchmark.fixedPopulation {

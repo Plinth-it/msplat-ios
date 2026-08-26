@@ -17,10 +17,12 @@ final class DatasetFolder {
     private struct NerfstudioManifest: Decodable, Sendable {
         struct Frame: Decodable, Sendable {
             let filePath: String
+            let maskPath: String?
             let cameraModel: String?
 
             private enum CodingKeys: String, CodingKey {
                 case filePath = "file_path"
+                case maskPath = "mask_path"
                 case cameraModel = "camera_model"
             }
         }
@@ -163,6 +165,14 @@ final class DatasetFolder {
 
     var supportsAutomaticTrainingMaskDiscovery: Bool {
         kind == .colmap
+    }
+
+    var hasNerfstudioTrainingMasks: Bool {
+        guard kind == .nerfstudio,
+              let manifest = try? Self.nerfstudioManifest(at: url) else {
+            return false
+        }
+        return manifest.frames.allSatisfy { $0.maskPath != nil }
     }
 
     /// COLMAP puts the model either at the root or under sparse/0.
@@ -432,6 +442,14 @@ final class DatasetFolder {
             manifest.cameraModel,
             context: "transforms.json"
         )
+        let maskedFrameCount = manifest.frames.lazy.filter {
+            $0.maskPath != nil
+        }.count
+        guard maskedFrameCount == 0 || maskedFrameCount == manifest.frames.count else {
+            throw MsplatError.invalidDataset(
+                "Nerfstudio mask_path must be present for every frame or no frames."
+            )
+        }
         for frame in manifest.frames {
             guard !frame.filePath.isEmpty else {
                 throw MsplatError.invalidDataset(
@@ -442,6 +460,23 @@ final class DatasetFolder {
                 frame.cameraModel ?? manifest.cameraModel,
                 context: "frame '\(frame.filePath)'"
             )
+            if let maskPath = frame.maskPath {
+                guard !maskPath.isEmpty else {
+                    throw MsplatError.invalidDataset(
+                        "transforms.json contains a frame with an empty mask_path."
+                    )
+                }
+                let maskURL = try Self.datasetURL(
+                    for: maskPath,
+                    under: root,
+                    purpose: "mask"
+                )
+                guard isRegularFile(maskURL) else {
+                    throw MsplatError.invalidDataset(
+                        "Nerfstudio mask '\(maskPath)' was not found."
+                    )
+                }
+            }
         }
         try Task.checkCancellation()
         return manifest
@@ -503,9 +538,10 @@ final class DatasetFolder {
         under root: URL,
         purpose: String
     ) throws -> URL {
-        let standardizedRoot = root.standardizedFileURL
+        let standardizedRoot = root.standardizedFileURL.resolvingSymlinksInPath()
         let candidate = URL(fileURLWithPath: path, relativeTo: standardizedRoot)
             .standardizedFileURL
+            .resolvingSymlinksInPath()
         let rootPath = standardizedRoot.path
         guard candidate.path == rootPath || candidate.path.hasPrefix(rootPath + "/") else {
             throw MsplatError.invalidDataset(
@@ -670,6 +706,24 @@ final class DatasetFolder {
             }
             maximumWidth = max(maximumWidth, dimensions.width)
             maximumHeight = max(maximumHeight, dimensions.height)
+            if let maskPath = frame.maskPath {
+                let maskURL = try Self.datasetURL(
+                    for: maskPath,
+                    under: datasetURL,
+                    purpose: "mask"
+                )
+                guard let maskDimensions = try sourceDimensions(at: maskURL) else {
+                    throw MsplatError.invalidDataset(
+                        "Nerfstudio mask '\(maskPath)' could not be inspected."
+                    )
+                }
+                guard maskDimensions == dimensions else {
+                    throw MsplatError.invalidDataset(
+                        "Nerfstudio mask '\(maskPath)' dimensions do not match " +
+                            "image '\(frame.filePath)'."
+                    )
+                }
+            }
         }
 
         return try TrainingImageDimensions(

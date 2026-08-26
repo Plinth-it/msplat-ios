@@ -3,10 +3,17 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    private enum Route: Identifiable {
+        case capture
+
+        var id: String { "capture" }
+    }
+
     @Environment(\.scenePhase) private var scenePhase
     @StateObject private var session = TrainingSession()
-    @State private var folder: DatasetFolder?
+    @State private var source: TrainingDatasetSource?
     @State private var picking = false
+    @State private var route: Route?
     @State private var pickError: String?
     @State private var trainingMaskCandidateCount: Int?
     @State private var trainingMaskSelectionWasEdited = false
@@ -16,11 +23,26 @@ struct ContentView: View {
         NavigationStack {
             Form {
                 datasetSection
-                if folder != nil { settingsSection }
+                if source != nil { settingsSection }
                 if session.phase != .idle { progressSection }
                 if let ply = session.exportedPly { exportSection(ply) }
             }
             .navigationTitle("msplat")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        route = .capture
+                    } label: {
+                        Label("Capture", systemImage: "camera.viewfinder")
+                    }
+                    .disabled(isBusy)
+                }
+            }
+            .fullScreenCover(item: $route) { _ in
+                CaptureRootView { capture in
+                    select(capture)
+                }
+            }
             .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
                 switch result {
                 case .success(let url):
@@ -49,6 +71,8 @@ struct ContentView: View {
         }
     }
 
+    private var folder: DatasetFolder? { source?.importedFolder }
+
     @MainActor
     private func startBenchmarkIfReady() {
         guard scenePhase == .active, let folder else { return }
@@ -62,7 +86,7 @@ struct ContentView: View {
     private func restoreLastDatasetIfNeeded() {
         guard !didAttemptDatasetRestore else { return }
         didAttemptDatasetRestore = true
-        guard folder == nil else { return }
+        guard source == nil else { return }
         let restored = DatasetFolder.benchmarkDatasetFromDocuments()
             ?? DatasetFolder.restoreLastPicked()
         guard let restored else {
@@ -76,7 +100,7 @@ struct ContentView: View {
         _ selectedFolder: DatasetFolder,
         persistBookmark: Bool
     ) {
-        folder = selectedFolder
+        source = .importedFolder(selectedFolder)
         trainingMaskCandidateCount = nil
         trainingMaskSelectionWasEdited = false
         session.trainingMasksEnabled = false
@@ -92,17 +116,32 @@ struct ContentView: View {
         }
     }
 
+    @MainActor
+    private func select(_ capture: CapturedDataset) {
+        source = .captured(capture)
+        trainingMaskCandidateCount = capture.descriptor.frames.lazy
+            .filter { $0.trainingMask != nil }
+            .count
+        trainingMaskSelectionWasEdited = true
+        session.trainingMasksEnabled = capture.descriptor.frames.contains {
+            $0.trainingMask != nil
+        }
+        session.trainingMaskMode = capture.manifest.mode == .object
+            ? .transparent : .coverage
+        pickError = nil
+    }
+
     private var datasetSection: some View {
         Section("Training dataset") {
             Button {
                 picking = true
             } label: {
-                Label(folder?.name ?? "Choose a folder…", systemImage: "folder")
+                Label(source?.name ?? "Choose a folder…", systemImage: "folder")
             }
             .disabled(isBusy)
 
-            if let folder {
-                LabeledContent("Contents", value: folder.summary)
+            if let source {
+                LabeledContent("Contents", value: source.summary)
             }
             if let pickError {
                 Text(pickError).font(.footnote).foregroundStyle(.red)
@@ -119,7 +158,14 @@ struct ContentView: View {
                     Text(profile.rawValue).tag(profile)
                 }
             }
-            if folder?.supportsAutomaticTrainingMaskDiscovery == true {
+            if let capture = source?.capturedDataset {
+                LabeledContent(
+                    "Capture masks",
+                    value: capture.descriptor.frames.contains {
+                        $0.trainingMask != nil
+                    } ? "Included" : "None"
+                )
+            } else if folder?.supportsAutomaticTrainingMaskDiscovery == true {
                 Toggle("Use discovered masks", isOn: trainingMasksBinding)
                     .disabled(isBusy)
                 if session.trainingMasksEnabled {
@@ -134,13 +180,22 @@ struct ContentView: View {
                     value: trainingMaskCandidateCount?.formatted() ?? "Scanning…"
                 )
             } else if folder?.kind == .nerfstudio {
-                Text("Automatic mask sidecars are not yet available for Nerfstudio imports.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                if folder?.hasNerfstudioTrainingMasks == true {
+                    LabeledContent("Manifest masks", value: "Included")
+                    Picker("Mask treatment", selection: $session.trainingMaskMode) {
+                        Text("Transparent").tag(TrainingMaskMode.transparent)
+                        Text("Coverage only").tag(TrainingMaskMode.coverage)
+                    }
+                    .disabled(isBusy)
+                } else {
+                    Text("Add mask_path to every frame in transforms.json to import Nerfstudio masks.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Button(trainButtonTitle) {
-                if let folder { session.start(folder: folder) }
+                if let source { session.start(source: source) }
             }
             .disabled(
                 isBusy ||

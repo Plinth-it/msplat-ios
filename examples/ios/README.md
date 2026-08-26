@@ -30,18 +30,27 @@ mask sidecars live below any case-insensitive `masks` path component.
 
 A Nerfstudio folder has `transforms.json` at its root. Frame `file_path`
 entries may include an image extension or omit it when the image is PNG, JPEG,
-or JPG. The current trainer still needs an initial point cloud: set
-`ply_file_path` to a PLY inside the selected folder, or provide
-`sparse/0/points3D.ply` or `points3D.ply`. The sample accepts pinhole,
-perspective, and OpenCV camera models and rejects `OPENCV_FISHEYE`, because the
-native image path currently implements Brown-Conrady rather than fisheye
-rectification. Automatic mask-sidecar discovery remains COLMAP-only.
+or JPG. The trainer needs an initial point cloud: set `ply_file_path` to a PLY
+inside the selected folder, or provide `sparse/0/points3D.ply` or
+`points3D.ply`. The sample accepts pinhole, perspective, and OpenCV camera
+models and rejects `OPENCV_FISHEYE`, because the native image path currently
+implements Brown-Conrady rather than fisheye rectification. A manifest may set
+`mask_path` on every frame; partial mask sets, external paths, missing files,
+and image/mask dimension mismatches are rejected.
 
-This folder contract is also the intended handoff for a future ARKit capture
-mode: ARKit camera-to-world poses can be written as Nerfstudio frames without a
-RealityKit reconstruction pass. Point-free/random initialization or an ARKit
-feature-point initializer is still required before such captures can train and
-is not part of this import sample yet.
+The camera button starts an ARKit Object or Scene capture. Object capture asks
+you to tap a Vision foreground instance before recording and requires scene
+depth. Vision, depth fusion, and frame gating operate in ARKit's native camera
+coordinates. Before persistence, the app rotates RGB and masks into the actual
+interface orientation and transforms each frame's intrinsics and camera pose by
+the same rotation. It writes opaque RGB, separate binary and soft masks, the
+applied per-frame orientation, a recovery journal, a voxel-fused colored point
+seed, and a portable `transforms.json` package under `Documents/Captures`.
+Review, in-memory training, and exported Nerfstudio assets therefore share the
+same screen-oriented raster geometry. Scene capture can fall
+back to ARKit feature points on a non-LiDAR device. After stopping, the review
+screen can share the package or pass its in-memory descriptor directly to the
+trainer; captured exports preserve the metric ARKit coordinate system.
 
 After a COLMAP folder is selected, the app counts regular files below those
 directories on a background task and automatically enables **Use discovered
