@@ -2,6 +2,7 @@
 import AVFoundation
 import CoreVideo
 import Foundation
+import OSLog
 import Synchronization
 import UIKit
 
@@ -179,7 +180,8 @@ final class CaptureFrameAdmissionController: Sendable {
         state.withLock { state in state.processingTask }
     }
 
-    func abort() {
+    @discardableResult
+    func abort() -> Task<Void, Never>? {
         let task = state.withLock { state in
             let task = state.processingTask
             state.generation &+= 1
@@ -191,6 +193,7 @@ final class CaptureFrameAdmissionController: Sendable {
             return task
         }
         task?.cancel()
+        return task
     }
 
     func finish() {
@@ -226,7 +229,8 @@ private final class CaptureFrameIngestor: NSObject,
         admission.stop()
     }
 
-    func abort() {
+    @discardableResult
+    func abort() -> Task<Void, Never>? {
         admission.abort()
     }
 
@@ -341,20 +345,27 @@ private final class CaptureFrameIngestor: NSObject,
 
 @MainActor
 final class CaptureEngine: NSObject {
+    private static let logger = Logger(
+        subsystem: Bundle.main.bundleIdentifier ?? "io.github.msplat",
+        category: "Capture"
+    )
+
     let session = ARSession()
     let events: AsyncStream<CaptureEngineEvent>
 
     private let continuation: AsyncStream<CaptureEngineEvent>.Continuation
     private let frameIngestor: CaptureFrameIngestor
     private let subjectSelector = CaptureSubjectSelector()
+    private let captureBaseDirectory: URL
     private var store: CaptureStore?
+    private var cleanupTask: Task<Void, Never>?
     private var interfaceOrientation: UIInterfaceOrientation?
     private var displayOrientation: CaptureDisplayOrientation?
     private(set) var subjectWorldPosition: SIMD3<Float>?
     private(set) var supportsSceneDepth = false
     private(set) var isRecording = false
 
-    override init() {
+    init(captureBaseDirectory: URL = .documentsDirectory) {
         let stream = AsyncStream.makeStream(
             of: CaptureEngineEvent.self,
             bufferingPolicy: .bufferingNewest(32)
@@ -362,6 +373,7 @@ final class CaptureEngine: NSObject {
         events = stream.stream
         continuation = stream.continuation
         frameIngestor = CaptureFrameIngestor(continuation: stream.continuation)
+        self.captureBaseDirectory = captureBaseDirectory
         super.init()
         session.delegate = frameIngestor
         session.delegateQueue = frameIngestor.queue
@@ -457,13 +469,19 @@ final class CaptureEngine: NSObject {
 
     func startRecording(mode: CaptureMode) throws {
         guard !isRecording else { return }
+        guard store == nil, cleanupTask == nil else {
+            throw CancellationError()
+        }
         guard displayOrientation != nil else {
             throw CaptureFailure.noCurrentFrame
         }
         if mode.requiresSubjectSelection, subjectWorldPosition == nil {
             throw CaptureFailure.subjectNotFound
         }
-        let store = try CaptureStore(mode: mode)
+        let store = try CaptureStore(
+            mode: mode,
+            baseDirectory: captureBaseDirectory
+        )
         self.store = store
         frameIngestor.start(
             store: store,
@@ -473,27 +491,58 @@ final class CaptureEngine: NSObject {
     }
 
     func stopAndFinalize() async throws -> CapturedDataset {
+        guard let finalizingStore = store else {
+            try Task.checkCancellation()
+            throw CaptureFailure.persistence("capture storage was not initialized")
+        }
         isRecording = false
         frameIngestor.stop()
         await frameIngestor.drain()
+        try Task.checkCancellation()
+        guard self.store === finalizingStore else { throw CancellationError() }
         if let processingTask = frameIngestor.processingTask {
             await processingTask.value
         }
+        try Task.checkCancellation()
+        guard self.store === finalizingStore else { throw CancellationError() }
+        frameIngestor.finish()
         session.pause()
-        defer {
-            store = nil
-            frameIngestor.finish()
-        }
-        guard let store else {
-            throw CaptureFailure.persistence("capture storage was not initialized")
-        }
-        return try await store.finalize()
+        let capture = try await finalizingStore.finalize()
+        try Task.checkCancellation()
+        guard self.store === finalizingStore else { throw CancellationError() }
+        self.store = nil
+        return capture
     }
 
-    func stop() {
+    @discardableResult
+    func stop() -> Task<Void, Never> {
         isRecording = false
-        frameIngestor.abort()
+        frameIngestor.stop()
         session.pause()
+        if let cleanupTask {
+            return cleanupTask
+        }
+        let abandonedStore = store
+        store = nil
+        let processingTask = frameIngestor.abort()
+        let cleanupTask = Task { [weak self, frameIngestor, abandonedStore] in
+            await frameIngestor.drain()
+            if let processingTask {
+                await processingTask.value
+            }
+            if let abandonedStore {
+                do {
+                    try await abandonedStore.discard()
+                } catch {
+                    Self.logger.error(
+                        "Failed to discard unfinished capture: \(error.localizedDescription, privacy: .public)"
+                    )
+                }
+            }
+            self?.cleanupTask = nil
+        }
+        self.cleanupTask = cleanupTask
+        return cleanupTask
     }
 
     func resetSubject() {

@@ -189,6 +189,7 @@ actor CaptureStore {
     private let voxelSize: Float
     private var frames: [CaptureFrameRecord] = []
     private var fusedPoints: [VoxelKey: FusedPoint] = [:]
+    private var isDiscarded = false
 
     init(mode: CaptureMode, baseDirectory: URL = .documentsDirectory) throws {
         self.mode = mode
@@ -219,6 +220,7 @@ actor CaptureStore {
     }
 
     func accept(_ candidate: CaptureFrameCandidate) throws -> CaptureCommit {
+        guard !isDiscarded else { throw CancellationError() }
         let frameNumber = frames.count + 1
         let frameID = String(format: "frame_%06d", frameNumber)
         let imagePath = "images/\(frameID).png"
@@ -354,6 +356,7 @@ actor CaptureStore {
     }
 
     func finalize() throws -> CapturedDataset {
+        guard !isDiscarded else { throw CancellationError() }
         guard frames.count >= 3, !fusedPoints.isEmpty else {
             throw CaptureFailure.insufficientCapture(
                 frameCount: frames.count,
@@ -439,6 +442,17 @@ actor CaptureStore {
             manifest: manifest,
             reviewSnapshot: review
         )
+    }
+
+    func discard() throws {
+        isDiscarded = true
+        frames.removeAll(keepingCapacity: false)
+        fusedPoints.removeAll(keepingCapacity: false)
+        do {
+            try removeIfPresent(rootURL)
+        } catch {
+            throw CaptureFailure.persistence(error.localizedDescription)
+        }
     }
 
     private func objectMask(

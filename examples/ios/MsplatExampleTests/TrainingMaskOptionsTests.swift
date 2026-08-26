@@ -1390,6 +1390,141 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(frames.first?["cy"] as? Double, 1.5)
     }
 
+    func testCaptureStoreDiscardRemovesCaptureDirectory() async throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let store = try CaptureStore(
+            mode: .scene,
+            baseDirectory: temporaryDirectory
+        )
+        let capturesDirectory = temporaryDirectory.appending(
+            path: "Captures",
+            directoryHint: .isDirectory
+        )
+        let captureDirectories = try FileManager.default.contentsOfDirectory(
+            at: capturesDirectory,
+            includingPropertiesForKeys: nil
+        )
+        let captureDirectory = try XCTUnwrap(captureDirectories.first)
+        XCTAssertEqual(captureDirectories.count, 1)
+        try Data([1, 2, 3]).write(
+            to: captureDirectory.appending(path: "images/unfinished.png")
+        )
+        try Data([4, 5, 6]).write(
+            to: captureDirectory.appending(path: "masks/unfinished.png")
+        )
+
+        try await store.discard()
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: captureDirectory.path))
+        try await store.discard()
+    }
+
+    @MainActor
+    func testCaptureEngineStopDiscardsUnfinishedStore() async throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let engine = CaptureEngine(captureBaseDirectory: temporaryDirectory)
+        engine.updateInterfaceOrientation(.portrait)
+        try engine.startRecording(mode: .scene)
+
+        let capturesDirectory = temporaryDirectory.appending(
+            path: "Captures",
+            directoryHint: .isDirectory
+        )
+        let captureDirectories = try FileManager.default.contentsOfDirectory(
+            at: capturesDirectory,
+            includingPropertiesForKeys: nil
+        )
+        let captureDirectory = try XCTUnwrap(captureDirectories.first)
+        XCTAssertEqual(captureDirectories.count, 1)
+        try Data([1, 2, 3]).write(
+            to: captureDirectory.appending(path: "images/unfinished.png")
+        )
+
+        let cleanupTask = engine.stop()
+        await cleanupTask.value
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: captureDirectory.path))
+    }
+
+    @MainActor
+    func testCaptureEngineWaitsForCleanupBeforeRestarting() async throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let engine = CaptureEngine(captureBaseDirectory: temporaryDirectory)
+        engine.updateInterfaceOrientation(.portrait)
+        try engine.startRecording(mode: .scene)
+
+        let capturesDirectory = temporaryDirectory.appending(
+            path: "Captures",
+            directoryHint: .isDirectory
+        )
+        let firstCaptureDirectory = try XCTUnwrap(
+            FileManager.default.contentsOfDirectory(
+                at: capturesDirectory,
+                includingPropertiesForKeys: nil
+            ).first
+        )
+
+        let firstCleanupTask = engine.stop()
+        XCTAssertThrowsError(try engine.startRecording(mode: .scene)) { error in
+            XCTAssertTrue(error is CancellationError)
+        }
+        await firstCleanupTask.value
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: firstCaptureDirectory.path)
+        )
+        try engine.startRecording(mode: .scene)
+        let secondCaptureDirectories = try FileManager.default.contentsOfDirectory(
+            at: capturesDirectory,
+            includingPropertiesForKeys: nil
+        )
+        let secondCaptureDirectory = try XCTUnwrap(secondCaptureDirectories.first)
+        XCTAssertEqual(secondCaptureDirectories.count, 1)
+        XCTAssertNotEqual(secondCaptureDirectory, firstCaptureDirectory)
+        XCTAssertTrue(engine.isRecording)
+
+        let secondCleanupTask = engine.stop()
+        await secondCleanupTask.value
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: secondCaptureDirectory.path)
+        )
+    }
+
+    @MainActor
+    func testCaptureEngineFinalizationFailureRemainsDiscardable() async throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let engine = CaptureEngine(captureBaseDirectory: temporaryDirectory)
+        engine.updateInterfaceOrientation(.portrait)
+        try engine.startRecording(mode: .scene)
+
+        let capturesDirectory = temporaryDirectory.appending(
+            path: "Captures",
+            directoryHint: .isDirectory
+        )
+        let captureDirectories = try FileManager.default.contentsOfDirectory(
+            at: capturesDirectory,
+            includingPropertiesForKeys: nil
+        )
+        let captureDirectory = try XCTUnwrap(captureDirectories.first)
+        XCTAssertEqual(captureDirectories.count, 1)
+
+        do {
+            _ = try await engine.stopAndFinalize()
+            XCTFail("Expected an empty capture to fail finalization")
+        } catch CaptureFailure.insufficientCapture(let frameCount, let pointCount) {
+            XCTAssertEqual(frameCount, 0)
+            XCTAssertEqual(pointCount, 0)
+        } catch {
+            XCTFail("Unexpected finalization error: \(error)")
+        }
+
+        let cleanupTask = engine.stop()
+        await cleanupTask.value
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: captureDirectory.path))
+    }
+
     func testCaptureFrameAdmissionStaysBoundedAndReleasesAfterCompletion() throws {
         let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
         let store = try CaptureStore(
