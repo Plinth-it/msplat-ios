@@ -308,6 +308,29 @@ final class TrainingSession: ObservableObject {
                     msplatSync()
                     measuredStartedAt = ProcessInfo.processInfo.systemUptime
                 }
+                let nextIteration = i + 1
+                if let benchmark,
+                   !benchmark.fixedPopulation,
+                   let latestStats,
+                   Self.isDensificationStep(
+                       nextIteration,
+                       config: baseConfig,
+                       cameraCount: cameras
+                   ) {
+                    // Preserve the completed descriptor immediately before a
+                    // growth candidate. The transition sample can then prove
+                    // that its own end-to-end time includes the capacity copy.
+                    msplatSync()
+                    let snapshot = try await telemetrySnapshot(
+                        session: activeSession,
+                        fallback: latestStats
+                    )
+                    benchmarkRecorder?.record(
+                        telemetry: snapshot.telemetry,
+                        memory: snapshot.memory,
+                        thermalState: thermalState
+                    )
+                }
                 let stats = try await activeSession.step()
                 latestStats = stats
                 let isFinalStep = i == steps - 1
@@ -691,8 +714,24 @@ final class TrainingSession: ObservableObject {
         config.warmupLength = 0
         config.refineEvery = 25
         config.resetAlphaEvery = 100
+        // Make the synthetic growth event deterministic enough to exercise
+        // capacity preservation rather than depend on scene-specific tuning.
+        config.densifyGradThresh = 0
         config.stopDensifyAt = stopDensifyAt
         return config
+    }
+
+    nonisolated static func isDensificationStep(
+        _ step: Int,
+        config: TrainingConfig,
+        cameraCount: Int
+    ) -> Bool {
+        let refineEvery = Int(config.refineEvery)
+        let resetInterval = Int(config.resetAlphaEvery) * refineEvery
+        return step % refineEvery == 0 &&
+            step > Int(config.warmupLength) &&
+            step < Int(config.stopDensifyAt) &&
+            step % resetInterval > cameraCount + refineEvery
     }
 
     private nonisolated static func megabytes(_ bytes: Int64) -> Int {

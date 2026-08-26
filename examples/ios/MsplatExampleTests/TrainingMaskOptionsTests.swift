@@ -485,6 +485,7 @@ final class TrainingMaskOptionsTests: XCTestCase {
         )
         XCTAssertFalse(benchmark.fixedPopulation)
         XCTAssertEqual(benchmark.growthMaximumGaussianCount, 400_000)
+        XCTAssertEqual(benchmark.maximumMissingMeasuredIterations, 1)
         XCTAssertEqual(
             try benchmark.validatedGrowthMaximumGaussianCount(
                 initialGaussianCount: 100_000
@@ -499,7 +500,29 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(config.warmupLength, 0)
         XCTAssertEqual(config.refineEvery, 25)
         XCTAssertEqual(config.resetAlphaEvery, 100)
+        XCTAssertEqual(config.densifyGradThresh, 0)
         XCTAssertEqual(config.stopDensifyAt, 101)
+        XCTAssertFalse(
+            TrainingSession.isDensificationStep(
+                25,
+                config: config,
+                cameraCount: 10
+            )
+        )
+        XCTAssertTrue(
+            TrainingSession.isDensificationStep(
+                50,
+                config: config,
+                cameraCount: 10
+            )
+        )
+        XCTAssertFalse(
+            TrainingSession.isDensificationStep(
+                51,
+                config: config,
+                cameraCount: 10
+            )
+        )
 
         let dimensions = try TrainingImageDimensions(width: 1_920, height: 1_440)
         let configuredPlan = try TrainingSession.makePlan(
@@ -578,6 +601,7 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(config.warmupLength, TrainingConfig().warmupLength)
         XCTAssertEqual(config.refineEvery, TrainingConfig().refineEvery)
         XCTAssertEqual(config.resetAlphaEvery, TrainingConfig().resetAlphaEvery)
+        XCTAssertEqual(benchmark.maximumMissingMeasuredIterations, 0)
     }
 
     func testGrowthBenchmarkRequiresMeasuredCapacityIncrease() {
@@ -588,6 +612,15 @@ final class TrainingMaskOptionsTests: XCTestCase {
                     (iteration: 2, capacity: 156_250),
                 ],
                 within: 3...5
+            )
+        )
+        XCTAssertNil(
+            TrainingBenchmarkRecorder.firstModelCapacityGrowth(
+                [
+                    (iteration: 1, capacity: 125_000),
+                    (iteration: 3, capacity: 156_250),
+                ],
+                within: 2...5
             )
         )
         let growth = TrainingBenchmarkRecorder.firstModelCapacityGrowth(

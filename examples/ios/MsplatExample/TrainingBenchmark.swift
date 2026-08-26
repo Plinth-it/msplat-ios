@@ -25,6 +25,10 @@ struct TrainingBenchmarkConfiguration: Sendable {
         !growthEnabled
     }
 
+    var maximumMissingMeasuredIterations: Int {
+        fixedPopulation ? 0 : max(1, measuredIterations / 100)
+    }
+
     static func requested(
         environment: [String: String] = ProcessInfo.processInfo.environment
     ) -> Self? {
@@ -466,8 +470,10 @@ struct TrainingBenchmarkRecorder {
         let measuredIterations = Set(measuredSamples.map(\.iteration))
         let expectedRange = (configuration.warmupIterations + 1)...configuration.totalIterations
         let missingIterations = expectedRange.filter { !measuredIterations.contains($0) }
-        guard missingIterations.isEmpty,
-              measuredSamples.count == configuration.measuredIterations,
+        guard missingIterations.count <=
+                configuration.maximumMissingMeasuredIterations,
+              measuredSamples.count ==
+                configuration.measuredIterations - missingIterations.count,
               finalDescriptor.iteration == configuration.totalIterations else {
             throw TrainingBenchmarkError.incompleteMeasurements(
                 captured: measuredSamples.count,
@@ -545,6 +551,7 @@ struct TrainingBenchmarkRecorder {
     ) -> TrainingBenchmarkCapacityGrowth? {
         for (previous, current) in zip(samples, samples.dropFirst())
         where measuredIterations.contains(current.iteration) &&
+            current.iteration == previous.iteration + 1 &&
             current.capacity > previous.capacity {
             return TrainingBenchmarkCapacityGrowth(
                 iteration: current.iteration,
