@@ -13,6 +13,7 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(config.ssimWeight, 0.2, accuracy: 0.001)
         XCTAssertFalse(config.refinePhotometricGains)
         XCTAssertFalse(config.refineCameraPoses)
+        XCTAssertEqual(config.cameraPoseConditioning, .raw)
         XCTAssertEqual(config.trainingMaskMode, .coverage)
         XCTAssertEqual(config.transparentAlphaLossWeight, 0.1, accuracy: 0.001)
         XCTAssertEqual(config.toRefinementOptionsV8().flags, 0)
@@ -66,6 +67,67 @@ final class MsplatTests: XCTestCase {
             UInt32(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS)
                 | UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS)
         )
+
+        config.cameraPoseConditioning = .camP
+        options = config.toRefinementOptionsV8()
+        XCTAssertEqual(
+            options.flags,
+            UInt32(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS)
+                | UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS)
+                | UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING)
+        )
+        XCTAssertNoThrow(try config.validate())
+    }
+
+    func testNativePoseRefinementStateConversion() throws {
+        XCTAssertEqual(MemoryLayout<MsplatPoseRefinementStateV15>.size, 128)
+
+        var native = MsplatPoseRefinementStateV15()
+        native.flags = UInt32(MSPLAT_POSE_REFINEMENT_STATE_ENABLED)
+            | UInt32(MSPLAT_POSE_REFINEMENT_STATE_ANCHOR)
+        native.canonicalCameraIndex = 7
+        native.optimizerStepCount = 11
+        copyFloats(
+            [1, 2, 3, 0.1, 0.2, 0.3],
+            into: &native.poseDelta
+        )
+        native.translationNorm = Float(14).squareRoot()
+        native.rotationNorm = Float(0.14).squareRoot()
+        let correctedPose: [Float] = [
+            1, 0, 0, 4,
+            0, 1, 0, 5,
+            0, 0, 1, 6,
+            0, 0, 0, 1,
+        ]
+        copyFloats(correctedPose, into: &native.correctedCameraToWorld)
+
+        let frameIDBytes = Array("frame_000007".utf8)
+        let state = try frameIDBytes.withUnsafeBufferPointer { bytes in
+            native.frameId = bytes.baseAddress.map {
+                UnsafeRawPointer($0).assumingMemoryBound(to: CChar.self)
+            }
+            native.frameIdLength = UInt64(bytes.count)
+            return try CameraPoseRefinementState(from: native)
+        }
+
+        XCTAssertTrue(state.isEnabled)
+        XCTAssertTrue(state.isAnchor)
+        XCTAssertEqual(state.canonicalCameraIndex, 7)
+        XCTAssertEqual(state.optimizerStepCount, 11)
+        XCTAssertEqual(state.translationDelta, [1, 2, 3])
+        XCTAssertEqual(state.rotationDelta, [0.1, 0.2, 0.3])
+        XCTAssertEqual(
+            state.translationNorm,
+            Float(14).squareRoot(),
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            state.rotationNorm,
+            Float(0.14).squareRoot(),
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(state.correctedCameraToWorld.elements, correctedPose)
+        XCTAssertEqual(state.frameID, "frame_000007")
     }
 
     func testInvalidConfigIsRejected() {
@@ -116,6 +178,10 @@ final class MsplatTests: XCTestCase {
         config.refinePhotometricGains = true
         invalidConfigs.append(config)
 
+        config = TrainingConfig()
+        config.cameraPoseConditioning = .camP
+        invalidConfigs.append(config)
+
         for invalidConfig in invalidConfigs {
             XCTAssertThrowsError(try invalidConfig.validate())
         }
@@ -134,12 +200,14 @@ final class MsplatTests: XCTestCase {
     }
 
     func testTrainingTelemetryConversionKeepsSubmissionAndCompletionSeparate() {
-        var native = MsplatTrainingMetrics()
+        var native = MsplatTrainingMetricsV12()
         native.flags = UInt32(MSPLAT_TRAINING_METRICS_HAS_SUBMITTED_STEP)
             | UInt32(MSPLAT_TRAINING_METRICS_HAS_COMPLETED_STEP)
             | UInt32(MSPLAT_TRAINING_METRICS_GPU_TIME_VALID)
             | UInt32(MSPLAT_TRAINING_METRICS_LOSS_VALID)
             | UInt32(MSPLAT_TRAINING_METRICS_INTERSECTIONS_VALID)
+            | UInt32(MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID)
+            | UInt32(MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID)
         native.submitted.iteration = 12
         native.submitted.splatCount = 120
         native.submitted.modelCapacity = 150
@@ -161,6 +229,18 @@ final class MsplatTests: XCTestCase {
             | UInt32(MSPLAT_RASTER_OVERFLOW_PACKED_CAPACITY)
         native.completed.retainedPackedIntersectionCount = 4_000_000_001
         native.completed.packedIntersectionCapacity = 5_000_000_001
+        native.completed.imagePrepareMs = 2.25
+        native.completed.countGpuMs = 3.5
+        native.completed.countWaitWallMs = 6.75
+        native.completed.queueIdleMs = 1.75
+        native.completed.postCountEncodeMs = 0.5
+        native.completed.intersectionArenaGrowMs = 0.25
+        native.completed.maximumTileCount = 2_049
+        native.completed.activeTileCount = 400
+        native.completed.trivialTileCount = 100
+        native.completed.smallTileCount = 200
+        native.completed.mediumTileCount = 90
+        native.completed.largeTileCount = 10
         native.overflowedCompletedSteps = 3
         native.tileCapOverflowedSteps = 2
         native.packedCapacityOverflowedSteps = 1
@@ -181,15 +261,29 @@ final class MsplatTests: XCTestCase {
             telemetry.completed?.retainedPackedIntersectionCount,
             4_000_000_001
         )
+        XCTAssertEqual(telemetry.completed?.exactIntersectionCount, 4_000_000_001)
+        XCTAssertEqual(telemetry.completed?.imagePrepareMs, 2.25)
+        XCTAssertEqual(telemetry.completed?.countGpuMs, 3.5)
+        XCTAssertEqual(telemetry.completed?.countWaitWallMs, 6.75)
+        XCTAssertEqual(telemetry.completed?.queueIdleMs, 1.75)
+        XCTAssertEqual(telemetry.completed?.postCountEncodeMs, 0.5)
+        XCTAssertEqual(telemetry.completed?.intersectionArenaGrowMs, 0.25)
+        XCTAssertEqual(telemetry.completed?.maximumTileCount, 2_049)
+        XCTAssertEqual(telemetry.completed?.activeTileCount, 400)
+        XCTAssertEqual(telemetry.completed?.trivialTileCount, 100)
+        XCTAssertEqual(telemetry.completed?.smallTileCount, 200)
+        XCTAssertEqual(telemetry.completed?.mediumTileCount, 90)
+        XCTAssertEqual(telemetry.completed?.largeTileCount, 10)
         XCTAssertEqual(telemetry.overflowedCompletedSteps, 3)
         XCTAssertEqual(telemetry.lastOverflowIteration, 10)
     }
 
     func testTrainingTelemetryValidityFlagsControlOptionals() {
-        var native = MsplatTrainingMetrics()
+        var native = MsplatTrainingMetricsV12()
         native.completed.iteration = 7
         native.completed.gpuExecutionMs = 99
         native.completed.loss = 99
+        native.completed.queueIdleMs = 99
 
         var telemetry = TrainingTelemetry(from: native)
         XCTAssertNil(telemetry.submitted)
@@ -200,6 +294,19 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(telemetry.completed?.iteration, 7)
         XCTAssertNil(telemetry.completed?.gpuExecutionMs)
         XCTAssertNil(telemetry.completed?.loss)
+        XCTAssertNil(telemetry.completed?.countGpuMs)
+        XCTAssertNil(telemetry.completed?.queueIdleMs)
+
+        native.flags |= UInt32(MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID)
+        native.completed.countGpuMs = 4.5
+        telemetry = TrainingTelemetry(from: native)
+        XCTAssertEqual(telemetry.completed?.countGpuMs, 4.5)
+        XCTAssertNil(telemetry.completed?.queueIdleMs)
+
+        native.flags |= UInt32(MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID)
+        native.completed.queueIdleMs = 1.25
+        telemetry = TrainingTelemetry(from: native)
+        XCTAssertEqual(telemetry.completed?.queueIdleMs, 1.25)
     }
 
     func testTrainingMemoryConversionPreservesCountsAndValidity() {
@@ -256,6 +363,29 @@ final class MsplatTests: XCTestCase {
 
         XCTAssertEqual(trainer.iteration, 10)
         XCTAssertGreaterThan(trainer.splatCount, 100_000)
+
+        let telemetry = try trainer.trainingMetrics()
+        XCTAssertEqual(telemetry.submitted?.iteration, 10)
+        let completed = try XCTUnwrap(telemetry.completed)
+        XCTAssertGreaterThan(completed.iteration, 0)
+        XCTAssertLessThanOrEqual(completed.iteration, 10)
+        XCTAssertGreaterThan(completed.exactIntersectionCount ?? 0, 0)
+        XCTAssertGreaterThan(completed.maximumTileCount, 0)
+        XCTAssertGreaterThanOrEqual(completed.imagePrepareMs, 0)
+        XCTAssertGreaterThanOrEqual(completed.countWaitWallMs, 0)
+        if let queueIdleMs = completed.queueIdleMs {
+            XCTAssertGreaterThanOrEqual(queueIdleMs, 0)
+        }
+        XCTAssertGreaterThanOrEqual(completed.postCountEncodeMs, 0)
+        XCTAssertGreaterThanOrEqual(completed.intersectionArenaGrowMs, 0)
+        let tileCount = ((completed.effectiveWidth + 15) / 16)
+            * ((completed.effectiveHeight + 15) / 16)
+        XCTAssertEqual(
+            completed.trivialTileCount + completed.smallTileCount
+                + completed.mediumTileCount + completed.largeTileCount,
+            tileCount
+        )
+        XCTAssertLessThanOrEqual(completed.activeTileCount, tileCount)
     }
 
     func testRender() throws {
@@ -320,5 +450,15 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(data[1], 0x8b)
 
         try FileManager.default.removeItem(atPath: tmpPath)
+    }
+}
+
+private func copyFloats<Tuple>(_ values: [Float], into tuple: inout Tuple) {
+    withUnsafeMutableBytes(of: &tuple) { destination in
+        values.withUnsafeBytes { source in
+            XCTAssertEqual(destination.count, source.count)
+            guard destination.count == source.count else { return }
+            destination.copyBytes(from: source)
+        }
     }
 }

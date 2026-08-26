@@ -3,57 +3,181 @@ import SwiftUI
 import UniformTypeIdentifiers
 
 struct ContentView: View {
+    private enum Route: Identifiable {
+        case capture
+        case alignment(RealityKitAlignmentInput)
+
+        var id: String {
+            switch self {
+            case .capture: "capture"
+            case .alignment(let input): "alignment-\(input.id.uuidString)"
+            }
+        }
+    }
+
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var session = TrainingSession()
-    @State private var folder: DatasetFolder?
+    @State private var source: TrainingDatasetSource?
     @State private var picking = false
+    @State private var route: Route?
     @State private var pickError: String?
     @State private var trainingMaskCandidateCount: Int?
     @State private var trainingMaskSelectionWasEdited = false
+    @State private var didAttemptDatasetRestore = false
 
     var body: some View {
         NavigationStack {
             Form {
                 datasetSection
-                if folder != nil { settingsSection }
+                if source != nil { settingsSection }
                 if session.phase != .idle { progressSection }
                 if let ply = session.exportedPly { exportSection(ply) }
             }
             .navigationTitle("msplat")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button {
+                        route = .capture
+                    } label: {
+                        Label("Capture", systemImage: "camera.viewfinder")
+                    }
+                    .disabled(isBusy)
+                }
+            }
+            .fullScreenCover(item: $route) { route in
+                switch route {
+                case .capture:
+                    CaptureRootView { capture in
+                        select(capture)
+                    }
+                case .alignment(let input):
+                    RealityKitAlignmentView(input: input) { alignedFolder in
+                        select(alignedFolder, persistBookmark: true)
+                    }
+                }
+            }
             .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
                 switch result {
                 case .success(let url):
                     if let picked = DatasetFolder(picked: url) {
-                        folder = picked
-                        trainingMaskCandidateCount = nil
-                        trainingMaskSelectionWasEdited = false
-                        session.trainingMasksEnabled = false
-                        session.trainingMaskMode = .transparent
+                        select(picked, persistBookmark: true)
+                    } else if let input = RealityKitAlignmentInput(picked: url) {
                         pickError = nil
+                        route = .alignment(input)
                     } else {
-                        pickError = "Choose a COLMAP-only folder with cameras.bin or cameras.txt at its root or in sparse/0."
+                        pickError = "Choose a COLMAP or Nerfstudio dataset, or a folder containing HEIC, JPEG, or PNG images for RealityKit alignment."
                     }
                 case .failure(let error):
                     pickError = error.localizedDescription
                 }
             }
+            .task {
+                restoreLastDatasetIfNeeded()
+            }
             .task(id: folder?.id) {
                 guard let selectedFolder = folder else { return }
                 await scanTrainingMasks(in: selectedFolder)
+                startBenchmarkIfReady()
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                if newPhase == .active {
+                    startBenchmarkIfReady()
+                }
             }
         }
     }
 
+    private var folder: DatasetFolder? { source?.importedFolder }
+
+    @MainActor
+    private func startBenchmarkIfReady() {
+        guard scenePhase == .active, let folder else { return }
+        session.startBenchmarkIfRequested(
+            folder: folder,
+            maskCandidateCount: trainingMaskCandidateCount
+        )
+    }
+
+    @MainActor
+    private func restoreLastDatasetIfNeeded() {
+        guard !didAttemptDatasetRestore else { return }
+        didAttemptDatasetRestore = true
+        guard source == nil else { return }
+        let restored = DatasetFolder.benchmarkDatasetFromDocuments()
+            ?? DatasetFolder.restoreLastPicked()
+        guard let restored else {
+            return
+        }
+        select(restored, persistBookmark: false)
+    }
+
+    @MainActor
+    private func select(
+        _ selectedFolder: DatasetFolder,
+        persistBookmark: Bool
+    ) {
+        source = .importedFolder(selectedFolder)
+        trainingMaskCandidateCount = nil
+        trainingMaskSelectionWasEdited = false
+        session.trainingMasksEnabled = false
+        session.trainingMaskMode = .transparent
+        session.refineCameraPosesEnabled = false
+        session.cameraPoseConditioning = .raw
+        pickError = nil
+
+        guard persistBookmark else { return }
+        do {
+            try selectedFolder.persistAsLastPicked()
+        } catch {
+            pickError = "The folder is selected, but it could not be remembered: " +
+                error.localizedDescription
+        }
+    }
+
+    @MainActor
+    private func select(_ capture: CapturedDataset) {
+        source = .captured(capture)
+        trainingMaskCandidateCount = capture.descriptor.frames.lazy
+            .filter { $0.trainingMask != nil }
+            .count
+        trainingMaskSelectionWasEdited = true
+        session.trainingMasksEnabled = capture.descriptor.frames.contains {
+            $0.trainingMask != nil
+        }
+        session.trainingMaskMode = capture.manifest.mode == .object
+            ? .transparent : .coverage
+        session.refineCameraPosesEnabled = false
+        session.cameraPoseConditioning = .raw
+        pickError = nil
+    }
+
     private var datasetSection: some View {
-        Section("COLMAP dataset") {
+        Section("Training dataset") {
             Button {
                 picking = true
             } label: {
-                Label(folder?.name ?? "Choose a folder…", systemImage: "folder")
+                Label(source?.name ?? "Choose a folder…", systemImage: "folder")
             }
             .disabled(isBusy)
 
-            if let folder {
-                LabeledContent("Contents", value: folder.summary)
+            if let source {
+                LabeledContent("Contents", value: source.summary)
+            }
+            if let capture = source?.capturedDataset {
+                Button {
+                    if let input = RealityKitAlignmentInput(capture: capture) {
+                        pickError = nil
+                        route = .alignment(input)
+                    } else {
+                        pickError = "The capture no longer contains readable source images."
+                    }
+                } label: {
+                    Label(
+                        "Realign capture with RealityKit",
+                        systemImage: "viewfinder"
+                    )
+                }
+                .disabled(isBusy)
             }
             if let pickError {
                 Text(pickError).font(.footnote).foregroundStyle(.red)
@@ -70,34 +194,115 @@ struct ContentView: View {
                     Text(profile.rawValue).tag(profile)
                 }
             }
-            Toggle("Use discovered masks", isOn: trainingMasksBinding)
-                .disabled(isBusy || folder == nil)
-            if session.trainingMasksEnabled {
-                Picker("Mask treatment", selection: $session.trainingMaskMode) {
-                    Text("Transparent").tag(TrainingMaskMode.transparent)
-                    Text("Coverage only").tag(TrainingMaskMode.coverage)
-                }
+            if let capture = source?.capturedDataset {
+                LabeledContent(
+                    "Capture masks",
+                    value: capture.descriptor.frames.contains {
+                        $0.trainingMask != nil
+                    } ? "Included" : "None"
+                )
+                Toggle(
+                    "Refine camera poses",
+                    isOn: $session.refineCameraPosesEnabled
+                )
                 .disabled(isBusy)
+                if session.refineCameraPosesEnabled {
+                    Picker(
+                        "Pose optimizer",
+                        selection: $session.cameraPoseConditioning
+                    ) {
+                        Text("Bounded SE(3)").tag(CameraPoseConditioning.raw)
+                        Text("CamP-conditioned").tag(CameraPoseConditioning.camP)
+                    }
+                    .disabled(isBusy)
+                }
+            } else if folder?.supportsAutomaticTrainingMaskDiscovery == true {
+                Toggle("Use discovered masks", isOn: trainingMasksBinding)
+                    .disabled(isBusy)
+                if session.trainingMasksEnabled {
+                    Picker("Mask treatment", selection: $session.trainingMaskMode) {
+                        Text("Transparent").tag(TrainingMaskMode.transparent)
+                        Text("Coverage only").tag(TrainingMaskMode.coverage)
+                    }
+                    .disabled(isBusy)
+                }
+                LabeledContent(
+                    "Mask candidates",
+                    value: trainingMaskCandidateCount?.formatted() ?? "Scanning…"
+                )
+            } else if folder?.kind == .nerfstudio {
+                if folder?.hasNerfstudioTrainingMasks == true {
+                    LabeledContent("Manifest masks", value: "Included")
+                    Picker("Mask treatment", selection: $session.trainingMaskMode) {
+                        Text("Transparent").tag(TrainingMaskMode.transparent)
+                        Text("Coverage only").tag(TrainingMaskMode.coverage)
+                    }
+                    .disabled(isBusy)
+                } else {
+                    Text("Add mask_path to every frame in transforms.json to import Nerfstudio masks.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
-            LabeledContent(
-                "Mask candidates",
-                value: trainingMaskCandidateCount?.formatted() ?? "Scanning…"
-            )
 
             Button(trainButtonTitle) {
-                if let folder { session.start(folder: folder) }
+                if let source { session.start(source: source) }
             }
             .disabled(
                 isBusy ||
-                (trainingMaskCandidateCount == nil && !trainingMaskSelectionWasEdited)
+                (folder?.supportsAutomaticTrainingMaskDiscovery == true &&
+                 trainingMaskCandidateCount == nil &&
+                 !trainingMaskSelectionWasEdited)
             )
 
             if isBusy {
                 Button("Stop", role: .destructive) { session.cancel() }
             }
         } footer: {
-            Text("Preview targets a 1,600-pixel edge, SH1, and a 250K Gaussian ceiling. Balanced targets 1,920 pixels, SH2, and a 400K ceiling when preflight memory permits. Either ceiling rises only enough to preserve a larger initial sparse model, and the memory estimate is recomputed. Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Transparent treats the mask as target alpha and suppresses exterior floaters. Coverage only uses mask values to weight RGB loss.")
+            Text("Preview targets a 1,600-pixel edge, SH1, and a 250K Gaussian ceiling. Balanced targets 1,920 pixels, SH2, and a 400K ceiling when preflight memory permits. Either ceiling rises only enough to preserve a larger initial point cloud, and the memory estimate is recomputed.")
+            if folder?.supportsAutomaticTrainingMaskDiscovery == true {
+                Text("Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Coverage only weights RGB loss and can skip off-mask tile work for throughput. Transparent supervises the full frame to suppress exterior floaters and is not expected to be faster.")
+            }
+            if source?.capturedDataset != nil {
+                Text("Pose refinement is an explicit A/B control for captured datasets. Bounded SE(3) preserves the baseline optimizer; CamP conditions the same bounded updates with a fixed per-camera projection metric. Neither mode changes the captured transforms.json.")
+                if let requirement = poseRefinementBudgetRequirement {
+                    Text(
+                        "It requires at least \(requirement.minimumIterations) iterations: " +
+                        "\(requirement.warmupIterations) warm-up iterations plus " +
+                        "\(requirement.postWarmupCameraVisits) camera visits to complete " +
+                        "one full post-warm-up shuffled pass."
+                    )
+                    if session.refineCameraPosesEnabled,
+                       session.iterations < requirement.minimumIterations {
+                        Text(
+                            "Increase Iterations to at least " +
+                            "\(requirement.minimumIterations) before training."
+                        )
+                        .foregroundStyle(.orange)
+                    }
+                }
+            }
         }
+    }
+
+    private var poseRefinementBudgetRequirement: PoseRefinementBudgetRequirement? {
+        guard let capture = source?.capturedDataset,
+              var config = try? TrainingSession.makeTrainingConfig(
+                  trainingMaskMode: capture.manifest.mode == .object
+                      ? .transparent : session.trainingMaskMode,
+                  keepCrs: true,
+                  refineCameraPoses: true,
+                  cameraPoseConditioning: session.cameraPoseConditioning,
+                  benchmark: nil
+              ),
+              let iterations = Int32(exactly: session.iterations) else {
+            return nil
+        }
+        config.iterations = iterations
+        return try? TrainingSession.poseRefinementBudgetRequirement(
+            config: config,
+            trainingCameraCount: capture.descriptor.frames.count
+        )
     }
 
     private var trainingMasksBinding: Binding<Bool> {
@@ -112,6 +317,12 @@ struct ContentView: View {
 
     @MainActor
     private func scanTrainingMasks(in selectedFolder: DatasetFolder) async {
+        guard selectedFolder.supportsAutomaticTrainingMaskDiscovery else {
+            session.trainingMasksEnabled = false
+            trainingMaskCandidateCount = 0
+            return
+        }
+
         let datasetURL = selectedFolder.url
         let scan = Task.detached(priority: .utility) {
             DatasetFolder.countTrainingMaskCandidates(at: datasetURL)
@@ -161,9 +372,11 @@ struct ContentView: View {
                 Text(message).foregroundStyle(.red)
             default:
                 if let preview = session.preview {
-                    Image(uiImage: preview)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
+                    MetalPreviewView(surface: preview)
+                        .aspectRatio(
+                            CGFloat(preview.width) / CGFloat(max(preview.height, 1)),
+                            contentMode: .fit
+                        )
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                         .listRowInsets(EdgeInsets())
                 }
@@ -184,7 +397,9 @@ struct ContentView: View {
                         : session.splatCount.formatted()
                 )
                 LabeledContent("CPU submit", value: duration(session.cpuSubmitMs))
+                LabeledContent("Image prepare", value: duration(session.imagePrepareMs))
                 LabeledContent("GPU execute", value: duration(session.gpuExecutionMs))
+                LabeledContent("GPU gap", value: duration(session.queueIdleMs))
                 LabeledContent("End to end", value: duration(session.endToEndMs))
                 LabeledContent("Loss", value: session.loss.map {
                     String(format: "%.5f", $0)
@@ -234,6 +449,17 @@ struct ContentView: View {
                         "step(s); latest source: \(overflowDescription)."
                     )
                     .foregroundStyle(.red)
+                }
+                if session.phase == .finished,
+                   let summary = session.poseCorrectionSummary {
+                    LabeledContent(
+                        "Pose translation",
+                        value: summary.translationDescription
+                    )
+                    LabeledContent(
+                        "Pose rotation",
+                        value: summary.rotationDescription
+                    )
                 }
             }
         }
@@ -285,6 +511,14 @@ struct ContentView: View {
         Section("Result") {
             ShareLink(item: ply) {
                 Label("Export \(ply.lastPathComponent)", systemImage: "square.and.arrow.up")
+            }
+            if let refinedTransformsURL = session.refinedTransformsURL {
+                ShareLink(item: refinedTransformsURL) {
+                    Label(
+                        "Export \(refinedTransformsURL.lastPathComponent)",
+                        systemImage: "square.and.arrow.up"
+                    )
+                }
             }
         }
     }

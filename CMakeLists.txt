@@ -193,6 +193,54 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             ${CMAKE_SOURCE_DIR}/core/include)
         add_test(NAME msplat_intersection_layout
             COMMAND msplat_intersection_layout_tests)
+        add_executable(msplat_exact_sort_tests
+            tests/test_exact_sort.mm)
+        target_include_directories(msplat_exact_sort_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/include)
+        target_link_libraries(msplat_exact_sort_tests PRIVATE
+            ${FOUNDATION_LIBRARY}
+            ${METAL_FRAMEWORK})
+        add_dependencies(msplat_exact_sort_tests metallib)
+        add_test(NAME msplat_exact_sort
+            COMMAND msplat_exact_sort_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_exact_sort PROPERTIES
+            SKIP_RETURN_CODE 77)
+        add_executable(msplat_tile_count_difference_tests
+            tests/test_tile_count_difference.mm)
+        target_link_libraries(msplat_tile_count_difference_tests PRIVATE
+            ${FOUNDATION_LIBRARY}
+            ${METAL_FRAMEWORK})
+        add_dependencies(msplat_tile_count_difference_tests metallib)
+        add_test(NAME msplat_tile_count_difference
+            COMMAND msplat_tile_count_difference_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_tile_count_difference PROPERTIES
+            SKIP_RETURN_CODE 77)
+        add_executable(msplat_gpu_tile_layout_tests
+            tests/test_gpu_tile_layout.mm)
+        target_include_directories(msplat_gpu_tile_layout_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/include)
+        target_link_libraries(msplat_gpu_tile_layout_tests PRIVATE
+            ${FOUNDATION_LIBRARY}
+            ${METAL_FRAMEWORK})
+        add_dependencies(msplat_gpu_tile_layout_tests metallib)
+        add_test(NAME msplat_gpu_tile_layout
+            COMMAND msplat_gpu_tile_layout_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_gpu_tile_layout PROPERTIES
+            SKIP_RETURN_CODE 77)
+        add_executable(msplat_raster_variants_tests
+            tests/test_raster_variants.mm)
+        target_link_libraries(msplat_raster_variants_tests PRIVATE
+            ${FOUNDATION_LIBRARY}
+            ${METAL_FRAMEWORK})
+        add_dependencies(msplat_raster_variants_tests metallib)
+        add_test(NAME msplat_raster_variants
+            COMMAND msplat_raster_variants_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_raster_variants PROPERTIES
+            SKIP_RETURN_CODE 77)
         add_executable(msplat_projection_math_tests
             tests/test_projection_math.cpp)
         add_test(NAME msplat_projection_math
@@ -218,22 +266,221 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             tests/test_densification.mm)
         target_link_libraries(msplat_densification_tests PRIVATE msplat_core)
         add_test(NAME msplat_densification_classification
-            COMMAND msplat_densification_tests
-                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
-        set_tests_properties(msplat_densification_classification PROPERTIES
-            SKIP_RETURN_CODE 77)
+            COMMAND ${CMAKE_COMMAND} -E env
+                --unset=MSPLAT_DENSIFY_RANDOM_MODE --
+                $<TARGET_FILE:msplat_densification_tests>
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib"
+                default)
+        add_test(NAME msplat_densification_cpu_random
+            COMMAND ${CMAKE_COMMAND} -E env
+                MSPLAT_DENSIFY_RANDOM_MODE=cpu --
+                $<TARGET_FILE:msplat_densification_tests>
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib"
+                cpu)
+        add_test(NAME msplat_densification_gpu_random
+            COMMAND ${CMAKE_COMMAND} -E env
+                MSPLAT_DENSIFY_RANDOM_MODE=gpu --
+                $<TARGET_FILE:msplat_densification_tests>
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib"
+                gpu)
+        add_test(NAME msplat_densification_invalid_random_mode
+            COMMAND ${CMAKE_COMMAND} -E env
+                MSPLAT_DENSIFY_RANDOM_MODE=invalid --
+                $<TARGET_FILE:msplat_densification_tests>
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib"
+                invalid)
+        set_tests_properties(
+            msplat_densification_classification
+            msplat_densification_cpu_random
+            msplat_densification_gpu_random
+            msplat_densification_invalid_random_mode
+            PROPERTIES SKIP_RETURN_CODE 77)
         add_executable(msplat_transparent_training_tests
             tests/test_transparent_training.mm)
         target_link_libraries(msplat_transparent_training_tests PRIVATE msplat_core)
         add_test(NAME msplat_transparent_training
             COMMAND msplat_transparent_training_tests
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_profile
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_16x8
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_16x16
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_difference
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_gpu_layout
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_difference_gpu_layout
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_arena_retry
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_arena_retry_profile
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_difference_arena_retry
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_ssim_staged
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_gather
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_transparent_training_gather_arena_retry
+            COMMAND msplat_transparent_training_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         set_tests_properties(msplat_transparent_training PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=fused"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_profile PROPERTIES
+            ENVIRONMENT
+                "PROFILE_STAGES=1;MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_TRAINING_ARENA_MODE=exact;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_16x8 PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=16x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_16x16 PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=16x16;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_difference PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_gpu_layout PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=gpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_difference_gpu_layout PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=gpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_arena_retry PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(
+            msplat_transparent_training_arena_retry_profile PROPERTIES
+            ENVIRONMENT
+                "PROFILE_STAGES=1;MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(
+            msplat_transparent_training_difference_arena_retry PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TRAINING_ARENA_MODE=retry;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_ssim_staged PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_gather PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=16x16;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=gather"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_transparent_training_gather_arena_retry PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=gather"
+            SKIP_RETURN_CODE 77)
+        add_executable(msplat_terminal_backward_tests
+            tests/test_terminal_backward.mm)
+        target_link_libraries(msplat_terminal_backward_tests PRIVATE msplat_core)
+        add_test(NAME msplat_terminal_backward
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_terminal_backward_16x8
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_terminal_backward_16x16
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_terminal_backward_difference
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_terminal_backward_gpu_layout
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_terminal_backward_difference_gpu_layout
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_terminal_backward_arena_retry
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_terminal_backward_ssim_staged
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        add_test(NAME msplat_terminal_backward_gather
+            COMMAND msplat_terminal_backward_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_terminal_backward PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=fused;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_terminal_backward_16x8 PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=16x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_terminal_backward_16x16 PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=16x16;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_terminal_backward_difference PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_terminal_backward_gpu_layout PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=gpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_terminal_backward_difference_gpu_layout PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=difference;MSPLAT_TILE_LAYOUT_MODE=gpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_terminal_backward_arena_retry PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TRAINING_ARENA_MODE=retry;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_terminal_backward_ssim_staged PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=packed"
+            SKIP_RETURN_CODE 77)
+        set_tests_properties(msplat_terminal_backward_gather PROPERTIES
+            ENVIRONMENT
+                "MSPLAT_RASTER_VARIANT=8x8;MSPLAT_TILE_COUNT_MODE=enumerated;MSPLAT_TILE_LAYOUT_MODE=cpu;MSPLAT_SSIM_MODE=staged;MSPLAT_INTERSECTION_ATTRIBUTES=gather"
             SKIP_RETURN_CODE 77)
         add_test(NAME msplat_exact_intersection_contract
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
                 -P ${CMAKE_SOURCE_DIR}/tests/check_exact_intersection_contract.cmake)
+        add_test(NAME msplat_raster_variant_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_raster_variant_contract.cmake)
+        add_test(NAME msplat_intersection_attribute_gather_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_intersection_attribute_gather_contract.cmake)
+        add_test(NAME msplat_tile_count_difference_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_tile_count_difference_contract.cmake)
+        add_test(NAME msplat_gpu_tile_layout_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_gpu_tile_layout_contract.cmake)
+        add_test(NAME msplat_training_arena_retry_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_training_arena_retry_contract.cmake)
         add_test(NAME msplat_ssim_storage_contract
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
@@ -254,6 +501,18 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
                 -P ${CMAKE_SOURCE_DIR}/tests/check_pose_refinement_contract.cmake)
+        add_test(NAME msplat_terminal_backward_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_terminal_backward_contract.cmake)
+        add_test(NAME msplat_compact_training_target_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_compact_training_target_contract.cmake)
+        add_test(NAME msplat_gpu_preview_contract
+            COMMAND ${CMAKE_COMMAND}
+                -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}
+                -P ${CMAKE_SOURCE_DIR}/tests/check_gpu_preview_contract.cmake)
         add_test(NAME msplat_densification_contract
             COMMAND ${CMAKE_COMMAND}
                 -DMSPLAT_SOURCE_DIR=${CMAKE_SOURCE_DIR}

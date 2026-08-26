@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include "dataset_descriptor.hpp"
 #include "metal_tensor.hpp"
 
@@ -20,6 +21,19 @@ struct Image {
     const float* ptr() const { return data.data(); }
 };
 
+/// Compact training raster. Bytes are tightly packed RGBA in the same
+/// sRGB-encoded numerical space used by the loss. Loader-produced alpha is 255;
+/// target publication replaces it with soft coverage when a mask is present.
+/// RGB loss sampling never treats alpha as color.
+struct RGBA8Image {
+    std::vector<uint8_t> data;  // width * height * 4 bytes, RGBA
+    int width = 0, height = 0;
+
+    bool empty() const { return data.empty(); }
+    uint8_t* ptr() { return data.data(); }
+    const uint8_t* ptr() const { return data.data(); }
+};
+
 struct CoverageMask {
     std::vector<uint8_t> data;  // width * height bytes, soft coverage [0,255]
     int width = 0, height = 0;
@@ -29,10 +43,26 @@ struct CoverageMask {
     const uint8_t* ptr() const { return data.data(); }
 };
 
+inline constexpr int kTrainingTileSize = 16;
+inline constexpr int kTrainingSsimHalo = 5;
+
+/// Builds a conservative render-tile map for coverage training. A 16x16 tile
+/// is active when it can contribute to any nonzero coverage center through the
+/// 11x11 SSIM window, including its exact five-pixel Chebyshev halo.
+CoverageMask buildCoverageRenderTileMap(const CoverageMask &mask);
+
 struct CameraTrainingTarget {
     MTensor *image = nullptr;
-    MTensor *coverageMask = nullptr;  // null means uniform full coverage
+    /// Null means uniform full coverage. Camera-produced masked targets alias
+    /// `image` here and store coverage in RGBA alpha, preserving the existing
+    /// fields while keeping one four-byte GPU pixel. A distinct pointer remains
+    /// a supported standalone UInt8 (H, W) mask for low-level callers.
+    MTensor *coverageMask = nullptr;
     uint64_t coverageUnits = 0;       // sum(mask), or width * height * 255
+    /// Optional UInt8 [ceil(H/16), ceil(W/16)] render-tile activity. It is
+    /// consumed only by coverage training; transparent and render paths ignore
+    /// it. Trailing placement preserves existing three-field aggregates.
+    MTensor *coverageRenderTiles = nullptr;
 };
 
 struct Camera {
@@ -46,12 +76,18 @@ struct Camera {
     RasterOrientation rasterOrientation = RasterOrientation::EncodedPixels;
     std::optional<TrainingMaskDescriptor> trainingMask;
 
-    Image image;
+    RGBA8Image image;
     CoverageMask coverageMask;
-    std::unordered_map<int, Image> imagePyramids;
+    /// Path/channel identity of CPU coverage state, including decoded masks,
+    /// pyramids, and cached denominators. This is separate from GPU residency
+    /// so descriptor mutations cannot reuse mask A before target publication.
+    std::optional<TrainingMaskDescriptor> decodedTrainingMaskSource;
+    std::unordered_map<int, RGBA8Image> imagePyramids;
     std::unordered_map<int, CoverageMask> coverageMaskPyramids;
     std::unordered_map<int, MTensor> mtensorImageCache;
-    std::unordered_map<int, MTensor> mtensorCoverageMaskCache;
+    std::unordered_map<int, MTensor> mtensorCoverageRenderTileCache;
+    std::unordered_map<int, std::optional<TrainingMaskDescriptor>>
+        gpuTrainingMaskSourceByDownscale;
     std::unordered_map<int, uint64_t> coverageUnitsByDownscale;
     float loadedImageDownscaleFactor = 0.0f;
     MTensor cachedViewMat, cachedProjViewMat;
@@ -76,11 +112,12 @@ struct Camera {
     DeclaredIntrinsics declared;
 
     void loadImage(float downscaleFactor);
-    const Image& getImage(int downscaleFactor);
+    const RGBA8Image& getImage(int downscaleFactor);
     const CoverageMask& getCoverageMask(int downscaleFactor);
     uint64_t getCoverageUnits(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
     CameraTrainingTarget getGPUTrainingTarget(int downscaleFactor);
+    bool hasGPUTrainingTarget(int downscaleFactor) const;
     /// Changes the pose and invalidates every derived render matrix.
     void setCameraToWorld(const float pose[16]);
     /// Direct pose writes remain detectable so legacy/internal callers cannot
@@ -88,6 +125,9 @@ struct Camera {
     bool projectionCacheMatchesPose() const noexcept;
     void recordProjectionCachePose() noexcept;
     void invalidateProjectionCache();
+    /// Releases decoded/pyramid pixels after their compact GPU target has
+    /// been published, while retaining corrected geometry and GPU caches.
+    void releaseCpuImageMemory();
     void releaseImageMemory();
     size_t cachedCpuImageBytes() const;
     size_t cachedGpuImageBytes() const;
@@ -116,8 +156,10 @@ struct DatasetMetadata {
     DatasetProvenance provenance;
 };
 
-/// Holds decoded training images under a byte budget, evicting the
-/// least-recently-used camera when the budget is exceeded.
+/// Holds compact GPU training targets under a byte budget, evicting the
+/// least-recently-used camera when the budget is exceeded. Masked and unmasked
+/// resident targets both use one RGBA8 buffer; masked coverage occupies alpha.
+/// Decode and pyramid pixels are released after a target is uploaded.
 ///
 /// Every entry point used to decode all images up front and then copy the
 /// camera array, so a dataset occupied twice its decoded size before the first
@@ -128,26 +170,45 @@ class CameraImageCache {
 public:
     /// MSPLAT_IMAGE_CACHE_MB overrides it; otherwise 512MB on iOS, 2GB elsewhere.
     static size_t defaultBudgetBytes();
+    /// Environment fallback for clients that do not explicitly enable the
+    /// instance-scoped depth-one prefetcher. Requires the exact value
+    /// MSPLAT_CAMERA_PREFETCH=1.
+    static bool defaultPrefetchEnabled() noexcept;
 
-    CameraImageCache() = default;
-    CameraImageCache(float downscaleFactor, size_t budgetBytes)
-        : _downscaleFactor(downscaleFactor), _budgetBytes(budgetBytes) {}
+    CameraImageCache();
+    CameraImageCache(float downscaleFactor, size_t budgetBytes,
+                     bool prefetchEnabled = defaultPrefetchEnabled());
+    ~CameraImageCache();
+    CameraImageCache(CameraImageCache&&) noexcept;
+    CameraImageCache& operator=(CameraImageCache&&) noexcept;
+    CameraImageCache(const CameraImageCache&) = delete;
+    CameraImageCache& operator=(const CameraImageCache&) = delete;
 
     /// Decodes cameras[index] if it is not resident and returns its GPU image at
     /// `downscaleFactor`, evicting other cameras to stay under budget. The
     /// camera being asked for is never the eviction victim.
     MTensor& gpuImage(std::vector<Camera> &cameras, size_t index, int downscaleFactor);
 
-    /// Returns the RGB tensor together with optional soft coverage. A cache hit
-    /// requires every tensor needed by the target to already be resident.
+    /// Returns the RGB tensor together with optional soft coverage. For a
+    /// camera mask, `coverageMask` aliases `image` and alpha stores coverage.
     CameraTrainingTarget gpuTrainingTarget(
         std::vector<Camera> &cameras, size_t index, int downscaleFactor);
 
-    /// Decodes cameras[index] if it is not resident, and accounts for it, but
-    /// uploads nothing. Render paths need this: the correction from the
-    /// dataset's declared image size to the file's real one happens during the
-    /// decode, so a camera that has never been loaded renders at the wrong
-    /// scale.
+    /// Best-effort CPU preparation for one exact future target. The worker
+    /// never references or mutates `cameras`; a matching foreground target
+    /// request performs the Metal upload and cache publication.
+    void prefetchTrainingTarget(
+        const std::vector<Camera> &cameras, size_t index,
+        int downscaleFactor) noexcept;
+
+    /// Waits for and discards any staged target. Decode failures are suppressed
+    /// because they only become user-visible when the matching target is used.
+    void discardPrefetch() noexcept;
+
+    /// Establishes and accounts for corrected camera geometry without an
+    /// upload. It decodes only when that geometry has not yet been established
+    /// at the cache's input scale; a prior compact-target upload can satisfy
+    /// render paths without recreating released CPU pixels.
     Camera& ensureLoaded(std::vector<Camera> &cameras, size_t index);
 
     size_t cachedBytes() const;
@@ -156,9 +217,19 @@ public:
     size_t budgetBytes() const { return _budgetBytes; }
     uint64_t hitCount() const { return _hitCount; }
     uint64_t missCount() const { return _missCount; }
+    bool prefetchEnabled() const { return _prefetchEnabled; }
+    /// Idempotently enables the existing depth-one worker for this cache.
+    /// Configure it before training starts; cache operations are not otherwise
+    /// designed for concurrent control-plane mutation.
+    void enablePrefetch() noexcept { _prefetchEnabled = true; }
+    uint64_t prefetchScheduledCount() const { return _prefetchScheduledCount; }
+    uint64_t prefetchUsedCount() const { return _prefetchUsedCount; }
+    uint64_t prefetchWaitCount() const { return _prefetchWaitCount; }
+    uint64_t prefetchDiscardedCount() const { return _prefetchDiscardedCount; }
 
 private:
     void evict(std::vector<Camera> &cameras, size_t protectedIndex);
+    struct PrefetchTask;
 
     struct Entry {
         uint64_t lastUse = 0;
@@ -173,6 +244,12 @@ private:
     uint64_t _clock = 0;
     uint64_t _hitCount = 0;
     uint64_t _missCount = 0;
+    bool _prefetchEnabled = false;
+    std::unique_ptr<PrefetchTask> _prefetch;
+    uint64_t _prefetchScheduledCount = 0;
+    uint64_t _prefetchUsedCount = 0;
+    uint64_t _prefetchWaitCount = 0;
+    uint64_t _prefetchDiscardedCount = 0;
 };
 
 struct InputData {

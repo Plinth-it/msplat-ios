@@ -78,9 +78,39 @@ public struct CompletedTrainingStep: Sendable, Equatable {
     public let overflowKinds: RasterizerOverflowKinds
     /// Exact live intersection count for the completed frame.
     public let retainedPackedIntersectionCount: UInt64?
+    /// Clearer alias for `retainedPackedIntersectionCount`.
+    public var exactIntersectionCount: UInt64? {
+        retainedPackedIntersectionCount
+    }
     public let packedIntersectionCapacity: UInt64?
+    /// CPU-side image loading, decode, resize, and upload before GPU encoding.
+    public let imagePrepareMs: Float
+    /// GPU duration of the exact-count command buffer when Metal timestamps
+    /// are available.
+    public let countGpuMs: Float?
+    /// Wall time spent waiting for the exact-count command buffer. This also
+    /// exposes queue drain latency ahead of the count pass.
+    public let countWaitWallMs: Float
+    /// Uncovered time between this logical step's Metal command-buffer GPU
+    /// intervals. This excludes backlog before the first interval and latency
+    /// after the final interval.
+    public let queueIdleMs: Float?
+    /// CPU time used to encode the stages after exact-count readback.
+    public let postCountEncodeMs: Float
+    /// CPU time spent growing the exact-intersection arena, or zero when reused.
+    public let intersectionArenaGrowMs: Float
+    public let maximumTileCount: Int
+    public let activeTileCount: Int
+    /// Tiles containing zero or one intersection.
+    public let trivialTileCount: Int
+    /// Tiles containing 2...32 intersections.
+    public let smallTileCount: Int
+    /// Tiles containing 33...2,048 intersections.
+    public let mediumTileCount: Int
+    /// Tiles containing more than 2,048 intersections.
+    public let largeTileCount: Int
 
-    init(from c: MsplatCompletedTrainingStep, flags: UInt32) {
+    init(from c: MsplatCompletedTrainingStepV12, flags: UInt32) {
         iteration = Int(c.iteration)
         splatCount = Int(c.splatCount)
         modelCapacity = Int(c.modelCapacity)
@@ -100,6 +130,22 @@ public struct CompletedTrainingStep: Sendable, Equatable {
             ? c.retainedPackedIntersectionCount : nil
         packedIntersectionCapacity = hasIntersections
             ? c.packedIntersectionCapacity : nil
+        imagePrepareMs = c.imagePrepareMs
+        countGpuMs =
+            flags & UInt32(MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID) != 0
+            ? c.countGpuMs : nil
+        countWaitWallMs = c.countWaitWallMs
+        queueIdleMs =
+            flags & UInt32(MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID) != 0
+            ? c.queueIdleMs : nil
+        postCountEncodeMs = c.postCountEncodeMs
+        intersectionArenaGrowMs = c.intersectionArenaGrowMs
+        maximumTileCount = Int(c.maximumTileCount)
+        activeTileCount = Int(c.activeTileCount)
+        trivialTileCount = Int(c.trivialTileCount)
+        smallTileCount = Int(c.smallTileCount)
+        mediumTileCount = Int(c.mediumTileCount)
+        largeTileCount = Int(c.largeTileCount)
     }
 }
 
@@ -113,7 +159,7 @@ public struct TrainingTelemetry: Sendable, Equatable {
     public let lastOverflowIteration: Int?
     public let lastFailedIteration: Int?
 
-    init(from c: MsplatTrainingMetrics) {
+    init(from c: MsplatTrainingMetricsV12) {
         let flags = c.flags
         submitted = flags & UInt32(MSPLAT_TRAINING_METRICS_HAS_SUBMITTED_STEP) != 0
             ? SubmittedTrainingStep(from: c.submitted) : nil

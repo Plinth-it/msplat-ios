@@ -22,11 +22,17 @@
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
-static_assert(MSPLAT_ABI_VERSION == 11u);
+static_assert(MSPLAT_ABI_VERSION == 16u);
 static_assert(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS == (1u << 0));
 static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS == (1u << 1));
+static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING == (1u << 2));
+static_assert(MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID == (1u << 7));
 static_assert((MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS &
                MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) == 0u);
+static_assert((MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS &
+               MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING) == 0u);
+static_assert((MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS &
+               MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING) == 0u);
 static_assert(sizeof(MsplatConfig) == 76);
 static_assert(alignof(MsplatConfig) == 4);
 static_assert(offsetof(MsplatConfig, keepCrs) == 56);
@@ -57,13 +63,82 @@ static_assert(offsetof(MsplatTrainingMetrics, submitted) == 8);
 static_assert(offsetof(MsplatTrainingMetrics, completed) == 40);
 static_assert(offsetof(MsplatTrainingMetrics, overflowedCompletedSteps) == 104);
 static_assert(offsetof(MsplatTrainingMetrics, lastFailedIteration) == 132);
+static_assert(std::is_standard_layout<MsplatCompletedTrainingStepV12>::value);
+static_assert(sizeof(MsplatCompletedTrainingStepV12) == 112);
+static_assert(alignof(MsplatCompletedTrainingStepV12) == 8);
+static_assert(offsetof(MsplatCompletedTrainingStepV12, imagePrepareMs) == 64);
+static_assert(offsetof(MsplatCompletedTrainingStepV12, countGpuMs) == 68);
+static_assert(offsetof(MsplatCompletedTrainingStepV12, maximumTileCount) == 84);
+static_assert(offsetof(MsplatCompletedTrainingStepV12, largeTileCount) == 104);
+static_assert(offsetof(MsplatCompletedTrainingStepV12, queueIdleMs) == 108);
+static_assert(std::is_standard_layout<MsplatTrainingMetricsV12>::value);
+static_assert(sizeof(MsplatTrainingMetricsV12) == 184);
+static_assert(alignof(MsplatTrainingMetricsV12) == 8);
+static_assert(offsetof(MsplatTrainingMetricsV12, submitted) == 8);
+static_assert(offsetof(MsplatTrainingMetricsV12, completed) == 40);
+static_assert(offsetof(MsplatTrainingMetricsV12, overflowedCompletedSteps) == 152);
+static_assert(offsetof(MsplatTrainingMetricsV12, lastFailedIteration) == 180);
 static_assert(sizeof(MsplatTrainingMemoryMetrics) == 96);
 static_assert(alignof(MsplatTrainingMemoryMetrics) == 8);
 static_assert(offsetof(MsplatTrainingMemoryMetrics, trainerModelBufferBytes) == 8);
 static_assert(offsetof(MsplatTrainingMemoryMetrics, trainingGpuImageCacheMisses) == 88);
+static_assert(MSPLAT_POSE_REFINEMENT_STATE_ENABLED == (1u << 0));
+static_assert(MSPLAT_POSE_REFINEMENT_STATE_ANCHOR == (1u << 1));
+static_assert((MSPLAT_POSE_REFINEMENT_STATE_ENABLED &
+               MSPLAT_POSE_REFINEMENT_STATE_ANCHOR) == 0u);
+static_assert(std::is_standard_layout<MsplatPoseRefinementStateV15>::value);
+static_assert(sizeof(MsplatPoseRefinementStateV15) == 128);
+static_assert(alignof(MsplatPoseRefinementStateV15) == 8);
+static_assert(offsetof(MsplatPoseRefinementStateV15, flags) == 0);
+static_assert(offsetof(MsplatPoseRefinementStateV15,
+                       canonicalCameraIndex) == 4);
+static_assert(offsetof(MsplatPoseRefinementStateV15,
+                       optimizerStepCount) == 8);
+static_assert(offsetof(MsplatPoseRefinementStateV15, reserved) == 12);
+static_assert(offsetof(MsplatPoseRefinementStateV15, poseDelta) == 16);
+static_assert(offsetof(MsplatPoseRefinementStateV15,
+                       translationNorm) == 40);
+static_assert(offsetof(MsplatPoseRefinementStateV15, rotationNorm) == 44);
+static_assert(offsetof(MsplatPoseRefinementStateV15,
+                       correctedCameraToWorld) == 48);
+static_assert(offsetof(MsplatPoseRefinementStateV15, frameId) == 112);
+static_assert(offsetof(MsplatPoseRefinementStateV15, frameIdLength) == 120);
 
 static_assert(sizeof(void*) == 8);
 static_assert(sizeof(size_t) == 8);
+static_assert(std::is_same<MsplatPreviewFrame, void*>::value);
+static_assert(std::is_same<MsplatMTLTextureRef, void*>::value);
+static_assert(sizeof(MsplatPreviewFrame) == sizeof(void*));
+static_assert(alignof(MsplatPreviewFrame) == alignof(void*));
+static_assert(sizeof(MsplatMTLTextureRef) == sizeof(void*));
+static_assert(alignof(MsplatMTLTextureRef) == alignof(void*));
+using RenderPreviewV13Function = MsplatStatus (*)(
+    MsplatTrainer, const float*, int, MsplatPreviewFrame*, MsplatErrorInfo*);
+using PollPreviewV13Function = MsplatStatus (*)(
+    MsplatPreviewFrame, bool*, MsplatErrorInfo*);
+using GetPreviewTextureV13Function = MsplatStatus (*)(
+    MsplatPreviewFrame, MsplatMTLTextureRef*, int*, int*, MsplatErrorInfo*);
+using DestroyPreviewV13Function = MsplatStatus (*)(
+    MsplatPreviewFrame, MsplatErrorInfo*);
+using PoseRefinementCountV15Function = MsplatStatus (*)(
+    MsplatTrainer, uint32_t*, MsplatErrorInfo*);
+using PoseRefinementStateV15Function = MsplatStatus (*)(
+    MsplatTrainer, uint32_t, MsplatPoseRefinementStateV15*, size_t,
+    MsplatErrorInfo*);
+static_assert(std::is_same<decltype(&msplat_trainer_render_pose_preview_v13),
+                           RenderPreviewV13Function>::value);
+static_assert(std::is_same<decltype(&msplat_preview_frame_poll_v13),
+                           PollPreviewV13Function>::value);
+static_assert(std::is_same<decltype(&msplat_preview_frame_texture_v13),
+                           GetPreviewTextureV13Function>::value);
+static_assert(std::is_same<decltype(&msplat_preview_frame_destroy_v13),
+                           DestroyPreviewV13Function>::value);
+static_assert(std::is_same<
+    decltype(&msplat_trainer_pose_refinement_count_v15),
+    PoseRefinementCountV15Function>::value);
+static_assert(std::is_same<
+    decltype(&msplat_trainer_pose_refinement_state_v15),
+    PoseRefinementStateV15Function>::value);
 static_assert(std::is_standard_layout<MsplatStringViewV5>::value);
 static_assert(sizeof(MsplatStringViewV5) == 16);
 static_assert(alignof(MsplatStringViewV5) == 8);
@@ -606,6 +681,10 @@ int main() {
     CHECK(copiedPose[10] == 1.0f);
     CHECK(copiedPose[15] == 1.0f);
     CHECK(copiedPose[3] == -1.0f);
+    CHECK(msplat_dataset_enable_training_target_prefetch_v14(
+              copiedDataset, &error) == MSPLAT_STATUS_OK);
+    CHECK(msplat_dataset_enable_training_target_prefetch_v14(
+              copiedDataset, &error) == MSPLAT_STATUS_OK);
     CHECK(msplat_dataset_destroy_v2(copiedDataset, &error) ==
           MSPLAT_STATUS_OK);
 
@@ -1147,6 +1226,69 @@ int main() {
     CHECK(stats.splatCount == 0);
     CHECK(stats.msPerStep == 0.0f);
 
+    float previewPose[16];
+    setIdentityPose(previewPose, 0.0f);
+    MsplatPreviewFrame previewFrame =
+        reinterpret_cast<MsplatPreviewFrame>(static_cast<uintptr_t>(1));
+    status = msplat_trainer_render_pose_preview_v13(
+        nullptr, previewPose, 0, &previewFrame, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(previewFrame == nullptr);
+    CHECK(error.status == status);
+    status = msplat_trainer_render_pose_preview_v13(
+        nullptr, previewPose, 0, nullptr, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+
+    bool previewReady = true;
+    status = msplat_preview_frame_poll_v13(nullptr, &previewReady, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(!previewReady);
+    CHECK(error.status == status);
+    status = msplat_preview_frame_poll_v13(nullptr, nullptr, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+
+    MsplatMTLTextureRef previewTexture =
+        reinterpret_cast<MsplatMTLTextureRef>(static_cast<uintptr_t>(1));
+    int previewWidth = 123;
+    int previewHeight = 456;
+    status = msplat_preview_frame_texture_v13(
+        nullptr, &previewTexture, &previewWidth, &previewHeight, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(previewTexture == nullptr);
+    CHECK(previewWidth == 0);
+    CHECK(previewHeight == 0);
+    CHECK(error.status == status);
+
+    previewWidth = 123;
+    previewHeight = 456;
+    status = msplat_preview_frame_texture_v13(
+        nullptr, nullptr, &previewWidth, &previewHeight, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(previewWidth == 0);
+    CHECK(previewHeight == 0);
+
+    previewTexture =
+        reinterpret_cast<MsplatMTLTextureRef>(static_cast<uintptr_t>(1));
+    previewHeight = 456;
+    status = msplat_preview_frame_texture_v13(
+        nullptr, &previewTexture, nullptr, &previewHeight, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(previewTexture == nullptr);
+    CHECK(previewHeight == 0);
+
+    previewTexture =
+        reinterpret_cast<MsplatMTLTextureRef>(static_cast<uintptr_t>(1));
+    previewWidth = 123;
+    status = msplat_preview_frame_texture_v13(
+        nullptr, &previewTexture, &previewWidth, nullptr, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(previewTexture == nullptr);
+    CHECK(previewWidth == 0);
+
+    status = msplat_preview_frame_destroy_v13(nullptr, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(error.status == status);
+
     MsplatTrainingMetrics trainingMetrics;
     std::memset(&trainingMetrics, 0x5a, sizeof(trainingMetrics));
     status = msplat_trainer_metrics_v4(
@@ -1172,6 +1314,31 @@ int main() {
         nullptr, nullptr, sizeof(trainingMetrics), &error);
     CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
 
+    MsplatTrainingMetricsV12 trainingMetricsV12;
+    std::memset(&trainingMetricsV12, 0x5a, sizeof(trainingMetricsV12));
+    status = msplat_trainer_metrics_v12(
+        nullptr, &trainingMetricsV12, sizeof(trainingMetricsV12), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    MsplatTrainingMetricsV12 zeroTrainingMetricsV12{};
+    CHECK(std::memcmp(&trainingMetricsV12, &zeroTrainingMetricsV12,
+                      sizeof(trainingMetricsV12)) == 0);
+
+    std::memset(&trainingMetricsV12, 0x5a, sizeof(trainingMetricsV12));
+    MsplatTrainingMetricsV12 unchangedTrainingMetricsV12 = trainingMetricsV12;
+    status = msplat_trainer_metrics_v12(
+        nullptr, &trainingMetricsV12, sizeof(trainingMetricsV12) - 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&trainingMetricsV12, &unchangedTrainingMetricsV12,
+                      sizeof(trainingMetricsV12)) == 0);
+    status = msplat_trainer_metrics_v12(
+        nullptr, &trainingMetricsV12, sizeof(trainingMetricsV12) + 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&trainingMetricsV12, &unchangedTrainingMetricsV12,
+                      sizeof(trainingMetricsV12)) == 0);
+    status = msplat_trainer_metrics_v12(
+        nullptr, nullptr, sizeof(trainingMetricsV12), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+
     MsplatTrainingMemoryMetrics memoryMetrics;
     std::memset(&memoryMetrics, 0x5a, sizeof(memoryMetrics));
     status = msplat_trainer_memory_metrics_v4(
@@ -1195,6 +1362,39 @@ int main() {
                       sizeof(memoryMetrics)) == 0);
     status = msplat_trainer_memory_metrics_v4(
         nullptr, nullptr, sizeof(memoryMetrics), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+
+    uint32_t poseStateCount = 99u;
+    status = msplat_trainer_pose_refinement_count_v15(
+        nullptr, &poseStateCount, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(poseStateCount == 0u);
+    status = msplat_trainer_pose_refinement_count_v15(
+        nullptr, nullptr, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+
+    MsplatPoseRefinementStateV15 poseState;
+    std::memset(&poseState, 0x5a, sizeof(poseState));
+    status = msplat_trainer_pose_refinement_state_v15(
+        nullptr, 0u, &poseState, sizeof(poseState), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    MsplatPoseRefinementStateV15 zeroPoseState{};
+    CHECK(std::memcmp(&poseState, &zeroPoseState, sizeof(poseState)) == 0);
+
+    std::memset(&poseState, 0x5a, sizeof(poseState));
+    const MsplatPoseRefinementStateV15 unchangedPoseState = poseState;
+    status = msplat_trainer_pose_refinement_state_v15(
+        nullptr, 0u, &poseState, sizeof(poseState) - 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&poseState, &unchangedPoseState,
+                      sizeof(poseState)) == 0);
+    status = msplat_trainer_pose_refinement_state_v15(
+        nullptr, 0u, &poseState, sizeof(poseState) + 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&poseState, &unchangedPoseState,
+                      sizeof(poseState)) == 0);
+    status = msplat_trainer_pose_refinement_state_v15(
+        nullptr, 0u, nullptr, sizeof(poseState), &error);
     CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
 
     status = msplat_set_metallib_path_v2("", &error);
@@ -1251,8 +1451,20 @@ int main() {
               &refinementOptions, sizeof(refinementOptions), &error) ==
           MSPLAT_STATUS_OK);
     refinementOptions.flags =
+        MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING;
+    CHECK(msplat_refinement_options_validate_v8(
+              &refinementOptions, sizeof(refinementOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    refinementOptions.flags =
+        MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS |
+        MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING;
+    CHECK(msplat_refinement_options_validate_v8(
+              &refinementOptions, sizeof(refinementOptions), &error) ==
+          MSPLAT_STATUS_OK);
+    refinementOptions.flags =
         MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS |
-        MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS;
+        MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS |
+        MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING;
     CHECK(msplat_refinement_options_validate_v8(
               &refinementOptions, sizeof(refinementOptions), &error) ==
           MSPLAT_STATUS_OK);
@@ -1332,6 +1544,8 @@ int main() {
               &maskOptions, sizeof(maskOptions), &trainer,
               &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
     CHECK(trainer == nullptr);
+    CHECK(msplat_dataset_enable_training_target_prefetch_v14(
+              nullptr, &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
 
     // Legacy entry points route through the same exception boundary.
     CHECK(msplat_dataset_create(nullptr, 1.0f, false, 8) == nullptr);

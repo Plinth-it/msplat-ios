@@ -9,10 +9,13 @@
 // CPU image metrics and SSIM window creation.
 // Training uses Metal kernels (ssim_h/v_fwd/bwd) directly.
 
-// Images are (H, W, 3) float32 in [0,1]. An optional coverage mask is
-// (H, W) uint8. Coverage weights metric centers without changing the pixels
-// sampled by an SSIM window. A zero coverageUnits value asks the CPU helper to
-// calculate and validate the denominator from the mask.
+// Rendered images are (H, W, 3) float32 in [0,1]. Targets may be matching
+// float32 RGB or compact uint8 RGBA; alpha is never sampled as color. An
+// optional coverage mask is either a distinct (H, W) uint8 tensor or the RGBA
+// target itself, in which case coverage comes from alpha. Coverage weights
+// metric centers without changing the pixels sampled by an SSIM window. A zero
+// coverageUnits value asks the CPU helper to calculate and validate the
+// denominator from the mask.
 float psnr(const MTensor& rendered, const MTensor& gt,
            const MTensor* coverageMask = nullptr,
            uint64_t coverageUnits = 0);

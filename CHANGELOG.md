@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- MsplatExample now accepts root `transforms.json` Nerfstudio datasets in
+  addition to COLMAP folders. Its device-memory preflight resolves referenced
+  image headers and the manifest PLY (with the native fallback names), preserves
+  Nerfstudio-over-COLMAP dispatch priority, and rejects unsupported fisheye or
+  out-of-folder asset references before training.
 - Added ABI v2 checked C entry points with structured errors, input and buffer
   validation, ABI/config-size checks, and exception containment.
 - Added ABI v3 checked trainer creation with a size-validated
@@ -56,6 +61,116 @@
   gain refinement so synthetic-background pixels cannot dominate those gains.
   Chunked raster backward now keeps every pixel alive through cooperative
   threadgroup barriers, so dense tiles propagate gradients through all chunks.
+- Added ABI v12 completed-step telemetry for image preparation, exact-count GPU
+  duration and wall wait, post-count encoding, arena growth, and tile-density
+  buckets. The ABI v4 telemetry structure and query remain byte-for-byte stable.
+- Added ABI v13 GPU-native preview submissions. Swift
+  `MsplatSession.submitPreview(...)` returns a `MetalPreviewSubmission`, whose
+  `waitUntilReady()` produces a `MetalPreviewSurface` that owns an immutable
+  BGRA8Unorm `MTLTexture`. Existing `renderRGBA` and `PixelData` APIs remain
+  available. MsplatExample keeps at most one pending submission plus the latest
+  completed surface, displays that texture without a CPU copy or UIImage
+  re-upload, preserves the legacy UIImage display orientation, and includes both
+  surfaces in its memory preflight. Fixed-camera submission still performs the
+  renderer's existing exact-count synchronization; fully nonblocking preview
+  submission depends on the planned GPU count/scan work.
+- Added ABI v14 instance-scoped training-target prefetch enablement. Swift
+  exposes it through `DatasetOptions.prefetchTrainingTargets`, and the iOS
+  sample enables it for both masked and unmasked runs so their timing comparison
+  remains fair. The existing environment opt-in remains available to native
+  clients. The first shuffled target is scheduled when the trainer is created;
+  later targets overlap the preceding Metal step while upload and LRU mutation
+  stay serialized.
+- Added ABI v15 read-only camera-pose refinement state. Checked count and
+  per-canonical-camera queries expose only the six bounded deltas, optimizer
+  visit count, fixed-anchor identity, corrected row-major OpenGL
+  camera-to-world matrix, and stable frame ID; Adam moment tensors remain
+  private. Translation values and corrected positions are returned in the
+  dataset's original pre-normalization units, rotations are radians, and pose
+  tensor reads synchronize pending Metal work under the trainer transaction.
+- Added ABI v16 opt-in CamP conditioning for bounded camera-pose refinement.
+  Swift and MsplatExample expose a Raw/CamP A/B control, while Raw remains the
+  allocation-free compatibility default. CamP builds a deterministic fixed full
+  6x6 projection-Jacobian preconditioner per visited camera, applies Adam in the
+  conditioned tangent coordinates, then retains the existing physical SE(3)
+  retraction, regularization, and bounds. Checkpoint v4 stores the exact matrices
+  and readiness state and rejects missing, singular, or mismatched optimizer
+  bases; Raw checkpoints remain v3.
+- Added an exact binary-grayscale PNG mask path for discovered Brush-style
+  masks. Eligible 8-bit black/white masks decode into one source byte per pixel
+  before the existing area filter; soft, profiled, alpha, and color masks retain
+  the established RGBA/sRGB fallback and byte-for-byte target semantics.
+- Removed the unused depth cotangent from RGB training, computed projected
+  opacity once per visible Gaussian, and recovered backward Gaussian IDs directly
+  from sorted keys. Exact-intersection storage drops from 56 to 52 bytes per
+  entry without changing raster output or the training objective. A resolution
+  stage now allocates the second 8-byte key arena only after a tile exceeds the
+  2,048-entry bitonic path, so bitonic-only stages use 44 bytes per arena slot at
+  runtime while memory planning retains the 52-byte worst case.
+- Precomputed exact tile ranges and a bucket-ordered compact list of tiles with
+  more than one intersection during the existing CPU layout pass. Exact sorting
+  now skips empty and single-entry tiles, uses 32-thread groups for 2-32-entry
+  ranges, and reserves 256-thread groups for larger tiles.
+- Added opt-in 16x8 and 16x16 monolithic forward-raster variants for controlled
+  device benchmarking while retaining 8x8 as the default. Chunked forward and
+  all backward paths remain 8x8, and a direct Metal fixture checks RGB,
+  transmittance, and contributor-index parity across parent-tile boundaries.
+- Added an opt-in exact difference-grid tile-count path for controlled
+  benchmarking. It replaces per-intersection count atomics with four signed
+  corner updates per visible Gaussian plus horizontal and vertical scans,
+  including post-scan coverage-tile masking. Per-intersection enumeration remains
+  the default pending physical-device and sustained-thermal results; both modes
+  retain the synchronized CPU layout and exact arena-allocation safety boundary.
+- Added an opt-in GPU exact-layout prerequisite that reproduces the CPU
+  inclusive offsets, tile bins, stable sort buckets, and checked ten-word
+  metadata for both enumerated and difference-grid counts. The CPU layout
+  remains the default, and the experimental path deliberately retains the
+  completed-count host wait, metadata validation, work-limit check, and host
+  arena sizing. It is groundwork for—not an implementation of—the planned
+  high-water arena, overflow-safe no-op, and retry design.
+- Split `PROFILE_STAGES` exact-intersection timing into projection/layout/
+  validation, scatter/sort/finalization, and attribute packing. Retry profiling
+  now measures its synchronized preflight separately from the queued training
+  tail, owns timestamp storage per logical step, and converts GPU ticks using
+  paired CPU/GPU samples rather than the CPU Mach timebase.
+- Added optional ABI v12 `queueIdleMs` telemetry in its reserved tail word,
+  without changing the structure size or ABI version. It merges overlapping
+  Metal command-buffer intervals and reports only the uncovered intra-step gaps;
+  Swift, MsplatExample, and benchmark schema v3 expose the same value.
+- Made retry-attempt results step-owned. Status, all ten checked GPU-layout
+  metadata words, and the final inclusive offset are captured after
+  scatter/sort finalization, so capacity retries and completed tile telemetry
+  no longer read reusable global layout buffers. The synchronized retry decision
+  remains in place until later steps can be transactionally poisoned and replayed.
+- Made key-driven intersection-attribute gathers the default after sustained,
+  counterbalanced physical-device profiling found effectively neutral throughput
+  while saving 68.83 MiB at 313,214 Gaussians. The default arena retains only
+  sorted keys and optional radix scratch; `MSPLAT_INTERSECTION_ATTRIBUTES=packed`
+  restores the three float3 copies as a device-specific fallback. Swift memory
+  planning now budgets the configured 16-byte gather or 52-byte packed arena,
+  keeping the app's memory admission gate conservative for either mode.
+- Made fused SSIM derivative processing the default after sustained physical-
+  device profiling found throughput within one percent of the mean of two
+  bracketing baselines while saving about 66 MiB of tracked native buffers and
+  74 MiB of process footprint at 1200x1600. `MSPLAT_SSIM_MODE=staged` restores
+  the three-dispatch fallback, and the public training plan retains its
+  conservative staged-memory estimate.
+- Fused geometry backward directly into the mean, scale, and quaternion Adam
+  updates, and folded opacity plus densification-stat updates into the terminal
+  backward stage. The training cache no longer owns or clears the three geometry
+  gradient tensors, removing 40 bytes per Gaussian and four standalone Adam plus
+  one statistics dispatch. Geometry and opacity preserve full-population
+  zero-gradient moment decay; SH retains its visibility/degree gates and now
+  includes degree-four backward updates.
+- Replaced retained Float32 RGB training images with tightly packed UInt8 RGBA
+  targets. ImageIO decode, resolution pyramids, and Brown-Conrady correction
+  remain byte-native; the SSIM/L1 kernels normalize RGB during their existing
+  tile loads, while CPU evaluation accepts the same compact representation.
+  Decoded CPU pixels are released after upload. Masked coverage is packed into
+  the existing alpha byte. Coverage-mode targets also cache one UInt8 activity
+  byte per 16x16 render tile, including the exact five-pixel SSIM halo, and use
+  it to prune exact intersections without changing projection, dense loss, or
+  transparent-mode execution.
 - Corrected the image-edge versus array-index conversion in Brown-Conrady
   rectification, including alpha=0 crop endpoints and paired mask sampling.
   The renderer now uses an exact homogeneous divide, propagates the missing
@@ -68,7 +183,7 @@
   grows compact arenas, and exact-range bitonic/radix sorting preserves every
   intersection. Allocation, native-index, and the explicit 65,536-per-tile
   work-limit failures now abort before rasterization or Adam; the planner models
-  the 56-byte exact arena without treating its estimate as a correctness cap.
+  the 52-byte exact arena without treating its estimate as a correctness cap.
 - Enforced the Gaussian ceiling during initialization, densification, PLY
   import, and checkpoint restore. Capacity-constrained densification keeps the
   highest normalized-gradient candidates, and `--max-gaussians` exposes the

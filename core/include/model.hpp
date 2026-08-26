@@ -4,6 +4,8 @@
 #include "metal_tensor.hpp"
 #include "ssim.hpp"
 #include "input_data.hpp"
+#include "pose_refinement_state.hpp"
+#include "camera_pose_conditioning.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -13,6 +15,14 @@ int numShBases(int degree);
 /// Validate checkpoint structure and tensor metadata without allocating Metal
 /// buffers or changing model state. Throws std::runtime_error when invalid.
 void validateCheckpointFile(const std::string &filename);
+
+struct ModelPoseRefinementState {
+  bool anchor = false;
+  uint32_t optimizerStepCount = 0;
+  msplat::detail::PoseRefinementGeometry geometry;
+  const char* frameId = nullptr;
+  size_t frameIdLength = 0;
+};
 
 struct Model{
   Model(const InputData &inputData, int numCameras,
@@ -25,6 +35,8 @@ struct Model{
         bool refinePhotometricGains = false,
         bool refineCameraPoses = false,
         int poseAnchorCameraIndex = -1,
+        msplat::CameraPoseConditioning cameraPoseConditioning =
+            msplat::CameraPoseConditioning::Raw,
         bool transparentTrainingMasks = false,
         float transparentAlphaLossWeight = 0.1f);
 
@@ -82,6 +94,11 @@ struct Model{
   /// Bytes held by the model's own GPU buffers — parameters, Adam state,
   /// and the densification scratch. Sized by capacity, not active count.
   size_t estimatedGpuBytes() const;
+  uint32_t poseRefinementStateCount() const;
+  /// The caller must synchronize Metal before reading the returned tensor
+  /// values. The borrowed frame ID remains valid for this Model's lifetime.
+  ModelPoseRefinementState poseRefinementState(
+      uint32_t canonicalCameraIndex) const;
   void allocateDensificationScratch();
   void resetDensificationScratch();
   void retireDensificationState();
@@ -119,9 +136,14 @@ struct Model{
   MTensor cameraPoseDeltas;
   MTensor cameraPoseExpAvg;
   MTensor cameraPoseExpAvgSq;
+  MTensor cameraPosePreconditioners;
   std::vector<uint32_t> cameraPoseStepCounts;
   std::vector<std::string> cameraFrameIds;
   std::vector<float> cameraBasePoses;
+  std::vector<float> cameraPosePreconditionerValues;
+  std::vector<uint8_t> cameraPosePreconditionerReady;
+  std::vector<float> cameraPosePointPool;
+  std::vector<uint64_t> cameraPosePointIds;
 
   int numCameras;
   int datasetCameraCount;
@@ -145,12 +167,17 @@ struct Model{
   bool refinePhotometricGains;
   bool refineCameraPoses;
   int poseAnchorCameraIndex;
+  msplat::CameraPoseConditioning cameraPoseConditioning;
   bool transparentTrainingMasks;
   float transparentAlphaLossWeight;
   bool keepCrs;
 
   float scale;
   float translation[3] = {};
+
+private:
+  void ensureCameraPosePreconditioner(
+      const Camera& camera, size_t canonicalCameraIndex);
 };
 
 #endif

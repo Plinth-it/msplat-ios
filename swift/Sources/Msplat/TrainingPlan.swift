@@ -97,6 +97,28 @@ public struct TrainingStageMemoryEstimate: Sendable, Equatable {
     public let trainingCacheBytes: Int64
 }
 
+/// Intersection-attribute representation budgeted by ``TrainingPlan``.
+///
+/// The configured default mirrors `MSPLAT_INTERSECTION_ATTRIBUTES`; only the
+/// exact value `packed` selects the larger fallback representation.
+public enum TrainingIntersectionAttributeStorage: Sendable, Equatable {
+    case gather
+    case packed
+
+    public static var configured: Self {
+        ProcessInfo.processInfo.environment["MSPLAT_INTERSECTION_ATTRIBUTES"] == "packed"
+            ? .packed
+            : .gather
+    }
+
+    fileprivate var arenaBytesPerSlot: Int64 {
+        switch self {
+        case .gather: 16
+        case .packed: 52
+        }
+    }
+}
+
 /// A checked peak-memory estimate derived from the current native allocations.
 ///
 /// This is a planning estimate, not a runtime memory measurement. The
@@ -127,6 +149,7 @@ public struct TrainingMemoryEstimate: Sendable, Equatable {
     }()
 
     public let imageCacheBudgetBytes: Int64
+    public let intersectionAttributeStorage: TrainingIntersectionAttributeStorage
     public let modelStorageBytes: Int64
     public let modelLifecycleBytes: Int64
     public let stages: [TrainingStageMemoryEstimate]
@@ -160,8 +183,10 @@ public struct TrainingPlan: Sendable, Equatable {
     /// ``MsplatSession``.
     public let maximumGaussianCount: Int
     /// Whether path-based plan sessions discover mask sidecars and whether
-    /// image-cache and decode estimates include per-frame UInt8 masks.
+    /// decode-transient estimates include their per-frame UInt8 storage.
     public let includesTrainingMasks: Bool
+    /// Intersection representation included in ``memoryEstimate``.
+    public let intersectionAttributeStorage: TrainingIntersectionAttributeStorage
     /// Source dimensions after `inputDecodeScale` is applied.
     public let decodedInputDimensions: TrainingImageDimensions
     /// Effective pixel dimensions for every stage.
@@ -180,7 +205,8 @@ public struct TrainingPlan: Sendable, Equatable {
         stages: [TrainingResolutionStage],
         targetSHDegree: Int32,
         maximumGaussianCount: Int,
-        includesTrainingMasks: Bool = false
+        includesTrainingMasks: Bool = false,
+        intersectionAttributeStorage: TrainingIntersectionAttributeStorage = .configured
     ) throws {
         guard inputDecodeScale.isFinite, (1...32).contains(inputDecodeScale) else {
             throw MsplatError.invalidArgument(
@@ -225,6 +251,7 @@ public struct TrainingPlan: Sendable, Equatable {
             targetSHDegree: targetSHDegree,
             maximumGaussianCount: maximumGaussianCount,
             includesTrainingMasks: includesTrainingMasks,
+            intersectionAttributeStorage: intersectionAttributeStorage,
             imageCacheBudgetBytes: TrainingMemoryEstimate.configuredNativeImageCacheBudgetBytes
         )
 
@@ -235,6 +262,7 @@ public struct TrainingPlan: Sendable, Equatable {
         self.targetSHDegree = targetSHDegree
         self.maximumGaussianCount = maximumGaussianCount
         self.includesTrainingMasks = includesTrainingMasks
+        self.intersectionAttributeStorage = intersectionAttributeStorage
         self.decodedInputDimensions = decodedInputDimensions
         self.resolvedStages = resolvedStages
         self.memoryEstimate = memoryEstimate
@@ -243,7 +271,8 @@ public struct TrainingPlan: Sendable, Equatable {
     /// Produces dataset options controlled by this plan.
     public func makeDatasetOptions(
         evalMode: Bool = false,
-        testEvery: Int32 = 8
+        testEvery: Int32 = 8,
+        prefetchTrainingTargets: Bool = false
     ) throws -> DatasetOptions {
         guard testEvery > 0 else {
             throw MsplatError.invalidArgument("testEvery must be greater than zero")
@@ -252,7 +281,8 @@ public struct TrainingPlan: Sendable, Equatable {
             downscaleFactor: inputDecodeScale,
             evalMode: evalMode,
             testEvery: testEvery,
-            discoverTrainingMasks: includesTrainingMasks
+            discoverTrainingMasks: includesTrainingMasks,
+            prefetchTrainingTargets: prefetchTrainingTargets
         )
     }
 
@@ -297,6 +327,7 @@ public struct TrainingPlan: Sendable, Equatable {
             targetSHDegree: targetSHDegree,
             maximumGaussianCount: maximumGaussianCount,
             includesTrainingMasks: includesTrainingMasks,
+            intersectionAttributeStorage: intersectionAttributeStorage,
             imageCacheBudgetBytes: imageCacheBudgetBytes
         )
     }
@@ -434,6 +465,7 @@ public struct TrainingPlan: Sendable, Equatable {
         targetSHDegree: Int32,
         maximumGaussianCount: Int,
         includesTrainingMasks: Bool,
+        intersectionAttributeStorage: TrainingIntersectionAttributeStorage,
         imageCacheBudgetBytes: Int64
     ) throws -> TrainingMemoryEstimate {
         guard imageCacheBudgetBytes > 0 else {
@@ -584,16 +616,23 @@ public struct TrainingPlan: Sendable, Equatable {
             }
 
             var trainingCacheBytes = try checkedSum([
+                // 52 bytes of projected forward state plus 36 bytes of
+                // raster-backward gradients per Gaussian. Geometry gradients
+                // remain register-local in the terminal update kernel.
                 try checkedProduct(
-                    [128, gaussianCount],
+                    [88, gaussianCount],
                     component: "training Gaussian cache"
                 ),
                 try checkedProduct(
-                    [56, intersectionCapacity],
-                    component: "exact intersection arenas and packed cache"
+                    // Gather retains two key arenas; packed additionally owns
+                    // three float3 attribute arrays. Runtime omits the second
+                    // key arena until a tile exceeds 2,048 entries.
+                    [intersectionAttributeStorage.arenaBytesPerSlot, intersectionCapacity],
+                    component: "exact intersection arenas"
                 ),
                 try checkedProduct([116, pixelCount], component: "training pixel cache"),
-                try checkedProduct([16, tileCount], component: "training tile metadata"),
+                // Counts, inclusive offsets, int2 ranges, and compact sortable IDs.
+                try checkedProduct([20, tileCount], component: "training tile metadata"),
                 8,
             ], component: "training cache")
             if chunkCount > 1 {
@@ -606,24 +645,17 @@ public struct TrainingPlan: Sendable, Equatable {
                 ], component: "training cache")
             }
 
-            let imageCacheEntryBytes: Int64
-            if stage.downscaleFactor == 1 {
-                imageCacheEntryBytes = try checkedProduct(
-                    [includesTrainingMasks ? 26 : 24, decodedPixelCount],
-                    component: "full-resolution image cache entry"
-                )
-            } else {
-                imageCacheEntryBytes = try checkedSum([
-                    try checkedProduct(
-                        [includesTrainingMasks ? 13 : 12, decodedPixelCount],
-                        component: "decoded image cache entry"
-                    ),
-                    try checkedProduct(
-                        [includesTrainingMasks ? 26 : 24, pixelCount],
-                        component: "stage image cache entry"
-                    ),
-                ], component: "image cache entry")
-            }
+            // The native cache releases decoded and pyramid pixels after a
+            // successful upload. Its retained stage target is one UInt8 RGBA
+            // buffer. Masked targets also retain one UInt8 activity byte per
+            // 16x16 render tile; coverage itself stays packed in RGBA alpha.
+            let imageCacheEntryBytes = try checkedSum([
+                try checkedProduct(
+                    [4, pixelCount],
+                    component: "compact stage image cache entry"
+                ),
+                includesTrainingMasks ? tileCount : 0,
+            ], component: "compact stage image cache entry")
 
             peakTrainingCacheBytes = max(peakTrainingCacheBytes, trainingCacheBytes)
             largestImageCacheEntryBytes = max(
@@ -641,21 +673,21 @@ public struct TrainingPlan: Sendable, Equatable {
             ))
         }
 
-        // RGB uses a decoded-input thumbnail. Masks decode at source resolution
-        // before exact area reduction because ImageIO does not promise a
-        // coverage-preserving thumbnail filter. The mask implementation
-        // releases its CG objects before copying the compact source coverage,
-        // so its largest explicit/decode-backed phase is 12P + 8S.
+        // RGB remains compact RGBA8 throughout decode and calibrated image
+        // transforms. Masks decode at source resolution before exact area
+        // reduction because ImageIO does not promise a coverage-preserving
+        // thumbnail filter. During that phase the retained target is 4P and
+        // the source mask's explicit/decode-backed storage is 8S.
         let targetResolutionDecodeBytes = try checkedProduct(
-            [includesTrainingMasks ? 41 : 36, decodedPixelCount],
+            [includesTrainingMasks ? 29 : 24, decodedPixelCount],
             component: "target-resolution image decode transient"
         )
         let imageDecodeTransientBytes: Int64
         if includesTrainingMasks {
             let sourceMaskDecodeBytes = try checkedSum([
                 try checkedProduct(
-                    [12, decodedPixelCount],
-                    component: "decoded RGB retained during mask decode"
+                    [4, decodedPixelCount],
+                    component: "decoded RGBA8 retained during mask decode"
                 ),
                 try checkedProduct(
                     [8, sourcePixelCount],
@@ -692,6 +724,7 @@ public struct TrainingPlan: Sendable, Equatable {
 
         return TrainingMemoryEstimate(
             imageCacheBudgetBytes: imageCacheBudgetBytes,
+            intersectionAttributeStorage: intersectionAttributeStorage,
             modelStorageBytes: modelStorageBytes,
             modelLifecycleBytes: modelLifecycleBytes,
             stages: stageEstimates,

@@ -12,6 +12,7 @@
 #include "memory_report.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -126,6 +127,9 @@ Dataset& Dataset::operator=(Dataset&&) noexcept = default;
 
 int Dataset::numTrain() const { return (int)impl->trainIndices.size(); }
 int Dataset::numTest() const { return (int)impl->testIndices.size(); }
+void Dataset::enableTrainingTargetPrefetch() noexcept {
+    impl->images.enablePrefetch();
+}
 void Dataset::cameraPose(int index, float camToWorld[16]) const {
     if (index >= 0 && index < (int)impl->trainIndices.size())
         memcpy(camToWorld, impl->data.cameras[impl->trainIndices[index]].camToWorld,
@@ -167,6 +171,68 @@ size_t rgbaCapacityRequired(int width, int height) {
 
 } // namespace
 
+struct PreviewFrame::Impl {
+    enum class Completion : uint8_t { Pending, Ready, Failed };
+
+    Impl(id<MTLTexture> value, int frameWidth, int frameHeight)
+        : texture([value retain]), width(frameWidth), height(frameHeight) {}
+
+    ~Impl() { [texture release]; }
+
+    void complete(bool succeeded, const char* message) noexcept {
+        if (!succeeded) {
+            try {
+                std::lock_guard<std::mutex> lock(errorMutex);
+                error = !message || message[0] == '\0'
+                    ? "msplat: preview command buffer failed"
+                    : message;
+            } catch (...) {
+                // Preserve a deterministic fallback even under allocation
+                // pressure; completion handlers must not throw.
+            }
+        }
+        completion.store(
+            succeeded ? Completion::Ready : Completion::Failed,
+            std::memory_order_release);
+    }
+
+    bool poll() const {
+        const Completion value = completion.load(std::memory_order_acquire);
+        if (value == Completion::Pending) return false;
+        if (value == Completion::Ready) return true;
+
+        std::lock_guard<std::mutex> lock(errorMutex);
+        throw std::runtime_error(error.empty()
+            ? "msplat: preview command buffer failed"
+            : error);
+    }
+
+    id<MTLTexture> texture = nil;
+    int width = 0;
+    int height = 0;
+    std::atomic<Completion> completion{Completion::Pending};
+    mutable std::mutex errorMutex;
+    std::string error;
+};
+
+PreviewFrame::PreviewFrame(std::shared_ptr<Impl> value)
+    : impl(std::move(value)) {}
+
+PreviewFrame::~PreviewFrame() = default;
+
+bool PreviewFrame::poll() const {
+    if (!impl) throw std::logic_error("Preview frame has no state");
+    return impl->poll();
+}
+
+void* PreviewFrame::texture() const {
+    if (!poll()) throw std::logic_error("Preview frame is not ready");
+    return (__bridge void*)impl->texture;
+}
+
+int PreviewFrame::width() const { return impl ? impl->width : 0; }
+int PreviewFrame::height() const { return impl ? impl->height : 0; }
+
 // ── Trainer::Impl ───────────────────────────────────────────────────────────
 
 struct Trainer::Impl {
@@ -193,6 +259,20 @@ struct Trainer::Impl {
 
     void advanceCamera() {
         ++camIterPos;
+    }
+
+    size_t cameraAfterCurrent() const {
+        const size_t nextPosition = camIterPos + 1;
+        if (nextPosition < camIndices.size())
+            return camIndices[nextPosition];
+
+        // Match the next epoch without advancing the live RNG or camera
+        // sequence. The eventual currentCamera() call performs this same
+        // shuffle after the committed step advances the cursor.
+        std::vector<size_t> nextIndices = camIndices;
+        std::mt19937 nextRng = rng;
+        std::shuffle(nextIndices.begin(), nextIndices.end(), nextRng);
+        return nextIndices.front();
     }
 };
 
@@ -222,6 +302,7 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.refineCameraPoses && !impl->ds->trainIndices.empty()
             ? static_cast<int>(impl->ds->trainIndices.front())
             : -1,
+        config.cameraPoseConditioning,
         config.trainingMaskMode == TrainingMaskMode::Transparent,
         config.transparentAlphaLossWeight
     );
@@ -229,10 +310,19 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
     impl->camIndices.resize(impl->ds->trainIndices.size());
     std::iota(impl->camIndices.begin(), impl->camIndices.end(), 0);
     impl->shuffleCameras();
+    if (impl->ds->images.prefetchEnabled() && !impl->camIndices.empty()) {
+        const size_t firstCamera = impl->currentCamera();
+        impl->ds->images.prefetchTrainingTarget(
+            impl->ds->data.cameras,
+            impl->ds->trainIndices[firstCamera],
+            impl->model->getDownscaleFactor(1));
+    }
 }
 
 Trainer::~Trainer() {
     std::lock_guard lock(g_trainerTransactionMutex);
+    if (impl && impl->ds)
+        impl->ds->images.discardPrefetch();
     impl.reset();
 }
 
@@ -246,13 +336,12 @@ Stats Trainer::step() {
     double cpuSubmitMs = 0.0;
     try {
         size_t camIdx = impl->currentCamera();
-        Camera& cam = impl->ds->trainCamera(camIdx);
-
         int ds = impl->model->getDownscaleFactor(nextStep);
         CameraTrainingTarget target =
             impl->ds->trainingTargetForTrainCamera(camIdx, ds);
         if (!target.image)
             throw std::runtime_error("Training target has no RGB image");
+        Camera& cam = impl->ds->trainCamera(camIdx);
 
         msplat_training_step_mark_cpu_start(logicalStep);
         impl->model->fullIteration(
@@ -273,6 +362,15 @@ Stats Trainer::step() {
             nextStep / impl->config.shDegreeInterval,
             impl->config.shDegree);
         cpuSubmitMs = msplat_training_step_submit(logicalStep, descriptor);
+
+        if (impl->ds->images.prefetchEnabled() &&
+            nextStep < impl->config.iterations) {
+            const size_t nextCamIdx = impl->cameraAfterCurrent();
+            impl->ds->images.prefetchTrainingTarget(
+                impl->ds->data.cameras,
+                impl->ds->trainIndices[nextCamIdx],
+                impl->model->getDownscaleFactor(nextStep + 1));
+        }
     } catch (...) {
         msplat_training_step_abort(logicalStep);
         throw;
@@ -323,8 +421,13 @@ EvalMetrics Trainer::evaluate() {
         MTensor maskCpu;
         const MTensor* coverageMask = nullptr;
         if (target.coverageMask) {
-            maskCpu = target.coverageMask->cpu();
-            coverageMask = &maskCpu;
+            if (target.coverageMask == target.image) {
+                // Preserve the packed-alpha marker across the GPU-to-CPU copy.
+                coverageMask = &gtCpu;
+            } else {
+                maskCpu = target.coverageMask->cpu();
+                coverageMask = &maskCpu;
+            }
         }
 
         sumPsnr += psnr(
@@ -437,6 +540,61 @@ void Trainer::renderFromPoseToBuffer(const float camToWorld[16], int refCameraIn
     }
 }
 
+std::unique_ptr<PreviewFrame> Trainer::renderFromPosePreview(
+    const float camToWorld[16], int refCameraIndex) {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    auto& indices = impl->ds->trainIndices;
+    if (refCameraIndex < 0 || refCameraIndex >= (int)indices.size())
+        throw std::invalid_argument("Reference camera index is out of range");
+
+    Camera cam = impl->ds->images.ensureLoaded(
+        impl->ds->data.cameras, indices[refCameraIndex]);
+    const int downscale = impl->model->getDownscaleFactor(impl->currentStep);
+    if (cam.width < downscale || cam.height < downscale)
+        throw std::invalid_argument(
+            "Training downscale produces a zero-sized image; reduce numDownscales");
+    const int width = cam.width / downscale;
+    const int height = cam.height / downscale;
+
+    MTLTextureDescriptor* descriptor =
+        [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:
+            MTLPixelFormatBGRA8Unorm
+            width:static_cast<NSUInteger>(width)
+            height:static_cast<NSUInteger>(height)
+            mipmapped:NO];
+    descriptor.textureType = MTLTextureType2D;
+    descriptor.storageMode = MTLStorageModePrivate;
+    descriptor.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    id<MTLTexture> texture = [msplat_device() newTextureWithDescriptor:descriptor];
+    if (!texture)
+        throw std::bad_alloc();
+    texture.label = @"msplat completed preview";
+
+    std::shared_ptr<PreviewFrame::Impl> frameState;
+    try {
+        frameState = std::make_shared<PreviewFrame::Impl>(
+            texture, width, height);
+    } catch (...) {
+        [texture release];
+        throw;
+    }
+    [texture release];
+
+    cam.setCameraToWorld(camToWorld);
+    MTensor rgb = impl->model->render(cam, impl->currentStep);
+    if (rgb.size(1) != width || rgb.size(0) != height)
+        throw std::runtime_error(
+            "Rendered preview dimensions changed unexpectedly");
+
+    msplat_submit_preview_texture(
+        rgb, (__bridge void*)frameState->texture,
+        [frameState](bool succeeded, const char* error) noexcept {
+            frameState->complete(succeeded, error);
+        });
+    return std::unique_ptr<PreviewFrame>(
+        new PreviewFrame(std::move(frameState)));
+}
+
 void Trainer::exportPly(const std::string& path) {
     std::lock_guard lock(g_trainerTransactionMutex);
     impl->model->savePly(path, impl->currentStep);
@@ -459,10 +617,23 @@ void Trainer::saveCheckpoint(const std::string& path) {
 
 int Trainer::loadCheckpoint(const std::string& path) {
     std::lock_guard lock(g_trainerTransactionMutex);
-    impl->currentStep = impl->model->loadCheckpoint(path);
+    // A constructor-prefetched step-one target cannot be reused after the
+    // checkpoint changes both the logical step and camera sequence.
+    impl->ds->images.discardPrefetch();
+    const int loadedStep = impl->model->loadCheckpoint(path);
+    impl->currentStep = loadedStep;
     msplat_training_telemetry_reset(impl->telemetry);
     // Re-shuffle cameras for resumed training
     impl->shuffleCameras();
+    if (impl->ds->images.prefetchEnabled() &&
+        loadedStep < impl->config.iterations &&
+        !impl->camIndices.empty()) {
+        const size_t firstCamera = impl->currentCamera();
+        impl->ds->images.prefetchTrainingTarget(
+            impl->ds->data.cameras,
+            impl->ds->trainIndices[firstCamera],
+            impl->model->getDownscaleFactor(loadedStep + 1));
+    }
     return impl->currentStep;
 }
 
@@ -491,6 +662,10 @@ TrainingMetrics Trainer::metrics() const {
     metrics.intersectionsValid =
         snapshot.flags & MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID;
     metrics.hasFailedStep = snapshot.flags & MSPLAT_TRAINING_TELEMETRY_HAS_FAILED;
+    metrics.countGpuTimeValid =
+        snapshot.flags & MSPLAT_TRAINING_TELEMETRY_COUNT_GPU_TIMING_VALID;
+    metrics.queueIdleTimeValid =
+        snapshot.flags & MSPLAT_TRAINING_TELEMETRY_QUEUE_IDLE_TIMING_VALID;
 
     auto copyDescriptor = [](const MsplatTrainingStepDescriptor& source,
                              SubmittedTrainingStep& destination) {
@@ -517,6 +692,26 @@ TrainingMetrics Trainer::metrics() const {
         snapshot.completedStep.retainedPackedIntersections;
     metrics.completed.packedIntersectionCapacity =
         snapshot.completedStep.packedIntersectionCapacity;
+    metrics.completed.imagePrepareMs =
+        static_cast<float>(snapshot.completedStep.imagePrepareMs);
+    metrics.completed.countGpuMs =
+        static_cast<float>(snapshot.completedStep.countGpuMs);
+    metrics.completed.countWaitWallMs =
+        static_cast<float>(snapshot.completedStep.countWaitWallMs);
+    metrics.completed.queueIdleMs =
+        static_cast<float>(snapshot.completedStep.queueIdleMs);
+    metrics.completed.postCountEncodeMs =
+        static_cast<float>(snapshot.completedStep.postCountEncodeMs);
+    metrics.completed.intersectionArenaGrowMs =
+        static_cast<float>(snapshot.completedStep.intersectionArenaGrowMs);
+    metrics.completed.maximumTileCount =
+        snapshot.completedStep.maximumTileCount;
+    metrics.completed.activeTileCount = snapshot.completedStep.activeTileCount;
+    metrics.completed.trivialTileCount =
+        snapshot.completedStep.trivialTileCount;
+    metrics.completed.smallTileCount = snapshot.completedStep.smallTileCount;
+    metrics.completed.mediumTileCount = snapshot.completedStep.mediumTileCount;
+    metrics.completed.largeTileCount = snapshot.completedStep.largeTileCount;
     metrics.overflowedCompletedSteps = snapshot.overflowedStepCount;
     metrics.tileCapOverflowedSteps = snapshot.tileCapOverflowedStepCount;
     metrics.packedCapacityOverflowedSteps =
@@ -549,6 +744,43 @@ TrainingMemoryMetrics Trainer::memoryMetrics() const {
     metrics.hasProcessPhysFootprint = processMemory.hasPhysicalFootprint;
     metrics.hasProcessAvailableBytes = processMemory.hasAvailableBytes;
     return metrics;
+}
+
+uint32_t Trainer::poseRefinementStateCount() const {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    return impl->model->poseRefinementStateCount();
+}
+
+PoseRefinementState Trainer::poseRefinementState(
+    uint32_t canonicalCameraIndex) const {
+    std::lock_guard lock(g_trainerTransactionMutex);
+    if (canonicalCameraIndex >= impl->model->poseRefinementStateCount()) {
+        throw std::invalid_argument(
+            "Pose-refinement camera index is out of range");
+    }
+
+    // Pose deltas are updated by the training command buffer in shared Metal
+    // storage. Keep this readback in the trainer transaction and wait before
+    // dereferencing that storage on the CPU.
+    msplat_gpu_sync();
+    const ModelPoseRefinementState source =
+        impl->model->poseRefinementState(canonicalCameraIndex);
+
+    PoseRefinementState state;
+    state.enabled = true;
+    state.anchor = source.anchor;
+    state.canonicalCameraIndex = canonicalCameraIndex;
+    state.optimizerStepCount = source.optimizerStepCount;
+    std::copy(source.geometry.poseDelta.begin(),
+              source.geometry.poseDelta.end(), state.poseDelta);
+    state.translationNorm = source.geometry.translationNorm;
+    state.rotationNorm = source.geometry.rotationNorm;
+    std::copy(source.geometry.correctedCameraToWorld.begin(),
+              source.geometry.correctedCameraToWorld.end(),
+              state.correctedCameraToWorld);
+    state.frameId = source.frameId;
+    state.frameIdLength = source.frameIdLength;
+    return state;
 }
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────
@@ -591,6 +823,10 @@ CApiDatasetHandle& datasetHandle(MsplatDataset handle) noexcept {
 
 CApiTrainerHandle& trainerHandle(MsplatTrainer handle) noexcept {
     return *static_cast<CApiTrainerHandle*>(handle);
+}
+
+msplat::PreviewFrame& previewFrameHandle(MsplatPreviewFrame handle) noexcept {
+    return *static_cast<msplat::PreviewFrame*>(handle);
 }
 
 void storeError(MsplatStatus status, const char* message,
@@ -1061,9 +1297,16 @@ void validateRefinementOptionsV8(
     const MsplatRefinementOptionsV8& options) {
     constexpr uint32_t knownFlags =
         MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS |
-        MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS;
+        MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS |
+        MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING;
     require((options.flags & ~knownFlags) == 0u,
             "Refinement options contain unknown flags");
+    require(
+        (options.flags &
+         MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING) == 0u ||
+            (options.flags &
+             MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) != 0u,
+        "CamP conditioning requires camera-pose refinement");
     for (uint32_t reserved : options.reserved)
         require(reserved == 0u,
                 "Refinement options reserved fields must be zero");
@@ -1127,6 +1370,17 @@ MsplatStatus msplat_dataset_create_v10(
     return createDatasetFromPath(
         path, downscaleFactor, evalMode, static_cast<int>(testEvery),
         discoverTrainingMasks, outDataset, error);
+}
+
+MsplatStatus msplat_dataset_enable_training_target_prefetch_v14(
+    MsplatDataset ds, MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(ds != nullptr, "Dataset handle must not be null");
+        CApiDatasetHandle& handle = datasetHandle(ds);
+        require(handle.dataset.use_count() == 1,
+                "Training target prefetch must be enabled before trainer creation");
+        handle.dataset->enableTrainingTargetPrefetch();
+    });
 }
 
 MsplatStatus msplat_dataset_create_from_descriptor_v5(
@@ -1418,6 +1672,11 @@ MsplatStatus msplat_trainer_create_v11(
         cfg.refineCameraPoses =
             (refinementOptions->flags &
              MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) != 0u;
+        cfg.cameraPoseConditioning =
+            (refinementOptions->flags &
+             MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING) != 0u
+                ? msplat::CameraPoseConditioning::CamP
+                : msplat::CameraPoseConditioning::Raw;
         cfg.trainingMaskMode =
             maskOptions->mode == MSPLAT_TRAINING_MASK_MODE_TRANSPARENT
                 ? msplat::TrainingMaskMode::Transparent
@@ -1518,6 +1777,58 @@ MsplatStatus msplat_trainer_render_pose_to_buffer_v2(
             camToWorld, refCameraIndex, outRGBA, outCapacity, outWidth, outHeight);
         require(*outWidth > 0 && *outHeight > 0,
                 "Reference camera index is out of range");
+    });
+}
+
+MsplatStatus msplat_trainer_render_pose_preview_v13(
+    MsplatTrainer t, const float camToWorld[16], int refCameraIndex,
+    MsplatPreviewFrame* outFrame, MsplatErrorInfo* error) {
+    if (outFrame) *outFrame = nullptr;
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        require(outFrame != nullptr, "outFrame must not be null");
+        requirePose(camToWorld);
+        auto frame = trainerHandle(t).trainer->renderFromPosePreview(
+            camToWorld, refCameraIndex);
+        require(frame != nullptr, "Preview frame creation returned no handle");
+        *outFrame = frame.release();
+    });
+}
+
+MsplatStatus msplat_preview_frame_poll_v13(
+    MsplatPreviewFrame frame, bool* outReady, MsplatErrorInfo* error) {
+    if (outReady) *outReady = false;
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(frame != nullptr, "Preview frame must not be null");
+        require(outReady != nullptr, "outReady must not be null");
+        *outReady = previewFrameHandle(frame).poll();
+    });
+}
+
+MsplatStatus msplat_preview_frame_texture_v13(
+    MsplatPreviewFrame frame, MsplatMTLTextureRef* outTexture,
+    int* outWidth, int* outHeight, MsplatErrorInfo* error) {
+    if (outTexture) *outTexture = nil;
+    if (outWidth) *outWidth = 0;
+    if (outHeight) *outHeight = 0;
+    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+        require(frame != nullptr, "Preview frame must not be null");
+        require(outTexture != nullptr, "outTexture must not be null");
+        require(outWidth != nullptr && outHeight != nullptr,
+                "Output dimensions must not be null");
+        auto& value = previewFrameHandle(frame);
+        require(value.poll(), "Preview frame is not ready");
+        *outTexture = (__bridge id<MTLTexture>)value.texture();
+        *outWidth = value.width();
+        *outHeight = value.height();
+    });
+}
+
+MsplatStatus msplat_preview_frame_destroy_v13(
+    MsplatPreviewFrame frame, MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(frame != nullptr, "Preview frame must not be null");
+        delete static_cast<msplat::PreviewFrame*>(frame);
     });
 }
 
@@ -1657,6 +1968,90 @@ MsplatStatus msplat_trainer_metrics_v4(
     });
 }
 
+MsplatStatus msplat_trainer_metrics_v12(
+    MsplatTrainer t, MsplatTrainingMetricsV12* outMetrics, size_t outputSize,
+    MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(outputSize == sizeof(MsplatTrainingMetricsV12),
+                "Training metrics v12 size does not match this msplat ABI");
+        require(outMetrics != nullptr, "outMetrics must not be null");
+        *outMetrics = {};
+        require(t != nullptr, "Trainer handle must not be null");
+
+        const msplat::TrainingMetrics metrics =
+            trainerHandle(t).trainer->metrics();
+        if (metrics.hasSubmittedStep)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_HAS_SUBMITTED_STEP;
+        if (metrics.hasCompletedStep)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_HAS_COMPLETED_STEP;
+        if (metrics.gpuTimeValid)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_GPU_TIME_VALID;
+        if (metrics.lossValid)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_LOSS_VALID;
+        if (metrics.intersectionsValid)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_INTERSECTIONS_VALID;
+        if (metrics.hasFailedStep)
+            outMetrics->flags |= MSPLAT_TRAINING_METRICS_HAS_FAILED_STEP;
+        if (metrics.countGpuTimeValid) {
+            outMetrics->flags |=
+                MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID;
+        }
+        if (metrics.queueIdleTimeValid) {
+            outMetrics->flags |=
+                MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID;
+        }
+
+        auto copySubmitted = [](const msplat::SubmittedTrainingStep& source,
+                                MsplatSubmittedTrainingStep& destination) {
+            destination.iteration = source.iteration;
+            destination.splatCount = source.splatCount;
+            destination.modelCapacity = source.modelCapacity;
+            destination.effectiveWidth = source.effectiveWidth;
+            destination.effectiveHeight = source.effectiveHeight;
+            destination.activeSHDegree = source.activeSHDegree;
+            destination.cpuSubmitMs = source.cpuSubmitMs;
+        };
+        copySubmitted(metrics.submitted, outMetrics->submitted);
+
+        const msplat::CompletedTrainingStep& completed = metrics.completed;
+        MsplatCompletedTrainingStepV12& destination = outMetrics->completed;
+        destination.iteration = completed.iteration;
+        destination.splatCount = completed.splatCount;
+        destination.modelCapacity = completed.modelCapacity;
+        destination.effectiveWidth = completed.effectiveWidth;
+        destination.effectiveHeight = completed.effectiveHeight;
+        destination.activeSHDegree = completed.activeSHDegree;
+        destination.cpuSubmitMs = completed.cpuSubmitMs;
+        destination.gpuExecutionMs = completed.gpuExecutionMs;
+        destination.endToEndMs = completed.endToEndMs;
+        destination.loss = completed.loss;
+        destination.overflowKinds = completed.overflowKinds;
+        destination.retainedPackedIntersectionCount =
+            completed.retainedPackedIntersectionCount;
+        destination.packedIntersectionCapacity =
+            completed.packedIntersectionCapacity;
+        destination.imagePrepareMs = completed.imagePrepareMs;
+        destination.countGpuMs = completed.countGpuMs;
+        destination.countWaitWallMs = completed.countWaitWallMs;
+        destination.postCountEncodeMs = completed.postCountEncodeMs;
+        destination.intersectionArenaGrowMs = completed.intersectionArenaGrowMs;
+        destination.maximumTileCount = completed.maximumTileCount;
+        destination.activeTileCount = completed.activeTileCount;
+        destination.trivialTileCount = completed.trivialTileCount;
+        destination.smallTileCount = completed.smallTileCount;
+        destination.mediumTileCount = completed.mediumTileCount;
+        destination.largeTileCount = completed.largeTileCount;
+        destination.queueIdleMs = completed.queueIdleMs;
+
+        outMetrics->overflowedCompletedSteps = metrics.overflowedCompletedSteps;
+        outMetrics->tileCapOverflowedSteps = metrics.tileCapOverflowedSteps;
+        outMetrics->packedCapacityOverflowedSteps =
+            metrics.packedCapacityOverflowedSteps;
+        outMetrics->lastOverflowIteration = metrics.lastOverflowIteration;
+        outMetrics->lastFailedIteration = metrics.lastFailedIteration;
+    });
+}
+
 MsplatStatus msplat_trainer_memory_metrics_v4(
     MsplatTrainer t, MsplatTrainingMemoryMetrics* outMetrics,
     size_t outputSize, MsplatErrorInfo* error) {
@@ -1693,6 +2088,51 @@ MsplatStatus msplat_trainer_memory_metrics_v4(
             metrics.trainingGpuImageCacheHits;
         outMetrics->trainingGpuImageCacheMisses =
             metrics.trainingGpuImageCacheMisses;
+    });
+}
+
+MsplatStatus msplat_trainer_pose_refinement_count_v15(
+    MsplatTrainer t, uint32_t* outCount, MsplatErrorInfo* error) {
+    if (outCount) *outCount = 0u;
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(t != nullptr, "Trainer handle must not be null");
+        require(outCount != nullptr,
+                "Pose-refinement count output must not be null");
+        *outCount = trainerHandle(t).trainer->poseRefinementStateCount();
+    });
+}
+
+MsplatStatus msplat_trainer_pose_refinement_state_v15(
+    MsplatTrainer t, uint32_t canonicalCameraIndex,
+    MsplatPoseRefinementStateV15* outState, size_t outputSize,
+    MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(outputSize == sizeof(MsplatPoseRefinementStateV15),
+                "Pose-refinement state size does not match this msplat ABI");
+        require(outState != nullptr,
+                "Pose-refinement state output must not be null");
+        *outState = {};
+        require(t != nullptr, "Trainer handle must not be null");
+
+        const msplat::PoseRefinementState state =
+            trainerHandle(t).trainer->poseRefinementState(
+                canonicalCameraIndex);
+        if (state.enabled)
+            outState->flags |= MSPLAT_POSE_REFINEMENT_STATE_ENABLED;
+        if (state.anchor)
+            outState->flags |= MSPLAT_POSE_REFINEMENT_STATE_ANCHOR;
+        outState->canonicalCameraIndex = state.canonicalCameraIndex;
+        outState->optimizerStepCount = state.optimizerStepCount;
+        std::memcpy(outState->poseDelta, state.poseDelta,
+                    sizeof(outState->poseDelta));
+        outState->translationNorm = state.translationNorm;
+        outState->rotationNorm = state.rotationNorm;
+        std::memcpy(outState->correctedCameraToWorld,
+                    state.correctedCameraToWorld,
+                    sizeof(outState->correctedCameraToWorld));
+        outState->frameId = state.frameId;
+        outState->frameIdLength =
+            static_cast<uint64_t>(state.frameIdLength);
     });
 }
 

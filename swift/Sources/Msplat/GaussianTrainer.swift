@@ -60,12 +60,12 @@ public class GaussianTrainer {
     /// The legacy blocking `train()` call holds the engine lock until it returns.
     public func trainingMetrics() throws -> TrainingTelemetry {
         try withNativeEngineLock {
-            var metrics = MsplatTrainingMetrics()
+            var metrics = MsplatTrainingMetricsV12()
             var nativeError = MsplatErrorInfo()
-            let status = msplat_trainer_metrics_v4(
+            let status = msplat_trainer_metrics_v12(
                 handle,
                 &metrics,
-                MemoryLayout<MsplatTrainingMetrics>.size,
+                MemoryLayout<MsplatTrainingMetricsV12>.size,
                 &nativeError
             )
             try checkNativeStatus(status, error: &nativeError)

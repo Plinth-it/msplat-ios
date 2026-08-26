@@ -7,6 +7,11 @@ using namespace metal;
 #define MSPLAT_OVERFLOW_TILE_CAP         (1u << 0)
 #define MSPLAT_OVERFLOW_PACKED_CAPACITY  (1u << 1)
 
+inline bool training_attempt_failed(device atomic_uint* attempt_status) {
+    return atomic_load_explicit(
+        attempt_status, memory_order_relaxed) != 0u;
+}
+
 #define BLOCK_X 16
 #define BLOCK_Y 16
 #define BLOCK_SIZE (BLOCK_X * BLOCK_Y)
@@ -42,6 +47,28 @@ constant float SH_C4[] = {
     0.47308734787878004f,
     -1.7701307697799304f,
     0.6258357354491761f};
+
+inline float preview_unorm_channel(const float value) {
+    // Match the existing CPU RGBA path: NaN becomes zero, infinities clamp,
+    // and positive values truncate rather than round before UNorm storage.
+    if (isnan(value)) return 0.0f;
+    const float clamped = clamp(value, 0.0f, 1.0f);
+    return floor(clamped * 255.0f) / 255.0f;
+}
+
+kernel void float_rgb_to_preview_texture_kernel(
+    const device float* rgb [[buffer(0)]],
+    texture2d<float, access::write> output [[texture(0)]],
+    constant uint2& image_size [[buffer(1)]],
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= image_size.x || gid.y >= image_size.y) return;
+    const uint offset = (gid.y * image_size.x + gid.x) * 3;
+    output.write(float4(
+        preview_unorm_channel(rgb[offset]),
+        preview_unorm_channel(rgb[offset + 1]),
+        preview_unorm_channel(rgb[offset + 2]),
+        1.0f), gid);
+}
 
 inline uint num_sh_bases(const uint degree) {
     if (degree == 0)
@@ -498,7 +525,46 @@ inline void write_packed_float3(device float* arr, int idx, float3 val) {
     arr[3*idx+2] = val.z;
 }
 
+// Attribute layout 0 reads the established sorted per-intersection float3
+// arrays. Layout 1 extracts the Gaussian ID from the sorted key and gathers
+// the same values from the compact per-Gaussian projection arrays.
+struct RasterIntersectionAttributes {
+    float3 xy_opacity;
+    float3 conic;
+    float3 rgb;
+};
+
+inline RasterIntersectionAttributes load_raster_intersection_attributes(
+    constant uint64_t* sorted_keys,
+    constant float* xy_attributes,
+    constant float* conic_attributes,
+    constant float* rgb_attributes,
+    constant float* projected_opacities,
+    uint attribute_layout,
+    int intersection_index
+) {
+    RasterIntersectionAttributes attributes;
+    int source_index = intersection_index;
+    if (attribute_layout != 0u) {
+        source_index = int(uint(
+            sorted_keys[intersection_index] & 0xffffffffu));
+        const float2 xy = read_packed_float2(xy_attributes, source_index);
+        attributes.xy_opacity = float3(
+            xy.x, xy.y, projected_opacities[source_index]);
+    } else {
+        attributes.xy_opacity =
+            read_packed_float3(xy_attributes, source_index);
+    }
+    attributes.conic = read_packed_float3(conic_attributes, source_index);
+    attributes.rgb = read_packed_float3(rgb_attributes, source_index);
+    return attributes;
+}
+
 inline float4 read_packed_float4(constant float* arr, int idx) {
+    return float4(arr[4*idx], arr[4*idx+1], arr[4*idx+2], arr[4*idx+3]);
+}
+
+inline float4 read_packed_float4(device const float* arr, int idx) {
     return float4(arr[4*idx], arr[4*idx+1], arr[4*idx+2], arr[4*idx+3]);
 }
 
@@ -590,22 +656,29 @@ kernel void project_gaussians_forward_kernel(
     aabb[idx * 2 + 1] = aabb_y;
 }
 
-kernel void nd_rasterize_forward_kernel(
+inline void nd_rasterize_forward_impl(
     constant uint3& tile_bounds,
     constant uint3& img_size,
     constant uint& channels,
-    constant int* tile_bins, // int2
-    constant float* packed_xy_opac, // float3: (x, y, sigmoid(opacity))
-    constant float* packed_conic,   // float3
-    constant float* packed_rgb,     // float3: raw SH (NOT clamped)
+    constant int* tile_bins,
+    constant float* packed_xy_opac,
+    constant float* packed_conic,
+    constant float* packed_rgb,
     device float* final_Ts,
     device int* final_index,
     device float* out_img,
     constant float* background,
     constant uint2& blockDim,
-    uint2 blockIdx [[threadgroup_position_in_grid]],
-    uint2 threadIdx [[thread_position_in_threadgroup]],
-    uint tr [[thread_index_in_threadgroup]]
+    constant uint64_t* sorted_keys,
+    constant float* projected_opacities,
+    constant uint& attribute_layout,
+    uint2 blockIdx,
+    uint2 threadIdx,
+    uint tr,
+    const uint raster_block_size,
+    threadgroup float3* xy_opacity_batch,
+    threadgroup float3* conic_batch,
+    threadgroup float3* rgbs_batch
 ) {
     // Threadgroup-batched forward rasterization: all threads in a tile
     // cooperatively load Gaussian data into shared memory, then read from it.
@@ -621,12 +694,9 @@ kernel void nd_rasterize_forward_kernel(
 
     // which gaussians to look through in this tile
     int2 range = read_packed_int2(tile_bins, tile_id);
-    const int num_batches = (range.y - range.x + RAST_BLOCK_SIZE - 1) / RAST_BLOCK_SIZE;
-
-    // threadgroup shared memory for batch loading
-    threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
-    threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
-    threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    const int num_batches =
+        (range.y - range.x + (int)raster_block_size - 1) /
+        (int)raster_block_size;
 
     float T = 1.f;
     float3 pix_out = {0.f, 0.f, 0.f};
@@ -638,22 +708,24 @@ kernel void nd_rasterize_forward_kernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // each thread loads one gaussian into shared memory
-        int batch_start = range.x + RAST_BLOCK_SIZE * b;
+        int batch_start = range.x + (int)raster_block_size * b;
         int idx = batch_start + tr;
         if (idx < range.y) {
-            // Sequential reads from packed sorted-order buffers
-            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
-            conic_batch[tr] = read_packed_float3(packed_conic, idx);
+            const RasterIntersectionAttributes attributes =
+                load_raster_intersection_attributes(
+                sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
+                projected_opacities, attribute_layout, idx);
+            xy_opacity_batch[tr] = attributes.xy_opacity;
+            conic_batch[tr] = attributes.conic;
             // packed_rgb has raw SH output — clamp_min(raw + 0.5, 0)
-            const float3 raw_c = read_packed_float3(packed_rgb, idx);
-            rgbs_batch[tr] = max(raw_c + 0.5f, 0.0f);
+            rgbs_batch[tr] = max(attributes.rgb + 0.5f, 0.0f);
         }
         // wait for all threads to finish loading
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         if (done || !inside) continue;
 
-        int batch_size = min(RAST_BLOCK_SIZE, range.y - batch_start);
+        int batch_size = min((int)raster_block_size, range.y - batch_start);
 
         // process gaussians in this batch
         for (int t = 0; t < batch_size; ++t) {
@@ -703,6 +775,103 @@ kernel void nd_rasterize_forward_kernel(
         out_img[CHANNELS * pix_id + 1] = final_rgb.y;
         out_img[CHANNELS * pix_id + 2] = final_rgb.z;
     }
+}
+
+// The exact-intersection bins remain 16x16. These entrypoints vary only the
+// raster threadgroup that cooperatively loads each bin's Gaussian sequence.
+// Their buffer ABI is intentionally identical so the host can A/B the variants
+// without changing any render resources or per-pixel semantics.
+kernel void nd_rasterize_forward_kernel(
+    constant uint3& tile_bounds [[buffer(0)]],
+    constant uint3& img_size [[buffer(1)]],
+    constant uint& channels [[buffer(2)]],
+    constant int* tile_bins [[buffer(3)]],
+    constant float* packed_xy_opac [[buffer(4)]],
+    constant float* packed_conic [[buffer(5)]],
+    constant float* packed_rgb [[buffer(6)]],
+    device float* final_Ts [[buffer(7)]],
+    device int* final_index [[buffer(8)]],
+    device float* out_img [[buffer(9)]],
+    constant float* background [[buffer(10)]],
+    constant uint2& blockDim [[buffer(11)]],
+    constant uint64_t* sorted_keys [[buffer(12)]],
+    constant float* projected_opacities [[buffer(13)]],
+    constant uint& attribute_layout [[buffer(14)]],
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    threadgroup float3 xy_opacity_batch[8 * 8];
+    threadgroup float3 conic_batch[8 * 8];
+    threadgroup float3 rgbs_batch[8 * 8];
+    nd_rasterize_forward_impl(
+        tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
+        packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
+        blockDim, sorted_keys, projected_opacities, attribute_layout,
+        blockIdx, threadIdx, tr, 8 * 8,
+        xy_opacity_batch, conic_batch, rgbs_batch);
+}
+
+kernel void nd_rasterize_forward_16x8_kernel(
+    constant uint3& tile_bounds [[buffer(0)]],
+    constant uint3& img_size [[buffer(1)]],
+    constant uint& channels [[buffer(2)]],
+    constant int* tile_bins [[buffer(3)]],
+    constant float* packed_xy_opac [[buffer(4)]],
+    constant float* packed_conic [[buffer(5)]],
+    constant float* packed_rgb [[buffer(6)]],
+    device float* final_Ts [[buffer(7)]],
+    device int* final_index [[buffer(8)]],
+    device float* out_img [[buffer(9)]],
+    constant float* background [[buffer(10)]],
+    constant uint2& blockDim [[buffer(11)]],
+    constant uint64_t* sorted_keys [[buffer(12)]],
+    constant float* projected_opacities [[buffer(13)]],
+    constant uint& attribute_layout [[buffer(14)]],
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    threadgroup float3 xy_opacity_batch[16 * 8];
+    threadgroup float3 conic_batch[16 * 8];
+    threadgroup float3 rgbs_batch[16 * 8];
+    nd_rasterize_forward_impl(
+        tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
+        packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
+        blockDim, sorted_keys, projected_opacities, attribute_layout,
+        blockIdx, threadIdx, tr, 16 * 8,
+        xy_opacity_batch, conic_batch, rgbs_batch);
+}
+
+kernel void nd_rasterize_forward_16x16_kernel(
+    constant uint3& tile_bounds [[buffer(0)]],
+    constant uint3& img_size [[buffer(1)]],
+    constant uint& channels [[buffer(2)]],
+    constant int* tile_bins [[buffer(3)]],
+    constant float* packed_xy_opac [[buffer(4)]],
+    constant float* packed_conic [[buffer(5)]],
+    constant float* packed_rgb [[buffer(6)]],
+    device float* final_Ts [[buffer(7)]],
+    device int* final_index [[buffer(8)]],
+    device float* out_img [[buffer(9)]],
+    constant float* background [[buffer(10)]],
+    constant uint2& blockDim [[buffer(11)]],
+    constant uint64_t* sorted_keys [[buffer(12)]],
+    constant float* projected_opacities [[buffer(13)]],
+    constant uint& attribute_layout [[buffer(14)]],
+    uint2 blockIdx [[threadgroup_position_in_grid]],
+    uint2 threadIdx [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]]
+) {
+    threadgroup float3 xy_opacity_batch[16 * 16];
+    threadgroup float3 conic_batch[16 * 16];
+    threadgroup float3 rgbs_batch[16 * 16];
+    nd_rasterize_forward_impl(
+        tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
+        packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
+        blockDim, sorted_keys, projected_opacities, attribute_layout,
+        blockIdx, threadIdx, tr, 16 * 16,
+        xy_opacity_batch, conic_batch, rgbs_batch);
 }
 
 void sh_coeffs_to_color(
@@ -1018,10 +1187,24 @@ inline float warpSum(float val, const int warp_size, const uint lane) {
     return simd_sum(val);
 }
 
+// Mask layout is (byte stride per pixel, coverage byte offset). Camera cache
+// targets use packed RGBA alpha (4,3); standalone masks use (1,0).
+inline float training_mask_coverage(
+    constant uchar* training_mask, uint pixel, uint2 layout) {
+    return float(training_mask[pixel * layout.x + layout.y]) / 255.0f;
+}
+
+inline bool training_render_tile_active(
+    constant uchar* coverage_render_tiles, uint stride,
+    uint tile_x, uint tile_y) {
+    return stride == 0 ||
+        coverage_render_tiles[tile_y * stride + tile_x] != 0;
+}
+
 kernel void rasterize_backward_kernel(
     constant uint3& tile_bounds,
     constant uint2& img_size,
-    constant int32_t* gaussian_ids_sorted,
+    constant uint64_t* sorted_keys,
     constant int* tile_bins, // int2
     constant float* packed_xy_opac, // float3: (x, y, sigmoid(opacity))
     constant float* packed_conic,   // float3
@@ -1034,9 +1217,11 @@ kernel void rasterize_backward_kernel(
     device atomic_float* v_conic, // float3
     device atomic_float* v_rgb, // float3
     device atomic_float* v_opacity,
-    constant uchar* training_mask, // (H, W), ignored when stride is zero
-    constant uint& alpha_stride,
+    constant uchar* training_mask, // packed alpha or (H, W), disabled by x=0
+    constant uint2& alpha_layout,
     constant float& alpha_gradient_scale,
+    constant float* projected_opacities,
+    constant uint& attribute_layout,
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -1060,9 +1245,9 @@ kernel void rasterize_backward_kernel(
     float T_final = final_Ts[pix_id];
     float T = T_final;
     float v_alpha_pixel = 0.0f;
-    if (inside && alpha_stride != 0) {
-        const float target_alpha =
-            float(training_mask[i * alpha_stride + j]) / 255.0f;
+    if (inside && alpha_layout.x != 0) {
+        const float target_alpha = training_mask_coverage(
+            training_mask, i * img_size.x + j, alpha_layout);
         const float rendered_alpha = 1.0f - T_final;
         v_alpha_pixel = alpha_gradient_scale * (
             rendered_alpha > target_alpha ? 1.0f :
@@ -1119,11 +1304,14 @@ kernel void rasterize_backward_kernel(
         int batch_size = min(RAST_BLOCK_SIZE, batch_end + 1 - range.x);
         const int idx = batch_end - tr;
         if (idx >= range.x) {
-            id_batch[tr] = gaussian_ids_sorted[idx];
-            // Sequential reads from packed sorted-order buffers
-            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
-            conic_batch[tr] = read_packed_float3(packed_conic, idx);
-            rgbs_batch[tr] = read_packed_float3(packed_rgb, idx);
+            id_batch[tr] = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
+            const RasterIntersectionAttributes attributes =
+                load_raster_intersection_attributes(
+                sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
+                projected_opacities, attribute_layout, idx);
+            xy_opacity_batch[tr] = attributes.xy_opacity;
+            conic_batch[tr] = attributes.conic;
+            rgbs_batch[tr] = attributes.rgb;
         }
         // wait for other threads to collect the gaussians in batch
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1181,33 +1369,39 @@ kernel void rasterize_backward_kernel(
             float2 v_xy_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
             //initialize everything to 0, only set if the lane is valid
-            if(valid && alpha<0.999f){
-                // compute the current T for this gaussian
-                // alpha = opac * vis (guaranteed since alpha < 0.99 = min cap)
+            if (valid) {
+                // Recover the transmittance before this Gaussian. Forward uses
+                // the same capped alpha, so this must also run when the 0.999
+                // cap binds or every nearer Gaussian receives a T that is
+                // 1000x too small.
                 float ra = 1.f / (1.f - alpha);
                 T *= ra;
                 const float fac = alpha * T;
-                float v_alpha = 0.f;
                 v_rgb_local = fac * v_out;
 
                 // b_rgb has raw SH output; clamp inline: max(raw + 0.5, 0)
                 const float3 rgb = max(b_rgb + 0.5f, 0.f);
                 // contribution from this pixel + background
-                v_alpha += dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
-                v_alpha += v_alpha_pixel * T_final * ra;
+                const float v_alpha =
+                    dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out) +
+                    v_alpha_pixel * T_final * ra;
                 // update the running sum
                 buffer = fma(rgb, fac, buffer);
 
-                // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
-                const float v_sigma = -alpha * v_alpha;
-                v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
-                                                           delta.x * delta.y,
-                                                           delta.y * delta.y);
-                v_xy_local = v_sigma * float2(
-                    fma(b_conic.x, delta.x, b_conic.y * delta.y),
-                    fma(b_conic.y, delta.x, b_conic.z * delta.y));
-                // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
-                v_opacity_local = -v_sigma * (1.f - opac);
+                // The cap makes alpha locally constant in sigma and opacity,
+                // but it does not remove the color gradient above.
+                if (alpha < 0.999f) {
+                    // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
+                    const float v_sigma = -alpha * v_alpha;
+                    v_conic_local = (0.5f * v_sigma) * float3(
+                        delta.x * delta.x, delta.x * delta.y,
+                        delta.y * delta.y);
+                    v_xy_local = v_sigma * float2(
+                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
+                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
+                    // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
+                    v_opacity_local = -v_sigma * (1.f - opac);
+                }
             }
 
             v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
@@ -1478,7 +1672,8 @@ void project_cov3d_ewa_vjp(
     v_mean3d[2] += (float)dot(v_t, W[2]);
 }
 
-// Thread-local overload: reads cov3d from registers, writes v_cov3d to registers
+// Thread-local overload: reads cov3d from registers and keeps both output
+// cotangents in registers for the terminal backward/update kernel.
 void project_cov3d_ewa_vjp(
     thread float* cov3d,
     constant float* viewmat,
@@ -1487,7 +1682,7 @@ void project_cov3d_ewa_vjp(
     const float tan_fovx,
     const float tan_fovy,
     float3 v_cov2d,
-    device float* v_mean3d,
+    thread float* v_mean3d,
     thread float* v_cov3d,
     float3 p_view
 ) {
@@ -1705,14 +1900,14 @@ void scale_rot_to_cov3d_vjp(
     v_quat[3] = out_v_quat.w;
 }
 
-// Thread-local overload: reads v_cov3d from registers
+// Thread-local overload: keeps every cotangent in registers.
 void scale_rot_to_cov3d_vjp(
     const float3 scale,
     const float glob_scale,
     const float4 quat,
     const thread float* v_cov3d,
-    device float* v_scale,
-    device float* v_quat
+    thread float* v_scale,
+    thread float* v_quat
 ) {
     float3x3 v_V = float3x3(
         v_cov3d[0],
@@ -1755,7 +1950,6 @@ kernel void project_gaussians_backward_kernel(
     constant int* radii,
     constant float* conics, // float3
     constant float* v_xy, // float2
-    constant float* v_depth,
     constant float* v_conic, // float3
     device float* v_cov2d, // float3
     device float* v_cov3d,
@@ -1774,15 +1968,6 @@ kernel void project_gaussians_backward_kernel(
     write_packed_float3(
         v_mean3d, idx, 
         project_pix_vjp(projmat, p_world, img_size, read_packed_float2(v_xy, idx))
-    );
-
-    // get z gradient contribution to mean3d gradient
-    // z = viemwat[8] * mean3d.x + viewmat[9] * mean3d.y + viewmat[10] *
-    // mean3d.z + viewmat[11]
-    float v_z = v_depth[idx];
-    write_packed_float3(
-        v_mean3d, idx, 
-        read_packed_float3(v_mean3d, idx) + float3(viewmat[8], viewmat[9], viewmat[10]) * v_z
     );
 
     // get v_cov2d
@@ -1847,58 +2032,6 @@ kernel void compute_cov2d_bounds_kernel(
     radii[row] = radius;
 }
 
-// Fused Adam optimizer kernel: single-pass update for params, exp_avg, exp_avg_sq.
-// Precomputed on CPU: step_size = lr / (1 - beta1^t), bc2_sqrt = sqrt(1 - beta2^t)
-// Fused per-step gradient accumulation for densification.
-// Replaces ~8 MPS dispatches (boolean mask, vector_norm, index_put_, max) with 1 kernel.
-kernel void accumulate_grad_stats_kernel(
-    constant int& num_points,
-    constant int* radii [[buffer(1)]],
-    constant float* xys_grad [[buffer(2)]],     // (N, 2) packed float2
-    device float* vis_counts [[buffer(3)]],      // (N,) in-place
-    device float* xys_grad_norm [[buffer(4)]],   // (N,) in-place
-    device float* max_2d_size [[buffer(5)]],     // (N,) in-place
-    constant float& inv_max_dim [[buffer(6)]],   // 1.0 / max(H, W)
-    uint idx [[thread_position_in_grid]]
-) {
-    if (idx >= (uint)num_points) return;
-    if (radii[idx] <= 0) return;
-
-    vis_counts[idx] += 1.0f;
-
-    float gx = xys_grad[idx * 2];
-    float gy = xys_grad[idx * 2 + 1];
-    xys_grad_norm[idx] += sqrt(gx * gx + gy * gy);
-
-    float r = (float)radii[idx] * inv_max_dim;
-    max_2d_size[idx] = max(max_2d_size[idx], r);
-}
-
-kernel void fused_adam_kernel(
-    device float * params [[buffer(0)]],
-    device const float * grads [[buffer(1)]],
-    device float * exp_avg [[buffer(2)]],
-    device float * exp_avg_sq [[buffer(3)]],
-    constant float & step_size [[buffer(4)]],
-    constant float & beta1 [[buffer(5)]],
-    constant float & beta2 [[buffer(6)]],
-    constant float & bc2_sqrt [[buffer(7)]],
-    constant float & eps [[buffer(8)]],
-    constant uint & n [[buffer(9)]],
-    uint tid [[thread_position_in_grid]]
-) {
-    if (tid >= n) return;
-
-    float g = grads[tid];
-    float m = fma(beta1, exp_avg[tid], (1.0f - beta1) * g);
-    float v = fma(beta2, exp_avg_sq[tid], (1.0f - beta2) * g * g);
-
-    params[tid] -= step_size * m / (sqrt(v) / bc2_sqrt + eps);
-
-    exp_avg[tid] = m;
-    exp_avg_sq[tid] = v;
-}
-
 // ===== Optional camera-pose refinement =====
 
 kernel void prepare_camera_pose_kernel(
@@ -1955,6 +2088,8 @@ kernel void prepare_camera_pose_kernel(
 
 struct PoseAdamParams {
     uint pose_offset;
+    uint preconditioner_offset;
+    uint conditioned;
     float step_size;
     float beta1;
     float beta2;
@@ -1971,9 +2106,14 @@ kernel void camera_pose_adam_kernel(
     device float* exp_avg,
     device float* exp_avg_sq,
     constant PoseAdamParams& params,
+    device atomic_uint* attempt_status,
+    constant uint& attempt_gating_enabled,
+    constant float* preconditioners,
     uint index [[thread_position_in_grid]]
 ) {
-    if (index != 0) return;
+    if (index != 0 ||
+        (attempt_gating_enabled != 0u &&
+         training_attempt_failed(attempt_status))) return;
 
     float3 translation = float3(
         pose_deltas[params.pose_offset],
@@ -1996,24 +2136,81 @@ kernel void camera_pose_adam_kernel(
             rotation[0][1] - rotation[1][0]);
 
     float update[6];
-    for (uint component = 0; component < 6; ++component) {
-        const uint parameter_index = params.pose_offset + component;
-        float regularization_gradient = component < 3
-            ? params.regularization * translation[component] /
-                translation_scale2
-            : rotation_regularizer[component - 3];
-        const float gradient =
-            pose_gradient[component] + regularization_gradient;
-        const float first_moment = fma(
-            params.beta1, exp_avg[parameter_index],
-            (1.0f - params.beta1) * gradient);
-        const float second_moment = fma(
-            params.beta2, exp_avg_sq[parameter_index],
-            (1.0f - params.beta2) * gradient * gradient);
-        update[component] = -params.step_size * first_moment /
-            (sqrt(second_moment) / params.bias_correction2_sqrt + params.eps);
-        exp_avg[parameter_index] = first_moment;
-        exp_avg_sq[parameter_index] = second_moment;
+    if (params.conditioned == 0u) {
+        // Preserve the established raw bounded-SE(3) optimizer exactly.
+        for (uint component = 0; component < 6; ++component) {
+            const uint parameter_index = params.pose_offset + component;
+            float regularization_gradient = component < 3
+                ? params.regularization * translation[component] /
+                    translation_scale2
+                : rotation_regularizer[component - 3];
+            const float gradient =
+                pose_gradient[component] + regularization_gradient;
+            const float first_moment = fma(
+                params.beta1, exp_avg[parameter_index],
+                (1.0f - params.beta1) * gradient);
+            const float second_moment = fma(
+                params.beta2, exp_avg_sq[parameter_index],
+                (1.0f - params.beta2) * gradient * gradient);
+            update[component] = -params.step_size * first_moment /
+                (sqrt(second_moment) / params.bias_correction2_sqrt + params.eps);
+            exp_avg[parameter_index] = first_moment;
+            exp_avg_sq[parameter_index] = second_moment;
+        }
+    } else {
+        // CamP keeps regularization and bounds in physical pose space. Adam
+        // operates in the fixed decorrelated tangent coordinates, then its
+        // update is mapped back before the usual SE(3) retraction.
+        float metric_gradient[6];
+        for (uint component = 0; component < 6; ++component) {
+            const float regularization_gradient = component < 3
+                ? params.regularization * translation[component] /
+                    translation_scale2
+                : rotation_regularizer[component - 3];
+            metric_gradient[component] =
+                pose_gradient[component] + regularization_gradient;
+        }
+
+        float latent_update[6];
+        for (uint latent_component = 0; latent_component < 6;
+             ++latent_component) {
+            float latent_gradient = 0.0f;
+            for (uint metric_component = 0; metric_component < 6;
+                 ++metric_component) {
+                latent_gradient = fma(
+                    preconditioners[
+                        params.preconditioner_offset +
+                        metric_component * 6u + latent_component],
+                    metric_gradient[metric_component], latent_gradient);
+            }
+            const uint parameter_index =
+                params.pose_offset + latent_component;
+            const float first_moment = fma(
+                params.beta1, exp_avg[parameter_index],
+                (1.0f - params.beta1) * latent_gradient);
+            const float second_moment = fma(
+                params.beta2, exp_avg_sq[parameter_index],
+                (1.0f - params.beta2) * latent_gradient * latent_gradient);
+            latent_update[latent_component] =
+                -params.step_size * first_moment /
+                (sqrt(second_moment) / params.bias_correction2_sqrt + params.eps);
+            exp_avg[parameter_index] = first_moment;
+            exp_avg_sq[parameter_index] = second_moment;
+        }
+
+        for (uint metric_component = 0; metric_component < 6;
+             ++metric_component) {
+            float metric_update = 0.0f;
+            for (uint latent_component = 0; latent_component < 6;
+                 ++latent_component) {
+                metric_update = fma(
+                    preconditioners[
+                        params.preconditioner_offset +
+                        metric_component * 6u + latent_component],
+                    latent_update[latent_component], metric_update);
+            }
+            update[metric_component] = metric_update;
+        }
     }
 
     const float3 increment_translation_tangent =
@@ -2065,7 +2262,7 @@ kernel void project_and_sh_forward_kernel(
     device float* depths,
     device int* radii,
     device float* conics,
-    device atomic_uint* tile_counts,
+    device atomic_uint* tile_count_storage,
     // SH args
     constant uint& degree,
     constant uint& degrees_to_use,
@@ -2075,6 +2272,9 @@ kernel void project_and_sh_forward_kernel(
     device float* colors,
     device float* aabb, // float2: per-axis pixel extents
     constant uint& pose_enabled,
+    constant uchar* coverage_render_tiles,
+    constant uint& coverage_render_tile_stride,
+    constant uint& tile_count_mode,
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -2136,15 +2336,37 @@ kernel void project_and_sh_forward_kernel(
     aabb[idx * 2] = aabb_x;
     aabb[idx * 2 + 1] = aabb_y;
 
-    // Phase one of the exact intersection pipeline. The host waits for this
-    // command buffer, builds checked inclusive tile offsets from these counts,
-    // and allocates enough compact storage before any intersection is written.
-    for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
-        for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
-            const uint tile_id = tile_y * tile_bounds.x + tile_x;
-            atomic_fetch_add_explicit(
-                &tile_counts[tile_id], 1u, memory_order_relaxed);
+    // Phase one of the exact intersection pipeline. The established mode
+    // enumerates every covered tile. The difference-grid A/B records four
+    // signed rectangle corners and defers whole-tile coverage masking until
+    // after the horizontal and vertical scans.
+    if (tile_count_mode == 0u) {
+        for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
+            for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
+                if (!training_render_tile_active(
+                        coverage_render_tiles, coverage_render_tile_stride,
+                        tile_x, tile_y)) {
+                    continue;
+                }
+                const uint tile_id = tile_y * tile_bounds.x + tile_x;
+                atomic_fetch_add_explicit(
+                    &tile_count_storage[tile_id], 1u, memory_order_relaxed);
+            }
         }
+    } else {
+        const uint diff_width = tile_bounds.x + 1u;
+        const uint top_left = tile_min.y * diff_width + tile_min.x;
+        const uint top_right = tile_min.y * diff_width + tile_max.x;
+        const uint bottom_left = tile_max.y * diff_width + tile_min.x;
+        const uint bottom_right = tile_max.y * diff_width + tile_max.x;
+        atomic_fetch_add_explicit(
+            &tile_count_storage[top_left], 1u, memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &tile_count_storage[top_right], uint(-1), memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &tile_count_storage[bottom_left], uint(-1), memory_order_relaxed);
+        atomic_fetch_add_explicit(
+            &tile_count_storage[bottom_right], 1u, memory_order_relaxed);
     }
 
     // SH: compute colors for non-culled gaussians (reuse p_world from registers)
@@ -2155,6 +2377,51 @@ kernel void project_and_sh_forward_kernel(
     uint rest_idx = (num_bases - 1) * num_channels * idx;
     uint idx_col = num_channels * idx;
     sh_coeffs_to_color(degrees_to_use, viewdir, &(features_dc[dc_idx]), &(features_rest[rest_idx]), &(colors[idx_col]));
+}
+
+// Difference-grid count pass 2a. Each thread owns one complete grid row, so the
+// signed horizontal prefix is safely written in place without synchronization.
+kernel void tile_count_diff_horizontal_kernel(
+    device int* diff                         [[buffer(0)]],
+    constant uint3& tile_bounds              [[buffer(1)]],
+    uint row [[thread_position_in_grid]]
+) {
+    if (row > tile_bounds.y) return;
+
+    const uint diff_width = tile_bounds.x + 1u;
+    const uint row_start = row * diff_width;
+    int running = 0;
+    for (uint tile_x = 0; tile_x <= tile_bounds.x; ++tile_x) {
+        const uint index = row_start + tile_x;
+        running += diff[index];
+        diff[index] = running;
+    }
+}
+
+// Difference-grid count pass 2b. Each thread owns one tile column and performs
+// its signed vertical prefix. Coverage-only training removes inactive tiles
+// here, after the exact unmasked rectangle counts have been reconstructed.
+kernel void tile_count_diff_vertical_kernel(
+    constant int* horizontal_diff            [[buffer(0)]],
+    device uint* tile_counts                  [[buffer(1)]],
+    constant uint3& tile_bounds               [[buffer(2)]],
+    constant uchar* coverage_render_tiles    [[buffer(3)]],
+    constant uint& coverage_render_tile_stride [[buffer(4)]],
+    uint tile_x [[thread_position_in_grid]]
+) {
+    if (tile_x >= tile_bounds.x) return;
+
+    const uint diff_width = tile_bounds.x + 1u;
+    int running = 0;
+    for (uint tile_y = 0; tile_y < tile_bounds.y; ++tile_y) {
+        running += horizontal_diff[tile_y * diff_width + tile_x];
+        const uint tile_id = tile_y * tile_bounds.x + tile_x;
+        tile_counts[tile_id] = training_render_tile_active(
+            coverage_render_tiles, coverage_render_tile_stride,
+            tile_x, tile_y)
+            ? uint(running)
+            : 0u;
+    }
 }
 
 // Adam update helper — applies one Adam step to a single element.
@@ -2191,24 +2458,200 @@ inline void atomic_add_threadgroup_float(
     }
 }
 
-// Packed Adam hyperparameters for SH groups (passed via setBytes)
-struct SHAdamParams {
+// Packed Adam hyperparameters for the appearance groups (passed via setBytes).
+struct SHOpacityAdamParams {
     float dc_step_size;
     float dc_bc2_sqrt;
     float rest_step_size;
     float rest_bc2_sqrt;
+    float opacity_step_size;
+    float opacity_bc2_sqrt;
     float beta1;
     float beta2;
     float eps;
 };
 
-kernel void project_and_sh_backward_kernel(
-    // Projection backward args
+// SH and opacity gradients are already materialized by raster backward. Apply
+// their Adam updates before geometry mutates the means used for the SH viewdir.
+// SH retains its existing visibility and active-degree gates. Opacity still
+// updates every Gaussian so its former full-tensor Adam decay is preserved.
+kernel void sh_opacity_backward_adam_kernel(
     constant int& num_points,
     constant float* means3d,
-    constant float* scales,
+    constant int* radii,
+    constant uint& degree,
+    constant uint& degrees_to_use,
+    constant float3& cam_pos,
+    constant float* v_colors,
+    device float* features_dc,
+    device float* features_rest,
+    device float* dc_exp_avg,
+    device float* dc_exp_avg_sq,
+    device float* rest_exp_avg,
+    device float* rest_exp_avg_sq,
+    constant float* v_opacity,
+    device float* opacities,
+    device float* opacity_exp_avg,
+    device float* opacity_exp_avg_sq,
+    constant SHOpacityAdamParams& adam_hp,
+    device atomic_uint* attempt_status,
+    constant uint& attempt_gating_enabled,
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)num_points ||
+        (attempt_gating_enabled != 0u &&
+         training_attempt_failed(attempt_status))) return;
+
+    const bool active = radii[idx] > 0;
+    const float3 color_gradient = active
+        ? read_packed_float3(v_colors, idx)
+        : float3(0.0f);
+    const uint num_channels = 3;
+    const uint num_bases = num_sh_bases(degree);
+    const uint dc_idx = num_channels * idx;
+    const uint rest_idx = (num_bases - 1) * num_channels * idx;
+
+    if (active) {
+        for (uint c = 0; c < num_channels; ++c) {
+            const float g = SH_C0 * color_gradient[c];
+            adam_update_element(features_dc[dc_idx + c], dc_exp_avg[dc_idx + c], dc_exp_avg_sq[dc_idx + c],
+                               g, adam_hp.dc_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.dc_bc2_sqrt, adam_hp.eps);
+        }
+    }
+
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+    float xx = 0.0f;
+    float xy = 0.0f;
+    float xz = 0.0f;
+    float yy = 0.0f;
+    float yz = 0.0f;
+    float zz = 0.0f;
+    if (active && degrees_to_use >= 1) {
+        const float3 viewdir = normalize(read_packed_float3(means3d, idx) - cam_pos);
+        x = viewdir.x;
+        y = viewdir.y;
+        z = viewdir.z;
+        xx = x * x;
+        xy = x * y;
+        xz = x * z;
+        yy = y * y;
+        yz = y * z;
+        zz = z * z;
+    }
+
+    if (active && degree >= 1 && degrees_to_use >= 1) {
+        const float basis_values[3] = {
+            -SH_C1 * y,
+            SH_C1 * z,
+            -SH_C1 * x,
+        };
+        for (uint basis = 0; basis < 3; ++basis) {
+            for (uint c = 0; c < num_channels; ++c) {
+                const uint i = rest_idx + basis * num_channels + c;
+                adam_update_element(
+                    features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
+                    basis_values[basis] * color_gradient[c],
+                    adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2,
+                    adam_hp.rest_bc2_sqrt, adam_hp.eps);
+            }
+        }
+    }
+    if (active && degree >= 2 && degrees_to_use >= 2) {
+        const float basis_values[5] = {
+            SH_C2[0] * xy,
+            SH_C2[1] * yz,
+            SH_C2[2] * (2.0f * zz - xx - yy),
+            SH_C2[3] * xz,
+            SH_C2[4] * (xx - yy),
+        };
+        for (uint basis = 0; basis < 5; ++basis) {
+            for (uint c = 0; c < num_channels; ++c) {
+                const uint i = rest_idx + (3 + basis) * num_channels + c;
+                adam_update_element(
+                    features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
+                    basis_values[basis] * color_gradient[c],
+                    adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2,
+                    adam_hp.rest_bc2_sqrt, adam_hp.eps);
+            }
+        }
+    }
+    if (active && degree >= 3 && degrees_to_use >= 3) {
+        const float basis_values[7] = {
+            SH_C3[0] * y * (3.0f * xx - yy),
+            SH_C3[1] * xy * z,
+            SH_C3[2] * y * (4.0f * zz - xx - yy),
+            SH_C3[3] * z *
+                (2.0f * zz - 3.0f * xx - 3.0f * yy),
+            SH_C3[4] * x * (4.0f * zz - xx - yy),
+            SH_C3[5] * z * (xx - yy),
+            SH_C3[6] * x * (xx - 3.0f * yy),
+        };
+        for (uint basis = 0; basis < 7; ++basis) {
+            for (uint c = 0; c < num_channels; ++c) {
+                const uint i = rest_idx + (8 + basis) * num_channels + c;
+                adam_update_element(
+                    features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
+                    basis_values[basis] * color_gradient[c],
+                    adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2,
+                    adam_hp.rest_bc2_sqrt, adam_hp.eps);
+            }
+        }
+    }
+    if (active && degree >= 4 && degrees_to_use >= 4) {
+        const float basis_values[9] = {
+            SH_C4[0] * xy * (xx - yy),
+            SH_C4[1] * yz * (3.0f * xx - yy),
+            SH_C4[2] * xy * (7.0f * zz - 1.0f),
+            SH_C4[3] * yz * (7.0f * zz - 3.0f),
+            SH_C4[4] * (zz * (35.0f * zz - 30.0f) + 3.0f),
+            SH_C4[5] * xz * (7.0f * zz - 3.0f),
+            SH_C4[6] * (xx - yy) * (7.0f * zz - 1.0f),
+            SH_C4[7] * xz * (xx - 3.0f * yy),
+            SH_C4[8] *
+                (xx * (xx - 3.0f * yy) - yy * (3.0f * xx - yy)),
+        };
+        for (uint basis = 0; basis < 9; ++basis) {
+            for (uint c = 0; c < num_channels; ++c) {
+                const uint i = rest_idx + (15 + basis) * num_channels + c;
+                adam_update_element(
+                    features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
+                    basis_values[basis] * color_gradient[c],
+                    adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2,
+                    adam_hp.rest_bc2_sqrt, adam_hp.eps);
+            }
+        }
+    }
+
+    const float opacity_gradient = active ? v_opacity[idx] : 0.0f;
+    adam_update_element(
+        opacities[idx], opacity_exp_avg[idx], opacity_exp_avg_sq[idx],
+        opacity_gradient, adam_hp.opacity_step_size, adam_hp.beta1,
+        adam_hp.beta2, adam_hp.opacity_bc2_sqrt, adam_hp.eps);
+}
+
+struct GeometryAdamParams {
+    float mean_step_size;
+    float mean_bc2_sqrt;
+    float scale_step_size;
+    float scale_bc2_sqrt;
+    float quat_step_size;
+    float quat_bc2_sqrt;
+    float beta1;
+    float beta2;
+    float eps;
+};
+
+// Terminal geometry backward pass. Geometry cotangents never leave registers:
+// this kernel immediately updates parameters and Adam state, and folds in the
+// per-Gaussian densification statistics while v_xy is still hot.
+kernel void project_backward_adam_kernel(
+    constant int& num_points,
+    device float* means3d,
+    device float* scales,
     constant float& glob_scale,
-    constant float* quats,
+    device float* quats,
     constant float* viewmat,
     constant float* projmat,
     constant float4& intrins,
@@ -2216,28 +2659,33 @@ kernel void project_and_sh_backward_kernel(
     constant int* radii,
     constant float* conics,
     constant float* v_xy,
-    constant float* v_depth,
     constant float* v_conic,
-    device float* v_mean3d,
-    device float* v_scale,
-    device float* v_quat,
-    // SH backward + fused Adam args
-    constant uint& degree,
-    constant uint& degrees_to_use,
-    constant float3& cam_pos,
-    constant float* v_colors,
-    device float* features_dc,         // params (read-write for Adam)
-    device float* features_rest,       // params (read-write for Adam)
-    device float* dc_exp_avg,          // Adam state
-    device float* dc_exp_avg_sq,
-    device float* rest_exp_avg,
-    device float* rest_exp_avg_sq,
-    constant SHAdamParams& adam_hp,
+    device float* mean_exp_avg,
+    device float* mean_exp_avg_sq,
+    device float* scale_exp_avg,
+    device float* scale_exp_avg_sq,
+    device float* quat_exp_avg,
+    device float* quat_exp_avg_sq,
+    constant GeometryAdamParams& adam_hp,
     constant uint& pose_enabled,
     device atomic_float* pose_gradient,
+    constant uint& collect_densification_stats,
+    device float* vis_counts,
+    device float* xys_grad_norm,
+    device float* max_2d_size,
+    constant float& inv_max_dim,
+    device atomic_uint* attempt_status,
+    constant uint& attempt_gating_enabled,
     uint idx [[thread_position_in_grid]],
     uint thread_index [[thread_index_in_threadgroup]]
 ) {
+    // This must precede the optional pose-reduction barriers below. The status
+    // is immutable after exact sorting, so every thread in a group takes the
+    // same branch and an overflow attempt cannot decay Adam state or collect
+    // densification statistics.
+    if (attempt_gating_enabled != 0u &&
+        training_attempt_failed(attempt_status)) return;
+
     threadgroup atomic_uint pose_group_gradient[6];
     if (pose_enabled != 0) {
         if (thread_index == 0) {
@@ -2250,129 +2698,94 @@ kernel void project_and_sh_backward_kernel(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    const bool active =
-        idx < (uint)num_points && radii[idx] > 0;
-    float3 p_world = float3(0.0f);
+    const bool in_bounds = idx < (uint)num_points;
+    const bool active = in_bounds && radii[idx] > 0;
+    float local_v_mean3d[3] = {0.0f, 0.0f, 0.0f};
+    float local_v_scale[3] = {0.0f, 0.0f, 0.0f};
+    float local_v_quat[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
     if (active) {
-    p_world = read_packed_float3(means3d, idx);
-    const float fx = intrins.x;
-    const float fy = intrins.y;
+        const float3 p_world = read_packed_float3(means3d, idx);
+        const float fx = intrins.x;
+        const float fy = intrins.y;
+        const float3 p_view = transform_4x3(viewmat, p_world);
+        float3 pose_v_p_view = float3(0.0f);
+        float3x3 pose_v_view_rotation = float3x3(0.0f);
 
-    const float3 p_view = transform_4x3(viewmat, p_world);
-    float3 pose_v_p_view = float3(0.0f);
-    float3x3 pose_v_view_rotation = float3x3(0.0f);
-    if (pose_enabled != 0) {
-        pose_v_p_view = project_view_pix_vjp(
-            p_view, fx, fy, read_packed_float2(v_xy, idx));
-        pose_v_p_view.z += v_depth[idx];
-    } else {
-        // Preserve the canonical projection VJP arithmetic exactly when pose
-        // refinement is disabled.
-        write_packed_float3(
-            v_mean3d, idx,
-            project_pix_vjp(
-                projmat, p_world, img_size, read_packed_float2(v_xy, idx))
-        );
-        write_packed_float3(
-            v_mean3d, idx,
-            read_packed_float3(v_mean3d, idx) +
-                float3(viewmat[8], viewmat[9], viewmat[10]) * v_depth[idx]
-        );
-    }
+        if (pose_enabled != 0) {
+            pose_v_p_view = project_view_pix_vjp(
+                p_view, fx, fy, read_packed_float2(v_xy, idx));
+        } else {
+            // Preserve the canonical projection VJP arithmetic exactly when pose
+            // refinement is disabled.
+            const float3 mean_gradient = project_pix_vjp(
+                projmat, p_world, img_size, read_packed_float2(v_xy, idx));
+            local_v_mean3d[0] = mean_gradient.x;
+            local_v_mean3d[1] = mean_gradient.y;
+            local_v_mean3d[2] = mean_gradient.z;
+        }
 
-    // v_cov2d from v_conic (thread-local, no device memory round-trip)
-    float local_v_cov2d[3];
-    cov2d_to_conic_vjp(
-        read_packed_float3(conics, idx),
-        read_packed_float3(v_conic, idx),
-        local_v_cov2d
-    );
+        float local_v_cov2d[3];
+        cov2d_to_conic_vjp(
+            read_packed_float3(conics, idx),
+            read_packed_float3(v_conic, idx),
+            local_v_cov2d);
 
-    // Recompute cov3d from scales+quats (avoids saving/reading 3.6MB tensor)
-    float3 exp_scale = exp(read_packed_float3(scales, idx));
-    float4 quat = read_packed_float4(quats, idx);
-    float local_cov3d[6];
-    scale_rot_to_cov3d(exp_scale, glob_scale, quat, local_cov3d);
+        const float3 exp_scale = exp(read_packed_float3(scales, idx));
+        const float4 quat = read_packed_float4(quats, idx);
+        float local_cov3d[6];
+        scale_rot_to_cov3d(exp_scale, glob_scale, quat, local_cov3d);
 
-    // v_cov3d (thread-local) and v_mean3d contribution
-    float tan_fovx = 0.5f * (float)img_size.x / fx;
-    float tan_fovy = 0.5f * (float)img_size.y / fy;
-    float local_v_cov3d[6];
-    if (pose_enabled != 0) {
-        float3 covariance_v_p_view;
-        project_cov3d_ewa_pose_vjp(
-            local_cov3d,
-            viewmat,
-            fx,
-            fy,
-            tan_fovx,
-            tan_fovy,
-            float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
-            local_v_cov3d,
-            covariance_v_p_view,
-            pose_v_view_rotation,
-            p_view
-        );
-        pose_v_p_view += covariance_v_p_view;
+        const float tan_fovx = 0.5f * (float)img_size.x / fx;
+        const float tan_fovy = 0.5f * (float)img_size.y / fy;
+        float local_v_cov3d[6];
+        if (pose_enabled != 0) {
+            float3 covariance_v_p_view;
+            project_cov3d_ewa_pose_vjp(
+                local_cov3d, viewmat, fx, fy, tan_fovx, tan_fovy,
+                float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
+                local_v_cov3d, covariance_v_p_view,
+                pose_v_view_rotation, p_view);
+            pose_v_p_view += covariance_v_p_view;
 
-        const float3x3 W = view_rotation(viewmat);
-        write_packed_float3(
-            v_mean3d, idx,
-            float3(
-                dot(pose_v_p_view, W[0]),
-                dot(pose_v_p_view, W[1]),
-                dot(pose_v_p_view, W[2]))
-        );
+            const float3x3 W = view_rotation(viewmat);
+            local_v_mean3d[0] = dot(pose_v_p_view, W[0]);
+            local_v_mean3d[1] = dot(pose_v_p_view, W[1]);
+            local_v_mean3d[2] = dot(pose_v_p_view, W[2]);
 
-        // Gradient for a positive local left perturbation Exp([v,w]) * V.
-        // Appearance direction is deliberately detached: this geometric pose
-        // optimizer follows the renderer's existing mean-gradient policy.
-        const float3 translation_gradient = pose_v_p_view;
-        const float3 rotation_gradient =
-            cross(p_view, pose_v_p_view) +
-            cross(W[0], pose_v_view_rotation[0]) +
-            cross(W[1], pose_v_view_rotation[1]) +
-            cross(W[2], pose_v_view_rotation[2]);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[0], translation_gradient.x);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[1], translation_gradient.y);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[2], translation_gradient.z);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[3], rotation_gradient.x);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[4], rotation_gradient.y);
-        atomic_add_threadgroup_float(
-            &pose_group_gradient[5], rotation_gradient.z);
-    } else {
-        project_cov3d_ewa_vjp(
-            local_cov3d,
-            viewmat,
-            fx,
-            fy,
-            tan_fovx,
-            tan_fovy,
-            float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
-            &(v_mean3d[3*idx]),
-            local_v_cov3d,
-            p_view
-        );
-    }
+            // Appearance direction is deliberately detached: the pose
+            // optimizer follows the renderer's existing geometry-only policy.
+            const float3 translation_gradient = pose_v_p_view;
+            const float3 rotation_gradient =
+                cross(p_view, pose_v_p_view) +
+                cross(W[0], pose_v_view_rotation[0]) +
+                cross(W[1], pose_v_view_rotation[1]) +
+                cross(W[2], pose_v_view_rotation[2]);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[0], translation_gradient.x);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[1], translation_gradient.y);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[2], translation_gradient.z);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[3], rotation_gradient.x);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[4], rotation_gradient.y);
+            atomic_add_threadgroup_float(
+                &pose_group_gradient[5], rotation_gradient.z);
+        } else {
+            project_cov3d_ewa_vjp(
+                local_cov3d, viewmat, fx, fy, tan_fovx, tan_fovy,
+                float3(local_v_cov2d[0], local_v_cov2d[1], local_v_cov2d[2]),
+                local_v_mean3d, local_v_cov3d, p_view);
+        }
 
-    // v_scale and v_quat (reads v_cov3d from thread-local)
-    scale_rot_to_cov3d_vjp(
-        exp_scale,
-        glob_scale,
-        quat,
-        local_v_cov3d,
-        &(v_scale[3*idx]),
-        &(v_quat[4*idx])
-    );
-    // Chain rule: dL/d(log_s) = dL/d(exp_s) * exp(log_s)
-    v_scale[3*idx + 0] *= exp_scale.x;
-    v_scale[3*idx + 1] *= exp_scale.y;
-    v_scale[3*idx + 2] *= exp_scale.z;
+        scale_rot_to_cov3d_vjp(
+            exp_scale, glob_scale, quat, local_v_cov3d,
+            local_v_scale, local_v_quat);
+        local_v_scale[0] *= exp_scale.x;
+        local_v_scale[1] *= exp_scale.y;
+        local_v_scale[2] *= exp_scale.z;
     }
 
     if (pose_enabled != 0) {
@@ -2388,81 +2801,40 @@ kernel void project_and_sh_backward_kernel(
             }
         }
     }
-    if (!active) return;
+    if (!in_bounds) return;
 
-    // ---- Fused SH backward + Adam ----
-    // Compute SH gradients in registers and apply Adam inline.
-    // Eliminates v_features_dc/v_features_rest write+read round-trip (~600 MB/iter at 1.6M gaussians).
-    float3 viewdir = normalize(p_world - cam_pos);
-    const uint num_channels = 3;
-    uint num_bases = num_sh_bases(degree);
-    uint dc_idx = num_channels * idx;
-    uint rest_idx = (num_bases - 1) * num_channels * idx;
-    uint idx_col = num_channels * idx;
-
-    float vc[3] = { v_colors[idx_col], v_colors[idx_col + 1], v_colors[idx_col + 2] };
-
-    // DC: grad = SH_C0 * v_colors[c]
-    for (int c = 0; c < 3; c++) {
-        float g = SH_C0 * vc[c];
-        adam_update_element(features_dc[dc_idx + c], dc_exp_avg[dc_idx + c], dc_exp_avg_sq[dc_idx + c],
-                           g, adam_hp.dc_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.dc_bc2_sqrt, adam_hp.eps);
+    if (collect_densification_stats != 0 && active) {
+        vis_counts[idx] += 1.0f;
+        const float gx = v_xy[idx * 2];
+        const float gy = v_xy[idx * 2 + 1];
+        xys_grad_norm[idx] += sqrt(gx * gx + gy * gy);
+        max_2d_size[idx] = max(
+            max_2d_size[idx], (float)radii[idx] * inv_max_dim);
     }
 
-    if (degrees_to_use < 1) return;
-
-    float x = viewdir.x, y = viewdir.y, z = viewdir.z;
-    float xx = x*x, xy = x*y, xz = x*z, yy = y*y, yz = y*z, zz = z*z;
-
-    // SH degree 1 (3 bases)
-    float sh1[3] = { -SH_C1 * y, SH_C1 * z, -SH_C1 * x };
-    for (int b = 0; b < 3; b++) {
-        for (int c = 0; c < 3; c++) {
-            uint i = rest_idx + b * 3 + c;
-            float g = sh1[b] * vc[c];
-            adam_update_element(features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
-                               g, adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.rest_bc2_sqrt, adam_hp.eps);
-        }
+    const uint mean_offset = idx * 3;
+    for (uint component = 0; component < 3; ++component) {
+        const uint parameter_index = mean_offset + component;
+        adam_update_element(
+            means3d[parameter_index], mean_exp_avg[parameter_index],
+            mean_exp_avg_sq[parameter_index], local_v_mean3d[component],
+            adam_hp.mean_step_size, adam_hp.beta1, adam_hp.beta2,
+            adam_hp.mean_bc2_sqrt, adam_hp.eps);
+        adam_update_element(
+            scales[parameter_index], scale_exp_avg[parameter_index],
+            scale_exp_avg_sq[parameter_index], local_v_scale[component],
+            adam_hp.scale_step_size, adam_hp.beta1, adam_hp.beta2,
+            adam_hp.scale_bc2_sqrt, adam_hp.eps);
     }
 
-    if (degrees_to_use < 2) return;
-
-    // SH degree 2 (5 bases)
-    float sh2[5] = {
-        SH_C2[0] * xy,
-        SH_C2[1] * yz,
-        SH_C2[2] * (2.f * zz - xx - yy),
-        SH_C2[3] * xz,
-        SH_C2[4] * (xx - yy)
-    };
-    for (int b = 0; b < 5; b++) {
-        for (int c = 0; c < 3; c++) {
-            uint i = rest_idx + (3 + b) * 3 + c;
-            float g = sh2[b] * vc[c];
-            adam_update_element(features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
-                               g, adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.rest_bc2_sqrt, adam_hp.eps);
-        }
-    }
-
-    if (degrees_to_use < 3) return;
-
-    // SH degree 3 (7 bases)
-    float sh3[7] = {
-        SH_C3[0] * y * (3.f * xx - yy),
-        SH_C3[1] * xy * z,
-        SH_C3[2] * y * (4.f * zz - xx - yy),
-        SH_C3[3] * z * (2.f * zz - 3.f * xx - 3.f * yy),
-        SH_C3[4] * x * (4.f * zz - xx - yy),
-        SH_C3[5] * z * (xx - yy),
-        SH_C3[6] * x * (xx - 3.f * yy)
-    };
-    for (int b = 0; b < 7; b++) {
-        for (int c = 0; c < 3; c++) {
-            uint i = rest_idx + (8 + b) * 3 + c;
-            float g = sh3[b] * vc[c];
-            adam_update_element(features_rest[i], rest_exp_avg[i], rest_exp_avg_sq[i],
-                               g, adam_hp.rest_step_size, adam_hp.beta1, adam_hp.beta2, adam_hp.rest_bc2_sqrt, adam_hp.eps);
-        }
+    const uint quat_offset = idx * 4;
+    for (uint component = 0; component < 4; ++component) {
+        const uint parameter_index = quat_offset + component;
+        adam_update_element(
+            quats[parameter_index], quat_exp_avg[parameter_index],
+            quat_exp_avg_sq[parameter_index], local_v_quat[component],
+            adam_hp.quat_step_size, adam_hp.beta1, adam_hp.beta2,
+            adam_hp.quat_bc2_sqrt, adam_hp.eps);
     }
 }
 
@@ -2471,6 +2843,254 @@ kernel void project_and_sh_backward_kernel(
 #define EXACT_SORT_TG_SIZE 256
 #define EXACT_SORT_RADIX 256
 #define EXACT_BITONIC_FAST_PATH 2048
+#define EXACT_SMALL_SORT_TG_SIZE 32
+#define EXACT_SMALL_TILE_MAX 32
+
+// GPU counterpart of buildTileIntersectionLayout. Keep these metadata indices
+// synchronized with the host ABI; word 9 is a bitmask so later layout checks
+// can be added without changing the fixed buffer shape.
+#define EXACT_LAYOUT_TOTAL_COUNT 0
+#define EXACT_LAYOUT_MAXIMUM_TILE_COUNT 1
+#define EXACT_LAYOUT_MAXIMUM_TILE_INDEX 2
+#define EXACT_LAYOUT_ACTIVE_TILE_COUNT 3
+#define EXACT_LAYOUT_SORTABLE_TILE_COUNT 4
+#define EXACT_LAYOUT_TRIVIAL_TILE_COUNT 5
+#define EXACT_LAYOUT_SMALL_TILE_COUNT 6
+#define EXACT_LAYOUT_MEDIUM_TILE_COUNT 7
+#define EXACT_LAYOUT_LARGE_TILE_COUNT 8
+#define EXACT_LAYOUT_ERROR_FLAGS 9
+#define EXACT_LAYOUT_ERROR_SIGNED_INDEX_OVERFLOW (1u << 0)
+
+// Correctness-first GPU layout builder. Tile grids are small enough that one
+// thread can reproduce the host's stable ordering while avoiding cross-group
+// synchronization and signed scan overflow. Offsets are inclusive; bins are
+// [start, end). Sortable indices are bucketed small, medium, then large, with
+// stable tile order inside each bucket.
+kernel void build_tile_intersection_layout_kernel(
+    device const uint* tile_counts         [[buffer(0)]],
+    device int* inclusive_offsets          [[buffer(1)]],
+    device int* tile_bins                  [[buffer(2)]],
+    device uint* sortable_tile_indices     [[buffer(3)]],
+    device uint* metadata                  [[buffer(4)]],
+    constant uint& num_tiles               [[buffer(5)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index != 0) return;
+
+    uint running = 0;
+    uint maximum_tile_count = 0;
+    uint maximum_tile_index = 0;
+    uint active_tile_count = 0;
+    uint sortable_tile_count = 0;
+    uint trivial_tile_count = 0;
+    uint small_tile_count = 0;
+    uint medium_tile_count = 0;
+    uint large_tile_count = 0;
+    uint error_flags = 0;
+
+    for (uint tile = 0; tile < num_tiles; ++tile) {
+        const uint count = tile_counts[tile];
+
+        // Validate before adding so neither the unsigned accumulator nor the
+        // signed output ABI can wrap. Once invalid, all ranges remain neutral.
+        if ((error_flags & EXACT_LAYOUT_ERROR_SIGNED_INDEX_OVERFLOW) == 0u &&
+            count <= 0x7FFFFFFFu - running) {
+            const int start = (int)running;
+            running += count;
+            const int end = (int)running;
+            inclusive_offsets[tile] = end;
+            tile_bins[tile * 2u] = start;
+            tile_bins[tile * 2u + 1u] = end;
+        } else {
+            error_flags |= EXACT_LAYOUT_ERROR_SIGNED_INDEX_OVERFLOW;
+            inclusive_offsets[tile] = 0;
+            tile_bins[tile * 2u] = 0;
+            tile_bins[tile * 2u + 1u] = 0;
+        }
+
+        if (count > 0u) ++active_tile_count;
+        if (count <= 1u) {
+            ++trivial_tile_count;
+        } else {
+            ++sortable_tile_count;
+            if (count <= EXACT_SMALL_TILE_MAX) {
+                ++small_tile_count;
+            } else if (count <= EXACT_BITONIC_FAST_PATH) {
+                ++medium_tile_count;
+            } else {
+                ++large_tile_count;
+            }
+        }
+        // Match the host's strict comparison so ties retain the first tile.
+        if (count > maximum_tile_count) {
+            maximum_tile_count = count;
+            maximum_tile_index = tile;
+        }
+    }
+
+    if ((error_flags & EXACT_LAYOUT_ERROR_SIGNED_INDEX_OVERFLOW) == 0u) {
+        uint next_small = 0;
+        uint next_medium = small_tile_count;
+        uint next_large = small_tile_count + medium_tile_count;
+        for (uint tile = 0; tile < num_tiles; ++tile) {
+            const uint count = tile_counts[tile];
+            if (count > 1u && count <= EXACT_SMALL_TILE_MAX) {
+                sortable_tile_indices[next_small++] = tile;
+            } else if (count > EXACT_SMALL_TILE_MAX &&
+                       count <= EXACT_BITONIC_FAST_PATH) {
+                sortable_tile_indices[next_medium++] = tile;
+            } else if (count > EXACT_BITONIC_FAST_PATH) {
+                sortable_tile_indices[next_large++] = tile;
+            }
+        }
+    } else {
+        // Earlier valid prefixes may already have been written. Clear every
+        // externally consumed range/list entry before the host observes the
+        // error so no later pass can accidentally use a partial layout.
+        for (uint tile = 0; tile < num_tiles; ++tile) {
+            inclusive_offsets[tile] = 0;
+            tile_bins[tile * 2u] = 0;
+            tile_bins[tile * 2u + 1u] = 0;
+            sortable_tile_indices[tile] = 0;
+        }
+        running = 0;
+    }
+
+    metadata[EXACT_LAYOUT_TOTAL_COUNT] = running;
+    metadata[EXACT_LAYOUT_MAXIMUM_TILE_COUNT] = maximum_tile_count;
+    metadata[EXACT_LAYOUT_MAXIMUM_TILE_INDEX] = maximum_tile_index;
+    metadata[EXACT_LAYOUT_ACTIVE_TILE_COUNT] = active_tile_count;
+    metadata[EXACT_LAYOUT_SORTABLE_TILE_COUNT] = sortable_tile_count;
+    metadata[EXACT_LAYOUT_TRIVIAL_TILE_COUNT] = trivial_tile_count;
+    metadata[EXACT_LAYOUT_SMALL_TILE_COUNT] = small_tile_count;
+    metadata[EXACT_LAYOUT_MEDIUM_TILE_COUNT] = medium_tile_count;
+    metadata[EXACT_LAYOUT_LARGE_TILE_COUNT] = large_tile_count;
+    metadata[EXACT_LAYOUT_ERROR_FLAGS] = error_flags;
+}
+
+// Decide whether a GPU-resident exact layout fits the buffers already retained
+// by the high-water training path. The control words let the host encode the
+// two compact sort lists without reading their sizes. A failed attempt keeps
+// its exact metadata for the completion-side grow/retry decision, but exposes
+// neutral bins to rasterization and poisons every persistent update.
+kernel void validate_tile_intersection_attempt_kernel(
+    constant uint* metadata                  [[buffer(0)]],
+    device int* tile_bins                    [[buffer(1)]],
+    constant uint& num_tiles                 [[buffer(2)]],
+    constant uint& arena_capacity            [[buffer(3)]],
+    constant uint& radix_scratch_available   [[buffer(4)]],
+    constant uint& planned_chunk_count       [[buffer(5)]],
+    device atomic_uint* attempt_status       [[buffer(6)]],
+    device uint* dispatch_control            [[buffer(7)]],
+    constant uint& pack_threads_per_group    [[buffer(8)]],
+    constant int* inclusive_offsets          [[buffer(9)]],
+    uint index [[thread_position_in_grid]]
+) {
+    if (index != 0) return;
+
+    const uint total_count = metadata[EXACT_LAYOUT_TOTAL_COUNT];
+    const uint maximum_tile_count =
+        metadata[EXACT_LAYOUT_MAXIMUM_TILE_COUNT];
+    const uint maximum_tile_index =
+        metadata[EXACT_LAYOUT_MAXIMUM_TILE_INDEX];
+    const uint active_tile_count =
+        metadata[EXACT_LAYOUT_ACTIVE_TILE_COUNT];
+    const uint sortable_tile_count =
+        metadata[EXACT_LAYOUT_SORTABLE_TILE_COUNT];
+    const uint trivial_tile_count =
+        metadata[EXACT_LAYOUT_TRIVIAL_TILE_COUNT];
+    const uint small_tile_count = metadata[EXACT_LAYOUT_SMALL_TILE_COUNT];
+    const uint medium_tile_count = metadata[EXACT_LAYOUT_MEDIUM_TILE_COUNT];
+    const uint large_tile_count = metadata[EXACT_LAYOUT_LARGE_TILE_COUNT];
+    const uint general_tile_count = medium_tile_count + large_tile_count;
+    const int final_offset = num_tiles > 0u
+        ? inclusive_offsets[num_tiles - 1u]
+        : 0;
+    const ulong classified_tile_count =
+        (ulong)trivial_tile_count + (ulong)sortable_tile_count;
+    const ulong categorized_sortable_tile_count =
+        (ulong)small_tile_count + (ulong)medium_tile_count +
+        (ulong)large_tile_count;
+
+    uint failure = 0u;
+    if (metadata[EXACT_LAYOUT_ERROR_FLAGS] != 0u ||
+        total_count > 0x7FFFFFFFu ||
+        classified_tile_count != (ulong)num_tiles ||
+        categorized_sortable_tile_count != (ulong)sortable_tile_count ||
+        active_tile_count > num_tiles ||
+        active_tile_count < sortable_tile_count ||
+        active_tile_count > total_count ||
+        (maximum_tile_count > 0u && maximum_tile_index >= num_tiles) ||
+        (maximum_tile_count == 0u && total_count != 0u) ||
+        maximum_tile_count > total_count ||
+        (large_tile_count == 0u &&
+         maximum_tile_count > EXACT_BITONIC_FAST_PATH) ||
+        (large_tile_count > 0u &&
+         maximum_tile_count <= EXACT_BITONIC_FAST_PATH) ||
+        final_offset < 0 || (uint)final_offset != total_count ||
+        maximum_tile_count > 65536u || pack_threads_per_group == 0u) {
+        failure |= MSPLAT_OVERFLOW_TILE_CAP;
+    }
+    if (total_count > arena_capacity ||
+        (maximum_tile_count > EXACT_BITONIC_FAST_PATH &&
+         radix_scratch_available == 0u)) {
+        failure |= MSPLAT_OVERFLOW_PACKED_CAPACITY;
+    }
+
+    const uint required_chunk_count = num_tiles >= 400u
+        ? 1u
+        : max(1u, (maximum_tile_count + 511u) / 512u);
+    if (required_chunk_count > planned_chunk_count) {
+        failure |= MSPLAT_OVERFLOW_PACKED_CAPACITY;
+    }
+
+    const uint enabled = failure == 0u ? 1u : 0u;
+    dispatch_control[0] = enabled * small_tile_count;
+    dispatch_control[1] = 1u;
+    dispatch_control[2] = 1u;
+    dispatch_control[3] = enabled * general_tile_count;
+    dispatch_control[4] = 1u;
+    dispatch_control[5] = 1u;
+    const uint safe_pack_threads_per_group = max(pack_threads_per_group, 1u);
+    dispatch_control[6] = enabled * (
+        (total_count + safe_pack_threads_per_group - 1u) /
+        safe_pack_threads_per_group);
+    dispatch_control[7] = 1u;
+    dispatch_control[8] = 1u;
+    dispatch_control[9] = small_tile_count;
+    dispatch_control[10] = general_tile_count;
+    dispatch_control[11] = small_tile_count;
+
+    if (failure != 0u) {
+        atomic_fetch_or_explicit(
+            attempt_status, failure, memory_order_relaxed);
+        for (uint tile = 0; tile < num_tiles; ++tile) {
+            tile_bins[tile * 2u] = 0;
+            tile_bins[tile * 2u + 1u] = 0;
+        }
+    }
+}
+
+// Scatter and segmented sort perform their own defensive checks and can poison
+// an attempt after the initial capacity decision. Neutralize every bin once
+// those checks have completed so the fixed raster/loss work can safely run on
+// background pixels while all persistent updates remain gated.
+kernel void finalize_tile_intersection_attempt_kernel(
+    device int* tile_bins                 [[buffer(0)]],
+    device atomic_uint* attempt_status    [[buffer(1)]],
+    constant uint& num_tiles              [[buffer(2)]],
+    device uint* dispatch_control         [[buffer(3)]],
+    uint tile [[thread_position_in_grid]]
+) {
+    if (tile >= num_tiles || !training_attempt_failed(attempt_status)) return;
+    if (tile == 0u) {
+        // Scatter/sort can discover a defensive failure after validation.
+        // Suppress packing without adding a status load to every intersection.
+        dispatch_control[6] = 0u;
+    }
+    tile_bins[tile * 2u] = 0;
+    tile_bins[tile * 2u + 1u] = 0;
+}
 
 // Scatter every Gaussian/tile intersection into the exact compact range that
 // the host built after reading tile_counts. Each tile owns a disjoint range, so
@@ -2488,10 +3108,15 @@ kernel void scatter_to_exact_bins_kernel(
     device uint64_t* keys_out               [[buffer(8)]],
     constant uint& capacity                 [[buffer(9)]],
     device atomic_uint* overflow_flag       [[buffer(10)]],
+    constant float* opacities               [[buffer(11)]],
+    device float* projected_opacities       [[buffer(12)]],
+    constant uchar* coverage_render_tiles   [[buffer(13)]],
+    constant uint& coverage_render_tile_stride [[buffer(14)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= num_points || radii[idx] <= 0) return;
 
+    projected_opacities[idx] = 1.f / (1.f + exp(-opacities[idx]));
     const float2 center = read_packed_float2(xys, idx);
     uint2 tile_min, tile_max;
     get_tile_bbox(
@@ -2503,6 +3128,11 @@ kernel void scatter_to_exact_bins_kernel(
 
     for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
         for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
+            if (!training_render_tile_active(
+                    coverage_render_tiles, coverage_render_tile_stride,
+                    tile_x, tile_y)) {
+                continue;
+            }
             const uint tile_id = tile_y * tile_bounds.x + tile_x;
             const int start_i = tile_id == 0 ? 0 : tile_offsets[tile_id - 1];
             const int end_i = tile_offsets[tile_id];
@@ -2530,6 +3160,100 @@ kernel void scatter_to_exact_bins_kernel(
     }
 }
 
+// Small exact ranges fit in one 32-thread group and only need 256 bytes of
+// threadgroup storage. The compact tile list is bucket-ordered by the host, so
+// this kernel consumes its leading 2-32 entry range.
+kernel void small_sort_per_tile_kernel(
+    constant int* tile_offsets       [[buffer(0)]],
+    device uint64_t* keys_a          [[buffer(1)]],
+    constant uint& num_tiles         [[buffer(2)]],
+    device int* tile_bins            [[buffer(3)]],
+    constant uint& capacity          [[buffer(4)]],
+    device atomic_uint* overflow_flag [[buffer(5)]],
+    constant uint* sortable_tile_indices [[buffer(6)]],
+    constant uint& small_tile_count  [[buffer(7)]],
+    uint sort_index [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]]
+) {
+    if (sort_index >= small_tile_count) return;
+    if (sort_index >= num_tiles) {
+        if (tid == 0) {
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
+    const uint tile_id = sortable_tile_indices[sort_index];
+    if (tile_id >= num_tiles) {
+        if (tid == 0) {
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
+
+    const int start_i = tile_id == 0 ? 0 : tile_offsets[tile_id - 1];
+    const int end_i = tile_offsets[tile_id];
+    if (start_i < 0 || end_i < start_i ||
+        (uint64_t)end_i > (uint64_t)capacity) {
+        if (tid == 0) {
+            write_packed_int2(tile_bins, tile_id, int2(0, 0));
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
+
+    const uint start = (uint)start_i;
+    const uint count = (uint)(end_i - start_i);
+    if (count < 2 || count > EXACT_SMALL_TILE_MAX) {
+        if (tid == 0) {
+            write_packed_int2(tile_bins, tile_id, int2(0, 0));
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
+    if (tid == 0) {
+        write_packed_int2(tile_bins, tile_id, int2(start_i, end_i));
+    }
+
+    uint padded_count = 1;
+    while (padded_count < count) padded_count <<= 1;
+    threadgroup uint64_t bitonic_data[EXACT_SMALL_SORT_TG_SIZE];
+    if (tid < padded_count) {
+        bitonic_data[tid] = tid < count
+            ? keys_a[start + tid]
+            : 0xFFFFFFFFFFFFFFFFULL;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint sequence = 2; sequence <= padded_count; sequence <<= 1) {
+        for (uint stride = sequence >> 1; stride > 0; stride >>= 1) {
+            if (tid < (padded_count >> 1)) {
+                const uint position = 2 * tid - (tid & (stride - 1));
+                const uint partner = position ^ stride;
+                const bool ascending = (position & sequence) == 0;
+                const uint64_t a = bitonic_data[position];
+                const uint64_t b = bitonic_data[partner];
+                if ((a > b) == ascending) {
+                    bitonic_data[position] = b;
+                    bitonic_data[partner] = a;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (tid < count) {
+        keys_a[start + tid] = bitonic_data[tid];
+    }
+}
+
 // Exact segmented sort. The common <=2,048-entry case keeps the previous
 // threadgroup bitonic performance, but reads the exact compact range rather than
 // a fixed per-tile allocation. Larger tiles use stable LSD radix passes over
@@ -2549,13 +3273,35 @@ kernel void radix_sort_per_tile_kernel(
     device int* tile_bins            [[buffer(4)]],
     constant uint& capacity          [[buffer(5)]],
     device atomic_uint* overflow_flag [[buffer(6)]],
-    uint tile_id [[threadgroup_position_in_grid]],
+    constant uint* sortable_tile_indices [[buffer(7)]],
+    constant uint& sortable_tile_count [[buffer(8)]],
+    constant uint& sortable_tile_offset [[buffer(9)]],
+    uint sort_index [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
     uint simd_lane [[thread_index_in_simdgroup]],
     uint simd_width [[threads_per_simdgroup]]
 ) {
-    if (tile_id >= num_tiles) return;
+    if (sort_index >= sortable_tile_count) return;
+    if (sortable_tile_offset > num_tiles ||
+        sort_index >= num_tiles - sortable_tile_offset) {
+        if (tid == 0) {
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
+    const uint tile_id =
+        sortable_tile_indices[sortable_tile_offset + sort_index];
+    if (tile_id >= num_tiles) {
+        if (tid == 0) {
+            atomic_fetch_or_explicit(
+                overflow_flag, MSPLAT_OVERFLOW_PACKED_CAPACITY,
+                memory_order_relaxed);
+        }
+        return;
+    }
 
     const int start_i = tile_id == 0 ? 0 : tile_offsets[tile_id - 1];
     const int end_i = tile_offsets[tile_id];
@@ -2702,29 +3448,27 @@ kernel void radix_sort_per_tile_kernel(
     }
 }
 
-// Extract Gaussian IDs from the sorted depth keys and pack the fields consumed
-// by both forward and backward rasterization. `exact_count` is the checked final
-// CPU prefix, not the allocated arena capacity.
+// Pack the fields consumed by forward and backward rasterization. Backward
+// extracts Gaussian IDs directly from the sorted keys. `exact_count` is the
+// checked final CPU prefix, not the allocated arena capacity.
 kernel void pack_sorted_gaussians_kernel(
     constant uint64_t* sorted_keys    [[buffer(0)]],
     constant float* xys               [[buffer(1)]],
     constant float* conics            [[buffer(2)]],
     constant float* colors            [[buffer(3)]],
-    constant float* opacities         [[buffer(4)]],
-    device int32_t* gaussian_ids      [[buffer(5)]],
-    device float* packed_xy_opac      [[buffer(6)]],
-    device float* packed_conic        [[buffer(7)]],
-    device float* packed_rgb          [[buffer(8)]],
-    constant uint& exact_count        [[buffer(9)]],
+    constant float* projected_opacities [[buffer(4)]],
+    device float* packed_xy_opac      [[buffer(5)]],
+    device float* packed_conic        [[buffer(6)]],
+    device float* packed_rgb          [[buffer(7)]],
+    constant uint& exact_count        [[buffer(8)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= exact_count) return;
     const int32_t gaussian_id = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
-    gaussian_ids[idx] = gaussian_id;
     const float2 xy = read_packed_float2(xys, gaussian_id);
-    const float opacity = 1.f / (1.f + exp(-opacities[gaussian_id]));
     write_packed_float3(
-        packed_xy_opac, idx, float3(xy.x, xy.y, opacity));
+        packed_xy_opac, idx,
+        float3(xy.x, xy.y, projected_opacities[gaussian_id]));
     write_packed_float3(
         packed_conic, idx, read_packed_float3(conics, gaussian_id));
     write_packed_float3(
@@ -3238,6 +3982,9 @@ kernel void rasterize_forward_chunked_kernel(
     constant uint& chunk_size,
     constant uint& K_max,
     constant uint2& blockDim,
+    constant uint64_t* sorted_keys,
+    constant float* projected_opacities,
+    constant uint& attribute_layout,
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]]
 ) {
@@ -3292,10 +4039,13 @@ kernel void rasterize_forward_chunked_kernel(
         int batch_start = chunk_start + RAST_BLOCK_SIZE * b;
         int idx = batch_start + tr;
         if (idx < chunk_end) {
-            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
-            conic_batch[tr] = read_packed_float3(packed_conic, idx);
-            const float3 raw_c = read_packed_float3(packed_rgb, idx);
-            rgbs_batch[tr] = max(raw_c + 0.5f, 0.0f);
+            const RasterIntersectionAttributes attributes =
+                load_raster_intersection_attributes(
+                sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
+                projected_opacities, attribute_layout, idx);
+            xy_opacity_batch[tr] = attributes.xy_opacity;
+            conic_batch[tr] = attributes.conic;
+            rgbs_batch[tr] = max(attributes.rgb + 0.5f, 0.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -3438,7 +4188,7 @@ kernel void compute_chunk_prefix_suffix_kernel(
 kernel void rasterize_backward_chunked_kernel(
     constant uint3& tile_bounds,
     constant uint2& img_size,
-    constant int32_t* gaussian_ids_sorted,
+    constant uint64_t* sorted_keys,
     constant int* tile_bins,
     constant float* packed_xy_opac,
     constant float* packed_conic,
@@ -3456,9 +4206,11 @@ kernel void rasterize_backward_chunked_kernel(
     device atomic_float* v_opacity,
     constant uint& chunk_size,
     constant uint& K_max,
-    constant uchar* training_mask, // (H, W), ignored when stride is zero
-    constant uint& alpha_stride,
+    constant uchar* training_mask, // packed alpha or (H, W), disabled by x=0
+    constant uint2& alpha_layout,
     constant float& alpha_gradient_scale,
+    constant float* projected_opacities,
+    constant uint& attribute_layout,
     uint3 gp [[thread_position_in_grid]],
     uint3 blockIdx [[threadgroup_position_in_grid]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3492,9 +4244,9 @@ kernel void rasterize_backward_chunked_kernel(
 
     float T_final = final_Ts[pix_id];
     float v_alpha_pixel = 0.0f;
-    if (inside && alpha_stride != 0) {
-        const float target_alpha =
-            float(training_mask[i * alpha_stride + j]) / 255.0f;
+    if (inside && alpha_layout.x != 0) {
+        const float target_alpha = training_mask_coverage(
+            training_mask, i * img_size.x + j, alpha_layout);
         const float rendered_alpha = 1.0f - T_final;
         v_alpha_pixel = alpha_gradient_scale * (
             rendered_alpha > target_alpha ? 1.0f :
@@ -3546,10 +4298,14 @@ kernel void rasterize_backward_chunked_kernel(
         int batch_size = min(RAST_BLOCK_SIZE, batch_end + 1 - chunk_start);
         const int idx = batch_end - tr;
         if (idx >= chunk_start) {
-            id_batch[tr] = gaussian_ids_sorted[idx];
-            xy_opacity_batch[tr] = read_packed_float3(packed_xy_opac, idx);
-            conic_batch[tr] = read_packed_float3(packed_conic, idx);
-            rgbs_batch[tr] = read_packed_float3(packed_rgb, idx);
+            id_batch[tr] = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
+            const RasterIntersectionAttributes attributes =
+                load_raster_intersection_attributes(
+                sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
+                projected_opacities, attribute_layout, idx);
+            xy_opacity_batch[tr] = attributes.xy_opacity;
+            conic_batch[tr] = attributes.conic;
+            rgbs_batch[tr] = attributes.rgb;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -3596,26 +4352,30 @@ kernel void rasterize_backward_chunked_kernel(
             float2 v_xy_local = {0.f, 0.f};
             float v_opacity_local = 0.f;
 
-            if (valid && alpha < 0.999f) {
+            if (valid) {
+                // Match the monolithic backward recurrence: the forward pass
+                // multiplied T by (1 - alpha) even when alpha hit its cap.
                 float ra = 1.f / (1.f - alpha);
                 T *= ra;
                 const float fac = alpha * T;
-                float v_alpha = 0.f;
                 v_rgb_local = fac * v_out;
 
                 const float3 rgb = max(b_rgb + 0.5f, 0.f);
-                v_alpha += dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out);
-                v_alpha += v_alpha_pixel * T_final * ra;
+                const float v_alpha =
+                    dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out) +
+                    v_alpha_pixel * T_final * ra;
                 buffer = fma(rgb, fac, buffer);
 
-                const float v_sigma = -alpha * v_alpha;
-                v_conic_local = (0.5f * v_sigma) * float3(delta.x * delta.x,
-                                                           delta.x * delta.y,
-                                                           delta.y * delta.y);
-                v_xy_local = v_sigma * float2(
-                    fma(b_conic.x, delta.x, b_conic.y * delta.y),
-                    fma(b_conic.y, delta.x, b_conic.z * delta.y));
-                v_opacity_local = -v_sigma * (1.f - opac);
+                if (alpha < 0.999f) {
+                    const float v_sigma = -alpha * v_alpha;
+                    v_conic_local = (0.5f * v_sigma) * float3(
+                        delta.x * delta.x, delta.x * delta.y,
+                        delta.y * delta.y);
+                    v_xy_local = v_sigma * float2(
+                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
+                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
+                    v_opacity_local = -v_sigma * (1.f - opac);
+                }
             }
 
             v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
@@ -3667,13 +4427,22 @@ inline float photometric_gain(
 inline float training_target_rgb(
     constant float* gt,
     constant uchar* training_mask,
-    uint alpha_stride,
+    uint2 alpha_layout,
     constant float* background,
+    uint target_pixel_stride_bytes,
     uint pixel,
     uint channel) {
-    const float source = gt[pixel * 3 + channel];
-    if (alpha_stride == 0) return source;
-    const float target_alpha = float(training_mask[pixel]) / 255.0f;
+    float source = 0.0f;
+    if (target_pixel_stride_bytes == 4) {
+        constant uchar* bytes =
+            reinterpret_cast<constant uchar*>(gt);
+        source = float(bytes[pixel * 4 + channel]) * (1.0f / 255.0f);
+    } else {
+        source = gt[pixel * 3 + channel];
+    }
+    if (alpha_layout.x == 0) return source;
+    const float target_alpha = training_mask_coverage(
+        training_mask, pixel, alpha_layout);
     return fma(source - background[channel], target_alpha,
                background[channel]);
 }
@@ -3684,15 +4453,16 @@ inline float training_target_rgb(
 // Output: ssim_h_buf (H, W, 15) — 5 values × 3 channels
 kernel void ssim_h_fwd_kernel(
     constant float* rendered,       // (H, W, 3) HWC
-    constant float* gt,             // (H, W, 3) HWC
+    constant float* gt,             // UInt8 RGBA or Float32 RGB, selected by stride
     constant uint2& img_size,       // (W, H)
     device float* ssim_h_buf,       // (H, W, 15)
     constant float* log_rgb_gains,  // (cameraCount, 3)
     constant uint& camera_gain_offset,
     constant uint& photometric_enabled,
-    constant uchar* training_mask,  // (H, W), ignored when stride is zero
-    constant uint& alpha_stride,
+    constant uchar* training_mask,  // packed alpha or (H, W), disabled by x=0
+    constant uint2& alpha_layout,
     constant float* background,
+    constant uint& target_pixel_stride_bytes,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3730,7 +4500,8 @@ kernel void ssim_h_fwd_kernel(
                 uint pixel = gy * W + gx;
                 uint idx = pixel * 3 + c;
                 gv = training_target_rgb(
-                    gt, training_mask, alpha_stride, background, pixel, c);
+                    gt, training_mask, alpha_layout, background,
+                    target_pixel_stride_bytes, pixel, c);
                 rv = rendered[idx] * tg_gain[c];
             }
             tg_gt[c][sy][sx] = gv;
@@ -3773,8 +4544,8 @@ kernel void ssim_v_fwd_kernel(
     constant float& ssim_weight,
     device float* intermediates,    // (H, W, 15)
     device atomic_float* loss_sum,
-    constant uchar* coverage_mask,  // (H, W), ignored when stride is zero
-    constant uint& coverage_stride,
+    constant uchar* coverage_mask,  // packed alpha or (H, W), disabled by x=0
+    constant uint2& coverage_layout,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -3853,9 +4624,10 @@ kernel void ssim_v_fwd_kernel(
     // Pixel loss
     float pixel_loss = 0.0f;
     if (px < W && py < H) {
-        const float coverage = coverage_stride == 0
+        const float coverage = coverage_layout.x == 0
             ? 1.0f
-            : float(coverage_mask[py * coverage_stride + px]) / 255.0f;
+            : training_mask_coverage(
+                coverage_mask, py * W + px, coverage_layout);
         pixel_loss = coverage * (
             ssim_weight * (1.0f - ssim_sum / 3.0f) +
             (1.0f - ssim_weight) * l1_sum / 3.0f);
@@ -3879,20 +4651,22 @@ kernel void ssim_v_fwd_kernel(
 // computes loss + derivative fields, then H convs derivatives to a compact
 // 3-float-per-channel output buffer.
 kernel void ssim_fused_v_fwd_h_bwd_kernel(
-    constant float* rendered, constant float* gt,
+    constant float* rendered,
+    constant float* gt,             // UInt8 RGBA or Float32 RGB, selected by stride
     constant float* ssim_h_buf, constant uint2& img_size,
     constant float& ssim_weight, constant float& inv_n,
     device float* deriv_h_buf, // (H, W, 9): 3 values × 3 channels
     device atomic_float* loss_sum,
-    constant uchar* coverage_mask, // (H, W), ignored when stride is zero
-    constant uint& coverage_stride,
+    constant uchar* coverage_mask, // packed alpha or (H, W), disabled by x=0
+    constant uint2& coverage_layout,
     constant float* log_rgb_gains, // (cameraCount, 3)
     constant uint& camera_gain_offset,
     constant uint& photometric_enabled,
-    constant uint& alpha_stride,
+    constant uint2& alpha_layout,
     constant float* background,
     constant float* final_Ts,
     constant float& alpha_loss_weight,
+    constant uint& target_pixel_stride_bytes,
     uint2 gid [[thread_position_in_grid]], uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]], uint2 tgid [[threadgroup_position_in_grid]],
     uint2 tg_size [[threads_per_threadgroup]]
@@ -3906,6 +4680,13 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
     float ssim_sum = 0.0f, l1_sum = 0.0f, coverage_sum = 0.0f;
     float alpha_loss_sum = 0.0f;
     threadgroup float tg_gain[3];
+    // The full horizontal-statistics tile is the largest live value. After all
+    // threads finish reading it, reuse the same storage for the three compact
+    // derivative tiles, and finally for loss reduction. This keeps static
+    // threadgroup memory near 13.5 KiB instead of 19.5 KiB, allowing two
+    // resident groups on 32 KiB Apple GPU cores and shader validation's shadow
+    // allocation to fit.
+    threadgroup float tg_scratch[TILE_PIXELS * 5];
 
     if (tr < 3) {
         tg_gain[tr] = photometric_enabled != 0
@@ -3916,41 +4697,53 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
 
     for (uint c = 0; c < 3; c++) {
         const float gain = tg_gain[c];
-        threadgroup float tg_hp[TILE_DIM][TILE_DIM][5];
-        for (uint i = tr; i < TILE_PIXELS; i += SSIM_TG * SSIM_TG) {
-            uint sy = i / TILE_DIM, sx = i % TILE_DIM;
-            int gy = base_gy + (int)sy, gx = base_gx + (int)sx;
-            if (gx >= 0 && gx < (int)W && gy >= 0 && gy < (int)H) {
-                uint hp = (gy * W + gx) * 15 + c * 5;
-                for (uint f = 0; f < 5; f++) tg_hp[sy][sx][f] = ssim_h_buf[hp + f];
-            } else {
-                for (uint f = 0; f < 5; f++) tg_hp[sy][sx][f] = 0.0f;
+        constexpr uint THREADS_PER_GROUP = SSIM_TG * SSIM_TG;
+        constexpr uint DERIV_PIXELS = SSIM_TG * TILE_DIM;
+        constexpr uint DERIV_VALUES_PER_THREAD =
+            (DERIV_PIXELS + THREADS_PER_GROUP - 1) / THREADS_PER_GROUP;
+        for (uint i = tr; i < TILE_PIXELS; i += THREADS_PER_GROUP) {
+            const uint sy = i / TILE_DIM, sx = i % TILE_DIM;
+            const int gy = base_gy + (int)sy, gx = base_gx + (int)sx;
+            const bool valid_sample =
+                gx >= 0 && gx < (int)W && gy >= 0 && gy < (int)H;
+            const uint hp = valid_sample
+                ? (uint(gy) * W + uint(gx)) * 15 + c * 5
+                : 0;
+            for (uint field = 0; field < 5; ++field) {
+                tg_scratch[i * 5 + field] = valid_sample
+                    ? ssim_h_buf[hp + field]
+                    : 0.0f;
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        threadgroup float tg_f1[SSIM_TG][TILE_DIM], tg_f2[SSIM_TG][TILE_DIM], tg_f3[SSIM_TG][TILE_DIM];
-        constexpr uint DERIV_PIXELS = SSIM_TG * TILE_DIM;
-        for (uint i = tr; i < DERIV_PIXELS; i += SSIM_TG * SSIM_TG) {
-            uint dy = i / TILE_DIM, dx = i % TILE_DIM;
-            uint tile_y = dy + SSIM_HALF_WIN;
-            float mu_x=0, mu_y=0, sq_x=0, sq_y=0, cross_xy=0;
-            for (uint k = 0; k < SSIM_WIN; k++) {
-                float w = GAUSS_1D[k];
-                mu_x += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][0];
-                mu_y += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][1];
-                sq_x += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][2];
-                sq_y += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][3];
-                cross_xy += w*tg_hp[tile_y-SSIM_HALF_WIN+k][dx][4];
+        float3 derivative_values[DERIV_VALUES_PER_THREAD] = {};
+        for (uint slot = 0; slot < DERIV_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= DERIV_PIXELS) continue;
+            const uint dy = i / TILE_DIM, dx = i % TILE_DIM;
+            const uint tile_y = dy + SSIM_HALF_WIN;
+            float mu_x = 0.0f, mu_y = 0.0f;
+            float sq_x = 0.0f, sq_y = 0.0f, cross_xy = 0.0f;
+            for (uint k = 0; k < SSIM_WIN; ++k) {
+                const float w = GAUSS_1D[k];
+                const uint hp =
+                    ((tile_y - SSIM_HALF_WIN + k) * TILE_DIM + dx) * 5;
+                mu_x += w * tg_scratch[hp + 0];
+                mu_y += w * tg_scratch[hp + 1];
+                sq_x += w * tg_scratch[hp + 2];
+                sq_y += w * tg_scratch[hp + 3];
+                cross_xy += w * tg_scratch[hp + 4];
             }
             int gpx = base_gx + (int)dx;
             int gpy = base_gy + (int)(dy + SSIM_HALF_WIN);
             const bool valid_center =
                 gpx >= 0 && gpx < (int)W && gpy >= 0 && gpy < (int)H;
             const float coverage = !valid_center ? 0.0f :
-                (coverage_stride == 0 ? 1.0f :
-                 float(coverage_mask[
-                    uint(gpy) * coverage_stride + uint(gpx)]) / 255.0f);
+                (coverage_layout.x == 0 ? 1.0f :
+                 training_mask_coverage(
+                    coverage_mask, uint(gpy) * W + uint(gpx),
+                    coverage_layout));
             float sigma_x_sq = sq_x - mu_x*mu_x, sigma_y_sq = sq_y - mu_y*mu_y;
             float sigma_xy = cross_xy - mu_x*mu_y;
             float A = 2.0f*mu_x*mu_y + SSIM_C1, B = 2.0f*sigma_xy + SSIM_C2;
@@ -3958,29 +4751,40 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             float iCD = 1.0f / (Cd * D);
             float dmu = 2.0f*B*(mu_x*Cd - A*mu_y) / (Cd*Cd*D);
             float dsyq = -A*B*iCD/D, dsxy = 2.0f*A*iCD;
-            tg_f1[dy][dx] = coverage *
-                (dmu - 2.0f*mu_y*dsyq - mu_x*dsxy);
-            tg_f2[dy][dx] = coverage * 2.0f*dsyq;
-            tg_f3[dy][dx] = coverage * dsxy;
+            derivative_values[slot] = coverage * float3(
+                dmu - 2.0f*mu_y*dsyq - mu_x*dsxy,
+                2.0f*dsyq,
+                dsxy);
             if (dx >= SSIM_HALF_WIN && dx < SSIM_HALF_WIN + SSIM_TG) {
                 if (valid_center) {
                     ssim_sum += coverage * (A * B) / (Cd * D);
                     const uint center_pixel = uint(gpy) * W + uint(gpx);
                     const float target = training_target_rgb(
-                        gt, coverage_mask, alpha_stride, background,
-                        center_pixel, c);
+                        gt, coverage_mask, alpha_layout, background,
+                        target_pixel_stride_bytes, center_pixel, c);
                     l1_sum += coverage *
                         fabs(target -
                              rendered[(gpy*W+gpx)*3+c] * gain);
                     coverage_sum += coverage;
-                    if (c == 0 && alpha_stride != 0) {
-                        const float target_alpha = float(coverage_mask[
-                            uint(gpy) * alpha_stride + uint(gpx)]) / 255.0f;
+                    if (c == 0 && alpha_layout.x != 0) {
+                        const float target_alpha = training_mask_coverage(
+                            coverage_mask, center_pixel, alpha_layout);
                         alpha_loss_sum += alpha_loss_weight * fabs(
                             (1.0f - final_Ts[center_pixel]) - target_alpha);
                     }
                 }
             }
+        }
+
+        // No thread may overwrite the statistics tile until every vertical
+        // convolution has finished reading it.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint slot = 0; slot < DERIV_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= DERIV_PIXELS) continue;
+            tg_scratch[i] = derivative_values[slot].x;
+            tg_scratch[DERIV_PIXELS + i] = derivative_values[slot].y;
+            tg_scratch[2 * DERIV_PIXELS + i] = derivative_values[slot].z;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -3988,7 +4792,10 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
             float h1=0, h2=0, h3=0;
             for (uint dx = 0; dx < SSIM_WIN; dx++) {
                 float w = GAUSS_1D[SSIM_WIN-1-dx];
-                h1 += w*tg_f1[lid.y][lid.x+dx]; h2 += w*tg_f2[lid.y][lid.x+dx]; h3 += w*tg_f3[lid.y][lid.x+dx];
+                const uint hp = lid.y * TILE_DIM + lid.x + dx;
+                h1 += w * tg_scratch[hp];
+                h2 += w * tg_scratch[DERIV_PIXELS + hp];
+                h3 += w * tg_scratch[2 * DERIV_PIXELS + hp];
             }
             uint out = (py*W+px)*9 + c*3;
             deriv_h_buf[out+0]=h1; deriv_h_buf[out+1]=h2; deriv_h_buf[out+2]=h3;
@@ -4003,15 +4810,288 @@ kernel void ssim_fused_v_fwd_h_bwd_kernel(
         ssim_weight * (coverage_sum - ssim_sum) / 3.0f +
         (1.0f - ssim_weight) * l1_sum / 3.0f +
         alpha_loss_sum;
-    threadgroup float tg_sum[256];
-    tg_sum[tr] = pixel_loss;
+    tg_scratch[tr] = pixel_loss;
     threadgroup_barrier(mem_flags::mem_threadgroup);
     uint tg_total = tg_size.x * tg_size.y;
     for (uint s = tg_total/2; s > 0; s >>= 1) {
-        if (tr < s) tg_sum[tr] += tg_sum[tr+s];
+        if (tr < s) tg_scratch[tr] += tg_scratch[tr+s];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    if (tr == 0) atomic_fetch_add_explicit(loss_sum, tg_sum[0], memory_order_relaxed);
+    if (tr == 0)
+        atomic_fetch_add_explicit(
+            loss_sum, tg_scratch[0], memory_order_relaxed);
+}
+
+// Default terminal SSIM pass: vertical forward, both derivative convolutions,
+// final rendered-image gradient, and loss/photometric reductions. A 16x8
+// output group keeps the complete 26x28 statistics halo below 16 KiB. Each
+// phase retains its outputs privately, then reuses the same threadgroup tile
+// after a barrier instead of materializing the 9-float-per-pixel derivative
+// buffer in device memory.
+kernel void ssim_fused_v_fwd_bwd_kernel(
+    device float* rendered_gradient,
+    constant float* gt,             // UInt8 RGBA or Float32 RGB, selected by stride
+    constant float* ssim_h_buf,
+    constant uint2& img_size,
+    constant float& ssim_weight,
+    constant float& inv_n,
+    device atomic_float* loss_sum,
+    constant uchar* coverage_mask, // packed alpha or (H, W), disabled by x=0
+    constant uint2& coverage_layout,
+    constant float* log_rgb_gains, // (cameraCount, 3)
+    constant uint& camera_gain_offset,
+    device atomic_float* log_gain_gradient, // (3)
+    constant uint& photometric_enabled,
+    constant uint2& alpha_layout,
+    constant float* background,
+    constant float* final_Ts,
+    constant float& alpha_loss_weight,
+    constant uint& target_pixel_stride_bytes,
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]],
+    uint tr [[thread_index_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    const uint W = img_size.x, H = img_size.y;
+    const uint px = gid.x, py = gid.y;
+    constexpr uint OUTPUT_W = 16;
+    constexpr uint OUTPUT_H = 8;
+    constexpr uint THREADS_PER_GROUP = OUTPUT_W * OUTPUT_H;
+    constexpr uint STATS_W = OUTPUT_W + 2 * SSIM_HALF_WIN; // 26
+    constexpr uint STATS_H = OUTPUT_H + 4 * SSIM_HALF_WIN; // 28
+    constexpr uint STATS_PIXELS = STATS_W * STATS_H;
+    constexpr uint RAW_H = OUTPUT_H + 2 * SSIM_HALF_WIN;   // 18
+    constexpr uint RAW_PIXELS = STATS_W * RAW_H;
+    constexpr uint H_PIXELS = OUTPUT_W * RAW_H;
+    constexpr uint RAW_VALUES_PER_THREAD =
+        (RAW_PIXELS + THREADS_PER_GROUP - 1) / THREADS_PER_GROUP;
+    constexpr uint H_VALUES_PER_THREAD =
+        (H_PIXELS + THREADS_PER_GROUP - 1) / THREADS_PER_GROUP;
+    const int output_base_x = int(tgid.x * OUTPUT_W);
+    const int output_base_y = int(tgid.y * OUTPUT_H);
+    const int stats_base_x = output_base_x - SSIM_HALF_WIN;
+    const int stats_base_y = output_base_y - 2 * SSIM_HALF_WIN;
+    const int raw_base_x = stats_base_x;
+    const int raw_base_y = output_base_y - SSIM_HALF_WIN;
+
+    float ssim_sum = 0.0f, l1_sum = 0.0f, coverage_sum = 0.0f;
+    float alpha_loss_sum = 0.0f;
+    float3 local_log_gain_gradient = float3(0.0f);
+    threadgroup float tg_gain[3];
+    threadgroup float tg_scratch[STATS_PIXELS * 5];
+
+    if (tr < 3) {
+        tg_gain[tr] = photometric_enabled != 0
+            ? photometric_gain(log_rgb_gains, camera_gain_offset, tr)
+            : 1.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint c = 0; c < 3; ++c) {
+        const float gain = tg_gain[c];
+        for (uint i = tr; i < STATS_PIXELS; i += THREADS_PER_GROUP) {
+            const uint sy = i / STATS_W, sx = i % STATS_W;
+            const int gy = stats_base_y + int(sy);
+            const int gx = stats_base_x + int(sx);
+            const bool valid_sample =
+                gx >= 0 && gx < int(W) && gy >= 0 && gy < int(H);
+            const uint hp = valid_sample
+                ? (uint(gy) * W + uint(gx)) * 15 + c * 5
+                : 0;
+            for (uint field = 0; field < 5; ++field) {
+                tg_scratch[i * 5 + field] = valid_sample
+                    ? ssim_h_buf[hp + field]
+                    : 0.0f;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float3 phase_values[RAW_VALUES_PER_THREAD] = {};
+        for (uint slot = 0; slot < RAW_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= RAW_PIXELS) continue;
+            const uint ry = i / STATS_W, rx = i % STATS_W;
+            float mu_x = 0.0f, mu_y = 0.0f;
+            float sq_x = 0.0f, sq_y = 0.0f, cross_xy = 0.0f;
+            for (uint k = 0; k < SSIM_WIN; ++k) {
+                const float w = GAUSS_1D[k];
+                const uint hp = ((ry + k) * STATS_W + rx) * 5;
+                mu_x += w * tg_scratch[hp + 0];
+                mu_y += w * tg_scratch[hp + 1];
+                sq_x += w * tg_scratch[hp + 2];
+                sq_y += w * tg_scratch[hp + 3];
+                cross_xy += w * tg_scratch[hp + 4];
+            }
+
+            const int gpx = raw_base_x + int(rx);
+            const int gpy = raw_base_y + int(ry);
+            const bool valid_center =
+                gpx >= 0 && gpx < int(W) && gpy >= 0 && gpy < int(H);
+            if (!valid_center) {
+                phase_values[slot] = float3(0.0f);
+                continue;
+            }
+            const float coverage = coverage_layout.x == 0
+                ? 1.0f
+                : training_mask_coverage(
+                    coverage_mask, uint(gpy) * W + uint(gpx),
+                    coverage_layout);
+            const float sigma_x_sq = sq_x - mu_x * mu_x;
+            const float sigma_y_sq = sq_y - mu_y * mu_y;
+            const float sigma_xy = cross_xy - mu_x * mu_y;
+            const float A = 2.0f * mu_x * mu_y + SSIM_C1;
+            const float B = 2.0f * sigma_xy + SSIM_C2;
+            const float Cd = mu_x * mu_x + mu_y * mu_y + SSIM_C1;
+            const float D = sigma_x_sq + sigma_y_sq + SSIM_C2;
+            const float iCD = 1.0f / (Cd * D);
+            const float dmu =
+                2.0f * B * (mu_x * Cd - A * mu_y) / (Cd * Cd * D);
+            const float dsyq = -A * B * iCD / D;
+            const float dsxy = 2.0f * A * iCD;
+            phase_values[slot] = coverage * float3(
+                dmu - 2.0f * mu_y * dsyq - mu_x * dsxy,
+                2.0f * dsyq,
+                dsxy);
+
+            const bool owns_loss_center =
+                rx >= SSIM_HALF_WIN &&
+                rx < SSIM_HALF_WIN + OUTPUT_W &&
+                ry >= SSIM_HALF_WIN &&
+                ry < SSIM_HALF_WIN + OUTPUT_H;
+            if (owns_loss_center) {
+                ssim_sum += coverage * (A * B) / (Cd * D);
+                const uint center_pixel = uint(gpy) * W + uint(gpx);
+                const float target = training_target_rgb(
+                    gt, coverage_mask, alpha_layout, background,
+                    target_pixel_stride_bytes, center_pixel, c);
+                l1_sum += coverage * fabs(
+                    target - rendered_gradient[center_pixel * 3 + c] * gain);
+                coverage_sum += coverage;
+                if (c == 0 && alpha_layout.x != 0) {
+                    const float target_alpha = training_mask_coverage(
+                        coverage_mask, center_pixel, alpha_layout);
+                    alpha_loss_sum += alpha_loss_weight * fabs(
+                        (1.0f - final_Ts[center_pixel]) - target_alpha);
+                }
+            }
+        }
+
+        // All statistics reads must finish before the raw derivative planes
+        // overwrite the shared tile. Loss owners also read rendered_gradient
+        // cooperatively, so fence device memory before output-owner threads
+        // begin replacing those pixels in place.
+        threadgroup_barrier(
+            mem_flags::mem_threadgroup | mem_flags::mem_device);
+        for (uint slot = 0; slot < RAW_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= RAW_PIXELS) continue;
+            tg_scratch[i] = phase_values[slot].x;
+            tg_scratch[RAW_PIXELS + i] = phase_values[slot].y;
+            tg_scratch[2 * RAW_PIXELS + i] = phase_values[slot].z;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint slot = 0; slot < H_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= H_PIXELS) continue;
+            const uint hy = i / OUTPUT_W, hx = i % OUTPUT_W;
+            float3 value = float3(0.0f);
+            for (uint dx = 0; dx < SSIM_WIN; ++dx) {
+                const float w = GAUSS_1D[SSIM_WIN - 1 - dx];
+                const uint raw = hy * STATS_W + hx + dx;
+                value.x += w * tg_scratch[raw];
+                value.y += w * tg_scratch[RAW_PIXELS + raw];
+                value.z += w * tg_scratch[2 * RAW_PIXELS + raw];
+            }
+            phase_values[slot] = value;
+        }
+
+        // Horizontal results reuse the raw derivative planes only after every
+        // thread has completed its reads.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint slot = 0; slot < H_VALUES_PER_THREAD; ++slot) {
+            const uint i = tr + slot * THREADS_PER_GROUP;
+            if (i >= H_PIXELS) continue;
+            tg_scratch[i] = phase_values[slot].x;
+            tg_scratch[H_PIXELS + i] = phase_values[slot].y;
+            tg_scratch[2 * H_PIXELS + i] = phase_values[slot].z;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (px < W && py < H) {
+            float3 convolved = float3(0.0f);
+            for (uint dy = 0; dy < SSIM_WIN; ++dy) {
+                const float w = GAUSS_1D[SSIM_WIN - 1 - dy];
+                const uint hp = (lid.y + dy) * OUTPUT_W + lid.x;
+                convolved.x += w * tg_scratch[hp];
+                convolved.y += w * tg_scratch[H_PIXELS + hp];
+                convolved.z += w * tg_scratch[2 * H_PIXELS + hp];
+            }
+
+            const uint pixel = py * W + px;
+            const uint pixel_channel = pixel * 3 + c;
+            const float raw_rend_val = rendered_gradient[pixel_channel];
+            const float rend_val = raw_rend_val * gain;
+            const float gt_val = training_target_rgb(
+                gt, coverage_mask, alpha_layout, background,
+                target_pixel_stride_bytes, pixel, c);
+            const float v_ssim = convolved.x +
+                rend_val * convolved.y + gt_val * convolved.z;
+            const float coverage = coverage_layout.x == 0
+                ? 1.0f
+                : training_mask_coverage(
+                    coverage_mask, pixel, coverage_layout);
+            const float v_l1 = coverage * (
+                (gt_val > rend_val) ? -1.0f :
+                ((gt_val < rend_val) ? 1.0f : 0.0f));
+            const float adjusted_gradient = inv_n * (
+                -ssim_weight * v_ssim +
+                (1.0f - ssim_weight) * v_l1);
+            rendered_gradient[pixel_channel] = adjusted_gradient * gain;
+            local_log_gain_gradient[c] = adjusted_gradient * rend_val;
+        }
+
+        // The next channel reloads the statistics tile.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    const float loss_contribution =
+        ssim_weight * (coverage_sum - ssim_sum) / 3.0f +
+        (1.0f - ssim_weight) * l1_sum / 3.0f +
+        alpha_loss_sum;
+    tg_scratch[tr] = loss_contribution;
+    if (photometric_enabled != 0) {
+        tg_scratch[THREADS_PER_GROUP + tr] = local_log_gain_gradient.x;
+        tg_scratch[2 * THREADS_PER_GROUP + tr] = local_log_gain_gradient.y;
+        tg_scratch[3 * THREADS_PER_GROUP + tr] = local_log_gain_gradient.z;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = THREADS_PER_GROUP / 2; stride > 0; stride >>= 1) {
+        if (tr < stride) {
+            tg_scratch[tr] += tg_scratch[tr + stride];
+            if (photometric_enabled != 0) {
+                for (uint c = 1; c <= 3; ++c) {
+                    const uint base = c * THREADS_PER_GROUP;
+                    tg_scratch[base + tr] +=
+                        tg_scratch[base + tr + stride];
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tr == 0) {
+        atomic_fetch_add_explicit(
+            loss_sum, tg_scratch[0], memory_order_relaxed);
+        if (photometric_enabled != 0) {
+            for (uint c = 0; c < 3; ++c) {
+                atomic_fetch_add_explicit(
+                    log_gain_gradient + c,
+                    tg_scratch[(c + 1) * THREADS_PER_GROUP],
+                    memory_order_relaxed);
+            }
+        }
+    }
 }
 
 // Backward pass 1: compute derivative fields + horizontal convolution.
@@ -4021,8 +5101,8 @@ kernel void ssim_h_bwd_kernel(
     constant float* intermediates,  // (H, W, 15) from forward
     constant uint2& img_size,       // (W, H)
     device float* ssim_h_buf,       // (H, W, 15) — reused from forward
-    constant uchar* coverage_mask,  // (H, W), ignored when stride is zero
-    constant uint& coverage_stride,
+    constant uchar* coverage_mask,  // packed alpha or (H, W), disabled by x=0
+    constant uint2& coverage_layout,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -4066,10 +5146,11 @@ kernel void ssim_h_bwd_kernel(
                 float dmu  = 2.0f * B * (mu_x * Cd - A * mu_y) / (Cd * Cd * D);
                 float dsyq = -A * B * iCD / D;
                 float dsxy = 2.0f * A * iCD;
-                const float coverage = coverage_stride == 0
+                const float coverage = coverage_layout.x == 0
                     ? 1.0f
-                    : float(coverage_mask[
-                        uint(gy) * coverage_stride + uint(gx)]) / 255.0f;
+                    : training_mask_coverage(
+                        coverage_mask, uint(gy) * W + uint(gx),
+                        coverage_layout);
 
                 f1 = coverage *
                     (dmu - 2.0f * mu_y * dsyq - mu_x * dsxy);
@@ -4104,19 +5185,20 @@ kernel void ssim_h_bwd_kernel(
 // overwritten in place with its gradient; each thread touches only its pixel.
 kernel void ssim_v_bwd_kernel(
     device float* rendered_gradient,// (H, W, 3), rendered in / gradient out
-    constant float* gt,             // (H, W, 3)
+    constant float* gt,             // UInt8 RGBA or Float32 RGB, selected by stride
     constant float* deriv_h_buf,    // (H, W, 9): 3 values × 3 channels
     constant uint2& img_size,       // (W, H)
     constant float& ssim_weight,
     constant float& inv_n,          // 255 / (sum(coverage bytes) * 3)
-    constant uchar* coverage_mask,  // (H, W), ignored when stride is zero
-    constant uint& coverage_stride,
+    constant uchar* coverage_mask,  // packed alpha or (H, W), disabled by x=0
+    constant uint2& coverage_layout,
     constant float* log_rgb_gains,  // (cameraCount, 3)
     constant uint& camera_gain_offset,
     device atomic_float* log_gain_gradient, // (3)
     constant uint& photometric_enabled,
-    constant uint& alpha_stride,
+    constant uint2& alpha_layout,
     constant float* background,
+    constant uint& target_pixel_stride_bytes,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -4179,13 +5261,14 @@ kernel void ssim_v_bwd_kernel(
             const float raw_rend_val = rendered_gradient[pixel_channel];
             const float rend_val = raw_rend_val * gain;
             float gt_val = training_target_rgb(
-                gt, coverage_mask, alpha_stride, background,
-                py * W + px, c);
+                gt, coverage_mask, alpha_layout, background,
+                target_pixel_stride_bytes, py * W + px, c);
 
             float v_ssim = conv_f1 + rend_val * conv_f2 + gt_val * conv_f3;
-            const float coverage = coverage_stride == 0
+            const float coverage = coverage_layout.x == 0
                 ? 1.0f
-                : float(coverage_mask[py * coverage_stride + px]) / 255.0f;
+                : training_mask_coverage(
+                    coverage_mask, py * W + px, coverage_layout);
             float v_l1 = coverage * (
                 (gt_val > rend_val) ? -1.0f :
                 ((gt_val < rend_val) ? 1.0f : 0.0f));
@@ -4242,8 +5325,12 @@ kernel void photometric_adam_kernel(
     constant float& eps,
     constant float& regularization,
     constant float& max_abs_log_gain,
+    device atomic_uint* attempt_status,
+    constant uint& attempt_gating_enabled,
     uint channel [[thread_position_in_grid]]) {
-    if (channel >= 3) return;
+    if (channel >= 3 ||
+        (attempt_gating_enabled != 0u &&
+         training_attempt_failed(attempt_status))) return;
     const uint index = camera_gain_offset + channel;
     const float parameter = log_rgb_gains[index];
     const float gradient =
@@ -4260,6 +5347,22 @@ kernel void photometric_adam_kernel(
     log_rgb_gains[index] = clamp(
         parameter - step_size * first_moment / denominator,
         -max_abs_log_gain, max_abs_log_gain);
+}
+
+// Periodic training maintenance. Keep NaN behavior identical to the previous
+// CPU comparison: only values strictly above the reset ceiling are replaced.
+kernel void reset_opacity_state_kernel(
+    device float* opacities      [[buffer(0)]],
+    device float* exp_avg        [[buffer(1)]],
+    device float* exp_avg_sq     [[buffer(2)]],
+    constant uint& count         [[buffer(3)]],
+    constant float& max_logit    [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= count) return;
+    if (opacities[idx] > max_logit) opacities[idx] = max_logit;
+    exp_avg[idx] = 0.0f;
+    exp_avg_sq[idx] = 0.0f;
 }
 
 // ============================================================
@@ -4309,6 +5412,35 @@ kernel void densify_classify_kernel(
     dup_flag[idx]   = do_dup   ? 1 : 0;
 }
 
+inline uint densify_mix_bits(uint value) {
+    value ^= value >> 16;
+    value *= 0x7feb352du;
+    value ^= value >> 15;
+    value *= 0x846ca68bu;
+    value ^= value >> 16;
+    return value;
+}
+
+constant bool densify_random_on_gpu [[function_constant(0)]];
+
+inline float densify_uniform_open(uint bits) {
+    // Force the least-significant retained bit so the exactly representable
+    // numerator stays in [1, 2^24 - 1], safely away from both endpoints.
+    return float((bits >> 8) | 1u) * (1.0f / 16777216.0f);
+}
+
+inline float2 densify_normal_pair(uint seed, uint pair_index) {
+    uint stream = pair_index + 1u;
+    uint base = seed ^ (stream * 0x9e3779b9u);
+    float u1 = densify_uniform_open(
+        densify_mix_bits(base ^ 0xa511e9b3u));
+    float u2 = densify_uniform_open(
+        densify_mix_bits(base ^ 0x63d83595u));
+    float radius = sqrt(-2.0f * log(u1));
+    float angle = 6.28318530717958647692f * u2;
+    return radius * float2(cos(angle), sin(angle));
+}
+
 // Append split children into backing buffers. One thread per original gaussian.
 // Each split gaussian produces 2 children at [N + 2*(ord)], [N + 2*(ord)+1].
 // Also shrinks parent scale by 1/1.6 and zeros optimizer state for children.
@@ -4337,6 +5469,7 @@ kernel void densify_append_split_kernel(
     device float* adam_es3           [[buffer(21)]],
     device float* adam_es4           [[buffer(22)]],
     device float* adam_es5           [[buffer(23)]],
+    constant uint& random_seed       [[buffer(24)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)N || split_flag[idx] == 0) return;
@@ -4354,15 +5487,40 @@ kernel void densify_append_split_kernel(
     // Parent scale (exp)
     float sx = exp(scales_buf[idx*3]), sy = exp(scales_buf[idx*3+1]), sz = exp(scales_buf[idx*3+2]);
 
+    float2 gpu_pair0, gpu_pair1, gpu_pair2;
+    if (densify_random_on_gpu) {
+        uint first_pair = uint(ord) * 3u;
+        gpu_pair0 = densify_normal_pair(random_seed, first_pair);
+        gpu_pair1 = densify_normal_pair(random_seed, first_pair + 1u);
+        gpu_pair2 = densify_normal_pair(random_seed, first_pair + 2u);
+    }
+
     // For each of 2 children
     for (int k = 0; k < 2; k++) {
         int child = (k == 0) ? c0 : c1;
         int rand_idx = ord * 2 + k;
 
-        // Scale random sample by parent scale
-        float r0 = random_samples[rand_idx*3]   * sx;
-        float r1 = random_samples[rand_idx*3+1] * sy;
-        float r2 = random_samples[rand_idx*3+2] * sz;
+        // GPU mode derives a stateless stream from logical step and split
+        // ordinal. CPU mode reads the exact legacy libc++ sample stream.
+        float r0, r1, r2;
+        if (densify_random_on_gpu) {
+            if (k == 0) {
+                r0 = gpu_pair0.x;
+                r1 = gpu_pair0.y;
+                r2 = gpu_pair1.x;
+            } else {
+                r0 = gpu_pair1.y;
+                r1 = gpu_pair2.x;
+                r2 = gpu_pair2.y;
+            }
+        } else {
+            r0 = random_samples[rand_idx*3];
+            r1 = random_samples[rand_idx*3+1];
+            r2 = random_samples[rand_idx*3+2];
+        }
+        r0 *= sx;
+        r1 *= sy;
+        r2 *= sz;
 
         // Rotate by parent quaternion: v' = R @ v
         float v0 = (1-2*(qy*qy+qz*qz))*r0 + 2*(qx*qy-qw*qz)*r1 + 2*(qx*qz+qw*qy)*r2;

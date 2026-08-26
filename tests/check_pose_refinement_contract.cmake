@@ -7,6 +7,8 @@ file(READ "${MSPLAT_SOURCE_DIR}/core/metal/msplat_metal.mm" host_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/src/model.cpp" model_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/src/msplat_api.mm" api_source)
 file(READ "${MSPLAT_SOURCE_DIR}/core/include/msplat_c_api.h" c_api_header)
+file(READ "${MSPLAT_SOURCE_DIR}/core/include/pose_refinement_state.hpp"
+    pose_state_header)
 file(READ "${MSPLAT_SOURCE_DIR}/cli/msplat.cpp" cli_source)
 file(READ "${MSPLAT_SOURCE_DIR}/python/bindings.cpp" python_source)
 
@@ -46,11 +48,11 @@ extract_section(metal_source "kernel void prepare_camera_pose_kernel("
 extract_section(metal_source "kernel void camera_pose_adam_kernel("
     "// ===== Fused Projection + SH Kernels" pose_adam)
 extract_section(metal_source "kernel void project_and_sh_forward_kernel("
-    "kernel void project_and_sh_backward_kernel(" fused_forward)
-extract_section(metal_source "kernel void project_and_sh_backward_kernel("
+    "inline void adam_update_element(" fused_forward)
+extract_section(metal_source "kernel void project_backward_adam_kernel("
     "// ===== Exact Tile Intersection Pipeline" fused_backward)
 extract_section(metal_source "inline void atomic_add_threadgroup_float("
-    "// Packed Adam hyperparameters" pose_group_atomic_add)
+    "struct SHOpacityAdamParams" pose_group_atomic_add)
 
 # D * V0 convention and the camera center derived from the same refined view.
 require_contains("${pose_prepare}"
@@ -132,6 +134,15 @@ require_contains("${pose_adam}"
 require_contains("${pose_adam}"
     "if (rotation_norm > params.max_rotation)"
     "rotation norm bound")
+require_contains("${pose_adam}"
+    "params.conditioned == 0u"
+    "raw optimizer compatibility branch")
+require_contains("${pose_adam}"
+    "metric_component * 6u + latent_component],\n                    metric_gradient[metric_component]"
+    "CamP transpose gradient transform")
+require_contains("${pose_adam}"
+    "metric_component * 6u + latent_component],\n                    latent_update[latent_component]"
+    "CamP metric update transform")
 
 extract_section(host_source "auto encode_pose_prepare ="
     "auto encode_proj_sh =" host_prepare)
@@ -166,7 +177,7 @@ require_contains("${canonical_render_pipeline}"
     "const uint32_t poseDisabled = 0u;\n        ENC_SCALAR(enc, poseDisabled, 23);"
     "canonical render pose-disabled binding")
 
-extract_section(host_source "MTensor msplat_train_step("
+extract_section(host_source "static MTensor msplat_train_step_locked("
     "// ========================== FORWARD ENCODE LAMBDAS" training_setup)
 require_contains("${training_setup}"
     "std::array<float, 4>{cam_pos[0], cam_pos[1], cam_pos[2], 0.0f}"
@@ -175,7 +186,7 @@ require_contains("${training_setup}"
 extract_section(host_source "auto encode_proj_sh_bwd_adam ="
     "// ========================== DISPATCH" host_backward)
 require_contains("${host_backward}"
-    "ENC_SCALAR(enc, poseEnabled, 28);\n        ENC_BUF(enc, poseGradient, 29);"
+    "ENC_SCALAR(enc, poseEnabled, 20); ENC_BUF(enc, poseGradient, 21);"
     "backward pose bindings")
 require_contains("${host_backward}"
     "if (pose.enabled) {\n            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];\n            [enc setComputePipelineState:ctx->camera_pose_adam_kernel_cpso];"
@@ -183,6 +194,9 @@ require_contains("${host_backward}"
 require_contains("${host_backward}"
     "ENC_BUF(enc, poseDeltas, 0);\n            ENC_BUF(enc, poseGradient, 1);\n            ENC_BUF(enc, poseExpAvg, 2);\n            ENC_BUF(enc, poseExpAvgSq, 3);"
     "pose Adam state bindings")
+require_contains("${host_backward}"
+    "ENC_BUF(enc, posePreconditioners, 7);"
+    "pose preconditioner binding")
 
 extract_section(host_source "auto do_blit_zero ="
     "auto encode_step_readback =" blit_zero)
@@ -201,8 +215,10 @@ require_contains("${host_forward}"
     "ENC_BUF(enc, g_tcache.pose_cam_pos, 18);"
     "refined forward camera-center binding")
 require_contains("${host_backward}"
-    "ENC_BUF(enc, g_tcache.pose_cam_pos, 19);"
+    "ENC_BUF(enc, g_tcache.pose_cam_pos, 5);"
     "refined backward camera-center binding")
+require_absent("${fused_backward}" "v_depth"
+    "fused backward depth cotangent")
 
 # Canonical render remains independent of training-only pose corrections.
 extract_section(model_source "MTensor Model::render("
@@ -249,9 +265,61 @@ require_contains("${api_source}"
 require_contains("${c_api_header}"
     "#define MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS     (1u << 1)"
     "C API camera-pose capability bit")
+require_contains("${c_api_header}"
+    "#define MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING (1u << 2)"
+    "C API CamP-conditioning capability bit")
 require_contains("${api_source}"
     "cfg.refineCameraPoses =\n            (refinementOptions->flags &\n             MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) != 0u;"
     "C API camera-pose option mapping")
+require_contains("${api_source}"
+    "? msplat::CameraPoseConditioning::CamP\n                : msplat::CameraPoseConditioning::Raw;"
+    "C API camera-pose conditioning mapping")
+
+# ABI v15 reads only the public pose row after serializing and synchronizing.
+extract_section(api_source
+    "PoseRefinementState Trainer::poseRefinementState("
+    "// ── Lifecycle" pose_state_trainer_query)
+require_contains("${pose_state_trainer_query}"
+    "std::lock_guard lock(g_trainerTransactionMutex);"
+    "pose-state trainer transaction lock")
+require_contains("${pose_state_trainer_query}"
+    "msplat_gpu_sync();"
+    "pose-state GPU synchronization")
+
+extract_section(model_source
+    "uint32_t Model::poseRefinementStateCount() const"
+    "void Model::ensureCapacity(" pose_state_model_query)
+require_contains("${pose_state_model_query}"
+    "cameraPoseDeltas.data<float>()"
+    "pose-state delta read")
+require_contains("${pose_state_model_query}"
+    "Pose-refinement anchor delta is not zero"
+    "pose-state zero anchor invariant")
+require_absent("${pose_state_model_query}" "cameraPoseExpAvg"
+    "pose-state model query")
+require_absent("${pose_state_model_query}" "cameraPoseExpAvgSq"
+    "pose-state model query")
+require_contains("${pose_state_header}"
+    "correctionRotation[row * 3 + inner] *\n                    declaredViewRotation[inner * 3 + column]"
+    "pose-state left view correction")
+require_contains("${pose_state_header}"
+    "correctedNormalizedPosition[row] / normalizationScale +\n            normalizationTranslation[row]"
+    "pose-state normalization reversal")
+require_contains("${c_api_header}"
+    "#define MSPLAT_POSE_REFINEMENT_STATE_ENABLED (1u << 0)"
+    "pose-state enabled flag")
+require_contains("${c_api_header}"
+    "#define MSPLAT_POSE_REFINEMENT_STATE_ANCHOR  (1u << 1)"
+    "pose-state anchor flag")
+require_contains("${c_api_header}"
+    "msplat_trainer_pose_refinement_count_v15("
+    "pose-state count query")
+require_contains("${c_api_header}"
+    "msplat_trainer_pose_refinement_state_v15("
+    "pose-state checked query")
+require_contains("${api_source}"
+    "require(outputSize == sizeof(MsplatPoseRefinementStateV15)"
+    "pose-state output size validation")
 
 # Selecting the fixed anchor must not dereference an empty training split
 # before the normal model validation can return a recoverable error.

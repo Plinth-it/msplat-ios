@@ -8,6 +8,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
+// The exported header remains valid C/C++. Objective-C and Swift clients get
+// the typed Metal protocol object used by ABI v13 preview frames.
+#ifdef __OBJC__
+#import <Metal/Metal.h>
+typedef id<MTLTexture> MsplatMTLTextureRef;
+#else
+typedef void* MsplatMTLTextureRef;
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -28,8 +37,18 @@ extern "C" {
 // COLMAP loading without changing any existing structure or symbol.
 // ABI v11 adds versioned training-mask treatment options without changing
 // MsplatConfig or the existing coverage-mask behavior.
+// ABI v12 adds detailed count-barrier and tile-distribution telemetry through
+// a new query structure without changing the ABI v4 telemetry layout.
+// ABI v13 adds separately owned, asynchronously completed Metal preview
+// frames while retaining every CPU render entry point.
+// ABI v14 adds instance-scoped, opt-in depth-one training-target prefetch.
+// ABI v15 adds read-only, size-checked camera-pose refinement state without
+// changing any existing structure or entry point.
+// ABI v16 adds opt-in CamP conditioning to the unchanged v8 refinement options.
+// The global bump lets new clients reject older binaries that would interpret
+// the new capability bit as unknown.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 11u
+#define MSPLAT_ABI_VERSION 16u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -126,6 +145,9 @@ static inline MsplatTrainingLimits msplat_default_training_limits(void) {
 /// Learn bounded camera-space pose corrections only for training. Imported
 /// camera geometry and canonical render/evaluation/export remain unchanged.
 #define MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS     (1u << 1)
+/// Apply fixed full-matrix CamP conditioning to camera-pose updates. This bit
+/// is valid only together with MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS.
+#define MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING (1u << 2)
 
 typedef struct {
     uint32_t flags;
@@ -175,13 +197,16 @@ typedef struct {
     float msPerStep; // CPU encode + command submission time; not completed GPU time.
 } MsplatStats;
 
-// Flags for MsplatTrainingMetrics.flags.
+// Flags shared by the v4 and v12 training-metrics snapshots. The count-GPU
+// timing flag is emitted only by the v12 query.
 #define MSPLAT_TRAINING_METRICS_HAS_SUBMITTED_STEP (1u << 0)
 #define MSPLAT_TRAINING_METRICS_HAS_COMPLETED_STEP (1u << 1)
 #define MSPLAT_TRAINING_METRICS_GPU_TIME_VALID     (1u << 2)
 #define MSPLAT_TRAINING_METRICS_LOSS_VALID         (1u << 3)
 #define MSPLAT_TRAINING_METRICS_INTERSECTIONS_VALID (1u << 4)
 #define MSPLAT_TRAINING_METRICS_HAS_FAILED_STEP    (1u << 5)
+#define MSPLAT_TRAINING_METRICS_COUNT_GPU_TIME_VALID (1u << 6)
+#define MSPLAT_TRAINING_METRICS_QUEUE_IDLE_TIME_VALID (1u << 7)
 
 // Bit values for MsplatCompletedTrainingStep.overflowKinds.
 #define MSPLAT_RASTER_OVERFLOW_TILE_CAP        (1u << 0)
@@ -232,6 +257,50 @@ typedef struct {
     int32_t lastFailedIteration;
 } MsplatTrainingMetrics;
 
+/// ABI v12 completed-step telemetry. The first 64 bytes intentionally match
+/// MsplatCompletedTrainingStep exactly; new fields are appended only here.
+typedef struct {
+    int32_t iteration;
+    int32_t splatCount;
+    int32_t modelCapacity;
+    int32_t effectiveWidth;
+    int32_t effectiveHeight;
+    int32_t activeSHDegree;
+    float cpuSubmitMs;
+    float gpuExecutionMs;
+    float endToEndMs;
+    float loss;
+    uint32_t overflowKinds;
+    uint32_t reserved;
+    uint64_t retainedPackedIntersectionCount;
+    uint64_t packedIntersectionCapacity;
+    float imagePrepareMs;
+    float countGpuMs;
+    float countWaitWallMs;
+    float postCountEncodeMs;
+    float intersectionArenaGrowMs;
+    uint32_t maximumTileCount;
+    uint32_t activeTileCount;
+    uint32_t trivialTileCount;
+    uint32_t smallTileCount;
+    uint32_t mediumTileCount;
+    uint32_t largeTileCount;
+    float queueIdleMs;
+} MsplatCompletedTrainingStepV12;
+
+/// ABI v12 query snapshot. The v4 query remains available for existing clients.
+typedef struct {
+    uint32_t flags;
+    uint32_t reserved;
+    MsplatSubmittedTrainingStep submitted;
+    MsplatCompletedTrainingStepV12 completed;
+    uint64_t overflowedCompletedSteps;
+    uint64_t tileCapOverflowedSteps;
+    uint64_t packedCapacityOverflowedSteps;
+    int32_t lastOverflowIteration;
+    int32_t lastFailedIteration;
+} MsplatTrainingMetricsV12;
+
 // Flags for MsplatTrainingMemoryMetrics.flags.
 #define MSPLAT_MEMORY_METRICS_PHYS_FOOTPRINT_VALID (1u << 0)
 #define MSPLAT_MEMORY_METRICS_AVAILABLE_VALID      (1u << 1)
@@ -255,6 +324,29 @@ typedef struct {
     uint64_t trainingGpuImageCacheMisses;
 } MsplatTrainingMemoryMetrics;
 
+#define MSPLAT_POSE_REFINEMENT_STATE_ENABLED (1u << 0)
+#define MSPLAT_POSE_REFINEMENT_STATE_ANCHOR  (1u << 1)
+
+/// ABI v15 read-only state for one canonical dataset camera. `poseDelta[0...2]`
+/// is the left-view translation correction expressed in the dataset's original
+/// pre-normalization length units; `poseDelta[3...5]` is axis-angle radians.
+/// `correctedCameraToWorld` is row-major OpenGL camera-to-world in that same
+/// original coordinate system. `frameId` is length-delimited, not necessarily
+/// NUL-terminated, and remains valid only for the owning trainer's lifetime.
+/// The reserved field is always zero.
+typedef struct {
+    uint32_t flags;
+    uint32_t canonicalCameraIndex;
+    uint32_t optimizerStepCount;
+    uint32_t reserved;
+    float poseDelta[6];
+    float translationNorm;
+    float rotationNorm;
+    float correctedCameraToWorld[16];
+    const char* frameId;
+    uint64_t frameIdLength;
+} MsplatPoseRefinementStateV15;
+
 typedef struct {
     float psnr;
     float ssim;
@@ -270,6 +362,11 @@ typedef struct {
     int width;
     int height;
 } MsplatPixelBuffer;
+
+/// Opaque ABI v13 preview-frame handle. The frame owns a private BGRA8Unorm
+/// Metal texture until destroyed. Its texture is immutable once ready and may
+/// outlive the trainer/session that submitted it.
+typedef void* MsplatPreviewFrame;
 
 // ── Dataset ─────────────────────────────────────────────────────────────────
 
@@ -431,6 +528,11 @@ MsplatStatus msplat_dataset_create_v10(
     const char* path, float downscaleFactor, bool evalMode, int32_t testEvery,
     bool discoverTrainingMasks, MsplatDataset* outDataset,
     MsplatErrorInfo* error);
+/// ABI v14 instance-scoped prefetch opt-in. This is idempotent and must be
+/// called before a trainer is created from the dataset. The environment-based
+/// default remains supported for existing clients.
+MsplatStatus msplat_dataset_enable_training_target_prefetch_v14(
+    MsplatDataset ds, MsplatErrorInfo* error);
 MsplatStatus msplat_dataset_destroy_v2(MsplatDataset ds, MsplatErrorInfo* error);
 MsplatStatus msplat_dataset_num_train_v2(MsplatDataset ds, int* outCount,
                                          MsplatErrorInfo* error);
@@ -572,6 +674,25 @@ MsplatStatus msplat_trainer_render_pose_to_buffer_v2(
     MsplatTrainer t, const float camToWorld[16], int refCameraIndex,
     uint8_t* outRGBA, size_t outCapacity, int* outWidth, int* outHeight,
     MsplatErrorInfo* error);
+/// Submit a fixed-pose preview into a separately owned BGRA8Unorm texture.
+/// The returned frame begins pending. Poll until ready before sampling its
+/// texture from another Metal queue. Submission still inherits the renderer's
+/// exact-count synchronization; completion of the final raster/conversion is
+/// asynchronous. Destroying a pending frame is safe.
+MsplatStatus msplat_trainer_render_pose_preview_v13(
+    MsplatTrainer t, const float camToWorld[16], int refCameraIndex,
+    MsplatPreviewFrame* outFrame, MsplatErrorInfo* error);
+/// Returns OK with outReady=false while pending, OK/true when complete, or a
+/// structured GPU error when the submitted command buffer failed.
+MsplatStatus msplat_preview_frame_poll_v13(
+    MsplatPreviewFrame frame, bool* outReady, MsplatErrorInfo* error);
+/// Returns the borrowed texture and dimensions only after successful
+/// completion. Swift/Objective-C clients retain the returned object normally.
+MsplatStatus msplat_preview_frame_texture_v13(
+    MsplatPreviewFrame frame, MsplatMTLTextureRef* outTexture,
+    int* outWidth, int* outHeight, MsplatErrorInfo* error);
+MsplatStatus msplat_preview_frame_destroy_v13(
+    MsplatPreviewFrame frame, MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_export_ply_v2(MsplatTrainer t, const char* path,
                                           MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_export_splat_v2(MsplatTrainer t, const char* path,
@@ -589,15 +710,31 @@ MsplatStatus msplat_trainer_splat_count_v2(MsplatTrainer t, int* outCount,
                                            MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_iteration_v2(MsplatTrainer t, int* outIteration,
                                          MsplatErrorInfo* error);
-// ABI v4 query APIs. outputSize must exactly match the corresponding struct.
+// Versioned query APIs. outputSize must exactly match the corresponding struct.
 // A size mismatch leaves the output untouched. With a correct size, failures
 // zero the output before returning an error status.
 MsplatStatus msplat_trainer_metrics_v4(
     MsplatTrainer t, MsplatTrainingMetrics* outMetrics, size_t outputSize,
     MsplatErrorInfo* error);
+MsplatStatus msplat_trainer_metrics_v12(
+    MsplatTrainer t, MsplatTrainingMetricsV12* outMetrics, size_t outputSize,
+    MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_memory_metrics_v4(
     MsplatTrainer t, MsplatTrainingMemoryMetrics* outMetrics,
     size_t outputSize, MsplatErrorInfo* error);
+/// Returns the canonical dataset-camera count when pose refinement is enabled,
+/// or zero when disabled. The count includes the fixed anchor and any held-out
+/// cameras because state rows use canonical dataset indices.
+MsplatStatus msplat_trainer_pose_refinement_count_v15(
+    MsplatTrainer t, uint32_t* outCount, MsplatErrorInfo* error);
+/// Reads one canonical pose row. `outputSize` must exactly equal
+/// sizeof(MsplatPoseRefinementStateV15). A size mismatch leaves output
+/// untouched; other failures clear it. Pending trainer GPU work is synchronized
+/// before pose tensors are read. No optimizer moment tensor is exposed.
+MsplatStatus msplat_trainer_pose_refinement_state_v15(
+    MsplatTrainer t, uint32_t canonicalCameraIndex,
+    MsplatPoseRefinementStateV15* outState, size_t outputSize,
+    MsplatErrorInfo* error);
 void msplat_pixel_buffer_free(MsplatPixelBuffer* buffer);
 
 MsplatTrainer msplat_trainer_create(MsplatDataset ds, MsplatConfig config);

@@ -1,6 +1,7 @@
 # MsplatExample
 
-An iOS app that imports a COLMAP reconstruction, trains it, and hands back a PLY.
+An iOS app that imports a COLMAP or Nerfstudio dataset, trains it, and hands
+back a PLY.
 
 ## Running it
 
@@ -19,7 +20,7 @@ signing.
 
 The app reads the folder you pick in place, so it works with anything the
 Files app can reach — iCloud Drive, an external drive, or the app's own
-folder. For the last one, with the device connected, drag a COLMAP folder
+folder. For the last one, with the device connected, drag a dataset folder
 into `MsplatExample` under Finder's Files tab, then pick it from
 `On My iPhone / MsplatExample`.
 
@@ -27,12 +28,89 @@ A COLMAP folder is one holding `cameras.bin` or `cameras.txt`, either at its
 root or under `sparse/0`, alongside an `images` directory. Optional training
 mask sidecars live below any case-insensitive `masks` path component.
 
-After a folder is selected, the app counts regular files below those
+If the selected folder contains only HEIC/HEIF, JPEG, or PNG images, the app
+offers **RealityKit alignment** instead of rejecting it. The alignment screen
+can treat filenames as a sequential capture or an unordered set. Its two mask
+controls are independent: RealityKit can use object masks while registering the
+images, and Vision can export training masks afterward. This supports aligning
+against the complete images while still making foreground masks available to
+training.
+On a physical device the app requests camera poses and a sparse colored point
+cloud, normalizes the registered images into their encoded raster orientation,
+and atomically publishes a separate COLMAP dataset under
+`Documents/RealityKitAlignments`. The result contains `images/` plus text and
+binary `cameras`, `images`, and `points3D` files under `sparse/0`, and can be
+selected immediately for training or shared through the Files sheet.
+
+When **Export Vision masks for training** is enabled, Vision processes only the
+registered, normalized images. It writes a matching 8-bit grayscale PNG for
+each exported JPEG under `masks/`, for example `images/image_000001.jpg` and
+`masks/image_000001.png`. Foreground is white and background is black. The
+sample app discovers these sidecars automatically when the aligned dataset is
+selected; the later **Use discovered masks** control still decides whether
+training consumes them.
+
+Imported-image alignment requires iOS 26 or later because that is where
+RealityKit exposes the estimated per-pose intrinsics needed for a correct
+COLMAP camera. ARKit captures already persist matching intrinsics, so their
+images can use the same alignment path on iOS 18 or later. Every camera is
+modeled as COLMAP `PINHOLE` without an extra lens-distortion remap; use
+camera/ISP-corrected inputs rather than unprocessed distorted rasters.
+Simulator tests cover the pure COLMAP serialization helpers, but RealityKit
+alignment, image normalization, atomic publication, and Vision mask generation
+must be exercised on a physical device.
+
+A Nerfstudio folder has `transforms.json` at its root. Frame `file_path`
+entries may include an image extension or omit it when the image is PNG, JPEG,
+or JPG. The trainer needs an initial point cloud: set `ply_file_path` to a PLY
+inside the selected folder, or provide `sparse/0/points3D.ply` or
+`points3D.ply`. The sample accepts pinhole, perspective, and OpenCV camera
+models and rejects `OPENCV_FISHEYE`, because the native image path currently
+implements Brown-Conrady rather than fisheye rectification. A manifest may set
+`mask_path` on every frame; partial mask sets, external paths, missing files,
+and image/mask dimension mismatches are rejected.
+
+The camera button starts an ARKit Object or Scene capture. Object capture asks
+you to tap a Vision foreground instance before recording and requires scene
+depth. Vision, depth fusion, and frame gating operate in ARKit's native camera
+coordinates. Before persistence, the app rotates RGB and masks into the actual
+interface orientation and transforms each frame's intrinsics and camera pose by
+the same rotation. It writes opaque RGB, separate binary and soft masks, the
+applied per-frame orientation, a recovery journal, a voxel-fused colored point
+seed, and a portable `transforms.json` package under `Documents/Captures`.
+Review, in-memory training, and exported Nerfstudio assets therefore share the
+same screen-oriented raster geometry. Scene capture can fall
+back to ARKit feature points on a non-LiDAR device. After stopping, the review
+screen can share the package or pass its in-memory descriptor directly to the
+trainer; captured exports preserve the metric ARKit coordinate system.
+After choosing **Use ARKit dataset**, the training screen also offers
+**Realign capture with RealityKit**. That runs only after the capture view has
+stopped its AR session, writes a new COLMAP folder instead of modifying the
+capture's `transforms.json`, and releases the photogrammetry session before the
+result can be handed to the trainer.
+Captured datasets expose a default-off **Refine camera poses** switch as an
+explicit A/B control. When enabled, a **Pose optimizer** picker keeps the
+existing **Bounded SE(3)** path as the default or opts into
+**CamP-conditioned**, which decorrelates the same bounded updates with a fixed
+per-camera projection metric. Both train corrections in memory; the raw
+`transforms.json` remains immutable. The app
+requires an iteration budget covering the configured 500-step warm-up, any
+remaining visits in that camera shuffle, and one complete post-warm-up shuffle;
+it reports the exact minimum beside the switch. After GPU
+completion, the app writes only the corrected camera matrices to the sibling
+`transforms_refined.json`, retaining the captured intrinsics, image and mask
+paths, and point-cloud path. It refuses to write that sibling unless every
+non-anchor camera actually received a pose-optimizer step. The finished view
+reports maximum and RMS translation and rotation corrections. Imported folders
+and benchmark runs do not expose or enable this setting.
+
+After a COLMAP folder is selected, the app counts regular files below those
 directories on a background task and automatically enables **Use discovered
 masks** when that count is nonzero. The switch remains manually available
-during and after the advisory scan, and can disable discovery for a run. The displayed number is a
-candidate-file count, not a matched-frame count: the native COLMAP loader owns
-exact sidecar matching, and frames without a match train with full coverage.
+during and after the advisory scan, and can disable discovery for a run. The
+displayed number is a candidate-file count, not a matched-frame count: the
+native COLMAP loader owns exact sidecar matching, and frames without a match
+train with full coverage.
 For an image such as `images/foo.jpeg`, supported names include
 `masks/foo.png`, `masks/foo.jpeg.mask`, and `masks/foo.mask.png`; matching is
 case-insensitive and supports nested directory suffixes. An alpha-bearing mask
@@ -57,20 +135,30 @@ metadata and builds one of two explicit plans:
   additional 2x downscale before moving to the final resolution, reaches SH
   degree 2, and has a 400,000-Gaussian ceiling.
 
-For either profile, when the selected COLMAP model starts with more sparse
-points, the ceiling rises only enough to preserve the input population and the
-memory estimate is recomputed before training.
+For either profile, when the selected dataset starts with more points, the
+ceiling rises only enough to preserve the input population and the memory
+estimate is recomputed before training.
 
 The plan screen shows each effective resolution stage, target SH degree,
 initial Gaussian count, Gaussian ceiling, and a conservative code-derived
 peak-memory estimate. The
 estimate covers native model and training buffers, image-cache insertion,
 target-resolution app-owned decode buffers, and recommended headroom. When mask
-discovery is enabled, it also includes conservative source-mask decoding and
-paired CPU/GPU mask caches. The current formula reflects the split cache and
-removal of dead workspaces. The app refuses to start when that estimate exceeds a nonzero
+discovery is enabled, it also includes conservative source-mask decoding.
+Training targets remain compact UInt8 RGBA buffers, with coverage packed into
+alpha, plus one activity byte per 16x16 tile for masked coverage targets; decoded
+CPU pixels are released after upload. The app adds space for two BGRA8Unorm
+preview surfaces: one pending submission and the latest completed surface. The
+current formula reflects that compact cache and removal of dead workspaces. The
+app refuses to start when that estimate exceeds a nonzero
 `os_proc_available_memory` value at preflight (the simulator reports zero and
 skips this comparison).
+
+The sample enables depth-one CPU camera prefetch for both masked and unmasked
+runs, keeping their timing comparison fair. It prepares the next training
+target while the current Metal step runs. Library clients remain opt-in through
+`DatasetOptions.prefetchTrainingTargets`; existing native clients can still set
+exactly `MSPLAT_CAMERA_PREFETCH=1` in their environment.
 
 This check is a planning aid, not a jetsam guarantee. Metal driver state,
 framework allocations, other process memory, and changing system pressure are
@@ -78,7 +166,7 @@ not fully modeled. The model term intentionally covers the pre-cutoff peak;
 densification-only state is released later. ImageIO now requests the selected
 input resolution directly,
 but a codec may still use private decoder surfaces that the estimate cannot
-observe. COLMAP camera calibration uses encoded raster coordinates, so valid
+observe. Imported camera calibration uses encoded raster coordinates, so valid
 EXIF orientation metadata is checked but intentionally not applied; an oriented
 image provider must transform its calibration and pose together with its pixels.
 
@@ -87,9 +175,20 @@ advances its progress bar only from GPU completion. At each sampled preview it
 polls the matching logical-step GPU execution and end-to-end time, loss,
 effective resolution and SH degree, Gaussian count/capacity, rasterizer
 overflow incidence, categorized native/image-cache memory, `phys_footprint`,
-iOS available memory, cache hit rate, and thermal state. The preview render is
-sampled rather than performed every iteration; because it synchronizes prior
-work, the following telemetry poll is an authoritative completion snapshot.
+iOS available memory, cache hit rate, and thermal state. Preview rendering uses
+ABI v13: `MsplatSession.submitPreview(...)` returns a
+`MetalPreviewSubmission`, and `waitUntilReady()` yields a completed
+`MetalPreviewSurface` that owns an immutable BGRA8Unorm `MTLTexture`. The app
+keeps at most one pending submission and the latest completed surface, displaying
+the texture directly instead of copying pixels to the CPU, building a UIImage,
+and uploading it again.
+
+The preview is sampled rather than submitted every iteration. A fixed-camera
+submission still performs the renderer's existing exact-count synchronization,
+so the GPU-native surface removes the final readback and re-upload but does not
+yet make preview submission fully nonblocking. That remaining stall is addressed
+by the planned GPU count/scan work. `renderRGBA` and `PixelData` remain available
+to integrations that require CPU-owned pixels.
 
 The model/transient/image figures are logical owned buffers. They do not include
 Metal driver state, codec-private surfaces, framework allocations, or allocator

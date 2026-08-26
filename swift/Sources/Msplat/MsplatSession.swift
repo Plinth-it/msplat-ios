@@ -15,17 +15,23 @@ public struct DatasetOptions: Sendable, Equatable {
     public var testEvery: Int32
     /// Whether path-based dataset loaders discover optional mask sidecars.
     public var discoverTrainingMasks: Bool
+    /// Whether the dataset prepares the next training target on a depth-one
+    /// worker while the current Metal step runs. `false` leaves the native
+    /// default unchanged, including its environment-variable opt-in.
+    public var prefetchTrainingTargets: Bool
 
     public init(
         downscaleFactor: Float = 1.0,
         evalMode: Bool = false,
         testEvery: Int32 = 8,
-        discoverTrainingMasks: Bool = false
+        discoverTrainingMasks: Bool = false,
+        prefetchTrainingTargets: Bool = false
     ) {
         self.downscaleFactor = downscaleFactor
         self.evalMode = evalMode
         self.testEvery = testEvery
         self.discoverTrainingMasks = discoverTrainingMasks
+        self.prefetchTrainingTargets = prefetchTrainingTargets
     }
 }
 
@@ -77,13 +83,15 @@ public final class MsplatSession {
         trainingPlan plan: TrainingPlan,
         baseConfig: TrainingConfig = TrainingConfig(),
         evalMode: Bool = false,
-        testEvery: Int32 = 8
+        testEvery: Int32 = 8,
+        prefetchTrainingTargets: Bool = false
     ) throws {
         try self.init(
             datasetURL: datasetURL,
             options: plan.makeDatasetOptions(
                 evalMode: evalMode,
-                testEvery: testEvery
+                testEvery: testEvery,
+                prefetchTrainingTargets: prefetchTrainingTargets
             ),
             config: plan.makeTrainingConfig(startingFrom: baseConfig),
             maximumGaussianCount: plan.maximumGaussianCount
@@ -194,12 +202,12 @@ public final class MsplatSession {
     /// Polls submission and GPU-completion progress without submitting work.
     public func trainingMetrics() throws -> TrainingTelemetry {
         try withTrainer { trainer in
-            var metrics = MsplatTrainingMetrics()
+            var metrics = MsplatTrainingMetricsV12()
             var nativeError = MsplatErrorInfo()
-            let status = msplat_trainer_metrics_v4(
+            let status = msplat_trainer_metrics_v12(
                 trainer,
                 &metrics,
-                MemoryLayout<MsplatTrainingMetrics>.size,
+                MemoryLayout<MsplatTrainingMetricsV12>.size,
                 &nativeError
             )
             try checkNativeStatus(status, error: &nativeError)
@@ -220,6 +228,41 @@ public final class MsplatSession {
             )
             try checkNativeStatus(status, error: &nativeError)
             return TrainingMemorySnapshot(from: metrics)
+        }
+    }
+
+    /// Returns one read-only pose-refinement snapshot per canonical dataset
+    /// camera, or an empty array when camera-pose refinement is disabled.
+    ///
+    /// This synchronizes pending trainer GPU work before reading pose tensors.
+    /// Frame IDs are copied before the native trainer lock is released.
+    public func cameraPoseRefinementStates() throws -> [CameraPoseRefinementState] {
+        try withTrainer { trainer in
+            var count: UInt32 = 0
+            var nativeError = MsplatErrorInfo()
+            let countStatus = msplat_trainer_pose_refinement_count_v15(
+                trainer,
+                &count,
+                &nativeError
+            )
+            try checkNativeStatus(countStatus, error: &nativeError)
+
+            var states: [CameraPoseRefinementState] = []
+            states.reserveCapacity(Int(count))
+            for cameraIndex in 0..<count {
+                var native = MsplatPoseRefinementStateV15()
+                var stateError = MsplatErrorInfo()
+                let stateStatus = msplat_trainer_pose_refinement_state_v15(
+                    trainer,
+                    cameraIndex,
+                    &native,
+                    MemoryLayout<MsplatPoseRefinementStateV15>.size,
+                    &stateError
+                )
+                try checkNativeStatus(stateStatus, error: &stateError)
+                states.append(try CameraPoseRefinementState(from: native))
+            }
+            return states
         }
     }
 
@@ -340,6 +383,40 @@ public final class MsplatSession {
         }
     }
 
+    /// Submits a fixed-pose preview into a separately owned BGRA8 Metal
+    /// texture. The returned submission can be awaited without holding this
+    /// runtime actor; keep displaying the latest completed surface meanwhile.
+    ///
+    /// The current renderer still performs its exact-count synchronization
+    /// during submission. Final raster completion and texture conversion do
+    /// not perform a CPU readback or block this method.
+    public func submitPreview(
+        pose: CameraPose,
+        referenceCamera: Int = 0
+    ) throws -> MetalPreviewSubmission {
+        let referenceCamera = try nativeIndex(referenceCamera)
+        return try withTrainer { trainer in
+            var frame: MsplatPreviewFrame?
+            var nativeError = MsplatErrorInfo()
+            let status = pose.elements.withUnsafeBufferPointer { elements in
+                msplat_trainer_render_pose_preview_v13(
+                    trainer,
+                    elements.baseAddress,
+                    referenceCamera,
+                    &frame,
+                    &nativeError
+                )
+            }
+            try checkNativeStatus(status, error: &nativeError)
+            guard let frame else {
+                throw MsplatError.internalFailure(
+                    "Native preview submission returned no frame handle"
+                )
+            }
+            return MetalPreviewSubmission(handle: frame)
+        }
+    }
+
     public func cameraPose(at index: Int) throws -> CameraPose {
         let index = try nativeIndex(index)
         return try withDataset { dataset in
@@ -436,7 +513,8 @@ public final class MsplatSession {
     ) throws -> (dataset: MsplatDataset, trainer: MsplatTrainer) {
         try createHandles(
             config: config,
-            maximumGaussianCount: maximumGaussianCount
+            maximumGaussianCount: maximumGaussianCount,
+            prefetchTrainingTargets: options.prefetchTrainingTargets
         ) {
             var dataset: MsplatDataset?
             var nativeError = MsplatErrorInfo()
@@ -467,7 +545,8 @@ public final class MsplatSession {
     ) throws -> (dataset: MsplatDataset, trainer: MsplatTrainer) {
         try createHandles(
             config: config,
-            maximumGaussianCount: maximumGaussianCount
+            maximumGaussianCount: maximumGaussianCount,
+            prefetchTrainingTargets: options.prefetchTrainingTargets
         ) {
             if descriptor.frames.contains(where: { $0.trainingMask != nil }) {
                 return try withUnsafeNativeDatasetDescriptorV6(descriptor) {
@@ -523,12 +602,22 @@ public final class MsplatSession {
     private static func createHandles(
         config: TrainingConfig,
         maximumGaussianCount: Int?,
+        prefetchTrainingTargets: Bool,
         createDataset: () throws -> MsplatDataset
     ) throws -> (dataset: MsplatDataset, trainer: MsplatTrainer) {
         try withConfiguredNativeEngine(metallibResourceName) {
             let dataset = try createDataset()
 
             do {
+                if prefetchTrainingTargets {
+                    var prefetchError = MsplatErrorInfo()
+                    let prefetchStatus =
+                        msplat_dataset_enable_training_target_prefetch_v14(
+                            dataset,
+                            &prefetchError
+                        )
+                    try checkNativeStatus(prefetchStatus, error: &prefetchError)
+                }
                 var nativeConfig = config.toC()
                 var limits = msplat_default_training_limits()
                 var refinementOptions = config.toRefinementOptionsV8()

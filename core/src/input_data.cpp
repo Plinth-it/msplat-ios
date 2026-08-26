@@ -12,6 +12,10 @@
 #include <limits>
 #include <stdexcept>
 #include <cstdlib>
+#include <atomic>
+#include <chrono>
+#include <cstring>
+#include <future>
 #include <TargetConditionals.h>
 
 namespace fs = std::filesystem;
@@ -99,12 +103,75 @@ uint64_t maskCoverageUnits(
     return units;
 }
 
+bool sameTrainingMask(
+    const std::optional<TrainingMaskDescriptor> &lhs,
+    const std::optional<TrainingMaskDescriptor> &rhs) {
+    if (lhs.has_value() != rhs.has_value()) return false;
+    if (!lhs) return true;
+    return lhs->path == rhs->path && lhs->channel == rhs->channel;
+}
+
+bool decodedTrainingMaskMatches(const Camera &camera) {
+    return camera.trainingMask && camera.decodedTrainingMaskSource &&
+        sameTrainingMask(camera.trainingMask,
+                         camera.decodedTrainingMaskSource);
+}
+
 bool isMirroredExifOrientation(int orientation) {
     return orientation == 2 || orientation == 4 ||
            orientation == 5 || orientation == 7;
 }
 
 } // namespace
+
+CoverageMask buildCoverageRenderTileMap(const CoverageMask &mask) {
+    const uint64_t expectedSize = static_cast<uint64_t>(mask.width) *
+        static_cast<uint64_t>(mask.height);
+    if (mask.width <= 0 || mask.height <= 0 ||
+        expectedSize != mask.data.size()) {
+        throw std::invalid_argument(
+            "Coverage render-tile input must be a valid UInt8 image");
+    }
+
+    CoverageMask tiles;
+    tiles.width = (mask.width - 1) / kTrainingTileSize + 1;
+    tiles.height = (mask.height - 1) / kTrainingTileSize + 1;
+    const uint64_t tileCount = static_cast<uint64_t>(tiles.width) *
+        static_cast<uint64_t>(tiles.height);
+    if (tileCount > std::numeric_limits<size_t>::max()) {
+        throw std::overflow_error("Coverage render-tile map is too large");
+    }
+    tiles.data.assign(static_cast<size_t>(tileCount), 0);
+
+    for (int y = 0; y < mask.height; ++y) {
+        for (int x = 0; x < mask.width; ++x) {
+            if (mask.data[static_cast<size_t>(y) * mask.width + x] == 0)
+                continue;
+
+            const int minTileX = static_cast<int>(
+                std::max<int64_t>(0, static_cast<int64_t>(x) -
+                    kTrainingSsimHalo) / kTrainingTileSize);
+            const int maxTileX = static_cast<int>(
+                std::min<int64_t>(mask.width - 1,
+                    static_cast<int64_t>(x) + kTrainingSsimHalo) /
+                    kTrainingTileSize);
+            const int minTileY = static_cast<int>(
+                std::max<int64_t>(0, static_cast<int64_t>(y) -
+                    kTrainingSsimHalo) / kTrainingTileSize);
+            const int maxTileY = static_cast<int>(
+                std::min<int64_t>(mask.height - 1,
+                    static_cast<int64_t>(y) + kTrainingSsimHalo) /
+                    kTrainingTileSize);
+            for (int tileY = minTileY; tileY <= maxTileY; ++tileY) {
+                for (int tileX = minTileX; tileX <= maxTileX; ++tileX) {
+                    tiles.data[static_cast<size_t>(tileY) * tiles.width +
+                               tileX] = 1;
+                }
+            }
+        }
+    }
+    return tiles;
+}
 
 // ── Image loading ───────────────────────────────────────────────────────────
 
@@ -140,8 +207,10 @@ void Camera::invalidateProjectionCache() {
 }
 
 void Camera::loadImage(float downscaleFactor) {
+    const bool maskSourceMatches = sameTrainingMask(
+        trainingMask, decodedTrainingMaskSource);
     if (!image.empty() && loadedImageDownscaleFactor == downscaleFactor &&
-        (!trainingMask || !coverageMask.empty())) {
+        maskSourceMatches && (!trainingMask || !coverageMask.empty())) {
         return;
     }
     releaseImageMemory();
@@ -238,8 +307,8 @@ void Camera::loadImage(float downscaleFactor) {
         sourceWidth, downscaleFactor, "width", filePath);
     const int targetHeight = targetDimension(
         sourceHeight, downscaleFactor, "height", filePath);
-    Image raw = imreadRGB(filePath, sourceInfo, targetWidth, targetHeight,
-                          normalizeExif);
+    RGBA8Image raw = imreadRGBA8(
+        filePath, sourceInfo, targetWidth, targetHeight, normalizeExif);
     CoverageMask rawMask;
     if (trainingMask) {
         rawMask = imreadCoverageMask(
@@ -268,7 +337,7 @@ void Camera::loadImage(float downscaleFactor) {
     // Undistort if needed
     if (hasDistortion()) {
         if (trainingMask) {
-            auto result = undistortImageAndCoverageMask(
+            auto result = undistortRGBA8ImageAndCoverageMask(
                 raw, rawMask, fx, fy, cx, cy, k1, k2, p1, p2, k3);
             raw = std::move(result.image);
             rawMask = std::move(result.coverageMask);
@@ -277,7 +346,7 @@ void Camera::loadImage(float downscaleFactor) {
             width = result.width; height = result.height;
             (void)maskCoverageUnits(rawMask, trainingMask->path);
         } else {
-            auto result = undistortImage(
+            auto result = undistortRGBA8Image(
                 raw, fx, fy, cx, cy, k1, k2, p1, p2, k3);
             raw = std::move(result.image);
             fx = result.fx; fy = result.fy;
@@ -289,6 +358,7 @@ void Camera::loadImage(float downscaleFactor) {
 
     image = std::move(raw);
     coverageMask = std::move(rawMask);
+    decodedTrainingMaskSource = trainingMask;
     if (trainingMask) {
         coverageUnitsByDownscale.emplace(
             1, maskCoverageUnits(coverageMask, trainingMask->path));
@@ -296,7 +366,7 @@ void Camera::loadImage(float downscaleFactor) {
     loadedImageDownscaleFactor = downscaleFactor;
 }
 
-const Image& Camera::getImage(int downscaleFactor) {
+const RGBA8Image& Camera::getImage(int downscaleFactor) {
     if (image.empty()) loadImage(1.0f);
     if (downscaleFactor <= 1) return image;
 
@@ -305,7 +375,7 @@ const Image& Camera::getImage(int downscaleFactor) {
 
     int newW = image.width / downscaleFactor;
     int newH = image.height / downscaleFactor;
-    Image scaled = resizeArea(image, newW, newH);
+    RGBA8Image scaled = resizeRGBA8Area(image, newW, newH);
     auto inserted = imagePyramids.emplace(downscaleFactor, std::move(scaled));
     return inserted.first->second;
 }
@@ -315,7 +385,12 @@ const CoverageMask& Camera::getCoverageMask(int downscaleFactor) {
         throw std::logic_error(
             "Coverage was requested for a camera without a training mask");
     }
-    if (coverageMask.empty()) loadImage(1.0f);
+    if (!decodedTrainingMaskMatches(*this) || coverageMask.empty()) {
+        const float reloadDownscale = loadedImageDownscaleFactor >= 1.0f
+            ? loadedImageDownscaleFactor
+            : 1.0f;
+        loadImage(reloadDownscale);
+    }
     if (downscaleFactor <= 1) return coverageMask;
 
     auto it = coverageMaskPyramids.find(downscaleFactor);
@@ -338,6 +413,11 @@ uint64_t Camera::getCoverageUnits(int downscaleFactor) {
             "Coverage was requested for a camera without a training mask");
     }
     const int cacheKey = std::max(downscaleFactor, 1);
+    if (!decodedTrainingMaskMatches(*this)) {
+        // Reload first so a denominator cached for another path/channel cannot
+        // return before getCoverageMask has a chance to invalidate it.
+        (void)getCoverageMask(cacheKey);
+    }
     const auto cached = coverageUnitsByDownscale.find(cacheKey);
     if (cached != coverageUnitsByDownscale.end()) return cached->second;
 
@@ -347,13 +427,149 @@ uint64_t Camera::getCoverageUnits(int downscaleFactor) {
     return units;
 }
 
-CameraTrainingTarget Camera::getGPUTrainingTarget(int downscaleFactor) {
+namespace {
+
+struct UploadedTrainingTarget {
+    MTensor image;
+    MTensor coverageRenderTiles;
+    uint64_t coverageUnits = 0;
+};
+
+void validateCoverageStorage(
+    const RGBA8Image &image, const CoverageMask &mask,
+    const std::string &maskPath) {
+    if (mask.width != image.width || mask.height != image.height) {
+        throw msplat::InvalidDatasetError(
+            "Generated training mask dimensions do not match the image: " +
+            maskPath);
+    }
+    const uint64_t pixelCount =
+        static_cast<uint64_t>(image.width) * image.height;
+    if (pixelCount != mask.data.size()) {
+        throw msplat::InvalidDatasetError(
+            "Training mask storage does not match its dimensions for " +
+            maskPath);
+    }
+}
+
+void packCoverageIntoAlpha(
+    RGBA8Image &image, const CoverageMask &mask,
+    const std::string &imagePath, const std::string &maskPath) {
+    validateCoverageStorage(image, mask, maskPath);
+    if (mask.data.size() > std::numeric_limits<size_t>::max() / 4u ||
+        image.data.size() != mask.data.size() * 4u) {
+        throw msplat::InvalidDatasetError(
+            "Training image storage does not match its dimensions for " +
+            imagePath);
+    }
+    for (size_t pixel = 0; pixel < mask.data.size(); ++pixel)
+        image.data[pixel * 4u + 3u] = mask.data[pixel];
+}
+
+void validateCoverageRenderTiles(
+    const RGBA8Image &image, const CoverageMask &tiles,
+    const std::string &maskPath) {
+    const int expectedWidth =
+        (image.width - 1) / kTrainingTileSize + 1;
+    const int expectedHeight =
+        (image.height - 1) / kTrainingTileSize + 1;
+    const uint64_t expectedSize = static_cast<uint64_t>(expectedWidth) *
+        static_cast<uint64_t>(expectedHeight);
+    if (tiles.width != expectedWidth || tiles.height != expectedHeight ||
+        tiles.data.size() != expectedSize) {
+        throw msplat::InvalidDatasetError(
+            "Coverage render-tile storage does not match the image for " +
+            maskPath);
+    }
+}
+
+UploadedTrainingTarget uploadTrainingTarget(
+    const RGBA8Image &image, const CoverageMask *mask,
+    const CoverageMask *preparedCoverageRenderTiles,
+    bool coverageIsPacked, uint64_t coverageUnits,
+    const std::string &imagePath, const std::string &maskPath) {
+    if (image.empty())
+        throw msplat::DatasetIOError("Failed to decode image: " + imagePath);
+
+    const uint64_t fullUnits =
+        fullCoverageUnits(image.width, image.height, imagePath);
+    const uint64_t pixelCount = fullUnits / 255u;
+    const uint64_t expectedImageBytes = pixelCount * 4u;
+    if (expectedImageBytes != image.data.size()) {
+        throw msplat::InvalidDatasetError(
+            "Training image storage does not match its dimensions for " +
+            imagePath);
+    }
+    if (mask && coverageIsPacked)
+        throw std::logic_error("Training coverage cannot use two storage forms");
+    const bool hasCoverage = mask || coverageIsPacked;
+    if (mask) validateCoverageStorage(image, *mask, maskPath);
+    CoverageMask builtCoverageRenderTiles;
+    const CoverageMask *coverageRenderTiles = preparedCoverageRenderTiles;
+    if (hasCoverage && !coverageRenderTiles) {
+        if (!mask) {
+            throw std::logic_error(
+                "Packed training coverage requires a render-tile map");
+        }
+        builtCoverageRenderTiles = buildCoverageRenderTileMap(*mask);
+        coverageRenderTiles = &builtCoverageRenderTiles;
+    }
+    if (!hasCoverage && coverageRenderTiles) {
+        throw std::logic_error(
+            "Unmasked training target cannot have coverage render tiles");
+    }
+    if (coverageRenderTiles) {
+        validateCoverageRenderTiles(image, *coverageRenderTiles, maskPath);
+    }
+    if (hasCoverage) {
+        if (coverageUnits == 0 || coverageUnits > fullUnits) {
+            throw msplat::InvalidDatasetError(
+                "Training mask coverage is invalid for " + maskPath);
+        }
+    } else {
+        coverageUnits = fullUnits;
+    }
+
+    UploadedTrainingTarget uploaded;
+    uploaded.image = gpu_empty(
+        {image.height, image.width, 4}, DType::UInt8);
+    memcpy(uploaded.image.data_ptr(), image.ptr(),
+           static_cast<size_t>(expectedImageBytes));
+    if (mask) {
+        auto *rgba = uploaded.image.data<uint8_t>();
+        for (size_t pixel = 0; pixel < mask->data.size(); ++pixel)
+            rgba[pixel * 4u + 3u] = mask->data[pixel];
+    }
+    if (coverageRenderTiles) {
+        uploaded.coverageRenderTiles = gpu_empty(
+            {coverageRenderTiles->height, coverageRenderTiles->width},
+            DType::UInt8);
+        memcpy(uploaded.coverageRenderTiles.data_ptr(),
+               coverageRenderTiles->ptr(), coverageRenderTiles->data.size());
+    }
+    uploaded.coverageUnits = coverageUnits;
+    return uploaded;
+}
+
+} // namespace
+
+bool Camera::hasGPUTrainingTarget(int downscaleFactor) const {
     const auto imageIt = mtensorImageCache.find(downscaleFactor);
-    const auto maskIt = mtensorCoverageMaskCache.find(downscaleFactor);
-    const bool imageIsResident = imageIt != mtensorImageCache.end();
-    const bool maskIsResident = !trainingMask ||
-        maskIt != mtensorCoverageMaskCache.end();
-    if (imageIsResident && maskIsResident) {
+    if (imageIt == mtensorImageCache.end()) return false;
+    const auto sourceIt =
+        gpuTrainingMaskSourceByDownscale.find(downscaleFactor);
+    if (sourceIt == gpuTrainingMaskSourceByDownscale.end() ||
+        !sameTrainingMask(sourceIt->second, trainingMask)) {
+        return false;
+    }
+    return !trainingMask ||
+        mtensorCoverageRenderTileCache.find(downscaleFactor) !=
+            mtensorCoverageRenderTileCache.end();
+}
+
+CameraTrainingTarget Camera::getGPUTrainingTarget(int downscaleFactor) {
+    if (hasGPUTrainingTarget(downscaleFactor)) {
+        auto imageIt = mtensorImageCache.find(downscaleFactor);
         const uint64_t units = trainingMask
             ? getCoverageUnits(downscaleFactor)
             : fullCoverageUnits(
@@ -361,86 +577,99 @@ CameraTrainingTarget Camera::getGPUTrainingTarget(int downscaleFactor) {
                   static_cast<int>(imageIt->second.size(0)), filePath);
         return {
             &imageIt->second,
-            trainingMask ? &maskIt->second : nullptr,
+            trainingMask ? &imageIt->second : nullptr,
             units,
+            trainingMask
+                ? &mtensorCoverageRenderTileCache.at(downscaleFactor)
+                : nullptr,
         };
     }
 
     // The training resolution only moves from coarse to fine. Keeping GPU and
     // CPU pyramid copies for earlier stages makes an uninterrupted run retain
     // substantially more memory than a checkpoint resume at the same step.
-    for (auto& item : mtensorImageCache) item.second.reset();
-    mtensorImageCache.clear();
-    for (auto& item : mtensorCoverageMaskCache) item.second.reset();
-    mtensorCoverageMaskCache.clear();
-    imagePyramids.clear();
-    coverageMaskPyramids.clear();
+    const bool hasPublishedTarget = !mtensorImageCache.empty() ||
+        !mtensorCoverageRenderTileCache.empty() ||
+        !gpuTrainingMaskSourceByDownscale.empty();
+    bool publishedSourceMatches =
+        !gpuTrainingMaskSourceByDownscale.empty();
+    for (const auto &source : gpuTrainingMaskSourceByDownscale) {
+        publishedSourceMatches = publishedSourceMatches &&
+            sameTrainingMask(source.second, trainingMask);
+    }
+    if (hasPublishedTarget && !publishedSourceMatches) {
+        // A changed path/channel invalidates GPU alpha, render tiles, and every
+        // cached coverage denominator. Force the next lookup to reload them as
+        // one source-consistent target.
+        releaseImageMemory();
+    } else {
+        // An ordinary resolution transition can retain the source-resolution
+        // decode and calibration while dropping every published GPU stage.
+        for (auto &item : mtensorImageCache) item.second.reset();
+        mtensorImageCache.clear();
+        for (auto &item : mtensorCoverageRenderTileCache)
+            item.second.reset();
+        mtensorCoverageRenderTileCache.clear();
+        gpuTrainingMaskSourceByDownscale.clear();
+        imagePyramids.clear();
+        coverageMaskPyramids.clear();
+    }
 
     const CoverageMask *mask = nullptr;
     uint64_t units = 0;
     if (trainingMask) {
         // Validate coverage before materializing the matching RGB pyramid so a
-        // zero-coverage stage cannot leave half of a CPU cache pair resident.
+        // zero-coverage stage cannot leave partial CPU target state resident.
         mask = &getCoverageMask(downscaleFactor);
         units = getCoverageUnits(downscaleFactor);
     }
 
-    const Image& img = getImage(downscaleFactor);
-    if (img.empty())
-        throw msplat::DatasetIOError("Failed to decode image: " + filePath);
-    if (mask) {
-        if (mask->width != img.width || mask->height != img.height) {
-            throw msplat::InvalidDatasetError(
-                "Generated training mask dimensions do not match the image: " +
-                trainingMask->path);
-        }
-    } else {
-        units = fullCoverageUnits(img.width, img.height, filePath);
-    }
-
-    // Allocate and populate the complete pair before publishing either cache
-    // entry. A mask validation/allocation failure must not strand an RGB tensor
-    // outside CameraImageCache accounting.
-    MTensor imageStorage = gpu_empty(
-        {img.height, img.width, 3}, DType::Float32);
-    memcpy(imageStorage.data_ptr(), img.ptr(),
-           img.width * img.height * 3 * sizeof(float));
-    std::optional<MTensor> maskStorage;
-    if (mask) {
-        maskStorage.emplace(gpu_empty(
-            {mask->height, mask->width}, DType::UInt8));
-        memcpy(maskStorage->data_ptr(), mask->ptr(), mask->data.size());
-    }
+    const RGBA8Image& img = getImage(downscaleFactor);
+    UploadedTrainingTarget uploaded = uploadTrainingTarget(
+        img, mask, nullptr, false, units, filePath,
+        trainingMask ? trainingMask->path : std::string());
 
     try {
         auto imageInserted = mtensorImageCache.emplace(
-            downscaleFactor, std::move(imageStorage));
+            downscaleFactor, std::move(uploaded.image));
         if (!imageInserted.second) {
             throw std::logic_error("Training image cache insertion failed");
         }
-
-        MTensor *maskTensor = nullptr;
-        if (maskStorage) {
-            auto maskInserted = mtensorCoverageMaskCache.emplace(
-                downscaleFactor, std::move(*maskStorage));
-            if (!maskInserted.second) {
+        MTensor *coverageRenderTiles = nullptr;
+        if (trainingMask) {
+            auto tilesInserted = mtensorCoverageRenderTileCache.emplace(
+                downscaleFactor, std::move(uploaded.coverageRenderTiles));
+            if (!tilesInserted.second) {
                 throw std::logic_error(
-                    "Training mask cache insertion failed");
+                    "Coverage render-tile cache insertion failed");
             }
-            maskTensor = &maskInserted.first->second;
+            coverageRenderTiles = &tilesInserted.first->second;
         }
-        return {&imageInserted.first->second, maskTensor, units};
+        auto sourceInserted = gpuTrainingMaskSourceByDownscale.emplace(
+            downscaleFactor, trainingMask);
+        if (!sourceInserted.second) {
+            throw std::logic_error(
+                "Training target source cache insertion failed");
+        }
+
+        return {
+            &imageInserted.first->second,
+            trainingMask ? &imageInserted.first->second : nullptr,
+            uploaded.coverageUnits,
+            coverageRenderTiles,
+        };
     } catch (...) {
         if (auto it = mtensorImageCache.find(downscaleFactor);
             it != mtensorImageCache.end()) {
             it->second.reset();
             mtensorImageCache.erase(it);
         }
-        if (auto it = mtensorCoverageMaskCache.find(downscaleFactor);
-            it != mtensorCoverageMaskCache.end()) {
+        if (auto it = mtensorCoverageRenderTileCache.find(downscaleFactor);
+            it != mtensorCoverageRenderTileCache.end()) {
             it->second.reset();
-            mtensorCoverageMaskCache.erase(it);
+            mtensorCoverageRenderTileCache.erase(it);
         }
+        gpuTrainingMaskSourceByDownscale.erase(downscaleFactor);
         throw;
     }
 }
@@ -450,26 +679,32 @@ MTensor& Camera::getGPUImage(int downscaleFactor) {
 }
 
 void Camera::releaseImageMemory() {
-    image = Image();
-    coverageMask = CoverageMask();
-    imagePyramids.clear();
-    coverageMaskPyramids.clear();
+    releaseCpuImageMemory();
+    decodedTrainingMaskSource.reset();
     for (auto& item : mtensorImageCache) {
         item.second.reset();
     }
     mtensorImageCache.clear();
-    for (auto& item : mtensorCoverageMaskCache) {
+    for (auto& item : mtensorCoverageRenderTileCache) {
         item.second.reset();
     }
-    mtensorCoverageMaskCache.clear();
+    mtensorCoverageRenderTileCache.clear();
+    gpuTrainingMaskSourceByDownscale.clear();
     coverageUnitsByDownscale.clear();
     loadedImageDownscaleFactor = 0.0f;
 }
 
+void Camera::releaseCpuImageMemory() {
+    image = RGBA8Image();
+    coverageMask = CoverageMask();
+    imagePyramids.clear();
+    coverageMaskPyramids.clear();
+}
+
 size_t Camera::cachedCpuImageBytes() const {
-    size_t bytes = image.data.size() * sizeof(float);
+    size_t bytes = image.data.size();
     for (const auto& item : imagePyramids) {
-        bytes += item.second.data.size() * sizeof(float);
+        bytes += item.second.data.size();
     }
     bytes += coverageMask.data.size();
     for (const auto& item : coverageMaskPyramids) {
@@ -483,7 +718,7 @@ size_t Camera::cachedGpuImageBytes() const {
     for (const auto& item : mtensorImageCache) {
         bytes += item.second.nbytes();
     }
-    for (const auto& item : mtensorCoverageMaskCache) {
+    for (const auto& item : mtensorCoverageRenderTileCache) {
         bytes += item.second.nbytes();
     }
     return bytes;
@@ -494,6 +729,269 @@ size_t Camera::cachedImageBytes() const {
 }
 
 // ── Image cache ─────────────────────────────────────────────────────────────
+
+namespace {
+
+struct CameraSourceSnapshot {
+    Camera::DeclaredIntrinsics declared;
+    std::string filePath;
+    RasterOrientation rasterOrientation = RasterOrientation::EncodedPixels;
+    std::optional<TrainingMaskDescriptor> trainingMask;
+};
+
+struct CameraTargetRequest {
+    size_t cameraIndex = 0;
+    int downscaleFactor = 1;
+    float inputDownscaleFactor = 1.0f;
+    CameraSourceSnapshot source;
+};
+
+struct PreparedCameraTarget {
+    CameraTargetRequest request;
+    int width = 0;
+    int height = 0;
+    float fx = 0, fy = 0, cx = 0, cy = 0;
+    float k1 = 0, k2 = 0, k3 = 0, p1 = 0, p2 = 0;
+    RGBA8Image image;
+    CoverageMask coverageRenderTiles;
+    uint64_t coverageUnits = 0;
+
+    size_t bytes() const {
+        return image.data.size() + coverageRenderTiles.data.size();
+    }
+};
+
+Camera::DeclaredIntrinsics sourceIntrinsics(const Camera &camera) {
+    if (camera.declared.captured) return camera.declared;
+    return {
+        true,
+        camera.fx, camera.fy, camera.cx, camera.cy,
+        camera.k1, camera.k2, camera.k3, camera.p1, camera.p2,
+        camera.width, camera.height,
+    };
+}
+
+CameraSourceSnapshot sourceSnapshot(const Camera &camera) {
+    return {
+        sourceIntrinsics(camera),
+        camera.filePath,
+        camera.rasterOrientation,
+        camera.trainingMask,
+    };
+}
+
+bool sameDeclaredIntrinsics(
+    const Camera::DeclaredIntrinsics &lhs,
+    const Camera::DeclaredIntrinsics &rhs) {
+    return lhs.fx == rhs.fx && lhs.fy == rhs.fy &&
+        lhs.cx == rhs.cx && lhs.cy == rhs.cy &&
+        lhs.k1 == rhs.k1 && lhs.k2 == rhs.k2 && lhs.k3 == rhs.k3 &&
+        lhs.p1 == rhs.p1 && lhs.p2 == rhs.p2 &&
+        lhs.width == rhs.width && lhs.height == rhs.height;
+}
+
+bool sourceMatches(const Camera &camera, const CameraSourceSnapshot &source) {
+    return camera.filePath == source.filePath &&
+        camera.rasterOrientation == source.rasterOrientation &&
+        sameTrainingMask(camera.trainingMask, source.trainingMask) &&
+        sameDeclaredIntrinsics(sourceIntrinsics(camera), source.declared);
+}
+
+PreparedCameraTarget prepareCameraTarget(
+    CameraTargetRequest request,
+    const std::shared_ptr<std::atomic<size_t>> &stagedBytes) {
+    try {
+        Camera staging;
+        staging.filePath = request.source.filePath;
+        staging.rasterOrientation = request.source.rasterOrientation;
+        staging.trainingMask = request.source.trainingMask;
+        staging.declared = request.source.declared;
+        staging.width = request.source.declared.width;
+        staging.height = request.source.declared.height;
+        staging.fx = request.source.declared.fx;
+        staging.fy = request.source.declared.fy;
+        staging.cx = request.source.declared.cx;
+        staging.cy = request.source.declared.cy;
+        staging.k1 = request.source.declared.k1;
+        staging.k2 = request.source.declared.k2;
+        staging.k3 = request.source.declared.k3;
+        staging.p1 = request.source.declared.p1;
+        staging.p2 = request.source.declared.p2;
+
+        staging.loadImage(request.inputDownscaleFactor);
+        stagedBytes->store(
+            staging.cachedCpuImageBytes(), std::memory_order_relaxed);
+
+        PreparedCameraTarget prepared;
+        prepared.request = std::move(request);
+        prepared.width = staging.width;
+        prepared.height = staging.height;
+        prepared.fx = staging.fx;
+        prepared.fy = staging.fy;
+        prepared.cx = staging.cx;
+        prepared.cy = staging.cy;
+        prepared.k1 = staging.k1;
+        prepared.k2 = staging.k2;
+        prepared.k3 = staging.k3;
+        prepared.p1 = staging.p1;
+        prepared.p2 = staging.p2;
+
+        const int downscale = prepared.request.downscaleFactor;
+        (void)staging.getImage(downscale);
+        if (staging.trainingMask) {
+            (void)staging.getCoverageMask(downscale);
+            prepared.coverageUnits = staging.getCoverageUnits(downscale);
+        }
+        stagedBytes->store(
+            staging.cachedCpuImageBytes(), std::memory_order_relaxed);
+
+        if (downscale <= 1) {
+            prepared.image = std::move(staging.image);
+            if (staging.trainingMask) {
+                prepared.coverageRenderTiles =
+                    buildCoverageRenderTileMap(staging.coverageMask);
+                stagedBytes->store(
+                    prepared.image.data.size() +
+                        staging.cachedCpuImageBytes() +
+                        prepared.coverageRenderTiles.data.size(),
+                    std::memory_order_relaxed);
+                packCoverageIntoAlpha(
+                    prepared.image, staging.coverageMask,
+                    staging.filePath,
+                    staging.trainingMask->path);
+            }
+        } else {
+            prepared.image =
+                std::move(staging.imagePyramids.at(downscale));
+            if (staging.trainingMask) {
+                prepared.coverageRenderTiles =
+                    buildCoverageRenderTileMap(
+                        staging.coverageMaskPyramids.at(downscale));
+                stagedBytes->store(
+                    prepared.image.data.size() +
+                        staging.cachedCpuImageBytes() +
+                        prepared.coverageRenderTiles.data.size(),
+                    std::memory_order_relaxed);
+                packCoverageIntoAlpha(
+                    prepared.image,
+                    staging.coverageMaskPyramids.at(downscale),
+                    staging.filePath,
+                    staging.trainingMask->path);
+            }
+        }
+        if (!staging.trainingMask) {
+            prepared.coverageUnits = fullCoverageUnits(
+                prepared.image.width, prepared.image.height,
+                staging.filePath);
+        }
+        stagedBytes->store(prepared.bytes(), std::memory_order_relaxed);
+        return prepared;
+    } catch (...) {
+        stagedBytes->store(0, std::memory_order_relaxed);
+        throw;
+    }
+}
+
+CameraTrainingTarget publishPreparedTarget(
+    Camera &camera, int downscaleFactor,
+    const PreparedCameraTarget &prepared) {
+    const bool hasCoverage = prepared.request.source.trainingMask.has_value();
+    UploadedTrainingTarget uploaded = uploadTrainingTarget(
+        prepared.image, nullptr,
+        hasCoverage ? &prepared.coverageRenderTiles : nullptr,
+        hasCoverage, prepared.coverageUnits,
+        prepared.request.source.filePath,
+        prepared.request.source.trainingMask
+            ? prepared.request.source.trainingMask->path
+            : std::string());
+
+    // GPU allocation and validation above are deliberately complete before
+    // the live camera or its LRU-visible state changes.
+    camera.releaseImageMemory();
+    camera.declared = prepared.request.source.declared;
+    camera.width = prepared.width;
+    camera.height = prepared.height;
+    camera.fx = prepared.fx;
+    camera.fy = prepared.fy;
+    camera.cx = prepared.cx;
+    camera.cy = prepared.cy;
+    camera.k1 = prepared.k1;
+    camera.k2 = prepared.k2;
+    camera.k3 = prepared.k3;
+    camera.p1 = prepared.p1;
+    camera.p2 = prepared.p2;
+    camera.loadedImageDownscaleFactor =
+        prepared.request.inputDownscaleFactor;
+    camera.invalidateProjectionCache();
+
+    auto imageInserted = camera.mtensorImageCache.emplace(
+        downscaleFactor, std::move(uploaded.image));
+    if (!imageInserted.second)
+        throw std::logic_error("Training image cache insertion failed");
+
+    MTensor *coverageRenderTiles = nullptr;
+    if (hasCoverage) {
+        auto tilesInserted = camera.mtensorCoverageRenderTileCache.emplace(
+            downscaleFactor, std::move(uploaded.coverageRenderTiles));
+        if (!tilesInserted.second) {
+            throw std::logic_error(
+                "Coverage render-tile cache insertion failed");
+        }
+        coverageRenderTiles = &tilesInserted.first->second;
+        camera.coverageUnitsByDownscale.emplace(
+            downscaleFactor, uploaded.coverageUnits);
+        camera.decodedTrainingMaskSource =
+            prepared.request.source.trainingMask;
+    }
+    auto sourceInserted = camera.gpuTrainingMaskSourceByDownscale.emplace(
+        downscaleFactor, prepared.request.source.trainingMask);
+    if (!sourceInserted.second) {
+        throw std::logic_error(
+            "Training target source cache insertion failed");
+    }
+    return {
+        &imageInserted.first->second,
+        hasCoverage ? &imageInserted.first->second : nullptr,
+        uploaded.coverageUnits,
+        coverageRenderTiles,
+    };
+}
+
+} // namespace
+
+struct CameraImageCache::PrefetchTask {
+    size_t cameraIndex;
+    int downscaleFactor;
+    CameraSourceSnapshot source;
+    std::shared_ptr<std::atomic<size_t>> stagedBytes;
+    std::future<PreparedCameraTarget> future;
+
+    PrefetchTask(
+        const CameraTargetRequest &request,
+        std::shared_ptr<std::atomic<size_t>> bytes,
+        std::future<PreparedCameraTarget> result)
+        : cameraIndex(request.cameraIndex),
+          downscaleFactor(request.downscaleFactor),
+          source(request.source),
+          stagedBytes(std::move(bytes)),
+          future(std::move(result)) {}
+};
+
+CameraImageCache::CameraImageCache()
+    : CameraImageCache(1.0f, 0, defaultPrefetchEnabled()) {}
+
+CameraImageCache::CameraImageCache(
+    float downscaleFactor, size_t budgetBytes, bool prefetchEnabled)
+    : _downscaleFactor(downscaleFactor),
+      _budgetBytes(budgetBytes),
+      _prefetchEnabled(prefetchEnabled) {}
+
+CameraImageCache::~CameraImageCache() {
+    discardPrefetch();
+}
+
+CameraImageCache::CameraImageCache(CameraImageCache&&) noexcept = default;
+CameraImageCache& CameraImageCache::operator=(CameraImageCache&&) noexcept = default;
 
 size_t CameraImageCache::defaultBudgetBytes() {
     if (const char *env = std::getenv("MSPLAT_IMAGE_CACHE_MB")) {
@@ -507,6 +1005,81 @@ size_t CameraImageCache::defaultBudgetBytes() {
 #endif
 }
 
+bool CameraImageCache::defaultPrefetchEnabled() noexcept {
+    const char *value = std::getenv("MSPLAT_CAMERA_PREFETCH");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+
+void CameraImageCache::prefetchTrainingTarget(
+    const std::vector<Camera> &cameras, size_t index,
+    int downscaleFactor) noexcept {
+    if (!_prefetchEnabled || index >= cameras.size() || downscaleFactor < 1)
+        return;
+
+    try {
+        const Camera &camera = cameras[index];
+        const bool targetIsResident =
+            camera.hasGPUTrainingTarget(downscaleFactor);
+
+        if (_prefetch) {
+            const bool sameKey = _prefetch->cameraIndex == index &&
+                _prefetch->downscaleFactor == downscaleFactor;
+            const bool sameSource = sourceMatches(camera, _prefetch->source);
+            if (sameKey && sameSource && !targetIsResident)
+                return;
+
+            // A running decode owns the one allowed slot. A completed stale
+            // decode can be reaped without delaying the current iteration.
+            if (_prefetch->future.wait_for(std::chrono::seconds(0)) !=
+                std::future_status::ready) {
+                return;
+            }
+            try {
+                (void)_prefetch->future.get();
+            } catch (...) {
+                // A stale decode error is irrelevant to the requested target.
+            }
+            _prefetch->stagedBytes->store(0, std::memory_order_relaxed);
+            _prefetch.reset();
+            ++_prefetchDiscardedCount;
+        }
+
+        if (targetIsResident) return;
+
+        CameraTargetRequest request;
+        request.cameraIndex = index;
+        request.downscaleFactor = downscaleFactor;
+        request.inputDownscaleFactor = _downscaleFactor;
+        request.source = sourceSnapshot(camera);
+        auto stagedBytes = std::make_shared<std::atomic<size_t>>(0);
+        auto future = std::async(
+            std::launch::async,
+            [workerRequest = request, stagedBytes]() mutable {
+                return prepareCameraTarget(
+                    std::move(workerRequest), stagedBytes);
+            });
+        _prefetch = std::make_unique<PrefetchTask>(
+            request, std::move(stagedBytes), std::move(future));
+        ++_prefetchScheduledCount;
+    } catch (...) {
+        // Prefetch is an optimization. If snapshotting or thread launch fails,
+        // preserve the synchronous path and avoid repeatedly paying the cost.
+        _prefetchEnabled = false;
+    }
+}
+
+void CameraImageCache::discardPrefetch() noexcept {
+    if (!_prefetch) return;
+    std::unique_ptr<PrefetchTask> task = std::move(_prefetch);
+    try {
+        (void)task->future.get();
+    } catch (...) {
+        // Stale work has no observable decode contract.
+    }
+    task->stagedBytes->store(0, std::memory_order_relaxed);
+    ++_prefetchDiscardedCount;
+}
+
 MTensor& CameraImageCache::gpuImage(std::vector<Camera> &cameras, size_t index,
                                     int downscaleFactor) {
     return *gpuTrainingTarget(cameras, index, downscaleFactor).image;
@@ -515,21 +1088,83 @@ MTensor& CameraImageCache::gpuImage(std::vector<Camera> &cameras, size_t index,
 CameraTrainingTarget CameraImageCache::gpuTrainingTarget(
     std::vector<Camera> &cameras, size_t index, int downscaleFactor) {
     Camera &cam = cameras[index];
-    const bool imageIsResident =
-        cam.mtensorImageCache.find(downscaleFactor) !=
-        cam.mtensorImageCache.end();
-    const bool maskIsResident = !cam.trainingMask ||
-        cam.mtensorCoverageMaskCache.find(downscaleFactor) !=
-            cam.mtensorCoverageMaskCache.end();
-    if (imageIsResident && maskIsResident) {
-        ++_hitCount;
-    } else {
-        ++_missCount;
-    }
+    const bool targetIsResident = cam.hasGPUTrainingTarget(downscaleFactor);
     try {
-        cam.loadImage(_downscaleFactor);
-        CameraTrainingTarget target =
-            cam.getGPUTrainingTarget(downscaleFactor);
+        CameraTrainingTarget target;
+        if (targetIsResident) {
+            ++_hitCount;
+            target = cam.getGPUTrainingTarget(downscaleFactor);
+        } else {
+            ++_missCount;
+            bool usedPrefetch = false;
+            const bool matchingKey = _prefetch &&
+                _prefetch->cameraIndex == index &&
+                _prefetch->downscaleFactor == downscaleFactor;
+            const bool matchingPrefetch = matchingKey &&
+                sourceMatches(cam, _prefetch->source);
+
+            // A camera descriptor can be edited by native callers between
+            // scheduling and use. Never surface an error from stale work or
+            // publish its geometry into the changed camera.
+            if (matchingKey && !matchingPrefetch &&
+                _prefetch->future.wait_for(std::chrono::seconds(0)) ==
+                    std::future_status::ready) {
+                try {
+                    (void)_prefetch->future.get();
+                } catch (...) {
+                    // The stale source is unrelated to this foreground load.
+                }
+                _prefetch->stagedBytes->store(
+                    0, std::memory_order_relaxed);
+                _prefetch.reset();
+                ++_prefetchDiscardedCount;
+            }
+            if (matchingPrefetch) {
+                if (_prefetch->future.wait_for(std::chrono::seconds(0)) !=
+                    std::future_status::ready) {
+                    ++_prefetchWaitCount;
+                }
+
+                PreparedCameraTarget prepared;
+                try {
+                    prepared = _prefetch->future.get();
+                } catch (...) {
+                    _prefetch->stagedBytes->store(
+                        0, std::memory_order_relaxed);
+                    _prefetch.reset();
+                    throw;
+                }
+
+                if (sourceMatches(cam, prepared.request.source)) {
+                    try {
+                        target = publishPreparedTarget(
+                            cam, downscaleFactor, prepared);
+                    } catch (...) {
+                        _prefetch->stagedBytes->store(
+                            0, std::memory_order_relaxed);
+                        _prefetch.reset();
+                        throw;
+                    }
+                    ++_prefetchUsedCount;
+                    usedPrefetch = true;
+                } else {
+                    ++_prefetchDiscardedCount;
+                }
+                _prefetch->stagedBytes->store(
+                    0, std::memory_order_relaxed);
+                _prefetch.reset();
+            }
+
+            if (!usedPrefetch) {
+                cam.loadImage(_downscaleFactor);
+                target = cam.getGPUTrainingTarget(downscaleFactor);
+            }
+        }
+
+        // Once the compact GPU target is published, retaining decoded pixels or
+        // a CPU pyramid only duplicates cache state. A later resolution-stage
+        // miss deliberately re-decodes that camera once.
+        cam.releaseCpuImageMemory();
 
         Entry &entry = _entries[index];
         entry.lastUse = ++_clock;
@@ -538,7 +1173,7 @@ CameraTrainingTarget CameraImageCache::gpuTrainingTarget(
         evict(cameras, index);
         return target;
     } catch (...) {
-        // A failed lazy decode, validation, or paired upload must not leave
+        // A failed lazy decode, validation, or target upload must not leave
         // resident bytes that the LRU has never accounted for.
         cam.releaseImageMemory();
         _entries.erase(index);
@@ -548,7 +1183,15 @@ CameraTrainingTarget CameraImageCache::gpuTrainingTarget(
 
 Camera& CameraImageCache::ensureLoaded(std::vector<Camera> &cameras, size_t index) {
     Camera &cam = cameras[index];
-    cam.loadImage(_downscaleFactor);
+    // Render paths need corrected calibration, not decoded pixels. Preserve
+    // the geometry established by an earlier compact-target upload.
+    const bool decodedMaskSourceIsStale = !cam.image.empty() &&
+        !sameTrainingMask(
+            cam.trainingMask, cam.decodedTrainingMaskSource);
+    if (cam.loadedImageDownscaleFactor != _downscaleFactor ||
+        decodedMaskSourceIsStale) {
+        cam.loadImage(_downscaleFactor);
+    }
 
     Entry &entry = _entries[index];
     entry.lastUse = ++_clock;
@@ -575,14 +1218,15 @@ void CameraImageCache::evict(std::vector<Camera> &cameras, size_t protectedIndex
 }
 
 size_t CameraImageCache::cachedBytes() const {
-    size_t bytes = 0;
-    for (const auto &item : _entries) bytes += item.second.bytes();
-    return bytes;
+    return cachedCpuBytes() + cachedGpuBytes();
 }
 
 size_t CameraImageCache::cachedCpuBytes() const {
     size_t bytes = 0;
     for (const auto &item : _entries) bytes += item.second.cpuBytes;
+    if (_prefetch) {
+        bytes += _prefetch->stagedBytes->load(std::memory_order_relaxed);
+    }
     return bytes;
 }
 

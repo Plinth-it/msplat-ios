@@ -7,7 +7,7 @@ beyond system frameworks.
 
 This fork reduces model and transient growth, adds a byte-budgeted image cache,
 enforces an optional hard Gaussian population limit, fixes correctness bugs,
-and provides an iOS build plus a COLMAP-to-PLY example app. Its Swift
+and provides an iOS build plus a COLMAP/Nerfstudio-to-PLY example app. Its Swift
 `TrainingPlan` also validates resolution stages and derives a conservative
 peak-memory estimate before a session is created. ABI v4 telemetry keeps CPU
 submission progress separate from completed GPU work and exposes categorized
@@ -30,6 +30,9 @@ canonical, caller-owned dataset directly through a checked deep-copy boundary.
   statistics are released after topology growth stops. They are never
   allocated for a cutoff at the first step, including checkpoint resumes that
   have already crossed the boundary.
+- Periodic opacity resets now clamp the active opacity logits and clear their
+  Adam moments in the ordered Metal command buffer. They no longer synchronize
+  the GPU for a CPU scan and two host-side buffer clears.
 - Depth-chunk buffers were carried to the end of training after chunking turned
   off. They are released.
 - Render-only calls retain just the shared forward cache. Loss, SSIM, and
@@ -39,8 +42,20 @@ canonical, caller-owned dataset directly through a checked deep-copy boundary.
   and the final pass overwrites rendered RGB with its gradient. This removes
   36 bytes per pixel from the training cache (23.73 MiB at 960×720) without
   reducing numerical precision.
-- Training images were all decoded up front. A byte-budgeted LRU holds what fits
-  and reloads the rest.
+- Training images were all decoded up front as CPU and GPU Float32 RGB copies.
+  A byte-budgeted LRU now retains one tightly packed UInt8 RGBA GPU target per
+  resident camera, releases decoded CPU pixels after upload, and reloads only
+  on an eviction or resolution-stage transition. Loss kernels convert the RGB
+  bytes to float during their existing tile loads. Masked targets reuse the
+  alpha byte for soft coverage. Coverage mode additionally caches one activity
+  byte per 16x16 render tile, expanded by the five-pixel SSIM halo, so exact
+  intersection packing omits inactive tiles and leaves their raster bins empty.
+  Transparent mode retains the full-frame path. Swift sessions can opt in with
+  `DatasetOptions.prefetchTrainingTargets`; native clients can use ABI v14 or
+  set exactly `MSPLAT_CAMERA_PREFETCH=1`. One detached CPU target for the next
+  shuffled camera and resolution is prepared while the current Metal step runs.
+  GPU upload and LRU mutation remain on the serialized training thread, and
+  library prefetch remains off by default.
 - `maxGaussians` bounds the active population and its backing buffers. When a
   densification step has more eligible candidates than remaining capacity, the
   highest normalized-gradient candidates are retained; pruning still runs at
@@ -53,15 +68,107 @@ arena, native image cache, and an additional headroom allowance. The
 intersection estimate scales a padded 16-intersections-per-Gaussian baseline
 at 960×720 by tile count. That baseline is above the measured 10.4 at 960×720
 and scales to 64 at 1920×1440, above the measured 43.5. The runtime still counts
-and sizes each frame exactly. ImageIO is asked to decode a
-thumbnail at the selected input resolution, and the app-owned decode allowance
-therefore scales with that target. It is intentionally conservative, but it is
-not a jetsam guarantee: codec-private surfaces, Metal driver state, framework
+and sizes each frame exactly. Key-driven gathers are the default, so the planner
+budgets both 8-byte key arenas (16 bytes per slot). Runtime allocates the second
+arena only after a tile exceeds the 2,048-entry bitonic path, leaving bitonic-only
+resolution stages at 8 bytes per slot. A plan using the packed fallback budgets
+52 bytes per slot. The synchronized layout pass also precomputes every tile
+range and bucket-orders tiles with more than one entry. Exact sorting skips
+empty and already-sorted single-entry tiles, uses one 32-thread group for 2-32
+entries, and reserves the 256-thread path for larger ranges. ImageIO is asked
+to decode a thumbnail at the selected input resolution, and the app-owned
+decode allowance therefore
+scales with that target. It is intentionally conservative, but it is not a
+jetsam guarantee: codec-private surfaces, Metal driver state, framework
 allocations, other process memory, and changing system pressure are outside the
-model. A valid `MSPLAT_IMAGE_CACHE_MB` override is reflected automatically; use
+model. A valid
+`MSPLAT_IMAGE_CACHE_MB` override is reflected automatically; use
 `memoryEstimate(imageCacheBudgetBytes:)` to evaluate another budget explicitly.
 The model term remains the topology-enabled peak; runtime model storage falls
 after the densification cutoff.
+
+The monolithic forward rasterizer defaults to its established 8x8 threadgroup.
+Native benchmark processes can set `MSPLAT_RASTER_VARIANT=16x8` or
+`MSPLAT_RASTER_VARIANT=16x16` before the first Metal call to compare larger
+threadgroups. These experimental overrides do not change chunked forward or
+backward rasterization, which remain 8x8; select a shipping default only from
+representative physical-device performance and thermal results.
+
+Intersection attributes use key-driven gathers by default. Rasterization extracts
+the Gaussian ID from each sorted key and gathers XY, conic, raw color, and the
+already projected sigmoid opacity from per-Gaussian arrays. This removes three
+sorted float3 copies and the pack dispatch, reducing the bitonic-only arena from
+44 to 8 bytes per slot and the radix arena from 52 to 16 bytes per slot. It saves
+36 bytes per retained intersection (about 450 MB at a 12.5-million-slot capacity).
+A counterbalanced sustained iPhone 16 Pro Max profile found the path effectively
+throughput-neutral while saving 68.83 MiB at 313,214 Gaussians and roughly 1.6
+million live intersections. Set `MSPLAT_INTERSECTION_ATTRIBUTES=packed` before
+the first Metal call to restore sequential packed attributes for device-specific
+fallback testing. `TrainingPlan` mirrors this process override by default, or
+callers can select `TrainingIntersectionAttributeStorage.packed` explicitly, so
+the memory admission estimate includes its additional 36 bytes per arena slot.
+
+Exact tile counting likewise keeps the established per-intersection enumeration
+as its default. A benchmark process can set
+`MSPLAT_TILE_COUNT_MODE=difference` before the first Metal call to record four
+signed corners per visible Gaussian and reconstruct the exact tile counts with
+horizontal and vertical scans. The experimental mode preserves coverage-tile
+masking and the synchronized CPU layout/allocation safety boundary; it does not
+remove the per-step host wait. Keep `enumerated` as the shipping mode until
+fixed-snapshot physical-device and sustained-thermal measurements justify a
+default change.
+
+Exact tile layout likewise remains on its established CPU implementation by
+default. `MSPLAT_TILE_LAYOUT_MODE=gpu` is a correctness-first experiment that
+builds the same inclusive offsets, tile bins, stable small/medium/large sort
+lists, and checked summary metadata with one GPU thread. It composes with both
+tile-count modes, but the host still waits for completion, validates the final
+offset and metadata, and sizes the arena before submitting rasterization and
+optimizer work.
+
+`MSPLAT_TRAINING_ARENA_MODE=retry` is the next correctness-first experiment. It
+forces GPU tile layout, reuses the grow-only intersection high-water mark, and
+keeps the normal count/layout and training work in one GPU attempt. If the
+arena, radix scratch, or raster chunks are too small, persistent model updates
+are suppressed, the host grows the required resources, and the same logical
+step is retried. The initial attempt at a resolution still bootstraps the arena
+through the synchronized exact path, and steady-state retry mode synchronizes at
+attempt retirement before committing CPU training state. It therefore removes
+the mid-step sizing barrier and its GPU idle gap, but does not yet provide
+multi-step queue depth. Before that retirement, the GPU copies attempt status,
+the checked ten-word layout, and its final inclusive offset into the logical
+step's own readback; retry decisions and completed tile telemetry no longer
+depend on reusable global layout buffers. Direct native calls without logical
+telemetry still copy those values immediately after the synchronized preflight
+while holding the engine lock, so they cannot outlive the reusable buffers.
+Recovered attempts remain visible as packed-capacity overflow events, and their
+resource-growth and encoding costs are accumulated into the completed logical
+step's telemetry. Keep `exact` as the shipping mode until physical-device
+throughput, memory, and sustained-thermal measurements justify a default change.
+
+The separable SSIM derivative path uses fused processing by default. A 16x8
+terminal threadgroup retains the vertical and horizontal derivative fields in
+one reusable shared-memory tile, removing the 9-float-per-pixel derivative
+buffer and final SSIM dispatch. At 1200x1600 and 313,214 Gaussians, sustained
+iPhone 16 Pro Max profiling measured throughput within one percent of the mean
+of two bracketing baselines while saving about 66 MiB of tracked native buffers
+and 74 MiB of process footprint.
+Set `MSPLAT_SSIM_MODE=staged` before first Metal use to restore the three-stage
+fallback. The public training-plan estimate deliberately continues to budget
+the larger staged storage so admission remains conservative for either mode.
+
+Densification split offsets keep the established libc++ CPU normal stream by
+default. `MSPLAT_DENSIFY_RANDOM_MODE=gpu` replaces the periodic host fill with
+a stateless counter-based Box-Muller stream generated directly by each split
+thread from the logical step and dense split ordinal. The experimental path
+avoids the sample-buffer write/read traffic and replaces the capacity-sized
+legacy sample arena with a one-float binding placeholder, saving almost
+12 bytes per Gaussian of model capacity while densification remains active.
+Because the random sequence changes the training trajectory, keep `cpu` as the
+shipping mode until fixed-checkpoint quality, densification-step timing, and
+sustained physical-device thermal results justify promotion. Resume with the
+same mode when comparing a continued run; the mode is process configuration,
+not checkpoint metadata.
 
 ## Correctness
 
@@ -70,9 +177,10 @@ after the densification cutoff.
 could drop intersections or write beyond their useful capacity. The current
 pipeline projects and counts every tile intersection, waits for that count,
 builds checked exact offsets, grows compact arenas, and sorts the complete range
-with a bitonic fast path through 2,048 entries and a deterministic radix path
-through the explicit 65,536-per-tile work limit. Index, allocation, or work-limit
-failures stop the step before rasterization and optimizer work instead of
+with a 32-thread small-range path, a bitonic fast path through 2,048 entries,
+and a deterministic radix path through the explicit 65,536-per-tile work limit.
+Index, allocation, or work-limit failures stop the step before rasterization
+and optimizer work instead of
 training against an incomplete frame.
 
 **Chunk buffers across a resolution change.** The guard compared against a
@@ -97,6 +205,9 @@ coordinates with EXIF reorientation disabled. Its adapter therefore validates
 EXIF orientation but deliberately preserves the raw pixel frame; applying a
 display transform without updating intrinsics and poses would corrupt the
 calibration. ImageIO converts decoded thumbnails into an explicit sRGB canvas.
+Training retains those encoded numerical values as RGBA8 and normalizes them
+manually; it does not use an sRGB texture conversion that would change the loss
+space.
 The canonical dataset descriptor records that pixel-frame choice explicitly;
 existing file adapters use encoded pixels, while calibration-aware native
 adapters can opt into tested EXIF-normalized materialization. Low-level decode
@@ -118,9 +229,14 @@ resume cannot silently attach corrections to different cameras.
 camera-space SE(3) corrections after warm-up. The first training camera is a
 fixed anchor, and the geometry-only pose gradient deliberately detaches the SH
 view-direction term. Imported poses and canonical rendering, evaluation, and
-export remain unchanged. Checkpoint v3 preserves corrections, Adam moments,
-per-camera visit counts, the anchor, exact frame IDs, and the immutable source
-poses.
+export remain unchanged. Raw bounded SE(3) remains the default. An explicit
+CamP option applies a deterministic fixed full 6x6 projection-Jacobian
+preconditioner, adapted from the pinned
+[CamP Zip-NeRF implementation](https://github.com/jonbarron/camp_zipnerf/tree/8e6d57e3aee34235faf3ef99decca0994efe66c9),
+while retaining the same physical bounds and regularization. Raw pose state
+continues to use checkpoint v3. CamP checkpoint v4 additionally preserves the
+exact per-camera preconditioners and readiness state alongside corrections,
+Adam moments, visit counts, the anchor, frame IDs, and immutable source poses.
 
 ## Additions
 
@@ -146,10 +262,29 @@ poses.
 - ABI v11 versioned training-mask treatment options. Coverage remains the
   default; transparent mode adds full-frame alpha supervision without changing
   the locked `MsplatConfig` layout or any earlier entry point.
+- ABI v12 detailed count-barrier and tile-distribution telemetry through a new
+  query structure; its reserved tail word now reports the optional intra-step
+  GPU queue gap without changing either ABI layout. The ABI v4 telemetry layout
+  and entry point remain unchanged.
+- ABI v13 GPU-native preview submission through an immutable BGRA8Unorm Metal
+  surface; existing CPU render entry points remain available.
+- ABI v14 instance-scoped training-target prefetch exposed through Swift
+  `DatasetOptions`; the native environment opt-in remains available.
+- ABI v15 size-checked camera-pose refinement state queries. They return zero
+  cameras when refinement is disabled; otherwise each canonical camera exposes
+  bounded six-component deltas, its optimizer visit count, anchor status,
+  corrected row-major OpenGL camera-to-world geometry in the dataset's original
+  pre-normalization coordinates, and a frame ID borrowed for the trainer
+  lifetime. Adam moments remain private and pending Metal work is synchronized
+  before pose rows are read.
+- ABI v16 opt-in CamP conditioning through a new capability bit in the unchanged
+  v8 refinement-options structure. Raw bounded SE(3) remains the default and
+  does not allocate CamP matrices; older clients retain their existing path.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
-  explicit sRGB conversion, and raw-coordinate EXIF handling for COLMAP
+  explicit sRGB conversion, compact RGBA8 training storage, and raw-coordinate
+  EXIF handling for COLMAP
 - A validated canonical descriptor shared by the COLMAP, Nerfstudio, and
   Polycam adapters, preserving source frame/calibration identity, sparse-point
   IDs, reprojection errors, image observations, and adapter provenance; COLMAP
@@ -231,6 +366,23 @@ func train() throws {
 process-global Metal state. The legacy `GaussianDataset` and `GaussianTrainer`
 types remain available for source compatibility.
 
+ABI v13 adds a GPU-native preview path. `MsplatSession.submitPreview(...)`
+returns a `MetalPreviewSubmission`; calling `waitUntilReady()` returns a
+`MetalPreviewSurface` only after its render has completed. The completed surface
+owns an immutable BGRA8Unorm `MTLTexture`, so a Metal-backed view can display it
+without copying pixels to the CPU or uploading them again. The texture's device
+is the source of truth for the consuming Metal view and command queue, and the
+surface must remain alive while the texture is displayed.
+
+`renderRGBA` and the `PixelData` render methods remain available for callers that
+need CPU-owned pixels. MsplatExample uses the Metal surface path, retains at most
+one pending submission and the latest completed surface, and accounts for both
+surfaces in its memory preflight. Submitting a fixed-camera preview still reaches
+the renderer's existing exact-count CPU/GPU synchronization before the remaining
+work is queued. The native surface avoids the later CPU readback and UIImage
+re-upload, but preview submission is not fully nonblocking until tile count and
+scan move entirely onto the GPU.
+
 Path-based COLMAP loading can opt into mask discovery with
 `DatasetOptions.discoverTrainingMasks`; plan-based sessions use
 `TrainingPlan.includesTrainingMasks` for both discovery and their conservative
@@ -270,7 +422,8 @@ cover every lazily decoded image and mask URL; the session releases those
 scopes after its native trainer and dataset are destroyed. Set
 `TrainingPlan.includesTrainingMasks` through its initializer when planning a
 masked dataset so the estimate includes full-source mask decoding and paired
-CPU/GPU mask caches.
+image/mask decode transients; the resident GPU target packs coverage into RGBA
+alpha.
 
 Before creating a session, a canonical descriptor can be checked against its
 sparse correspondences without reading any image or mask and without starting
@@ -298,7 +451,21 @@ descriptors may name different iterations. A completed descriptor is published
 only after every command buffer in that logical step succeeds;
 `gpuExecutionMs` sums their Metal GPU intervals, while `endToEndMs` is
 completion-observed wall latency, including queueing, completion-handler
-scheduling, and any required synchronous readbacks.
+scheduling, and any required synchronous readbacks. `queueIdleMs` merges any
+overlapping command-buffer intervals and reports the uncovered gaps between
+them. It therefore measures intra-step GPU queue bubbles, including retry gaps,
+but not backlog before the step's first GPU interval or latency after its last.
+ABI v12 additionally reports image preparation, exact-count GPU and wall-wait
+time, post-count CPU encoding, intersection-arena growth, the exact intersection
+count, maximum tile population, and trivial/small/medium/large tile counts. This
+makes the per-step count barrier measurable without enabling the heavier stage
+profiler.
+When `PROFILE_STAGES=1` is enabled, exact-intersection work is reported as
+separate `proj_layout_validate`, `scatter_sort_finalize`, and `pack` stages so
+retry preflight cost is not folded into the asynchronous training tail.
+With camera prefetch enabled, decode work overlapped with the preceding Metal
+step is outside the next step's `imagePrepareMs`; any remaining wait plus target
+installation and GPU upload is still included.
 `memoryMetrics()` separates model, render-transient, training-transient,
 telemetry-readback, and image-cache bytes from process `phys_footprint` and iOS
 available memory. The buffer categories are logical allocations, not a claim
@@ -319,6 +486,12 @@ Output: `.ply`, `.splat`, `.spz`.
 | Variable | Effect |
 |---|---|
 | `MSPLAT_IMAGE_CACHE_MB` | Image cache budget. Default 512 on iOS, 2048 elsewhere. |
+| `MSPLAT_CAMERA_PREFETCH` | Set exactly `1` to predecode one upcoming training camera. Default off. |
+| `MSPLAT_TILE_COUNT_MODE` | `enumerated` (default) or experimental exact `difference` counting. Set before first Metal use. |
+| `MSPLAT_TILE_LAYOUT_MODE` | `cpu` (default) or experimental exact `gpu` layout. The GPU mode retains the synchronized host validation and arena-sizing boundary. Set before first Metal use. |
+| `MSPLAT_TRAINING_ARENA_MODE` | `exact` (default) or experimental transactional `retry`. Retry forces GPU tile layout and replaces steady-state mid-step sizing with an end-of-attempt validation/retry boundary. Set before first Metal use. |
+| `MSPLAT_SSIM_MODE` | Fused derivative processing (default) or `staged` fallback. Staged uses a 36-byte-per-pixel derivative buffer and one additional dispatch. Set before first Metal use. |
+| `MSPLAT_INTERSECTION_ATTRIBUTES` | Key-driven `gather` (default) or `packed` fallback. Packed attributes add three float3 arrays and one pack dispatch, using 36 additional bytes per arena slot. Set before first Metal use. |
 | `MSPLAT_MEM_LOG_EVERY` | Memory breakdown every N steps. |
 | `MSPLAT_ISECT_LOG` | Intersection count against capacity at each sample. |
 
@@ -366,19 +539,29 @@ the compact intersection arena:
 
 ```
 Forward:
-  project_and_sh_forward     fused projection + SH + exact per-tile counts
+  project_and_sh_forward     fused projection + SH + exact count contributions
+  optional difference scans  exact per-tile counts for the experimental mode
   CPU checked prefix         exact offsets and grow-only arena sizing
-  exact scatter + sort       compact checked tile ranges + packing
+  exact scatter + sort       compact checked tile ranges + optional packing
   nd_rasterize_forward       per-pixel alpha compositing (16×16 tiles)
-  ssim_h_fwd + fused_v_h_bwd separable 11-tap SSIM + L1 loss
+  ssim_h_fwd + fused_v_bwd   default fused 11-tap SSIM + L1 loss
 
 Backward:
-  ssim_v_bwd                 in-place final SSIM image gradient
+  optional staged SSIM       materializes derivatives, then runs ssim_v_bwd
   rasterize_backward         per-pixel backward compositing
-  project_and_sh_backward    fused projection + SH VJP + SH Adam update
-  fused_adam (×4 groups)     optimizer step
-  accumulate_grad_stats      gradient norms for densification
+  sh_opacity_backward_adam   register SH VJP + SH/opacity Adam update
+  project_backward_adam      register geometry VJP + Adam + densify stats
 ```
+
+The optional difference scans only replace how the first command buffer derives
+the per-tile counts. Both modes still synchronize before the checked CPU prefix,
+use the same exact scatter/sort/raster stages, and fail before optimizer work if
+the layout or arena cannot be represented safely.
+
+The loss target entering `ssim_h_fwd` is a tightly packed UInt8 RGBA buffer;
+RGB is sampled and converted with `byte / 255`. For camera masks, alpha carries
+soft coverage and the same buffer drives coverage weighting or transparent
+alpha supervision. Low-level callers may still supply a standalone UInt8 mask.
 
 Upstream's [README](https://github.com/rayanht/msplat) covers the design behind
 this and carries M4 Max benchmarks against gsplat. This fork has not re-run

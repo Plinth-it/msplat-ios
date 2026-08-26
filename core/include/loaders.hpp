@@ -40,11 +40,18 @@ ImageSourceInfo inspectImageSource(const std::string &path);
 Image imreadRGB(const std::string &path, const ImageSourceInfo &sourceInfo,
                 int targetWidth, int targetHeight,
                 bool applyExifOrientation);
+/// Compact counterpart used by the training cache. The result is tightly
+/// packed RGBA8 with an opaque alpha byte and retains sRGB-encoded values.
+RGBA8Image imreadRGBA8(
+    const std::string &path, const ImageSourceInfo &sourceInfo,
+    int targetWidth, int targetHeight, bool applyExifOrientation);
 CoverageMask imreadCoverageMask(
     const std::string &path, const ImageSourceInfo &sourceInfo,
     int targetWidth, int targetHeight, bool applyExifOrientation,
     TrainingMaskChannel channel);
 Image resizeArea(const Image &src, int dstW, int dstH);  // box-filter downscale
+RGBA8Image resizeRGBA8Area(
+    const RGBA8Image &src, int dstW, int dstH);  // box-filter, UInt8 round
 CoverageMask resizeCoverageArea(
     const CoverageMask &src, int dstW, int dstH);  // box-filter, UInt8 round
 void imwriteRGB(const std::string &path, const Image &img);  // save as PNG
@@ -60,6 +67,15 @@ UndistortResult undistortImage(const Image &src,
     float fx, float fy, float cx, float cy,
     float k1, float k2, float p1, float p2, float k3);
 
+struct UndistortRGBA8Result {
+    RGBA8Image image;
+    float fx, fy, cx, cy;
+    int width, height;
+};
+UndistortRGBA8Result undistortRGBA8Image(const RGBA8Image &src,
+    float fx, float fy, float cx, float cy,
+    float k1, float k2, float p1, float p2, float k3);
+
 struct UndistortTrainingTargetResult {
     Image image;
     CoverageMask coverageMask;
@@ -68,6 +84,17 @@ struct UndistortTrainingTargetResult {
 };
 UndistortTrainingTargetResult undistortImageAndCoverageMask(
     const Image &image, const CoverageMask &coverageMask,
+    float fx, float fy, float cx, float cy,
+    float k1, float k2, float p1, float p2, float k3);
+
+struct UndistortRGBA8TrainingTargetResult {
+    RGBA8Image image;
+    CoverageMask coverageMask;
+    float fx, fy, cx, cy;
+    int width, height;
+};
+UndistortRGBA8TrainingTargetResult undistortRGBA8ImageAndCoverageMask(
+    const RGBA8Image &image, const CoverageMask &coverageMask,
     float fx, float fy, float cx, float cy,
     float k1, float k2, float p1, float p2, float k3);
 

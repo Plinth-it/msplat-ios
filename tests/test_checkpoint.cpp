@@ -25,6 +25,7 @@ constexpr uint32_t checkpointMagic = 0x4C50534D;
 constexpr uint32_t checkpointVersionV1 = 1;
 constexpr uint32_t checkpointVersionV2 = 2;
 constexpr uint32_t checkpointVersionV3 = 3;
+constexpr uint32_t checkpointVersionV4 = 4;
 
 template <typename T>
 void appendScalar(std::vector<uint8_t> &bytes, T value) {
@@ -133,6 +134,7 @@ struct V3CheckpointFixture {
     size_t anchorIndexOffset = 0;
     size_t firstPoseStepOffset = 0;
     size_t basePosesByteCountOffset = 0;
+    size_t poseOptimizerPayloadOffset = 0;
     size_t poseDeltaByteCountOffset = 0;
     size_t firstMomentByteCountOffset = 0;
     size_t secondMomentByteCountOffset = 0;
@@ -185,12 +187,55 @@ V3CheckpointFixture validV3Checkpoint(
     std::memcpy(fixture.bytes.data() + basePoseDataOffset,
                 basePoses.data(), sizeof(basePoses));
 
+    fixture.poseOptimizerPayloadOffset = fixture.bytes.size();
     appendTensor(fixture.bytes, {2, 6},
                  &fixture.poseDeltaByteCountOffset);
     appendTensor(fixture.bytes, {2, 6},
                  &fixture.firstMomentByteCountOffset);
     appendTensor(fixture.bytes, {2, 6},
                  &fixture.secondMomentByteCountOffset);
+    return fixture;
+}
+
+struct V4CheckpointFixture {
+    std::vector<uint8_t> bytes;
+    size_t conditioningOffset = 0;
+    size_t firstReadinessOffset = 0;
+    size_t preconditionerByteCountOffset = 0;
+};
+
+V4CheckpointFixture validV4Checkpoint() {
+    const V3CheckpointFixture v3 = validV3Checkpoint(false, true);
+    V4CheckpointFixture fixture;
+    fixture.bytes = v3.bytes;
+    std::memcpy(fixture.bytes.data() + sizeof(uint32_t),
+                &checkpointVersionV4, sizeof(checkpointVersionV4));
+
+    std::vector<uint8_t> extension;
+    fixture.conditioningOffset = v3.poseOptimizerPayloadOffset;
+    appendScalar(extension, uint32_t{1});
+    fixture.firstReadinessOffset =
+        v3.poseOptimizerPayloadOffset + extension.size();
+    appendScalar(extension, uint8_t{1});
+    appendScalar(extension, uint8_t{1});
+    size_t preconditionerDataOffset = 0;
+    size_t relativeByteCountOffset = 0;
+    appendTensor(extension, {2, 36}, &relativeByteCountOffset,
+                 &preconditionerDataOffset);
+    fixture.preconditionerByteCountOffset =
+        v3.poseOptimizerPayloadOffset + relativeByteCountOffset;
+
+    std::array<float, 72> preconditioners{};
+    for (size_t camera = 0; camera < 2; ++camera) {
+        for (size_t axis = 0; axis < 6; ++axis)
+            preconditioners[camera * 36 + axis * 6 + axis] = 1.0f;
+    }
+    std::memcpy(extension.data() + preconditionerDataOffset,
+                preconditioners.data(), sizeof(preconditioners));
+    fixture.bytes.insert(
+        fixture.bytes.begin() +
+            static_cast<std::ptrdiff_t>(v3.poseOptimizerPayloadOffset),
+        extension.begin(), extension.end());
     return fixture;
 }
 
@@ -260,6 +305,11 @@ int main() {
     const fs::path truncatedPosePayloadPath =
         prefix.string() + "-pose-payload.msplat";
     const fs::path trailingV3Path = prefix.string() + "-trailing-v3.msplat";
+    const fs::path validV4Path = prefix.string() + "-valid-v4.msplat";
+    const fs::path poseConditioningCorruptPath =
+        prefix.string() + "-pose-conditioning-corrupt.msplat";
+    const fs::path truncatedV4Path =
+        prefix.string() + "-pose-conditioning-truncated.msplat";
     const fs::path atomicDestination = prefix.string() + "-atomic.bin";
     const fs::path atomicSentinel = atomicDestination.string() + ".tmp";
     RemoveFiles cleanup{{validPath, truncatedPath, badByteCountPath,
@@ -272,6 +322,8 @@ int main() {
                          validV3DisabledPath, validV3PosePath,
                          validV3BothPath, poseCorruptPath,
                          truncatedPosePayloadPath, trailingV3Path,
+                         validV4Path, poseConditioningCorruptPath,
+                         truncatedV4Path,
                          atomicDestination, atomicSentinel}};
 
     size_t firstTensorByteCountOffset = 0;
@@ -512,6 +564,83 @@ int main() {
     trailingV3.push_back(0);
     writeFile(trailingV3Path, trailingV3);
     CHECK(rejects(trailingV3Path, "trailing data"));
+
+    // Version 4 preserves the v3 pose prefix, then records the conditioning
+    // mode, one readiness byte per camera, and the exact full 6x6 matrices
+    // before the existing delta and Adam tensors.
+    const V4CheckpointFixture validV4 = validV4Checkpoint();
+    writeFile(validV4Path, validV4.bytes);
+    validateCheckpointFile(validV4Path.string());
+
+    std::vector<uint8_t> invalidConditioning = validV4.bytes;
+    const uint32_t invalidConditioningMode = 2;
+    std::memcpy(
+        invalidConditioning.data() + validV4.conditioningOffset,
+        &invalidConditioningMode, sizeof(invalidConditioningMode));
+    writeFile(poseConditioningCorruptPath, invalidConditioning);
+    CHECK(rejects(poseConditioningCorruptPath,
+                  "require CamP conditioning"));
+
+    std::vector<uint8_t> rawV4Conditioning = validV4.bytes;
+    const uint32_t rawConditioningMode = 0;
+    std::memcpy(
+        rawV4Conditioning.data() + validV4.conditioningOffset,
+        &rawConditioningMode, sizeof(rawConditioningMode));
+    writeFile(poseConditioningCorruptPath, rawV4Conditioning);
+    CHECK(rejects(poseConditioningCorruptPath,
+                  "require CamP conditioning"));
+
+    std::vector<uint8_t> invalidReadiness = validV4.bytes;
+    const uint8_t invalidReadinessFlag = 2;
+    std::memcpy(
+        invalidReadiness.data() + validV4.firstReadinessOffset,
+        &invalidReadinessFlag, sizeof(invalidReadinessFlag));
+    writeFile(poseConditioningCorruptPath, invalidReadiness);
+    CHECK(rejects(poseConditioningCorruptPath,
+                  "preconditioner readiness flag"));
+
+    std::vector<uint8_t> missingOptimizedPreconditioner = validV4.bytes;
+    const uint8_t notReady = 0;
+    std::memcpy(
+        missingOptimizedPreconditioner.data() +
+            validV4.firstReadinessOffset + 1,
+        &notReady, sizeof(notReady));
+    writeFile(poseConditioningCorruptPath,
+              missingOptimizedPreconditioner);
+    CHECK(rejects(poseConditioningCorruptPath,
+                  "inconsistent with optimizer steps"));
+
+    std::vector<uint8_t> badPreconditionerShape = validV4.bytes;
+    const int64_t badPreconditionerWidth = 35;
+    std::memcpy(
+        badPreconditionerShape.data() +
+            validV4.preconditionerByteCountOffset - sizeof(int64_t),
+        &badPreconditionerWidth, sizeof(badPreconditionerWidth));
+    writeFile(poseConditioningCorruptPath, badPreconditionerShape);
+    CHECK(rejects(poseConditioningCorruptPath, "incompatible shape"));
+
+    std::vector<uint8_t> badPreconditionerBytes = validV4.bytes;
+    uint64_t preconditionerBytes = 0;
+    std::memcpy(
+        &preconditionerBytes,
+        badPreconditionerBytes.data() +
+            validV4.preconditionerByteCountOffset,
+        sizeof(preconditionerBytes));
+    ++preconditionerBytes;
+    std::memcpy(
+        badPreconditionerBytes.data() +
+            validV4.preconditionerByteCountOffset,
+        &preconditionerBytes, sizeof(preconditionerBytes));
+    writeFile(poseConditioningCorruptPath, badPreconditionerBytes);
+    CHECK(rejects(poseConditioningCorruptPath, "byte count"));
+
+    std::vector<uint8_t> truncatedV4(
+        validV4.bytes.begin(),
+        validV4.bytes.begin() +
+            static_cast<std::ptrdiff_t>(validV4.firstReadinessOffset + 1));
+    writeFile(truncatedV4Path, truncatedV4);
+    CHECK(rejects(truncatedV4Path,
+                  "truncated pose checkpoint payload"));
 
     {
         std::ofstream sentinel(atomicSentinel, std::ios::binary | std::ios::trunc);

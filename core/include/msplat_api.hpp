@@ -10,9 +10,13 @@
 #include <memory>
 #include <string>
 
+#include "camera_pose_conditioning.hpp"
+
 struct DatasetDescriptor;
 
 namespace msplat {
+
+class PreviewFrame;
 
 // ── Config ──────────────────────────────────────────────────────────────────
 
@@ -45,6 +49,10 @@ struct Config {
     // Learn small regularized camera-space SE(3) corrections after warm-up.
     // Imported poses and canonical render/evaluation/export remain unchanged.
     bool refineCameraPoses = false;
+    // Raw retains the established bounded optimizer. CamP opt-in conditions
+    // its six-dimensional camera update with a fixed full matrix.
+    CameraPoseConditioning cameraPoseConditioning =
+        CameraPoseConditioning::Raw;
     // Transparent mode applies only to frames that actually carry a mask.
     TrainingMaskMode trainingMaskMode = TrainingMaskMode::Coverage;
     float transparentAlphaLossWeight = 0.1f;
@@ -79,6 +87,18 @@ struct CompletedTrainingStep : SubmittedTrainingStep {
     uint32_t overflowKinds = 0;
     uint64_t retainedPackedIntersectionCount = 0;
     uint64_t packedIntersectionCapacity = 0;
+    float imagePrepareMs = 0.0f;
+    float countGpuMs = 0.0f;
+    float countWaitWallMs = 0.0f;
+    float queueIdleMs = 0.0f;
+    float postCountEncodeMs = 0.0f;
+    float intersectionArenaGrowMs = 0.0f;
+    uint32_t maximumTileCount = 0;
+    uint32_t activeTileCount = 0;
+    uint32_t trivialTileCount = 0;
+    uint32_t smallTileCount = 0;
+    uint32_t mediumTileCount = 0;
+    uint32_t largeTileCount = 0;
 };
 
 struct TrainingMetrics {
@@ -88,6 +108,8 @@ struct TrainingMetrics {
     bool lossValid = false;
     bool intersectionsValid = false;
     bool hasFailedStep = false;
+    bool countGpuTimeValid = false;
+    bool queueIdleTimeValid = false;
     SubmittedTrainingStep submitted;
     CompletedTrainingStep completed;
     uint64_t overflowedCompletedSteps = 0;
@@ -111,6 +133,23 @@ struct TrainingMemoryMetrics {
     uint64_t trainingGpuImageCacheMisses = 0;
     bool hasProcessPhysFootprint = false;
     bool hasProcessAvailableBytes = false;
+};
+
+/// Read-only snapshot of one canonical camera's opt-in pose refinement.
+/// Translation deltas and the corrected matrix translation use the dataset's
+/// original pre-normalization length units; rotation deltas use radians.
+/// `frameId` is borrowed and remains valid for the owning Trainer's lifetime.
+struct PoseRefinementState {
+    bool enabled = false;
+    bool anchor = false;
+    uint32_t canonicalCameraIndex = 0;
+    uint32_t optimizerStepCount = 0;
+    float poseDelta[6] = {};
+    float translationNorm = 0.0f;
+    float rotationNorm = 0.0f;
+    float correctedCameraToWorld[16] = {};
+    const char* frameId = nullptr;
+    size_t frameIdLength = 0;
 };
 
 struct EvalMetrics {
@@ -167,6 +206,9 @@ public:
     int numTrain() const;
     int numTest() const;
     void cameraPose(int index, float camToWorld[16]) const;
+    /// Enables depth-one target preparation for trainers subsequently created
+    /// from this dataset. Call before constructing a Trainer.
+    void enableTrainingTargetPrefetch() noexcept;
 
     // Opaque handle for Trainer
     void* _handle() const;
@@ -218,6 +260,11 @@ public:
                             uint8_t* outRGBA, size_t outCapacity,
                             int* outWidth, int* outHeight);
 
+    /// Submit a separately owned BGRA8 Metal preview texture. The returned
+    /// frame may outlive this trainer; poll it before sampling the texture.
+    std::unique_ptr<PreviewFrame> renderFromPosePreview(
+        const float camToWorld[16], int refCameraIndex);
+
     /// Export scene to PLY format.
     void exportPly(const std::string& path);
 
@@ -239,10 +286,40 @@ public:
     TrainingMetrics metrics() const;
     /// Live buffer ownership, cache, and process-memory measurements.
     TrainingMemoryMetrics memoryMetrics() const;
+    /// Returns zero when camera-pose refinement was not enabled.
+    uint32_t poseRefinementStateCount() const;
+    /// Synchronizes pending Metal work before reading the selected pose row.
+    PoseRefinementState poseRefinementState(
+        uint32_t canonicalCameraIndex) const;
 
 private:
     struct Impl;
     std::unique_ptr<Impl> impl;
+};
+
+/// Ownership-safe asynchronous preview result. The borrowed texture pointer is
+/// an id<MTLTexture> in Objective-C++ and remains valid for this object's
+/// lifetime. Pixel contents are immutable after poll() returns true.
+class PreviewFrame {
+public:
+    ~PreviewFrame();
+
+    PreviewFrame(const PreviewFrame&) = delete;
+    PreviewFrame& operator=(const PreviewFrame&) = delete;
+    PreviewFrame(PreviewFrame&&) noexcept = default;
+    PreviewFrame& operator=(PreviewFrame&&) noexcept = default;
+
+    /// False while pending, true when complete, and throws on GPU failure.
+    bool poll() const;
+    void* texture() const;
+    int width() const;
+    int height() const;
+
+    struct Impl;
+private:
+    explicit PreviewFrame(std::shared_ptr<Impl> impl);
+    std::shared_ptr<Impl> impl;
+    friend class Trainer;
 };
 
 // ── Lifecycle ───────────────────────────────────────────────────────────────

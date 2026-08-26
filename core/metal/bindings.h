@@ -2,6 +2,7 @@
 #define MSPLAT_BINDINGS_H
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <tuple>
 #include "metal_tensor.hpp"
@@ -24,11 +25,24 @@ void* msplat_device();
 MTensor gpu_zeros(std::vector<int64_t> shape, DType dtype);
 MTensor gpu_empty(std::vector<int64_t> shape, DType dtype);
 
+// The densification random mode is selected once with the Metal context.
+// GPU mode does not retain the capacity-sized legacy sample arena.
+bool msplat_densify_uses_gpu_random();
+
 // Commit current command buffer (non-blocking)
 void msplat_commit();
 
 // Synchronize (commit + wait for completion)
 void msplat_gpu_sync();
+
+/// Convert one completed Float32 RGB render into a caller-owned BGRA8Unorm
+/// texture and commit the current root command buffer without waiting. The
+/// completion runs on Metal's callback queue after GPU completion and must not
+/// re-enter the engine. `texture` is an id<MTLTexture> in Objective-C++.
+using MsplatPreviewCompletion =
+    std::function<void(bool succeeded, const char* error)>;
+void msplat_submit_preview_texture(
+    MTensor& rgb, void* texture, MsplatPreviewCompletion completion);
 
 // Completion-only training telemetry. A trainer owns one shared state. Each
 // submitted logical step owns a distinct readback buffer until every command
@@ -47,6 +61,8 @@ enum MsplatTrainingTelemetryFlag : uint32_t {
     MSPLAT_TRAINING_TELEMETRY_LOSS_VALID = 1u << 3,
     MSPLAT_TRAINING_TELEMETRY_INTERSECTION_COUNT_VALID = 1u << 4,
     MSPLAT_TRAINING_TELEMETRY_HAS_FAILED = 1u << 5,
+    MSPLAT_TRAINING_TELEMETRY_COUNT_GPU_TIMING_VALID = 1u << 6,
+    MSPLAT_TRAINING_TELEMETRY_QUEUE_IDLE_TIMING_VALID = 1u << 7,
 };
 
 struct MsplatTrainingStepDescriptor {
@@ -69,6 +85,18 @@ struct MsplatCompletedTrainingStepMetrics {
     uint64_t packedIntersectionCapacity = 0;
     uint32_t overflowReasons = MSPLAT_TRAINING_OVERFLOW_NONE;
     uint32_t commandBufferCount = 0;
+    double imagePrepareMs = 0.0;
+    double countGpuMs = 0.0;
+    double countWaitWallMs = 0.0;
+    double queueIdleMs = 0.0;
+    double postCountEncodeMs = 0.0;
+    double intersectionArenaGrowMs = 0.0;
+    uint32_t maximumTileCount = 0;
+    uint32_t activeTileCount = 0;
+    uint32_t trivialTileCount = 0;
+    uint32_t smallTileCount = 0;
+    uint32_t mediumTileCount = 0;
+    uint32_t largeTileCount = 0;
 };
 
 struct MsplatTrainingTelemetrySnapshot {
@@ -122,6 +150,9 @@ size_t msplat_cached_tensor_bytes();
 // is sufficient for a cold render; the training side is allocated lazily.
 size_t msplat_shared_cached_tensor_bytes();
 size_t msplat_training_cached_tensor_bytes();
+// Internal diagnostics for verifying that gather mode does not retain the
+// three legacy per-intersection attribute arrays.
+size_t msplat_packed_intersection_attribute_bytes();
 
 // GPU timing — non-invasive, uses completion handlers on committed CBs
 void msplat_enable_gpu_timing(bool enable);
@@ -158,10 +189,12 @@ struct MsplatPhotometricRefinementStep {
 
 struct MsplatPoseRefinementStep {
     bool enabled = false;
+    bool conditioned = false;
     uint32_t cameraIndex = 0;
     MTensor* deltas = nullptr;       // [N,6]: camera-space translation, axis-angle
     MTensor* expAvg = nullptr;
     MTensor* expAvgSq = nullptr;
+    MTensor* preconditioners = nullptr; // [N,36], row-major fixed full matrices
     float adamStepSize = 0.0f;
     float adamBiasCorrection2Sqrt = 1.0f;
     float regularization = 0.0f;
@@ -182,6 +215,7 @@ MTensor msplat_train_step(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
     MTensor &gt, const MTensor* coverage_mask,
+    const MTensor* coverage_render_tiles,
     uint64_t loss_coverage_units, float ssim_weight,
     float loss_inv_n, bool transparent_mask,
     float alpha_loss_weight,
@@ -195,6 +229,13 @@ MTensor msplat_train_step(
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
     float inv_max_dim
 );
+
+// Normally enqueue the periodic opacity clamp and active Adam-state reset in
+// the current Metal command buffer. If encoder creation fails, the binding
+// finishes preceding work and applies the same operation through shared memory.
+void msplat_reset_opacity_state(
+    MTensor &opacities, MTensor &exp_avg, MTensor &exp_avg_sq,
+    float max_logit);
 
 // Classification and its prefix sums, split out so the caller learns how many
 // gaussians will actually be written before it allocates room for them.
@@ -213,7 +254,9 @@ void msplat_prepare_densify(
 );
 
 // Runs the prepared grow -> cull -> compact pipeline. `population` is
-// N + 2*splits + dups as reported by msplat_prepare_densify.
+// N + 2*splits + dups as reported by msplat_prepare_densify. `random_seed`
+// is the logical step used by both the legacy CPU stream and the opt-in
+// counter-based GPU stream.
 int msplat_densify(
     int N, int population,
     float cull_alpha_thresh, float cull_scale_thresh, float cull_screen_size,
@@ -227,7 +270,7 @@ int msplat_densify(
     MTensor &split_prefix, MTensor &dup_prefix,
     MTensor &keep_flag, MTensor &keep_prefix,
     MTensor &block_totals, MTensor &compact_scratch,
-    MTensor &random_samples
+    MTensor &random_samples, uint32_t random_seed
 );
 
 #endif
