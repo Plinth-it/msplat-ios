@@ -286,7 +286,7 @@ private struct CaptureReviewView: View {
 
                 Section {
                     Button(action: onUseDataset) {
-                        Label("Use for training", systemImage: "sparkles")
+                        Label("Use ARKit dataset", systemImage: "sparkles")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.borderedProminent)
@@ -296,6 +296,7 @@ private struct CaptureReviewView: View {
                     }
                 } footer: {
                     Text("RGB, per-frame intrinsics and poses, masks, the colored point seed, transforms.json, and the recovery journal are stored together.")
+                    Text("After using the dataset, the training screen can optionally use RealityKit to estimate new camera poses and a sparse point cloud from its images before training.")
                 }
             }
             .navigationTitle("Review capture")

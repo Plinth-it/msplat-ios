@@ -28,6 +28,38 @@ A COLMAP folder is one holding `cameras.bin` or `cameras.txt`, either at its
 root or under `sparse/0`, alongside an `images` directory. Optional training
 mask sidecars live below any case-insensitive `masks` path component.
 
+If the selected folder contains only HEIC/HEIF, JPEG, or PNG images, the app
+offers **RealityKit alignment** instead of rejecting it. The alignment screen
+can treat filenames as a sequential capture or an unordered set. Its two mask
+controls are independent: RealityKit can use object masks while registering the
+images, and Vision can export training masks afterward. This supports aligning
+against the complete images while still making foreground masks available to
+training.
+On a physical device the app requests camera poses and a sparse colored point
+cloud, normalizes the registered images into their encoded raster orientation,
+and atomically publishes a separate COLMAP dataset under
+`Documents/RealityKitAlignments`. The result contains `images/` plus text and
+binary `cameras`, `images`, and `points3D` files under `sparse/0`, and can be
+selected immediately for training or shared through the Files sheet.
+
+When **Export Vision masks for training** is enabled, Vision processes only the
+registered, normalized images. It writes a matching 8-bit grayscale PNG for
+each exported JPEG under `masks/`, for example `images/image_000001.jpg` and
+`masks/image_000001.png`. Foreground is white and background is black. The
+sample app discovers these sidecars automatically when the aligned dataset is
+selected; the later **Use discovered masks** control still decides whether
+training consumes them.
+
+Imported-image alignment requires iOS 26 or later because that is where
+RealityKit exposes the estimated per-pose intrinsics needed for a correct
+COLMAP camera. ARKit captures already persist matching intrinsics, so their
+images can use the same alignment path on iOS 18 or later. Every camera is
+modeled as COLMAP `PINHOLE` without an extra lens-distortion remap; use
+camera/ISP-corrected inputs rather than unprocessed distorted rasters.
+Simulator tests cover the pure COLMAP serialization helpers, but RealityKit
+alignment, image normalization, atomic publication, and Vision mask generation
+must be exercised on a physical device.
+
 A Nerfstudio folder has `transforms.json` at its root. Frame `file_path`
 entries may include an image extension or omit it when the image is PNG, JPEG,
 or JPG. The trainer needs an initial point cloud: set `ply_file_path` to a PLY
@@ -51,6 +83,11 @@ same screen-oriented raster geometry. Scene capture can fall
 back to ARKit feature points on a non-LiDAR device. After stopping, the review
 screen can share the package or pass its in-memory descriptor directly to the
 trainer; captured exports preserve the metric ARKit coordinate system.
+After choosing **Use ARKit dataset**, the training screen also offers
+**Realign capture with RealityKit**. That runs only after the capture view has
+stopped its AR session, writes a new COLMAP folder instead of modifying the
+capture's `transforms.json`, and releases the photogrammetry session before the
+result can be handed to the trainer.
 Captured datasets expose a default-off **Refine camera poses** switch as an
 explicit A/B control. When enabled, a **Pose optimizer** picker keeps the
 existing **Bounded SE(3)** path as the default or opts into

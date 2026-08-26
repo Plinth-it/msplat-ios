@@ -3,6 +3,7 @@ import CoreVideo
 import Foundation
 import Msplat
 @testable import MsplatExample
+@preconcurrency import RealityKit
 import simd
 import UIKit
 import UniformTypeIdentifiers
@@ -1718,6 +1719,280 @@ final class TrainingMaskOptionsTests: XCTestCase {
             components: [0.25, 0.5, 0.75, 1]
         ) ?? CGColor(gray: 0.5, alpha: 1))
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        let image = try XCTUnwrap(context.makeImage())
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
+            url as CFURL,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ))
+        CGImageDestinationAddImage(destination, image, nil)
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+    }
+}
+
+final class RealityKitColmapExportBuilderTests: XCTestCase {
+    private var temporaryDirectory: URL?
+
+    override func setUpWithError() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(
+            path: "msplat-realitykit-colmap-\(UUID().uuidString)",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        temporaryDirectory = directory
+    }
+
+    override func tearDownWithError() throws {
+        if let temporaryDirectory {
+            try FileManager.default.removeItem(at: temporaryDirectory)
+        }
+        temporaryDirectory = nil
+    }
+
+    func testRealityKitIdentityPoseConvertsToColmapConvention() {
+        let pose = RealityKitColmapPoseConverter.convertToColmapCamera(
+            cameraToWorld: matrix_identity_float4x4
+        )
+
+        XCTAssertEqual(pose.qvec[0], 0, accuracy: 0.000_001)
+        XCTAssertEqual(pose.qvec[1], 1, accuracy: 0.000_001)
+        XCTAssertEqual(pose.qvec[2], 0, accuracy: 0.000_001)
+        XCTAssertEqual(pose.qvec[3], 0, accuracy: 0.000_001)
+        XCTAssertTrue(pose.tvec.allSatisfy { abs($0) < 0.000_001 })
+    }
+
+    func testRealityKitTranslatedPoseStaysInPointCloudFrame() {
+        var cameraToWorld = matrix_identity_float4x4
+        cameraToWorld.columns.3 = SIMD4<Float>(1, 2, 3, 1)
+
+        let pose = RealityKitColmapPoseConverter.convertToColmapCamera(
+            cameraToWorld: cameraToWorld
+        )
+
+        XCTAssertEqual(pose.tvec[0], -1, accuracy: 0.000_001)
+        XCTAssertEqual(pose.tvec[1], 2, accuracy: 0.000_001)
+        XCTAssertEqual(pose.tvec[2], 3, accuracy: 0.000_001)
+    }
+
+    func testAlignmentMaskAndTrainingMaskExportAreIndependent() {
+        let combinations = [
+            (alignmentMask: false, trainingMasks: false),
+            (alignmentMask: false, trainingMasks: true),
+            (alignmentMask: true, trainingMasks: false),
+            (alignmentMask: true, trainingMasks: true),
+        ]
+
+        for combination in combinations {
+            let options = RealityKitAlignmentOptions(
+                usesObjectMaskingForAlignment: combination.alignmentMask,
+                exportsTrainingMasks: combination.trainingMasks,
+                ordering: .sequential
+            )
+            XCTAssertEqual(
+                options.usesObjectMaskingForAlignment,
+                combination.alignmentMask
+            )
+            XCTAssertEqual(
+                options.exportsTrainingMasks,
+                combination.trainingMasks
+            )
+        }
+    }
+
+    func testRealityKitInternalMeshStagesUseAlignmentSpecificCopy() {
+        XCTAssertEqual(
+            RealityKitAlignmentStageDescription.message(for: .meshGeneration),
+            "Finalizing camera and point-cloud alignment…"
+        )
+        XCTAssertEqual(
+            RealityKitAlignmentStageDescription.message(for: .textureMapping),
+            "Finalizing camera and point-cloud alignment…"
+        )
+    }
+
+    func testTrainingMaskFilenameMatchesExportedImageStem() {
+        XCTAssertEqual(
+            RealityKitColmapExportBuilder.maskFilename(
+                forExportedImage: "image_000123.jpg"
+            ),
+            "image_000123.png"
+        )
+    }
+
+    func testRightOrientedImageRotatesIntrinsicsIntoExportedRaster() {
+        let raw = RealityKitColmapCamera(
+            width: 4_032,
+            height: 3_024,
+            fx: 3_000,
+            fy: 2_990,
+            cx: 2_016,
+            cy: 1_512
+        )
+
+        let camera = RealityKitColmapExportBuilder.camera(
+            raw,
+            applying: .right
+        )
+
+        XCTAssertEqual(camera.width, 3_024)
+        XCTAssertEqual(camera.height, 4_032)
+        XCTAssertEqual(camera.fx, 2_990, accuracy: 0.000_001)
+        XCTAssertEqual(camera.fy, 3_000, accuracy: 0.000_001)
+        XCTAssertEqual(camera.cx, 1_511, accuracy: 0.000_001)
+        XCTAssertEqual(camera.cy, 2_016, accuracy: 0.000_001)
+    }
+
+    func testCameraGroupingUsesHalfPixelTolerance() {
+        let entries = [
+            imageEntry(id: 1, fx: 1_000, fy: 1_001, cx: 512, cy: 384),
+            imageEntry(id: 2, fx: 1_000.4, fy: 1_001.3, cx: 512.5, cy: 383.7),
+            imageEntry(id: 3, fx: 1_001, fy: 1_001, cx: 512, cy: 384),
+        ]
+
+        let (cameras, assignments) = RealityKitColmapExportBuilder
+            .groupCameras(entries)
+
+        XCTAssertEqual(cameras.count, 2)
+        XCTAssertEqual(assignments[1], 1)
+        XCTAssertEqual(assignments[2], 1)
+        XCTAssertEqual(assignments[3], 2)
+    }
+
+    func testSparseWriterProducesTrainableColmapLayout() throws {
+        let root = try XCTUnwrap(temporaryDirectory).appending(
+            path: "Aligned",
+            directoryHint: .isDirectory
+        )
+        let sparse = root
+            .appending(path: "sparse", directoryHint: .isDirectory)
+            .appending(path: "0", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: root.appending(path: "images", directoryHint: .isDirectory),
+            withIntermediateDirectories: true
+        )
+
+        try RealityKitColmapExportBuilder.writeSparseFiles(
+            to: sparse,
+            entries: [
+                imageEntry(id: 1),
+                imageEntry(id: 2),
+                imageEntry(id: 3),
+            ],
+            points: [
+                RealityKitColmapPoint(
+                    position: SIMD3<Float>(1, 2, 3),
+                    color: SIMD3<Float>(10, 20, 30)
+                ),
+                RealityKitColmapPoint(
+                    position: SIMD3<Float>(-1, -2, -3),
+                    color: SIMD3<Float>(40, 50, 60)
+                ),
+            ]
+        )
+
+        let folder = try XCTUnwrap(DatasetFolder(picked: root))
+        XCTAssertEqual(folder.kind, .colmap)
+        XCTAssertEqual(try DatasetFolder.initialSparsePointCount(at: root), 2)
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: sparse.appending(path: "cameras.bin").path
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: sparse.appending(path: "images.bin").path
+        ))
+        XCTAssertTrue(FileManager.default.fileExists(
+            atPath: sparse.appending(path: "points3D.bin").path
+        ))
+
+        let imagesText = try String(
+            contentsOf: sparse.appending(path: "images.txt"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(imagesText.contains("1 0.0 1.0 0.0 0.0"))
+        XCTAssertTrue(imagesText.contains("1 image_000001.jpg"))
+    }
+
+    func testSparseWriterRejectsEmptyPointCloud() throws {
+        let sparse = try XCTUnwrap(temporaryDirectory).appending(
+            path: "sparse/0",
+            directoryHint: .isDirectory
+        )
+
+        XCTAssertThrowsError(
+            try RealityKitColmapExportBuilder.writeSparseFiles(
+                to: sparse,
+                entries: [imageEntry(id: 1)],
+                points: []
+            )
+        ) { error in
+            guard case RealityKitColmapExportError.noSparsePoints = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testRawAlignmentInputFindsReadableImagesInNestedImagesFolder() throws {
+        let root = try XCTUnwrap(temporaryDirectory).appending(
+            path: "Raw",
+            directoryHint: .isDirectory
+        )
+        let images = root.appending(path: "images", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(
+            at: images,
+            withIntermediateDirectories: true
+        )
+        try writePNG(to: images.appending(path: "frame_2.png"))
+        try writePNG(to: images.appending(path: "frame_1.png"))
+        try Data("not an image".utf8).write(
+            to: images.appending(path: "broken.png")
+        )
+
+        let input = try XCTUnwrap(RealityKitAlignmentInput(picked: root))
+
+        XCTAssertEqual(input.imagesURL.standardizedFileURL, images.standardizedFileURL)
+        XCTAssertEqual(
+            input.imageURLs.map(\.lastPathComponent),
+            ["frame_1.png", "frame_2.png"]
+        )
+        XCTAssertTrue(input.knownCamerasByFilename.isEmpty)
+    }
+
+    private func imageEntry(
+        id: Int,
+        fx: Double = 1_000,
+        fy: Double = 1_001,
+        cx: Double = 512,
+        cy: Double = 384
+    ) -> RealityKitColmapImageEntry {
+        RealityKitColmapImageEntry(
+            imageID: id,
+            filename: String(format: "image_%06d.jpg", id),
+            cameraToWorld: matrix_identity_float4x4,
+            camera: RealityKitColmapCamera(
+                width: 1_024,
+                height: 768,
+                fx: fx,
+                fy: fy,
+                cx: cx,
+                cy: cy
+            ),
+            orientation: .up
+        )
+    }
+
+    private func writePNG(to url: URL) throws {
+        let context = try XCTUnwrap(CGContext(
+            data: nil,
+            width: 4,
+            height: 3,
+            bitsPerComponent: 8,
+            bytesPerRow: 16,
+            space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ))
         let image = try XCTUnwrap(context.makeImage())
         let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
             url as CFURL,

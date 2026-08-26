@@ -5,8 +5,14 @@ import UniformTypeIdentifiers
 struct ContentView: View {
     private enum Route: Identifiable {
         case capture
+        case alignment(RealityKitAlignmentInput)
 
-        var id: String { "capture" }
+        var id: String {
+            switch self {
+            case .capture: "capture"
+            case .alignment(let input): "alignment-\(input.id.uuidString)"
+            }
+        }
     }
 
     @Environment(\.scenePhase) private var scenePhase
@@ -38,9 +44,16 @@ struct ContentView: View {
                     .disabled(isBusy)
                 }
             }
-            .fullScreenCover(item: $route) { _ in
-                CaptureRootView { capture in
-                    select(capture)
+            .fullScreenCover(item: $route) { route in
+                switch route {
+                case .capture:
+                    CaptureRootView { capture in
+                        select(capture)
+                    }
+                case .alignment(let input):
+                    RealityKitAlignmentView(input: input) { alignedFolder in
+                        select(alignedFolder, persistBookmark: true)
+                    }
                 }
             }
             .fileImporter(isPresented: $picking, allowedContentTypes: [.folder]) { result in
@@ -48,8 +61,11 @@ struct ContentView: View {
                 case .success(let url):
                     if let picked = DatasetFolder(picked: url) {
                         select(picked, persistBookmark: true)
+                    } else if let input = RealityKitAlignmentInput(picked: url) {
+                        pickError = nil
+                        route = .alignment(input)
                     } else {
-                        pickError = "Choose a folder with root transforms.json, or COLMAP cameras.bin/cameras.txt at its root or in sparse/0."
+                        pickError = "Choose a COLMAP or Nerfstudio dataset, or a folder containing HEIC, JPEG, or PNG images for RealityKit alignment."
                     }
                 case .failure(let error):
                     pickError = error.localizedDescription
@@ -146,6 +162,22 @@ struct ContentView: View {
 
             if let source {
                 LabeledContent("Contents", value: source.summary)
+            }
+            if let capture = source?.capturedDataset {
+                Button {
+                    if let input = RealityKitAlignmentInput(capture: capture) {
+                        pickError = nil
+                        route = .alignment(input)
+                    } else {
+                        pickError = "The capture no longer contains readable source images."
+                    }
+                } label: {
+                    Label(
+                        "Realign capture with RealityKit",
+                        systemImage: "viewfinder"
+                    )
+                }
+                .disabled(isBusy)
             }
             if let pickError {
                 Text(pickError).font(.footnote).foregroundStyle(.red)
