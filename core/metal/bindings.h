@@ -189,10 +189,12 @@ struct MsplatPhotometricRefinementStep {
 
 struct MsplatPoseRefinementStep {
     bool enabled = false;
+    bool conditioned = false;
     uint32_t cameraIndex = 0;
     MTensor* deltas = nullptr;       // [N,6]: camera-space translation, axis-angle
     MTensor* expAvg = nullptr;
     MTensor* expAvgSq = nullptr;
+    MTensor* preconditioners = nullptr; // [N,36], row-major fixed full matrices
     float adamStepSize = 0.0f;
     float adamBiasCorrection2Sqrt = 1.0f;
     float regularization = 0.0f;

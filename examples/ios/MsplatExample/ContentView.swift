@@ -106,6 +106,7 @@ struct ContentView: View {
         session.trainingMasksEnabled = false
         session.trainingMaskMode = .transparent
         session.refineCameraPosesEnabled = false
+        session.cameraPoseConditioning = .raw
         pickError = nil
 
         guard persistBookmark else { return }
@@ -130,6 +131,7 @@ struct ContentView: View {
         session.trainingMaskMode = capture.manifest.mode == .object
             ? .transparent : .coverage
         session.refineCameraPosesEnabled = false
+        session.cameraPoseConditioning = .raw
         pickError = nil
     }
 
@@ -172,6 +174,16 @@ struct ContentView: View {
                     isOn: $session.refineCameraPosesEnabled
                 )
                 .disabled(isBusy)
+                if session.refineCameraPosesEnabled {
+                    Picker(
+                        "Pose optimizer",
+                        selection: $session.cameraPoseConditioning
+                    ) {
+                        Text("Bounded SE(3)").tag(CameraPoseConditioning.raw)
+                        Text("CamP-conditioned").tag(CameraPoseConditioning.camP)
+                    }
+                    .disabled(isBusy)
+                }
             } else if folder?.supportsAutomaticTrainingMaskDiscovery == true {
                 Toggle("Use discovered masks", isOn: trainingMasksBinding)
                     .disabled(isBusy)
@@ -220,7 +232,7 @@ struct ContentView: View {
                 Text("Mask candidates are regular files below any masks/ path component; the native loader decides which candidates match frames. Coverage only weights RGB loss and can skip off-mask tile work for throughput. Transparent supervises the full frame to suppress exterior floaters and is not expected to be faster.")
             }
             if source?.capturedDataset != nil {
-                Text("Refine camera poses is an explicit A/B control for captured datasets. It learns bounded training-time pose corrections without changing the captured transforms.json.")
+                Text("Pose refinement is an explicit A/B control for captured datasets. Bounded SE(3) preserves the baseline optimizer; CamP conditions the same bounded updates with a fixed per-camera projection metric. Neither mode changes the captured transforms.json.")
                 if let requirement = poseRefinementBudgetRequirement {
                     Text(
                         "It requires at least \(requirement.minimumIterations) iterations: " +
@@ -248,6 +260,7 @@ struct ContentView: View {
                       ? .transparent : session.trainingMaskMode,
                   keepCrs: true,
                   refineCameraPoses: true,
+                  cameraPoseConditioning: session.cameraPoseConditioning,
                   benchmark: nil
               ),
               let iterations = Int32(exactly: session.iterations) else {

@@ -15,6 +15,7 @@
 #include <vector>
 #include "model.hpp"
 #include "atomic_output.hpp"
+#include "camp_pose_point_sampler.hpp"
 #include "kdtree_tensor.hpp"
 #include "msplat.hpp"
 #include "loaders.hpp"
@@ -54,6 +55,15 @@ constexpr float kPoseLearningRate = 1.0e-4f;
 constexpr float kPoseRegularization = 1.0e-4f;
 constexpr float kPoseMaxTranslation = 0.05f;
 constexpr float kPoseMaxRotation = 0.05235987756f; // 3 degrees
+
+uint64_t stablePoseCameraKey(const std::string& frameId) noexcept {
+    uint64_t hash = 1469598103934665603ULL;
+    for (unsigned char byte : frameId) {
+        hash ^= static_cast<uint64_t>(byte);
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
 
 static_assert(!collectsDensificationStats(1, 0));
 static_assert(!collectsDensificationStats(1, 1));
@@ -130,6 +140,7 @@ Model::Model(const InputData &inputData, int numCameras,
     bool refinePhotometricGains,
     bool refineCameraPoses,
     int poseAnchorCameraIndex,
+    msplat::CameraPoseConditioning cameraPoseConditioning,
     bool transparentTrainingMasks,
     float transparentAlphaLossWeight)
     : numCameras(numCameras),
@@ -144,6 +155,7 @@ Model::Model(const InputData &inputData, int numCameras,
       refinePhotometricGains(refinePhotometricGains),
       refineCameraPoses(refineCameraPoses),
       poseAnchorCameraIndex(poseAnchorCameraIndex),
+      cameraPoseConditioning(cameraPoseConditioning),
       transparentTrainingMasks(transparentTrainingMasks),
       transparentAlphaLossWeight(transparentAlphaLossWeight),
       keepCrs(keepCrs) {
@@ -184,6 +196,16 @@ Model::Model(const InputData &inputData, int numCameras,
     if (!refineCameraPoses && poseAnchorCameraIndex != -1) {
         throw std::invalid_argument(
             "A pose anchor requires camera pose refinement");
+    }
+    if (cameraPoseConditioning != msplat::CameraPoseConditioning::Raw &&
+        cameraPoseConditioning != msplat::CameraPoseConditioning::CamP) {
+        throw std::invalid_argument(
+            "Camera pose conditioning mode is not recognized");
+    }
+    if (!refineCameraPoses &&
+        cameraPoseConditioning != msplat::CameraPoseConditioning::Raw) {
+        throw std::invalid_argument(
+            "CamP conditioning requires camera pose refinement");
     }
     if (refinePhotometricGains || refineCameraPoses) {
         if (inputData.cameras.size() > kPhotometricMaxCameras) {
@@ -256,6 +278,44 @@ Model::Model(const InputData &inputData, int numCameras,
             cameraBasePoses.insert(
                 cameraBasePoses.end(), std::begin(camera.camToWorld),
                 std::end(camera.camToWorld));
+        }
+        if (cameraPoseConditioning == msplat::CameraPoseConditioning::CamP) {
+            const size_t cameraCount = inputData.cameras.size();
+            cameraPosePreconditionerValues.assign(cameraCount * 36, 0.0f);
+            cameraPosePreconditionerReady.assign(cameraCount, uint8_t{0});
+            for (size_t camera = 0; camera < cameraCount; ++camera) {
+                for (size_t axis = 0; axis < 6; ++axis) {
+                    cameraPosePreconditionerValues[
+                        camera * 36 + axis * 6 + axis] = 1.0f;
+                }
+            }
+            cameraPosePreconditionerReady[
+                static_cast<size_t>(poseAnchorCameraIndex)] = 1;
+            constexpr size_t kMaximumCampPointPool = 65'536;
+            const size_t availablePoints = static_cast<size_t>(numPoints);
+            const size_t pooledPoints =
+                std::min(availablePoints, kMaximumCampPointPool);
+            cameraPosePointPool.reserve(pooledPoints * 3);
+            cameraPosePointIds.reserve(pooledPoints);
+            const bool hasStablePointIds =
+                inputData.metadata.pointSourceIds.size() == availablePoints;
+            const std::vector<size_t> selectedPointIndices =
+                msplat::detail::selectCampPoseWorldPointPoolIndices(
+                    availablePoints,
+                    hasStablePointIds
+                        ? inputData.metadata.pointSourceIds.data()
+                        : nullptr,
+                    kMaximumCampPointPool);
+            for (size_t pointIndex : selectedPointIndices) {
+                const size_t offset = pointIndex * 3;
+                cameraPosePointPool.insert(
+                    cameraPosePointPool.end(),
+                    inputData.points.xyz.begin() + offset,
+                    inputData.points.xyz.begin() + offset + 3);
+                cameraPosePointIds.push_back(hasStablePointIds
+                    ? inputData.metadata.pointSourceIds[pointIndex]
+                    : static_cast<uint64_t>(pointIndex));
+            }
         }
     }
     scale = inputData.scale;
@@ -370,6 +430,16 @@ void Model::setupOptimizers(){
 
     const int poseRows = refineCameraPoses ? datasetCameraCount : 1;
     cameraPoseDeltas = gpu_zeros({poseRows, 6}, DType::Float32);
+    if (refineCameraPoses &&
+        cameraPoseConditioning == msplat::CameraPoseConditioning::CamP) {
+        cameraPosePreconditioners = gpu_empty(
+            {poseRows, 36}, DType::Float32);
+        memcpy(cameraPosePreconditioners.data_ptr(),
+               cameraPosePreconditionerValues.data(),
+               cameraPosePreconditionerValues.size() * sizeof(float));
+    } else {
+        cameraPosePreconditioners.reset();
+    }
     if (refineCameraPoses) {
         cameraPoseExpAvg = gpu_zeros({poseRows, 6}, DType::Float32);
         cameraPoseExpAvgSq = gpu_zeros({poseRows, 6}, DType::Float32);
@@ -444,6 +514,7 @@ void Model::releaseOptimizers(){
     cameraLogGainStepCounts.clear();
     cameraPoseDeltas.reset();
     cameraPoseExpAvg.reset(); cameraPoseExpAvgSq.reset();
+    cameraPosePreconditioners.reset();
     cameraPoseStepCounts.clear();
     resetDensificationScratch();
 }
@@ -466,6 +537,70 @@ void Model::refreshViews(){
     }
 }
 
+void Model::ensureCameraPosePreconditioner(
+    const Camera& camera, size_t canonicalCameraIndex) {
+    if (cameraPoseConditioning != msplat::CameraPoseConditioning::CamP)
+        return;
+    const size_t cameraCount = static_cast<size_t>(datasetCameraCount);
+    if (canonicalCameraIndex >= cameraCount ||
+        cameraPosePreconditionerReady.size() != cameraCount ||
+        cameraPosePreconditionerValues.size() != cameraCount * 36 ||
+        cameraFrameIds.size() != cameraCount ||
+        cameraPosePointIds.size() * 3 != cameraPosePointPool.size()) {
+        throw std::runtime_error(
+            "CamP camera-preconditioner state is incomplete");
+    }
+    if (cameraPosePreconditionerReady[canonicalCameraIndex] != 0)
+        return;
+    if (!cameraPosePreconditioners.defined() ||
+        !cameraPosePreconditioners.isGpu() ||
+        cameraPosePreconditioners.dtype() != DType::Float32 ||
+        cameraPosePreconditioners.ndim() != 2 ||
+        cameraPosePreconditioners.size(0) != datasetCameraCount ||
+        cameraPosePreconditioners.size(1) != 36) {
+        throw std::runtime_error(
+            "CamP GPU preconditioner storage is invalid");
+    }
+
+    msplat::detail::CampPoseCameraGeometry geometry;
+    for (size_t value = 0; value < 16; ++value)
+        geometry.cameraToWorld[value] = camera.camToWorld[value];
+    geometry.focalX = camera.fx;
+    geometry.focalY = camera.fy;
+    geometry.principalX = camera.cx;
+    geometry.principalY = camera.cy;
+    geometry.width = camera.width;
+    geometry.height = camera.height;
+    geometry.deterministicKey = stablePoseCameraKey(
+        cameraFrameIds[canonicalCameraIndex]);
+
+    const msplat::detail::CampPoseWorldPointPool pointPool{
+        cameraPosePointPool.data(), cameraPosePointIds.data(),
+        cameraPosePointPool.size() / 3};
+    const auto built = msplat::detail::buildCampPosePreconditioner(
+        geometry, pointPool);
+    std::array<float, 36> values{};
+    for (size_t value = 0; value < values.size(); ++value) {
+        if (!std::isfinite(built.preconditioner[value]) ||
+            std::abs(built.preconditioner[value]) >
+                std::numeric_limits<float>::max()) {
+            throw std::runtime_error(
+                "CamP preconditioner exceeds Float32 range");
+        }
+        values[value] = static_cast<float>(built.preconditioner[value]);
+    }
+
+    // Each row is initialized once. Synchronize before publishing CPU writes
+    // into the shared Metal buffer so an in-flight step cannot overlap them.
+    msplat_gpu_sync();
+    const size_t offset = canonicalCameraIndex * 36;
+    std::copy(values.begin(), values.end(),
+              cameraPosePreconditionerValues.begin() + offset);
+    memcpy(cameraPosePreconditioners.data<float>() + offset,
+           values.data(), values.size() * sizeof(float));
+    cameraPosePreconditionerReady[canonicalCameraIndex] = 1;
+}
+
 size_t Model::estimatedGpuBytes() const {
     size_t bytes = 0;
     const MTensor* tensors[] = {
@@ -477,7 +612,8 @@ size_t Model::estimatedGpuBytes() const {
         // buffer, so counting it here would report the same allocation twice.
         &xysGradNorm, &visCounts, &max2DSize, &backgroundColor,
         &cameraLogGains, &cameraLogGainExpAvg, &cameraLogGainExpAvgSq,
-        &cameraPoseDeltas, &cameraPoseExpAvg, &cameraPoseExpAvgSq
+        &cameraPoseDeltas, &cameraPoseExpAvg, &cameraPoseExpAvgSq,
+        &cameraPosePreconditioners
     };
     for (const MTensor* tensor : tensors) {
         if (tensor->defined()) bytes += tensor->nbytes();
@@ -825,7 +961,7 @@ int Model::loadPly(const std::string &filename){
 // ── Checkpoint save/load ────────────────────────────────────────────────────
 
 static constexpr uint32_t CKPT_MAGIC = 0x4C50534D; // "MSPL"
-static constexpr uint32_t CKPT_VERSION = 3;
+static constexpr uint32_t CKPT_VERSION = 4;
 static constexpr uint32_t CKPT_MIN_VERSION = 1;
 static constexpr uint32_t CKPT_MAX_CAMERAS =
     static_cast<uint32_t>(kPhotometricMaxCameras);
@@ -1050,6 +1186,10 @@ struct ParsedCheckpoint {
     std::vector<std::string> poseFrameIds;
     std::vector<uint32_t> poseStepCounts;
     CheckpointTensorRecord poseBasePoses;
+    msplat::CameraPoseConditioning poseConditioning =
+        msplat::CameraPoseConditioning::Raw;
+    std::vector<uint8_t> posePreconditionerReady;
+    CheckpointTensorRecord posePreconditioners;
     std::array<CheckpointTensorRecord, 3> poseTensors;
 };
 
@@ -1213,6 +1353,10 @@ ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
         if (poseEnabled > 1)
             checkpointError("pose enabled flag is invalid");
         checkpoint.poseEnabled = poseEnabled != 0;
+        if (version >= 4 && !checkpoint.poseEnabled) {
+            checkpointError(
+                "version 4 checkpoints require enabled CamP pose refinement");
+        }
         if (checkpoint.poseEnabled) {
             checkpoint.poseCameraCount =
                 reader.scalar<uint32_t>("pose camera count");
@@ -1235,11 +1379,19 @@ ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
             constexpr uint64_t minimumPerCameraBytes =
                 sizeof(uint32_t) + 1 + sizeof(uint32_t) +
                 (16 + 3 * 6) * sizeof(float);
-            const uint64_t minimumRemainingBytes =
+            uint64_t minimumRemainingBytes =
                 checkedMultiply(checkpoint.poseCameraCount,
                                 minimumPerCameraBytes,
                                 "pose checkpoint minimum") +
                 4 * minimumTensorRecordBytes;
+            if (version >= 4) {
+                minimumRemainingBytes += sizeof(uint32_t) +
+                    checkedMultiply(
+                        checkpoint.poseCameraCount,
+                        sizeof(uint8_t) + 36 * sizeof(float),
+                        "pose conditioning checkpoint minimum") +
+                    minimumTensorRecordBytes;
+            }
             if (reader.remaining() < minimumRemainingBytes)
                 checkpointError("truncated pose checkpoint payload");
 
@@ -1302,6 +1454,44 @@ ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
                 static_cast<int64_t>(checkpoint.poseCameraCount);
             checkpoint.poseBasePoses = readTensorRecord(
                 reader, {poseCameraCount, 16}, "pose.base_camera_to_world");
+            if (version >= 4) {
+                const uint32_t conditioning =
+                    reader.scalar<uint32_t>("pose conditioning mode");
+                if (conditioning != static_cast<uint32_t>(
+                        msplat::CameraPoseConditioning::CamP)) {
+                    checkpointError(
+                        "version 4 pose checkpoints require CamP conditioning");
+                }
+                checkpoint.poseConditioning =
+                    static_cast<msplat::CameraPoseConditioning>(conditioning);
+
+                checkpoint.posePreconditionerReady.resize(
+                    checkpoint.poseCameraCount);
+                reader.bytes(
+                    checkpoint.posePreconditionerReady.data(),
+                    checkedMultiply(checkpoint.poseCameraCount,
+                                    sizeof(uint8_t),
+                                    "pose preconditioner readiness"),
+                    "pose preconditioner readiness");
+                for (size_t camera = 0;
+                     camera < checkpoint.posePreconditionerReady.size();
+                     ++camera) {
+                    const uint8_t ready =
+                        checkpoint.posePreconditionerReady[camera];
+                    if (ready > 1) {
+                        checkpointError(
+                            "pose preconditioner readiness flag is invalid");
+                    }
+                    if (ready == 0 &&
+                        checkpoint.poseStepCounts[camera] != 0) {
+                        checkpointError(
+                            "pose preconditioner readiness is inconsistent with optimizer steps");
+                    }
+                }
+                checkpoint.posePreconditioners = readTensorRecord(
+                    reader, {poseCameraCount, 36},
+                    "pose.preconditioner");
+            }
             static constexpr const char* poseNames[3] = {
                 "pose.delta",
                 "pose.adam_exp_avg",
@@ -1353,6 +1543,81 @@ std::vector<float> loadCheckpointFloatVector(
     return values;
 }
 
+std::vector<float> identityPosePreconditioners(size_t cameraCount) {
+    if (cameraCount > std::numeric_limits<size_t>::max() / 36)
+        checkpointError("pose preconditioner size overflows");
+    std::vector<float> values(cameraCount * 36, 0.0f);
+    for (size_t camera = 0; camera < cameraCount; ++camera) {
+        for (size_t axis = 0; axis < 6; ++axis)
+            values[camera * 36 + axis * 6 + axis] = 1.0f;
+    }
+    return values;
+}
+
+bool posePreconditionersAreValid(const std::vector<float>& values,
+                                 size_t cameraCount) {
+    if (cameraCount > std::numeric_limits<size_t>::max() / 36 ||
+        values.size() != cameraCount * 36) {
+        return false;
+    }
+    for (size_t camera = 0; camera < cameraCount; ++camera) {
+        const float* matrix = values.data() + camera * 36;
+        float maximumMagnitude = 0.0f;
+        for (size_t element = 0; element < 36; ++element) {
+            if (!std::isfinite(matrix[element]))
+                return false;
+            maximumMagnitude = std::max(
+                maximumMagnitude, std::abs(matrix[element]));
+        }
+        const float symmetryTolerance =
+            64.0f * std::numeric_limits<float>::epsilon() *
+            std::max(1.0f, maximumMagnitude);
+        for (size_t row = 0; row < 6; ++row) {
+            if (!(matrix[row * 6 + row] > 0.0f))
+                return false;
+            for (size_t column = row + 1; column < 6; ++column) {
+                if (std::abs(matrix[row * 6 + column] -
+                             matrix[column * 6 + row]) >
+                    symmetryTolerance) {
+                    return false;
+                }
+            }
+        }
+
+        // Every persisted transform must be strictly positive definite. A
+        // symmetric-but-singular matrix would silently freeze a pose axis;
+        // an indefinite matrix would no longer represent CamP's inverse
+        // square root. Cholesky is small, deterministic, and sufficient here.
+        std::array<double, 36> lower{};
+        for (size_t row = 0; row < 6; ++row) {
+            for (size_t column = 0; column <= row; ++column) {
+                double value = row == column
+                    ? static_cast<double>(matrix[row * 6 + column])
+                    : 0.5 * static_cast<double>(
+                        matrix[row * 6 + column] +
+                        matrix[column * 6 + row]);
+                for (size_t inner = 0; inner < column; ++inner) {
+                    value -= lower[row * 6 + inner] *
+                        lower[column * 6 + inner];
+                }
+                if (row == column) {
+                    if (!std::isfinite(value) || !(value > 0.0))
+                        return false;
+                    lower[row * 6 + column] = std::sqrt(value);
+                } else {
+                    const double pivot = lower[column * 6 + column];
+                    if (!std::isfinite(pivot) || !(pivot > 0.0))
+                        return false;
+                    lower[row * 6 + column] = value / pivot;
+                    if (!std::isfinite(lower[row * 6 + column]))
+                        return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 } // namespace
 
 void validateCheckpointFile(const std::string &filename) {
@@ -1363,13 +1628,19 @@ void validateCheckpointFile(const std::string &filename) {
 void Model::saveCheckpoint(const std::string &filename, int step) {
     msplat_gpu_sync();
 
+    const bool savesCampPoseConditioning = refineCameraPoses &&
+        cameraPoseConditioning == msplat::CameraPoseConditioning::CamP;
+    const uint32_t checkpointVersion =
+        savesCampPoseConditioning ? CKPT_VERSION : 3u;
+
     msplat::detail::AtomicOutputFile output(filename);
     std::ofstream f(output.temporary(), std::ios::binary | std::ios::trunc);
     if (!f.is_open()) throw std::runtime_error("Cannot open checkpoint file for writing: " + filename);
 
     // Header
     f.write(reinterpret_cast<const char*>(&CKPT_MAGIC), sizeof(CKPT_MAGIC));
-    f.write(reinterpret_cast<const char*>(&CKPT_VERSION), sizeof(CKPT_VERSION));
+    f.write(reinterpret_cast<const char*>(&checkpointVersion),
+            sizeof(checkpointVersion));
 
     // Scalar state
     uint32_t u;
@@ -1478,7 +1749,8 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
 
     // Version 3 extension. Pose rows remain relative to the exact imported
     // camera geometry recorded here; resume refuses to attach them to changed
-    // poses even when frame names are unchanged.
+    // poses even when frame names are unchanged. Version 4 additionally saves
+    // CamP's fixed per-camera conditioning state before the optimizer tensors.
     u = refineCameraPoses ? 1u : 0u;
     f.write(reinterpret_cast<const char*>(&u), sizeof(u));
     if (refineCameraPoses) {
@@ -1486,6 +1758,11 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
             return tensor.defined() && tensor.isGpu() &&
                 tensor.dtype() == DType::Float32 && tensor.ndim() == 2 &&
                 tensor.size(0) == datasetCameraCount && tensor.size(1) == 6;
+        };
+        auto hasPosePreconditionerShape = [&](const MTensor& tensor) {
+            return tensor.defined() && tensor.isGpu() &&
+                tensor.dtype() == DType::Float32 && tensor.ndim() == 2 &&
+                tensor.size(0) == datasetCameraCount && tensor.size(1) == 36;
         };
         const size_t cameraCount = static_cast<size_t>(datasetCameraCount);
         if (datasetCameraCount <= 0 || adam_step_count < 0 ||
@@ -1497,8 +1774,34 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
             cameraPoseStepCounts.size() != cameraCount ||
             !hasPoseShape(cameraPoseDeltas) ||
             !hasPoseShape(cameraPoseExpAvg) ||
-            !hasPoseShape(cameraPoseExpAvgSq)) {
+            !hasPoseShape(cameraPoseExpAvgSq) ||
+            (savesCampPoseConditioning &&
+             (!hasPosePreconditionerShape(cameraPosePreconditioners) ||
+              cameraPosePreconditionerValues.size() != cameraCount * 36 ||
+              cameraPosePreconditionerReady.size() != cameraCount))) {
             throw std::runtime_error("Camera pose checkpoint state is incomplete");
+        }
+
+        if (savesCampPoseConditioning) {
+            for (size_t camera = 0; camera < cameraCount; ++camera) {
+                const uint8_t ready = cameraPosePreconditionerReady[camera];
+                if (ready > 1 ||
+                    (ready == 0 && cameraPoseStepCounts[camera] != 0)) {
+                    throw std::runtime_error(
+                        "Camera pose checkpoint preconditioner readiness is invalid");
+                }
+            }
+            if (cameraPosePreconditionerReady[
+                    static_cast<size_t>(poseAnchorCameraIndex)] == 0 ||
+                !posePreconditionersAreValid(
+                    cameraPosePreconditionerValues, cameraCount) ||
+                !std::equal(
+                    cameraPosePreconditionerValues.begin(),
+                    cameraPosePreconditionerValues.end(),
+                    cameraPosePreconditioners.data<float>())) {
+                throw std::runtime_error(
+                    "Camera pose checkpoint preconditioner data is invalid");
+            }
         }
 
         std::unordered_set<std::string> uniqueFrameIds;
@@ -1594,6 +1897,18 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
         writeFloatTensor(
             f, cameraBasePoses,
             {static_cast<int64_t>(datasetCameraCount), 16});
+        if (savesCampPoseConditioning) {
+            u = static_cast<uint32_t>(cameraPoseConditioning);
+            f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+            f.write(
+                reinterpret_cast<const char*>(
+                    cameraPosePreconditionerReady.data()),
+                static_cast<std::streamsize>(
+                    cameraPosePreconditionerReady.size() * sizeof(uint8_t)));
+            writeFloatTensor(
+                f, cameraPosePreconditionerValues,
+                {static_cast<int64_t>(datasetCameraCount), 36});
+        }
         writeTensor(f, cameraPoseDeltas);
         writeTensor(f, cameraPoseExpAvg);
         writeTensor(f, cameraPoseExpAvgSq);
@@ -1644,6 +1959,11 @@ int Model::loadCheckpoint(const std::string &filename) {
         checkpoint.poseAnchorCameraIndex !=
             static_cast<uint32_t>(poseAnchorCameraIndex)) {
         checkpointError("pose anchor does not match the training split");
+    }
+    if (checkpoint.poseEnabled &&
+        checkpoint.poseConditioning != cameraPoseConditioning) {
+        checkpointError(
+            "pose conditioning mode does not match the configured mode");
     }
     const int capacity = capacityFor(activeCount);
     if (capacity < activeCount)
@@ -1720,7 +2040,10 @@ int Model::loadCheckpoint(const std::string &filename) {
     MTensor newCameraPoseDeltas;
     MTensor newCameraPoseExpAvg;
     MTensor newCameraPoseExpAvgSq;
+    MTensor newCameraPosePreconditioners;
     std::vector<uint32_t> newCameraPoseStepCounts;
+    std::vector<float> newCameraPosePreconditionerValues;
+    std::vector<uint8_t> newCameraPosePreconditionerReady;
     if (checkpoint.poseEnabled) {
         const std::vector<float> checkpointBasePoses =
             loadCheckpointFloatVector(
@@ -1732,6 +2055,24 @@ int Model::loadCheckpoint(const std::string &filename) {
         }
         if (checkpointBasePoses != cameraBasePoses)
             checkpointError("pose base camera geometry does not match the dataset");
+
+        if (checkpoint.version >= 4) {
+            newCameraPosePreconditionerValues = loadCheckpointFloatVector(
+                reader, checkpoint.posePreconditioners,
+                "pose.preconditioner");
+            if (!posePreconditionersAreValid(
+                    newCameraPosePreconditionerValues,
+                    static_cast<size_t>(datasetCameraCount))) {
+                checkpointError("pose preconditioner data is invalid");
+            }
+            newCameraPosePreconditionerReady =
+                checkpoint.posePreconditionerReady;
+            if (newCameraPosePreconditionerReady[
+                    static_cast<size_t>(poseAnchorCameraIndex)] == 0) {
+                checkpointError(
+                    "pose anchor preconditioner must be ready");
+            }
+        }
 
         newCameraPoseDeltas = loadCheckpointBuffer(
             reader, checkpoint.poseTensors[0], datasetCameraCount,
@@ -1793,7 +2134,27 @@ int Model::loadCheckpoint(const std::string &filename) {
                 {poseRows, 6}, DType::Float32);
             newCameraPoseStepCounts.assign(
                 static_cast<size_t>(datasetCameraCount), 0);
+            if (cameraPoseConditioning ==
+                msplat::CameraPoseConditioning::CamP) {
+                newCameraPosePreconditionerValues =
+                    identityPosePreconditioners(
+                        static_cast<size_t>(datasetCameraCount));
+                newCameraPosePreconditionerReady.assign(
+                    static_cast<size_t>(datasetCameraCount), uint8_t{0});
+                newCameraPosePreconditionerReady[
+                    static_cast<size_t>(poseAnchorCameraIndex)] = 1;
+            }
         }
+    }
+
+    if (refineCameraPoses &&
+        cameraPoseConditioning == msplat::CameraPoseConditioning::CamP) {
+        newCameraPosePreconditioners = gpu_empty(
+            {poseRows, 36}, DType::Float32);
+        memcpy(
+            newCameraPosePreconditioners.data_ptr(),
+            newCameraPosePreconditionerValues.data(),
+            newCameraPosePreconditionerValues.size() * sizeof(float));
     }
 
     DensificationScratch newDensificationScratch;
@@ -1854,7 +2215,12 @@ int Model::loadCheckpoint(const std::string &filename) {
     cameraPoseDeltas = std::move(newCameraPoseDeltas);
     cameraPoseExpAvg = std::move(newCameraPoseExpAvg);
     cameraPoseExpAvgSq = std::move(newCameraPoseExpAvgSq);
+    cameraPosePreconditioners = std::move(newCameraPosePreconditioners);
     cameraPoseStepCounts = std::move(newCameraPoseStepCounts);
+    cameraPosePreconditionerValues =
+        std::move(newCameraPosePreconditionerValues);
+    cameraPosePreconditionerReady =
+        std::move(newCameraPosePreconditionerReady);
 
     densify_split_flag = std::move(newDensificationScratch.splitFlag);
     densify_dup_flag = std::move(newDensificationScratch.dupFlag);
@@ -2010,6 +2376,10 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
     }
 
     auto s = prepareCam(cam, step);
+    if (refineCameraPoses &&
+        cameraPoseConditioning == msplat::CameraPoseConditioning::CamP) {
+        ensureCameraPosePreconditioner(cam, cameraIndex);
+    }
     lastHeight = s.height; lastWidth = s.width;
     int numPoints = means.size(0);
 
@@ -2145,10 +2515,15 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
         cameraIndex != static_cast<size_t>(poseAnchorCameraIndex);
     MsplatPoseRefinementStep pose;
     pose.enabled = poseStepEnabled;
+    pose.conditioned = poseStepEnabled &&
+        cameraPoseConditioning == msplat::CameraPoseConditioning::CamP;
     pose.cameraIndex = poseStepEnabled
         ? static_cast<uint32_t>(cameraIndex)
         : 0u;
     pose.deltas = &cameraPoseDeltas;
+    pose.preconditioners = pose.conditioned
+        ? &cameraPosePreconditioners
+        : nullptr;
     uint32_t previousPoseStep = 0;
     uint32_t nextPoseStep = 0;
     if (poseStepEnabled) {

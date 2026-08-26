@@ -52,8 +52,11 @@ back to ARKit feature points on a non-LiDAR device. After stopping, the review
 screen can share the package or pass its in-memory descriptor directly to the
 trainer; captured exports preserve the metric ARKit coordinate system.
 Captured datasets expose a default-off **Refine camera poses** switch as an
-explicit A/B control. When enabled, training learns the existing bounded pose
-corrections in memory; the raw `transforms.json` remains immutable. The app
+explicit A/B control. When enabled, a **Pose optimizer** picker keeps the
+existing **Bounded SE(3)** path as the default or opts into
+**CamP-conditioned**, which decorrelates the same bounded updates with a fixed
+per-camera projection metric. Both train corrections in memory; the raw
+`transforms.json` remains immutable. The app
 requires an iteration budget covering the configured 500-step warm-up, any
 remaining visits in that camera shuffle, and one complete post-warm-up shuffle;
 it reports the exact minimum beside the switch. After GPU

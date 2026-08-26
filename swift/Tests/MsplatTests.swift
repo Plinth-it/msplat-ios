@@ -13,6 +13,7 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(config.ssimWeight, 0.2, accuracy: 0.001)
         XCTAssertFalse(config.refinePhotometricGains)
         XCTAssertFalse(config.refineCameraPoses)
+        XCTAssertEqual(config.cameraPoseConditioning, .raw)
         XCTAssertEqual(config.trainingMaskMode, .coverage)
         XCTAssertEqual(config.transparentAlphaLossWeight, 0.1, accuracy: 0.001)
         XCTAssertEqual(config.toRefinementOptionsV8().flags, 0)
@@ -66,6 +67,16 @@ final class MsplatTests: XCTestCase {
             UInt32(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS)
                 | UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS)
         )
+
+        config.cameraPoseConditioning = .camP
+        options = config.toRefinementOptionsV8()
+        XCTAssertEqual(
+            options.flags,
+            UInt32(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS)
+                | UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS)
+                | UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING)
+        )
+        XCTAssertNoThrow(try config.validate())
     }
 
     func testNativePoseRefinementStateConversion() throws {
@@ -165,6 +176,10 @@ final class MsplatTests: XCTestCase {
         config = TrainingConfig()
         config.trainingMaskMode = .transparent
         config.refinePhotometricGains = true
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.cameraPoseConditioning = .camP
         invalidConfigs.append(config)
 
         for invalidConfig in invalidConfigs {

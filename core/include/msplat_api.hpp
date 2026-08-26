@@ -10,6 +10,8 @@
 #include <memory>
 #include <string>
 
+#include "camera_pose_conditioning.hpp"
+
 struct DatasetDescriptor;
 
 namespace msplat {
@@ -47,6 +49,10 @@ struct Config {
     // Learn small regularized camera-space SE(3) corrections after warm-up.
     // Imported poses and canonical render/evaluation/export remain unchanged.
     bool refineCameraPoses = false;
+    // Raw retains the established bounded optimizer. CamP opt-in conditions
+    // its six-dimensional camera update with a fixed full matrix.
+    CameraPoseConditioning cameraPoseConditioning =
+        CameraPoseConditioning::Raw;
     // Transparent mode applies only to frames that actually carry a mask.
     TrainingMaskMode trainingMaskMode = TrainingMaskMode::Coverage;
     float transparentAlphaLossWeight = 0.1f;

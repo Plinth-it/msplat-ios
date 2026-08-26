@@ -330,6 +330,7 @@ final class TrainingSession: ObservableObject {
     @Published var trainingMasksEnabled = false
     @Published var trainingMaskMode: TrainingMaskMode = .transparent
     @Published var refineCameraPosesEnabled = false
+    @Published var cameraPoseConditioning: CameraPoseConditioning = .raw
 
     private struct PendingPreview {
         let id: UInt64
@@ -375,6 +376,7 @@ final class TrainingSession: ObservableObject {
         iterations = benchmark.totalIterations
         qualityProfile = .preview
         refineCameraPosesEnabled = false
+        cameraPoseConditioning = .raw
         start(
             source: .importedFolder(folder),
             benchmark: benchmark,
@@ -436,6 +438,9 @@ final class TrainingSession: ObservableObject {
         let refineCameraPoses = benchmark == nil &&
             source.capturedDataset != nil &&
             refineCameraPosesEnabled
+        let selectedPoseConditioning = refineCameraPoses
+            ? cameraPoseConditioning
+            : CameraPoseConditioning.raw
 
         worker = Task { [weak self] in
             guard let self else { return }
@@ -446,6 +451,7 @@ final class TrainingSession: ObservableObject {
                 useTrainingMasks: useTrainingMasks,
                 trainingMaskMode: selectedTrainingMaskMode,
                 refineCameraPoses: refineCameraPoses,
+                cameraPoseConditioning: selectedPoseConditioning,
                 benchmark: benchmark,
                 trainingMaskCandidateCount: trainingMaskCandidateCount
             )
@@ -466,6 +472,7 @@ final class TrainingSession: ObservableObject {
         useTrainingMasks: Bool,
         trainingMaskMode: TrainingMaskMode,
         refineCameraPoses: Bool,
+        cameraPoseConditioning: CameraPoseConditioning,
         benchmark: TrainingBenchmarkConfiguration?,
         trainingMaskCandidateCount: Int?
     ) async {
@@ -506,6 +513,7 @@ final class TrainingSession: ObservableObject {
                 trainingMaskMode: trainingMaskMode,
                 keepCrs: source.capturedDataset != nil,
                 refineCameraPoses: refineCameraPoses,
+                cameraPoseConditioning: cameraPoseConditioning,
                 benchmark: benchmark
             )
             let trainingConfig = try plan.makeTrainingConfig(startingFrom: baseConfig)
@@ -1055,12 +1063,16 @@ final class TrainingSession: ObservableObject {
         trainingMaskMode: TrainingMaskMode,
         keepCrs: Bool = false,
         refineCameraPoses: Bool = false,
+        cameraPoseConditioning: CameraPoseConditioning = .raw,
         benchmark: TrainingBenchmarkConfiguration?
     ) throws -> TrainingConfig {
         var config = TrainingConfig()
         config.trainingMaskMode = trainingMaskMode
         config.keepCrs = keepCrs
         config.refineCameraPoses = refineCameraPoses && benchmark == nil
+        config.cameraPoseConditioning = config.refineCameraPoses
+            ? cameraPoseConditioning
+            : .raw
         guard let benchmark else { return config }
 
         if benchmark.fixedPopulation {

@@ -229,9 +229,14 @@ resume cannot silently attach corrections to different cameras.
 camera-space SE(3) corrections after warm-up. The first training camera is a
 fixed anchor, and the geometry-only pose gradient deliberately detaches the SH
 view-direction term. Imported poses and canonical rendering, evaluation, and
-export remain unchanged. Checkpoint v3 preserves corrections, Adam moments,
-per-camera visit counts, the anchor, exact frame IDs, and the immutable source
-poses.
+export remain unchanged. Raw bounded SE(3) remains the default. An explicit
+CamP option applies a deterministic fixed full 6x6 projection-Jacobian
+preconditioner, adapted from the pinned
+[CamP Zip-NeRF implementation](https://github.com/jonbarron/camp_zipnerf/tree/8e6d57e3aee34235faf3ef99decca0994efe66c9),
+while retaining the same physical bounds and regularization. Raw pose state
+continues to use checkpoint v3. CamP checkpoint v4 additionally preserves the
+exact per-camera preconditioners and readiness state alongside corrections,
+Adam moments, visit counts, the anchor, frame IDs, and immutable source poses.
 
 ## Additions
 
@@ -272,6 +277,9 @@ poses.
   pre-normalization coordinates, and a frame ID borrowed for the trainer
   lifetime. Adam moments remain private and pending Metal work is synchronized
   before pose rows are read.
+- ABI v16 opt-in CamP conditioning through a new capability bit in the unchanged
+  v8 refinement-options structure. Raw bounded SE(3) remains the default and
+  does not allocate CamP matrices; older clients retain their existing path.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,

@@ -2088,6 +2088,8 @@ kernel void prepare_camera_pose_kernel(
 
 struct PoseAdamParams {
     uint pose_offset;
+    uint preconditioner_offset;
+    uint conditioned;
     float step_size;
     float beta1;
     float beta2;
@@ -2106,6 +2108,7 @@ kernel void camera_pose_adam_kernel(
     constant PoseAdamParams& params,
     device atomic_uint* attempt_status,
     constant uint& attempt_gating_enabled,
+    constant float* preconditioners,
     uint index [[thread_position_in_grid]]
 ) {
     if (index != 0 ||
@@ -2133,24 +2136,81 @@ kernel void camera_pose_adam_kernel(
             rotation[0][1] - rotation[1][0]);
 
     float update[6];
-    for (uint component = 0; component < 6; ++component) {
-        const uint parameter_index = params.pose_offset + component;
-        float regularization_gradient = component < 3
-            ? params.regularization * translation[component] /
-                translation_scale2
-            : rotation_regularizer[component - 3];
-        const float gradient =
-            pose_gradient[component] + regularization_gradient;
-        const float first_moment = fma(
-            params.beta1, exp_avg[parameter_index],
-            (1.0f - params.beta1) * gradient);
-        const float second_moment = fma(
-            params.beta2, exp_avg_sq[parameter_index],
-            (1.0f - params.beta2) * gradient * gradient);
-        update[component] = -params.step_size * first_moment /
-            (sqrt(second_moment) / params.bias_correction2_sqrt + params.eps);
-        exp_avg[parameter_index] = first_moment;
-        exp_avg_sq[parameter_index] = second_moment;
+    if (params.conditioned == 0u) {
+        // Preserve the established raw bounded-SE(3) optimizer exactly.
+        for (uint component = 0; component < 6; ++component) {
+            const uint parameter_index = params.pose_offset + component;
+            float regularization_gradient = component < 3
+                ? params.regularization * translation[component] /
+                    translation_scale2
+                : rotation_regularizer[component - 3];
+            const float gradient =
+                pose_gradient[component] + regularization_gradient;
+            const float first_moment = fma(
+                params.beta1, exp_avg[parameter_index],
+                (1.0f - params.beta1) * gradient);
+            const float second_moment = fma(
+                params.beta2, exp_avg_sq[parameter_index],
+                (1.0f - params.beta2) * gradient * gradient);
+            update[component] = -params.step_size * first_moment /
+                (sqrt(second_moment) / params.bias_correction2_sqrt + params.eps);
+            exp_avg[parameter_index] = first_moment;
+            exp_avg_sq[parameter_index] = second_moment;
+        }
+    } else {
+        // CamP keeps regularization and bounds in physical pose space. Adam
+        // operates in the fixed decorrelated tangent coordinates, then its
+        // update is mapped back before the usual SE(3) retraction.
+        float metric_gradient[6];
+        for (uint component = 0; component < 6; ++component) {
+            const float regularization_gradient = component < 3
+                ? params.regularization * translation[component] /
+                    translation_scale2
+                : rotation_regularizer[component - 3];
+            metric_gradient[component] =
+                pose_gradient[component] + regularization_gradient;
+        }
+
+        float latent_update[6];
+        for (uint latent_component = 0; latent_component < 6;
+             ++latent_component) {
+            float latent_gradient = 0.0f;
+            for (uint metric_component = 0; metric_component < 6;
+                 ++metric_component) {
+                latent_gradient = fma(
+                    preconditioners[
+                        params.preconditioner_offset +
+                        metric_component * 6u + latent_component],
+                    metric_gradient[metric_component], latent_gradient);
+            }
+            const uint parameter_index =
+                params.pose_offset + latent_component;
+            const float first_moment = fma(
+                params.beta1, exp_avg[parameter_index],
+                (1.0f - params.beta1) * latent_gradient);
+            const float second_moment = fma(
+                params.beta2, exp_avg_sq[parameter_index],
+                (1.0f - params.beta2) * latent_gradient * latent_gradient);
+            latent_update[latent_component] =
+                -params.step_size * first_moment /
+                (sqrt(second_moment) / params.bias_correction2_sqrt + params.eps);
+            exp_avg[parameter_index] = first_moment;
+            exp_avg_sq[parameter_index] = second_moment;
+        }
+
+        for (uint metric_component = 0; metric_component < 6;
+             ++metric_component) {
+            float metric_update = 0.0f;
+            for (uint latent_component = 0; latent_component < 6;
+                 ++latent_component) {
+                metric_update = fma(
+                    preconditioners[
+                        params.preconditioner_offset +
+                        metric_component * 6u + latent_component],
+                    latent_update[latent_component], metric_update);
+            }
+            update[metric_component] = metric_update;
+        }
     }
 
     const float3 increment_translation_tangent =

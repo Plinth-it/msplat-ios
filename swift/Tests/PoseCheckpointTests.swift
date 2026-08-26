@@ -14,6 +14,10 @@ final class PoseCheckpointTests: XCTestCase {
     func testGPUPreviewMatchesLegacyRenderAndOutlivesSession() async throws {
         try await runGPUPreviewRegression()
     }
+
+    func testCampPoseCheckpointRoundTripAndModeMismatch() async throws {
+        try await runCampPoseCheckpointRegression()
+    }
 }
 
 @MsplatRuntimeActor
@@ -156,6 +160,140 @@ private func runGPUPreviewRegression() async throws {
         actual: previewRGBA,
         tolerance: 1
     )
+}
+
+@MsplatRuntimeActor
+private func runCampPoseCheckpointRegression() throws {
+    let fixtureDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("msplat-camp-pose-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: fixtureDirectory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: fixtureDirectory) }
+
+    let anchorImageURL = fixtureDirectory.appendingPathComponent("anchor.png")
+    let movableImageURL = fixtureDirectory.appendingPathComponent("movable.png")
+    try writePoseFixturePNG(to: anchorImageURL, horizontalShift: 0)
+    try writePoseFixturePNG(to: movableImageURL, horizontalShift: 3)
+    let descriptor = try makePoseFixtureDescriptor(
+        anchorImageURL: anchorImageURL,
+        movableImageURL: movableImageURL
+    )
+    var campConfig = makePoseFixtureConfig()
+    campConfig.cameraPoseConditioning = .camP
+    let checkpointURL = fixtureDirectory.appendingPathComponent("camp.msplat")
+    let reloadedURL = fixtureDirectory.appendingPathComponent("camp-reloaded.msplat")
+    let singularURL = fixtureDirectory.appendingPathComponent("camp-singular.msplat")
+    let missingBasisURL = fixtureDirectory.appendingPathComponent("camp-missing-basis.msplat")
+
+    let rawModelBytes: UInt64
+    do {
+        let session = try MsplatSession(
+            dataset: descriptor,
+            config: makePoseFixtureConfig(),
+            maximumGaussianCount: 5
+        )
+        defer { try? session.close() }
+        rawModelBytes = try session.memoryMetrics().trainerModelBufferBytes
+    }
+
+    do {
+        let session = try MsplatSession(
+            dataset: descriptor,
+            config: campConfig,
+            maximumGaussianCount: 5
+        )
+        defer { try? session.close() }
+        let campModelBytes = try session.memoryMetrics().trainerModelBufferBytes
+        XCTAssertEqual(campModelBytes, rawModelBytes + UInt64(2 * 36 * 4))
+        _ = try session.step()
+        _ = try session.step()
+        try session.saveCheckpoint(to: checkpointURL)
+    }
+
+    let snapshot = try readPoseCheckpoint(at: checkpointURL)
+    XCTAssertEqual(snapshot.version, 4)
+    XCTAssertEqual(snapshot.conditioning, .camP)
+    XCTAssertEqual(snapshot.preconditionerReady, [1, 1])
+    XCTAssertEqual(snapshot.preconditioners.count, 72)
+    XCTAssertTrue(snapshot.preconditioners.allSatisfy(\.isFinite))
+    XCTAssertEqual(snapshot.stepCounts, [0, 1])
+    for camera in 0..<2 {
+        for row in 0..<6 {
+            for column in 0..<6 {
+                XCTAssertEqual(
+                    snapshot.preconditioners[camera * 36 + row * 6 + column],
+                    snapshot.preconditioners[camera * 36 + column * 6 + row],
+                    accuracy: 0.000_01
+                )
+            }
+        }
+    }
+    let movablePreconditioner = Array(snapshot.preconditioners[36..<72])
+    let identityPreconditioner = (0..<36).map { index in
+        Float(index / 6 == index % 6 ? 1 : 0)
+    }
+    XCTAssertNotEqual(movablePreconditioner, identityPreconditioner)
+
+    let movableDelta = Array(snapshot.deltas[6..<12])
+    let movableFirstMoment = Array(snapshot.firstMoments[6..<12])
+    let movableSecondMoment = Array(snapshot.secondMoments[6..<12])
+    XCTAssertTrue(
+        (movableDelta + movableFirstMoment + movableSecondMoment)
+            .allSatisfy(\.isFinite)
+    )
+    XCTAssertTrue(movableDelta.contains { $0 != 0 })
+    XCTAssertTrue(movableFirstMoment.contains { $0 != 0 })
+    XCTAssertTrue(movableSecondMoment.contains { $0 > 0 })
+    XCTAssertLessThanOrEqual(vectorNorm(movableDelta[0..<3]), 0.050_001)
+    XCTAssertLessThanOrEqual(vectorNorm(movableDelta[3..<6]), 0.052_361)
+
+    guard let preconditionerDataOffset = snapshot.preconditionerDataOffset,
+          let readinessDataOffset = snapshot.preconditionerReadyDataOffset else {
+        XCTFail("CamP checkpoint offsets are missing")
+        return
+    }
+    var singularData = try Data(contentsOf: checkpointURL)
+    var zeroBits = Float.zero.bitPattern.littleEndian
+    withUnsafeBytes(of: &zeroBits) { bytes in
+        singularData.replaceSubrange(
+            preconditionerDataOffset..<(preconditionerDataOffset + bytes.count),
+            with: bytes
+        )
+    }
+    try singularData.write(to: singularURL)
+
+    var missingBasisData = try Data(contentsOf: checkpointURL)
+    missingBasisData[readinessDataOffset + 1] = 0
+    try missingBasisData.write(to: missingBasisURL)
+
+    do {
+        let session = try MsplatSession(
+            dataset: descriptor,
+            config: campConfig,
+            maximumGaussianCount: 5
+        )
+        defer { try? session.close() }
+        XCTAssertThrowsError(try session.loadCheckpoint(from: singularURL))
+        XCTAssertThrowsError(try session.loadCheckpoint(from: missingBasisURL))
+        XCTAssertEqual(try session.loadCheckpoint(from: checkpointURL), 2)
+        try session.saveCheckpoint(to: reloadedURL)
+    }
+    XCTAssertEqual(
+        try Data(contentsOf: reloadedURL),
+        try Data(contentsOf: checkpointURL)
+    )
+
+    do {
+        let session = try MsplatSession(
+            dataset: descriptor,
+            config: makePoseFixtureConfig(),
+            maximumGaussianCount: 5
+        )
+        defer { try? session.close() }
+        XCTAssertThrowsError(try session.loadCheckpoint(from: checkpointURL))
+    }
 }
 
 @MsplatRuntimeActor
@@ -392,12 +530,18 @@ private func writePoseFixturePNG(to url: URL, horizontalShift: Int) throws {
 }
 
 private struct PoseCheckpointSnapshot: Equatable {
+    let version: UInt32
     let iteration: UInt32
     let adamStep: UInt32
     let frameIDs: [String]
     let anchorIndex: Int
     let stepCounts: [UInt32]
     let basePoses: [Float]
+    let conditioning: CameraPoseConditioning?
+    let preconditionerReady: [UInt8]
+    let preconditioners: [Float]
+    let preconditionerReadyDataOffset: Int?
+    let preconditionerDataOffset: Int?
     let deltas: [Float]
     let firstMoments: [Float]
     let secondMoments: [Float]
@@ -413,6 +557,10 @@ private func assertPoseSnapshot(
     iteration: UInt32,
     expectedMovableSteps: UInt32
 ) {
+    XCTAssertEqual(snapshot.version, 3)
+    XCTAssertNil(snapshot.conditioning)
+    XCTAssertEqual(snapshot.preconditionerReady, [])
+    XCTAssertEqual(snapshot.preconditioners, [])
     XCTAssertEqual(snapshot.iteration, iteration)
     XCTAssertEqual(snapshot.adamStep, iteration)
     XCTAssertEqual(snapshot.frameIDs, ["anchor", "movable"])
@@ -587,7 +735,8 @@ private struct PoseCheckpointReader {
         guard try readUInt32() == 0x4C50_534D else {
             throw PoseFixtureError.invalidCheckpoint
         }
-        guard try readUInt32() == 3 else {
+        let version = try readUInt32()
+        guard version == 3 || version == 4 else {
             throw PoseFixtureError.invalidCheckpoint
         }
         let iteration = try readUInt32()
@@ -614,6 +763,32 @@ private struct PoseCheckpointReader {
         let frameIDs = try (0..<cameraCount).map { _ in try readString() }
         let stepCounts = try (0..<cameraCount).map { _ in try readUInt32() }
         let basePoses = try readTensor(expectedShape: [cameraCount, 16])
+        let conditioning: CameraPoseConditioning?
+        let preconditionerReady: [UInt8]
+        let preconditioners: [Float]
+        let preconditionerReadyDataOffset: Int?
+        let preconditionerDataOffset: Int?
+        if version >= 4 {
+            conditioning = CameraPoseConditioning(rawValue: try readUInt32())
+            guard conditioning != nil else {
+                throw PoseFixtureError.invalidCheckpoint
+            }
+            preconditionerReadyDataOffset = cursor
+            preconditionerReady = try (0..<cameraCount).map { _ in
+                try readUInt8()
+            }
+            let preconditionerTensor = try readTensorWithDataOffset(
+                expectedShape: [cameraCount, 36]
+            )
+            preconditioners = preconditionerTensor.values
+            preconditionerDataOffset = preconditionerTensor.dataOffset
+        } else {
+            conditioning = nil
+            preconditionerReady = []
+            preconditioners = []
+            preconditionerReadyDataOffset = nil
+            preconditionerDataOffset = nil
+        }
         let deltas = try readTensor(expectedShape: [cameraCount, 6])
         let firstMoments = try readTensor(expectedShape: [cameraCount, 6])
         let secondMoments = try readTensor(expectedShape: [cameraCount, 6])
@@ -622,12 +797,18 @@ private struct PoseCheckpointReader {
         }
 
         return PoseCheckpointSnapshot(
+            version: version,
             iteration: iteration,
             adamStep: adamStep,
             frameIDs: frameIDs,
             anchorIndex: anchorIndex,
             stepCounts: stepCounts,
             basePoses: basePoses,
+            conditioning: conditioning,
+            preconditionerReady: preconditionerReady,
+            preconditioners: preconditioners,
+            preconditionerReadyDataOffset: preconditionerReadyDataOffset,
+            preconditionerDataOffset: preconditionerDataOffset,
             deltas: deltas,
             firstMoments: firstMoments,
             secondMoments: secondMoments
@@ -643,6 +824,12 @@ private struct PoseCheckpointReader {
     }
 
     private mutating func readTensor(expectedShape: [Int]) throws -> [Float] {
+        try readTensorWithDataOffset(expectedShape: expectedShape).values
+    }
+
+    private mutating func readTensorWithDataOffset(
+        expectedShape: [Int]
+    ) throws -> (values: [Float], dataOffset: Int) {
         let rank = try checkedInt(readUInt32())
         guard rank == expectedShape.count else {
             throw PoseFixtureError.invalidCheckpoint
@@ -670,9 +857,11 @@ private struct PoseCheckpointReader {
               try readUInt64() == UInt64(expectedBytes.partialValue) else {
             throw PoseFixtureError.invalidCheckpoint
         }
-        return try (0..<elementCount).map { _ in
+        let dataOffset = cursor
+        let values = try (0..<elementCount).map { _ in
             Float(bitPattern: try readUInt32())
         }
+        return (values, dataOffset)
     }
 
     private mutating func readString() throws -> String {
@@ -692,6 +881,14 @@ private struct PoseCheckpointReader {
         return data[range].withUnsafeBytes {
             UInt32(littleEndian: $0.loadUnaligned(as: UInt32.self))
         }
+    }
+
+    private mutating func readUInt8() throws -> UInt8 {
+        let range = try takeRange(byteCount: MemoryLayout<UInt8>.size)
+        guard let value = data[range].first else {
+            throw PoseFixtureError.invalidCheckpoint
+        }
+        return value
     }
 
     private mutating func readUInt64() throws -> UInt64 {

@@ -3090,6 +3090,15 @@ static MTensor msplat_train_step_locked(
         throw std::invalid_argument(
             "Disabled pose refinement must use the identity pose row");
     }
+    if (!pose.enabled && pose.conditioned) {
+        throw std::invalid_argument(
+            "Disabled pose refinement cannot be conditioned");
+    }
+    if (pose.conditioned &&
+        pose.cameraIndex > std::numeric_limits<uint32_t>::max() / 36u) {
+        throw std::invalid_argument(
+            "Pose-refinement preconditioner offset is out of range");
+    }
     if (pose.enabled) {
         validatePoseTensor(pose.expAvg, "Camera pose Adam first moment");
         validatePoseTensor(pose.expAvgSq, "Camera pose Adam second moment");
@@ -3097,6 +3106,16 @@ static MTensor msplat_train_step_locked(
             pose.expAvgSq->size(0) != pose.deltas->size(0)) {
             throw std::invalid_argument(
                 "Camera pose Adam tensors must match the delta tensor shape");
+        }
+        if (pose.conditioned && (!pose.preconditioners ||
+            !pose.preconditioners->defined() ||
+            !pose.preconditioners->isGpu() ||
+            pose.preconditioners->dtype() != DType::Float32 ||
+            pose.preconditioners->ndim() != 2 ||
+            pose.preconditioners->size(0) != pose.deltas->size(0) ||
+            pose.preconditioners->size(1) != 36)) {
+            throw std::invalid_argument(
+                "Camera pose preconditioners must be a GPU Float32 [N,36] tensor matching the delta rows");
         }
         constexpr float expectedMaxTranslation = 0.05f;
         constexpr float expectedMaxRotation = 0.05235987756f;
@@ -3117,7 +3136,13 @@ static MTensor msplat_train_step_locked(
     MTensor& poseDeltas = *pose.deltas;
     MTensor& poseExpAvg = pose.enabled ? *pose.expAvg : poseDeltas;
     MTensor& poseExpAvgSq = pose.enabled ? *pose.expAvgSq : poseDeltas;
+    MTensor& posePreconditioners = pose.enabled && pose.conditioned
+        ? *pose.preconditioners
+        : poseDeltas;
     const uint32_t cameraPoseOffset = pose.cameraIndex * 6u;
+    const uint32_t cameraPosePreconditionerOffset = pose.conditioned
+        ? pose.cameraIndex * 36u
+        : 0u;
     const uint32_t poseEnabled = pose.enabled ? 1u : 0u;
 
     if (collect_densification_stats) {
@@ -3861,6 +3886,8 @@ static MTensor msplat_train_step_locked(
 
     struct PoseAdamParams {
         uint32_t pose_offset;
+        uint32_t preconditioner_offset;
+        uint32_t conditioned;
         float step_size;
         float beta1;
         float beta2;
@@ -3870,10 +3897,13 @@ static MTensor msplat_train_step_locked(
         float max_translation;
         float max_rotation;
     };
-    static_assert(sizeof(PoseAdamParams) == 36);
+    static_assert(sizeof(PoseAdamParams) == 44);
     auto pose_adam_hp = std::make_shared<PoseAdamParams>();
     if (pose.enabled) {
         pose_adam_hp->pose_offset = cameraPoseOffset;
+        pose_adam_hp->preconditioner_offset =
+            cameraPosePreconditionerOffset;
+        pose_adam_hp->conditioned = pose.conditioned ? 1u : 0u;
         pose_adam_hp->step_size = pose.adamStepSize;
         pose_adam_hp->beta1 = adam_beta1;
         pose_adam_hp->beta2 = adam_beta2;
@@ -3956,6 +3986,7 @@ static MTensor msplat_train_step_locked(
                    length:sizeof(PoseAdamParams) atIndex:4];
             ENC_BUF(enc, overflow_flag, 5);
             ENC_SCALAR(enc, attemptGatingEnabled, 6);
+            ENC_BUF(enc, posePreconditioners, 7);
             [enc dispatchThreads:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
         }

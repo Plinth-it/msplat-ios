@@ -9,6 +9,14 @@ public enum TrainingMaskMode: UInt32, CaseIterable, Sendable {
     case transparent = 1
 }
 
+/// Coordinate conditioning for optional camera-pose refinement.
+public enum CameraPoseConditioning: UInt32, CaseIterable, Sendable {
+    /// Preserve the established bounded SE(3) optimizer exactly.
+    case raw = 0
+    /// Condition six-dimensional pose updates with a fixed full CamP matrix.
+    case camP = 1
+}
+
 /// Configuration for Gaussian splatting training.
 public struct TrainingConfig: Sendable {
     public var iterations: Int32 = 30_000
@@ -34,6 +42,9 @@ public struct TrainingConfig: Sendable {
     /// Learn small, regularized camera-space pose corrections after warm-up.
     /// Imported geometry and canonical render, evaluation, and export stay unchanged.
     public var refineCameraPoses: Bool = false
+    /// Conditioning applied when `refineCameraPoses` is enabled. Raw remains
+    /// the compatibility default; CamP is an explicit opt-in.
+    public var cameraPoseConditioning: CameraPoseConditioning = .raw
     /// Treatment for frames that have a training mask. Frames without a mask
     /// remain ordinary opaque RGB targets in either mode. Transparent mode
     /// cannot be combined with `refinePhotometricGains`.
@@ -108,6 +119,11 @@ public struct TrainingConfig: Sendable {
                 "Transparent training masks cannot be combined with photometric gain refinement"
             )
         }
+        guard cameraPoseConditioning == .raw || refineCameraPoses else {
+            throw MsplatError.invalidArgument(
+                "CamP conditioning requires camera-pose refinement"
+            )
+        }
         guard downscaleFactor.isFinite, (1...32).contains(downscaleFactor) else {
             throw MsplatError.invalidArgument("downscaleFactor must be finite and in 1...32")
         }
@@ -146,6 +162,9 @@ public struct TrainingConfig: Sendable {
         }
         if refineCameraPoses {
             options.flags |= UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS)
+        }
+        if cameraPoseConditioning == .camP {
+            options.flags |= UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING)
         }
         return options
     }

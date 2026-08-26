@@ -686,6 +686,7 @@ final class TrainingMaskOptionsTests: XCTestCase {
 
         XCTAssertEqual(config.trainingMaskMode, .transparent)
         XCTAssertFalse(config.refineCameraPoses)
+        XCTAssertEqual(config.cameraPoseConditioning, .raw)
         XCTAssertEqual(config.stopDensifyAt, 0)
         XCTAssertEqual(config.warmupLength, TrainingConfig().warmupLength)
         XCTAssertEqual(config.refineEvery, TrainingConfig().refineEvery)
@@ -704,6 +705,7 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(config.trainingMaskMode, .transparent)
         XCTAssertFalse(config.refinePhotometricGains)
         XCTAssertFalse(config.refineCameraPoses)
+        XCTAssertEqual(config.cameraPoseConditioning, .raw)
     }
 
     func testCapturedTrainingConfigEnablesPoseRefinementWhenOptedIn() throws {
@@ -711,11 +713,13 @@ final class TrainingMaskOptionsTests: XCTestCase {
             trainingMaskMode: .transparent,
             keepCrs: true,
             refineCameraPoses: true,
+            cameraPoseConditioning: .camP,
             benchmark: nil
         )
 
         XCTAssertTrue(config.keepCrs)
         XCTAssertTrue(config.refineCameraPoses)
+        XCTAssertEqual(config.cameraPoseConditioning, .camP)
     }
 
     func testPoseRefinementBudgetRejectsInsufficientPostWarmupCameraPass() throws {

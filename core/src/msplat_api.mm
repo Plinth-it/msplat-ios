@@ -302,6 +302,7 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         config.refineCameraPoses && !impl->ds->trainIndices.empty()
             ? static_cast<int>(impl->ds->trainIndices.front())
             : -1,
+        config.cameraPoseConditioning,
         config.trainingMaskMode == TrainingMaskMode::Transparent,
         config.transparentAlphaLossWeight
     );
@@ -1296,9 +1297,16 @@ void validateRefinementOptionsV8(
     const MsplatRefinementOptionsV8& options) {
     constexpr uint32_t knownFlags =
         MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS |
-        MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS;
+        MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS |
+        MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING;
     require((options.flags & ~knownFlags) == 0u,
             "Refinement options contain unknown flags");
+    require(
+        (options.flags &
+         MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING) == 0u ||
+            (options.flags &
+             MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) != 0u,
+        "CamP conditioning requires camera-pose refinement");
     for (uint32_t reserved : options.reserved)
         require(reserved == 0u,
                 "Refinement options reserved fields must be zero");
@@ -1664,6 +1672,11 @@ MsplatStatus msplat_trainer_create_v11(
         cfg.refineCameraPoses =
             (refinementOptions->flags &
              MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) != 0u;
+        cfg.cameraPoseConditioning =
+            (refinementOptions->flags &
+             MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING) != 0u
+                ? msplat::CameraPoseConditioning::CamP
+                : msplat::CameraPoseConditioning::Raw;
         cfg.trainingMaskMode =
             maskOptions->mode == MSPLAT_TRAINING_MASK_MODE_TRANSPARENT
                 ? msplat::TrainingMaskMode::Transparent

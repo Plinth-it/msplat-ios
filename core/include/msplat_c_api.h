@@ -44,8 +44,11 @@ extern "C" {
 // ABI v14 adds instance-scoped, opt-in depth-one training-target prefetch.
 // ABI v15 adds read-only, size-checked camera-pose refinement state without
 // changing any existing structure or entry point.
+// ABI v16 adds opt-in CamP conditioning to the unchanged v8 refinement options.
+// The global bump lets new clients reject older binaries that would interpret
+// the new capability bit as unknown.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 15u
+#define MSPLAT_ABI_VERSION 16u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -142,6 +145,9 @@ static inline MsplatTrainingLimits msplat_default_training_limits(void) {
 /// Learn bounded camera-space pose corrections only for training. Imported
 /// camera geometry and canonical render/evaluation/export remain unchanged.
 #define MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS     (1u << 1)
+/// Apply fixed full-matrix CamP conditioning to camera-pose updates. This bit
+/// is valid only together with MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS.
+#define MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING (1u << 2)
 
 typedef struct {
     uint32_t flags;

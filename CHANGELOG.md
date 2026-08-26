@@ -88,6 +88,14 @@
   private. Translation values and corrected positions are returned in the
   dataset's original pre-normalization units, rotations are radians, and pose
   tensor reads synchronize pending Metal work under the trainer transaction.
+- Added ABI v16 opt-in CamP conditioning for bounded camera-pose refinement.
+  Swift and MsplatExample expose a Raw/CamP A/B control, while Raw remains the
+  allocation-free compatibility default. CamP builds a deterministic fixed full
+  6x6 projection-Jacobian preconditioner per visited camera, applies Adam in the
+  conditioned tangent coordinates, then retains the existing physical SE(3)
+  retraction, regularization, and bounds. Checkpoint v4 stores the exact matrices
+  and readiness state and rejects missing, singular, or mismatched optimizer
+  bases; Raw checkpoints remain v3.
 - Added an exact binary-grayscale PNG mask path for discovered Brush-style
   masks. Eligible 8-bit black/white masks decode into one source byte per pixel
   before the existing area filter; soft, profiled, alpha, and color masks retain

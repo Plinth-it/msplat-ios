@@ -134,6 +134,15 @@ require_contains("${pose_adam}"
 require_contains("${pose_adam}"
     "if (rotation_norm > params.max_rotation)"
     "rotation norm bound")
+require_contains("${pose_adam}"
+    "params.conditioned == 0u"
+    "raw optimizer compatibility branch")
+require_contains("${pose_adam}"
+    "metric_component * 6u + latent_component],\n                    metric_gradient[metric_component]"
+    "CamP transpose gradient transform")
+require_contains("${pose_adam}"
+    "metric_component * 6u + latent_component],\n                    latent_update[latent_component]"
+    "CamP metric update transform")
 
 extract_section(host_source "auto encode_pose_prepare ="
     "auto encode_proj_sh =" host_prepare)
@@ -185,6 +194,9 @@ require_contains("${host_backward}"
 require_contains("${host_backward}"
     "ENC_BUF(enc, poseDeltas, 0);\n            ENC_BUF(enc, poseGradient, 1);\n            ENC_BUF(enc, poseExpAvg, 2);\n            ENC_BUF(enc, poseExpAvgSq, 3);"
     "pose Adam state bindings")
+require_contains("${host_backward}"
+    "ENC_BUF(enc, posePreconditioners, 7);"
+    "pose preconditioner binding")
 
 extract_section(host_source "auto do_blit_zero ="
     "auto encode_step_readback =" blit_zero)
@@ -253,9 +265,15 @@ require_contains("${api_source}"
 require_contains("${c_api_header}"
     "#define MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS     (1u << 1)"
     "C API camera-pose capability bit")
+require_contains("${c_api_header}"
+    "#define MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING (1u << 2)"
+    "C API CamP-conditioning capability bit")
 require_contains("${api_source}"
     "cfg.refineCameraPoses =\n            (refinementOptions->flags &\n             MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) != 0u;"
     "C API camera-pose option mapping")
+require_contains("${api_source}"
+    "? msplat::CameraPoseConditioning::CamP\n                : msplat::CameraPoseConditioning::Raw;"
+    "C API camera-pose conditioning mapping")
 
 # ABI v15 reads only the public pose row after serializing and synchronizing.
 extract_section(api_source

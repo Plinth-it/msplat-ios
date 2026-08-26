@@ -3,9 +3,13 @@
 #include <cmath>
 #include <cstddef>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
+#include "../core/include/camp_pose_point_sampler.hpp"
+#include "../core/include/camp_pose_preconditioner.hpp"
 #include "../core/include/pose_refinement_state.hpp"
 
 namespace {
@@ -15,6 +19,7 @@ using Vec3 = std::array<double, 3>;
 using Mat2 = std::array<double, 4>;
 using Mat23 = std::array<double, 6>;
 using Mat3 = std::array<double, 9>;
+using Mat6 = msplat::detail::CampPoseMatrix;
 
 constexpr double kMaxTranslation = 0.05;
 constexpr double kMaxRotation = 0.05235987755982989; // 3 degrees
@@ -769,6 +774,443 @@ void testPoseStateReadbackGeometry() {
                1.0e-7, 1.0e-7));
 }
 
+Mat6 multiply6(const Mat6& lhs, const Mat6& rhs) {
+    Mat6 result{};
+    for (size_t row = 0; row < 6; ++row) {
+        for (size_t columnIndex = 0; columnIndex < 6; ++columnIndex) {
+            for (size_t inner = 0; inner < 6; ++inner) {
+                result[row * 6 + columnIndex] +=
+                    lhs[row * 6 + inner] * rhs[inner * 6 + columnIndex];
+            }
+        }
+    }
+    return result;
+}
+
+void testCampProjectionJacobian() {
+    constexpr std::array<double, 3> point{0.4, -0.25, 2.3};
+    constexpr double focalX = 720.0;
+    constexpr double focalY = 690.0;
+    constexpr double width = 1280.0;
+    constexpr double height = 720.0;
+    const auto analytic = msplat::detail::campPoseProjectionJacobian(
+        point, focalX, focalY, width, height);
+
+    const auto normalizedProjection = [&](size_t parameter, double amount) {
+        Vec3 translation{};
+        Vec3 rotation{};
+        if (parameter < 3)
+            translation[parameter] = amount;
+        else
+            rotation[parameter - 3] = amount;
+        const Vec3 transformed = transformPoint(
+            se3Exp(translation, rotation), point);
+        return Vec2{
+            focalX * transformed[0] / transformed[2] /
+                std::max(width, height),
+            focalY * transformed[1] / transformed[2] /
+                std::max(width, height),
+        };
+    };
+
+    constexpr double epsilon = 1.0e-6;
+    for (size_t parameter = 0; parameter < 6; ++parameter) {
+        const Vec2 positive = normalizedProjection(parameter, epsilon);
+        const Vec2 negative = normalizedProjection(parameter, -epsilon);
+        for (size_t output = 0; output < 2; ++output) {
+            const double finiteDifference =
+                (positive[output] - negative[output]) / (2.0 * epsilon);
+            CHECK(near(finiteDifference, analytic[output * 6 + parameter],
+                       2.0e-10, 2.0e-9));
+        }
+    }
+}
+
+void testCampFullInverseSquareRoot() {
+    const std::array<Vec3, 9> points = {{
+        {-0.7, -0.3, 1.2}, {0.4, -0.5, 1.5}, {0.8, 0.6, 2.0},
+        {-0.2, 0.7, 2.4}, {0.1, -0.1, 3.1}, {-1.0, 0.2, 3.5},
+        {0.5, 0.9, 4.0}, {-0.6, -0.8, 4.5}, {1.1, -0.4, 5.0},
+    }};
+    Mat6 hessianSum{};
+    for (const Vec3& point : points) {
+        msplat::detail::accumulateCampPoseApproximateHessian(
+            hessianSum,
+            msplat::detail::campPoseProjectionJacobian(
+                point, 810.0, 790.0, 1440.0, 1080.0));
+    }
+    const Mat6 hessian =
+        msplat::detail::finishCampPoseApproximateHessian(
+            hessianSum, points.size());
+    const Mat6 damped =
+        msplat::detail::dampCampPoseApproximateHessian(hessian);
+    const Mat6 preconditioner =
+        msplat::detail::campPosePreconditionerFromHessian(hessian);
+    const Mat6 repeated =
+        msplat::detail::campPosePreconditionerFromHessian(hessian);
+    CHECK(preconditioner == repeated);
+
+    bool hasTranslationRotationCoupling = false;
+    for (size_t row = 0; row < 6; ++row) {
+        for (size_t columnIndex = 0; columnIndex < 6; ++columnIndex) {
+            CHECK(std::isfinite(preconditioner[row * 6 + columnIndex]));
+            CHECK(near(preconditioner[row * 6 + columnIndex],
+                       preconditioner[columnIndex * 6 + row],
+                       1.0e-12, 1.0e-12));
+            if (row < 3 && columnIndex >= 3 &&
+                std::abs(preconditioner[row * 6 + columnIndex]) > 1.0e-7) {
+                hasTranslationRotationCoupling = true;
+            }
+        }
+    }
+    CHECK(hasTranslationRotationCoupling);
+
+    const Mat6 whitened = multiply6(
+        multiply6(preconditioner, damped), preconditioner);
+    for (size_t row = 0; row < 6; ++row) {
+        for (size_t columnIndex = 0; columnIndex < 6; ++columnIndex) {
+            CHECK(near(whitened[row * 6 + columnIndex],
+                       row == columnIndex ? 1.0 : 0.0,
+                       2.0e-10, 2.0e-10));
+        }
+    }
+
+    const msplat::detail::CampPoseVector latent = {
+        0.2, -0.1, 0.05, 0.01, -0.02, 0.03,
+    };
+    const auto metric = msplat::detail::applyCampPosePreconditioner(
+        preconditioner, latent);
+    for (double value : metric) CHECK(std::isfinite(value));
+}
+
+void testCampDampingAndValidation() {
+    Mat6 diagonal{};
+    const std::array<double, 6> values = {1.0, 4.0, 9.0, 16.0, 25.0, 36.0};
+    for (size_t axis = 0; axis < 6; ++axis)
+        diagonal[axis * 6 + axis] = values[axis];
+    const Mat6 damped = msplat::detail::dampCampPoseApproximateHessian(
+        diagonal, 1.0e-8, 0.1);
+    const Mat6 preconditioner =
+        msplat::detail::campPosePreconditionerFromHessian(
+            diagonal, 1.0e-8, 0.1);
+    for (size_t row = 0; row < 6; ++row) {
+        CHECK(near(damped[row * 6 + row], 1.1 * values[row]));
+        CHECK(near(preconditioner[row * 6 + row],
+                   1.0 / std::sqrt(1.1 * values[row]),
+                   1.0e-12, 1.0e-12));
+        for (size_t columnIndex = 0; columnIndex < 6; ++columnIndex) {
+            if (row != columnIndex)
+                CHECK(preconditioner[row * 6 + columnIndex] == 0.0);
+        }
+    }
+
+    const Mat6 zeroHessian{};
+    const Mat6 zeroPreconditioner =
+        msplat::detail::campPosePreconditionerFromHessian(zeroHessian);
+    for (size_t row = 0; row < 6; ++row) {
+        for (size_t columnIndex = 0; columnIndex < 6; ++columnIndex) {
+            CHECK(near(zeroPreconditioner[row * 6 + columnIndex],
+                       row == columnIndex ? 1.0e4 : 0.0,
+                       1.0e-9, 1.0e-12));
+        }
+    }
+
+    bool asymmetricRejected = false;
+    try {
+        Mat6 asymmetric = diagonal;
+        asymmetric[1] = 0.25;
+        (void)msplat::detail::campPosePreconditionerFromHessian(asymmetric);
+    } catch (const std::invalid_argument&) {
+        asymmetricRejected = true;
+    }
+    CHECK(asymmetricRejected);
+
+    bool nonfiniteRejected = false;
+    try {
+        Mat6 nonfinite = diagonal;
+        nonfinite[0] = std::numeric_limits<double>::infinity();
+        (void)msplat::detail::campPosePreconditionerFromHessian(nonfinite);
+    } catch (const std::invalid_argument&) {
+        nonfiniteRejected = true;
+    }
+    CHECK(nonfiniteRejected);
+}
+
+msplat::detail::CampPoseCameraGeometry campTestCamera() {
+    msplat::detail::CampPoseCameraGeometry camera;
+    camera.cameraToWorld = {
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    };
+    camera.focalX = 100.0;
+    camera.focalY = 100.0;
+    camera.principalX = 50.0;
+    camera.principalY = 50.0;
+    camera.width = 100;
+    camera.height = 100;
+    camera.deterministicKey = 0x12345678ULL;
+    return camera;
+}
+
+void testCampRepresentativeVisibilityAndConvention() {
+    const std::vector<float> xyz = {
+         0.0f,  0.0f, -2.0f,   // center, visible
+         0.5f,  0.5f, -2.0f,   // upper-right, visible after Y flip
+         0.0f,  0.0f,  2.0f,   // behind
+         2.0f,  0.0f, -1.0f,   // outside the right edge
+         0.0f,  0.0f, -0.005f, // clipped by the renderer near plane
+    };
+    const msplat::detail::CampPoseWorldPointPool pool{
+        xyz.data(), nullptr, xyz.size() / 3,
+    };
+    const auto camera = campTestCamera();
+    const auto sample = msplat::detail::sampleCampPoseRepresentativePoints(
+        camera, pool, 256);
+    const auto repeated = msplat::detail::sampleCampPoseRepresentativePoints(
+        camera, pool, 256);
+    CHECK(sample.viewPoints == repeated.viewPoints);
+    CHECK(sample.sourcePointIndices == repeated.sourcePointIndices);
+    CHECK(sample.visiblePointCount == 2);
+    CHECK(sample.selectedVisiblePointCount == 2);
+    CHECK(sample.fallbackPointCount == 254);
+    CHECK(sample.viewPoints.size() == 256);
+    CHECK(sample.sourcePointIndices.size() == 256);
+
+    bool foundCenter = false;
+    bool foundUpperRight = false;
+    for (size_t index = 0; index < sample.viewPoints.size(); ++index) {
+        const Vec3& point = sample.viewPoints[index];
+        CHECK(point[2] > msplat::detail::kCampRepresentativeNearPlane);
+        const double pixelX = camera.focalX * point[0] / point[2] +
+            camera.principalX;
+        const double pixelY = camera.focalY * point[1] / point[2] +
+            camera.principalY;
+        CHECK(pixelX >= 0.0 && pixelX < camera.width);
+        CHECK(pixelY >= 0.0 && pixelY < camera.height);
+        if (sample.sourcePointIndices[index] == 0) {
+            checkNear(point, {0.0, 0.0, 2.0});
+            foundCenter = true;
+        } else if (sample.sourcePointIndices[index] == 1) {
+            checkNear(point, {0.5, -0.5, 2.0});
+            foundUpperRight = true;
+        } else {
+            CHECK(sample.sourcePointIndices[index] ==
+                  std::numeric_limits<size_t>::max());
+            CHECK(pixelX >= 0.5 && pixelX <= camera.width - 0.5);
+            CHECK(pixelY >= 0.5 && pixelY <= camera.height - 0.5);
+        }
+    }
+    CHECK(foundCenter);
+    CHECK(foundUpperRight);
+
+    auto rotatedCamera = camera;
+    rotatedCamera.cameraToWorld = {
+         0.0, 0.0, 1.0, 10.0,
+         0.0, 1.0, 0.0, 20.0,
+        -1.0, 0.0, 0.0, 30.0,
+         0.0, 0.0, 0.0,  1.0,
+    };
+    rotatedCamera.focalX = 100.0;
+    rotatedCamera.focalY = 100.0;
+    rotatedCamera.principalX = 320.0;
+    rotatedCamera.principalY = 240.0;
+    rotatedCamera.width = 640;
+    rotatedCamera.height = 480;
+    const std::array<float, 3> rotatedXYZ = {6.0f, 18.0f, 29.0f};
+    const msplat::detail::CampPoseWorldPointPool rotatedPool{
+        rotatedXYZ.data(), nullptr, 1,
+    };
+    const auto rotated = msplat::detail::sampleCampPoseRepresentativePoints(
+        rotatedCamera, rotatedPool, 256);
+    CHECK(rotated.visiblePointCount == 1);
+    const auto source = std::find(
+        rotated.sourcePointIndices.begin(),
+        rotated.sourcePointIndices.end(), size_t{0});
+    CHECK(source != rotated.sourcePointIndices.end());
+    checkNear(rotated.viewPoints[static_cast<size_t>(
+        source - rotated.sourcePointIndices.begin())], {1.0, 2.0, 4.0});
+}
+
+void testCampRepresentativeSpatialCapAndStableIDs() {
+    auto camera = campTestCamera();
+    camera.width = 640;
+    camera.height = 480;
+    camera.focalX = 500.0;
+    camera.focalY = 500.0;
+    camera.principalX = 320.0;
+    camera.principalY = 240.0;
+
+    std::vector<float> xyz;
+    std::vector<uint64_t> stableIds;
+    xyz.reserve(16 * 16 * 3 * 3);
+    stableIds.reserve(16 * 16 * 3);
+    for (size_t pass = 0; pass < 3; ++pass) {
+        for (size_t cellY = 0; cellY < 16; ++cellY) {
+            for (size_t cellX = 0; cellX < 16; ++cellX) {
+                const double pixelX =
+                    (static_cast<double>(cellX) + 0.35 + 0.1 * pass) * 40.0;
+                const double pixelY =
+                    (static_cast<double>(cellY) + 0.35 + 0.1 * pass) * 30.0;
+                const double depth = 1.5 + 0.25 * pass;
+                const double viewX =
+                    (pixelX - camera.principalX) * depth / camera.focalX;
+                const double viewY =
+                    (pixelY - camera.principalY) * depth / camera.focalY;
+                xyz.insert(xyz.end(), {
+                    static_cast<float>(viewX),
+                    static_cast<float>(-viewY),
+                    static_cast<float>(-depth),
+                });
+                stableIds.push_back(
+                    1000 + pass * 256 + cellY * 16 + cellX);
+            }
+        }
+    }
+    const msplat::detail::CampPoseWorldPointPool pool{
+        xyz.data(), stableIds.data(), stableIds.size(),
+    };
+    const auto sample = msplat::detail::sampleCampPoseRepresentativePoints(
+        camera, pool);
+    CHECK(sample.visiblePointCount == 768);
+    CHECK(sample.selectedVisiblePointCount == 512);
+    CHECK(sample.fallbackPointCount == 0);
+    std::array<size_t, 256> selectedPerCell{};
+    for (const Vec3& point : sample.viewPoints) {
+        const double pixelX = camera.focalX * point[0] / point[2] +
+            camera.principalX;
+        const double pixelY = camera.focalY * point[1] / point[2] +
+            camera.principalY;
+        const size_t cellX = std::min<size_t>(15,
+            static_cast<size_t>(pixelX * 16.0 / camera.width));
+        const size_t cellY = std::min<size_t>(15,
+            static_cast<size_t>(pixelY * 16.0 / camera.height));
+        ++selectedPerCell[cellY * 16 + cellX];
+    }
+    for (size_t count : selectedPerCell) CHECK(count == 2);
+
+    std::vector<float> reversedXYZ;
+    std::vector<uint64_t> reversedIDs;
+    reversedXYZ.reserve(xyz.size());
+    reversedIDs.reserve(stableIds.size());
+    for (size_t reverseIndex = stableIds.size(); reverseIndex-- > 0;) {
+        reversedXYZ.insert(reversedXYZ.end(), {
+            xyz[reverseIndex * 3], xyz[reverseIndex * 3 + 1],
+            xyz[reverseIndex * 3 + 2],
+        });
+        reversedIDs.push_back(stableIds[reverseIndex]);
+    }
+    const msplat::detail::CampPoseWorldPointPool reversedPool{
+        reversedXYZ.data(), reversedIDs.data(), reversedIDs.size(),
+    };
+    const auto reordered = msplat::detail::sampleCampPoseRepresentativePoints(
+        camera, reversedPool);
+    CHECK(sample.viewPoints == reordered.viewPoints);
+
+    const auto built = msplat::detail::buildCampPosePreconditioner(
+        camera, pool);
+    const auto rebuilt = msplat::detail::buildCampPosePreconditioner(
+        camera, reversedPool);
+    CHECK(built.hessian == rebuilt.hessian);
+    CHECK(built.preconditioner == rebuilt.preconditioner);
+    for (double value : built.preconditioner) CHECK(std::isfinite(value));
+
+    auto doubledRaster = camera;
+    doubledRaster.width *= 2;
+    doubledRaster.height *= 2;
+    doubledRaster.focalX *= 2.0;
+    doubledRaster.focalY *= 2.0;
+    doubledRaster.principalX *= 2.0;
+    doubledRaster.principalY *= 2.0;
+    const auto doubled = msplat::detail::buildCampPosePreconditioner(
+        doubledRaster, pool);
+    for (size_t index = 0; index < built.hessian.size(); ++index) {
+        CHECK(near(built.hessian[index], doubled.hessian[index],
+                   1.0e-13, 1.0e-13));
+        CHECK(near(built.preconditioner[index], doubled.preconditioner[index],
+                   1.0e-11, 1.0e-11));
+    }
+}
+
+void testCampRepresentativeHaltonFallbackAndBounds() {
+    const auto camera = campTestCamera();
+    const msplat::detail::CampPoseWorldPointPool emptyPool{};
+    const auto sample = msplat::detail::sampleCampPoseRepresentativePoints(
+        camera, emptyPool);
+    const auto repeated = msplat::detail::sampleCampPoseRepresentativePoints(
+        camera, emptyPool);
+    CHECK(sample.viewPoints == repeated.viewPoints);
+    CHECK(sample.sourcePointIndices == repeated.sourcePointIndices);
+    CHECK(sample.visiblePointCount == 0);
+    CHECK(sample.selectedVisiblePointCount == 0);
+    CHECK(sample.fallbackPointCount == 512);
+    CHECK(sample.viewPoints.size() == 512);
+    for (size_t sourceIndex : sample.sourcePointIndices) {
+        CHECK(sourceIndex == std::numeric_limits<size_t>::max());
+    }
+
+    const auto built = msplat::detail::buildCampPosePreconditioner(
+        camera, emptyPool);
+    const auto rebuilt = msplat::detail::buildCampPosePreconditioner(
+        camera, emptyPool);
+    CHECK(built.hessian == rebuilt.hessian);
+    CHECK(built.preconditioner == rebuilt.preconditioner);
+    CHECK(built.fallbackPointCount == 512);
+    for (double value : built.preconditioner) CHECK(std::isfinite(value));
+
+    bool smallTargetRejected = false;
+    try {
+        (void)msplat::detail::sampleCampPoseRepresentativePoints(
+            camera, emptyPool, 255);
+    } catch (const std::invalid_argument&) {
+        smallTargetRejected = true;
+    }
+    CHECK(smallTargetRejected);
+
+    const float placeholder[3] = {};
+    const msplat::detail::CampPoseWorldPointPool oversizedPool{
+        placeholder, nullptr,
+        msplat::detail::kCampMaximumWorldPointPoolCount + 1,
+    };
+    bool oversizedPoolRejected = false;
+    try {
+        (void)msplat::detail::sampleCampPoseRepresentativePoints(
+            camera, oversizedPool);
+    } catch (const std::invalid_argument&) {
+        oversizedPoolRejected = true;
+    }
+    CHECK(oversizedPoolRejected);
+}
+
+void testCampWorldPointPoolCapUsesStableIDs() {
+    const size_t pointCount =
+        msplat::detail::kCampMaximumWorldPointPoolCount + 17;
+    std::vector<uint64_t> stableIds(pointCount);
+    for (size_t point = 0; point < pointCount; ++point)
+        stableIds[point] = 10'000'000 + point * 13;
+
+    const auto selected =
+        msplat::detail::selectCampPoseWorldPointPoolIndices(
+            pointCount, stableIds.data());
+    CHECK(selected.size() ==
+          msplat::detail::kCampMaximumWorldPointPoolCount);
+    std::vector<uint64_t> selectedIds;
+    selectedIds.reserve(selected.size());
+    for (size_t index : selected)
+        selectedIds.push_back(stableIds[index]);
+
+    std::reverse(stableIds.begin(), stableIds.end());
+    const auto reordered =
+        msplat::detail::selectCampPoseWorldPointPoolIndices(
+            pointCount, stableIds.data());
+    std::vector<uint64_t> reorderedIds;
+    reorderedIds.reserve(reordered.size());
+    for (size_t index : reordered)
+        reorderedIds.push_back(stableIds[index]);
+    CHECK(selectedIds == reorderedIds);
+}
+
 } // namespace
 
 int main() {
@@ -780,6 +1222,13 @@ int main() {
         testRegularizationAndBounds();
         testDescentSignAndCanonicalIndexIsolation();
         testPoseStateReadbackGeometry();
+        testCampProjectionJacobian();
+        testCampFullInverseSquareRoot();
+        testCampDampingAndValidation();
+        testCampRepresentativeVisibilityAndConvention();
+        testCampRepresentativeSpatialCapAndStableIDs();
+        testCampRepresentativeHaltonFallbackAndBounds();
+        testCampWorldPointPoolCapUsesStableIDs();
         std::cout << "Pose refinement math tests passed\n";
         return 0;
     } catch (const std::exception& error) {

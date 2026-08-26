@@ -5,6 +5,7 @@
 #include "ssim.hpp"
 #include "input_data.hpp"
 #include "pose_refinement_state.hpp"
+#include "camera_pose_conditioning.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -34,6 +35,8 @@ struct Model{
         bool refinePhotometricGains = false,
         bool refineCameraPoses = false,
         int poseAnchorCameraIndex = -1,
+        msplat::CameraPoseConditioning cameraPoseConditioning =
+            msplat::CameraPoseConditioning::Raw,
         bool transparentTrainingMasks = false,
         float transparentAlphaLossWeight = 0.1f);
 
@@ -133,9 +136,14 @@ struct Model{
   MTensor cameraPoseDeltas;
   MTensor cameraPoseExpAvg;
   MTensor cameraPoseExpAvgSq;
+  MTensor cameraPosePreconditioners;
   std::vector<uint32_t> cameraPoseStepCounts;
   std::vector<std::string> cameraFrameIds;
   std::vector<float> cameraBasePoses;
+  std::vector<float> cameraPosePreconditionerValues;
+  std::vector<uint8_t> cameraPosePreconditionerReady;
+  std::vector<float> cameraPosePointPool;
+  std::vector<uint64_t> cameraPosePointIds;
 
   int numCameras;
   int datasetCameraCount;
@@ -159,12 +167,17 @@ struct Model{
   bool refinePhotometricGains;
   bool refineCameraPoses;
   int poseAnchorCameraIndex;
+  msplat::CameraPoseConditioning cameraPoseConditioning;
   bool transparentTrainingMasks;
   float transparentAlphaLossWeight;
   bool keepCrs;
 
   float scale;
   float translation[3] = {};
+
+private:
+  void ensureCameraPosePreconditioner(
+      const Camera& camera, size_t canonicalCameraIndex);
 };
 
 #endif
