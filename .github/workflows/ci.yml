@@ -1,6 +1,7 @@
 name: CI
 
 on:
+  workflow_dispatch:
   push:
     branches: ["**"]
     tags-ignore: ["v*"]
@@ -128,6 +129,8 @@ jobs:
           swift test
 
       - name: Build iOS example
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
         run: |
           xcodebuild \
             -project examples/ios/MsplatExample.xcodeproj \
@@ -137,6 +140,8 @@ jobs:
             build
 
       - name: Test pose checkpoint resume on iOS Simulator
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
         run: |
           xcodebuild \
             -project examples/ios/MsplatExample.xcodeproj \
@@ -146,6 +151,8 @@ jobs:
             test
 
       - name: Link iOS device test bundle
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
         run: |
           xcodebuild \
             -project examples/ios/MsplatExample.xcodeproj \

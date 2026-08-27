@@ -143,7 +143,7 @@ final class Engine: ObservableObject {
     @Published var countdown: Int = 5
 
     enum Phase: Equatable {
-        case countdown(Int), loading, training, orbiting
+        case countdown(Int), loading, training, orbiting, failed(String)
     }
 
     func start(datasetPath: String) {
@@ -166,13 +166,22 @@ final class Engine: ObservableObject {
         Thread.detachNewThread { [weak self] in
             guard let self else { return }
           autoreleasepool {
-
-            let dataset = GaussianDataset(path: datasetPath)
-            var config = TrainingConfig()
-            config.iterations = 2_000
-            config.numDownscales = 0
-            config.bgColor = (0, 0, 0)
-            let trainer = GaussianTrainer(dataset: dataset, config: config)
+            let dataset: GaussianDataset
+            let trainer: GaussianTrainer
+            do {
+                dataset = try GaussianDataset(path: datasetPath)
+                var config = TrainingConfig()
+                config.iterations = 2_000
+                config.numDownscales = 0
+                config.bgColor = (0, 0, 0)
+                trainer = try GaussianTrainer(dataset: dataset, config: config)
+            } catch {
+                let message = error.localizedDescription
+                DispatchQueue.main.async {
+                    self.phase = .failed(message)
+                }
+                return
+            }
 
             DispatchQueue.main.async { self.phase = .training }
 
@@ -210,7 +219,7 @@ final class Engine: ObservableObject {
                 self.phase = .orbiting
             }
 
-            // Phase 2: Smooth circular orbit with zero-copy render
+            // Phase 2: Smooth circular orbit with zero-copy native rendering
             let poses = (0..<dataset.numTrain).map { dataset.cameraPose(at: $0) }
             let orbit = computeOrbitParams(poses)
             var frameCount = 0
@@ -218,19 +227,59 @@ final class Engine: ObservableObject {
 
             // Query dimensions once to pre-allocate RGBA buffer
             var imgW: Int32 = 0, imgH: Int32 = 0
-            let firstPose = lookAtCamToWorld(eye: orbit.eyeCenter, target: orbit.lookAt, up: orbit.up)
-            trainer.renderFromPoseToBuffer(camToWorld: firstPose, rgba: nil,
-                                           width: &imgW, height: &imgH)
-            let rgbaBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: Int(imgW * imgH) * 4)
-            for i in 0..<Int(imgW * imgH) { rgbaBuf[i * 4 + 3] = 255 }
+            let firstPose = lookAtCamToWorld(
+                eye: orbit.eyeCenter,
+                target: orbit.lookAt,
+                up: orbit.up
+            )
+            do {
+                try trainer.renderFromPoseToBuffer(
+                    camToWorld: firstPose,
+                    rgba: UnsafeMutableRawBufferPointer(start: nil, count: 0),
+                    width: &imgW,
+                    height: &imgH
+                )
+            } catch {
+                let message = error.localizedDescription
+                DispatchQueue.main.async {
+                    self.phase = .failed(message)
+                }
+                return
+            }
+            guard imgW > 0, imgH > 0 else {
+                DispatchQueue.main.async {
+                    self.phase = .failed("Native renderer returned invalid dimensions.")
+                }
+                return
+            }
+            let (pixelCount, pixelCountOverflow) = Int(imgW)
+                .multipliedReportingOverflow(by: Int(imgH))
+            let (byteCount, byteCountOverflow) = pixelCount
+                .multipliedReportingOverflow(by: 4)
+            guard !pixelCountOverflow, !byteCountOverflow else {
+                DispatchQueue.main.async {
+                    self.phase = .failed("Render dimensions exceed Swift buffer limits.")
+                }
+                return
+            }
+            let rgbaBuf = UnsafeMutablePointer<UInt8>.allocate(capacity: byteCount)
+            defer { rgbaBuf.deallocate() }
+            let rgbaStorage = UnsafeMutableRawBufferPointer(
+                start: rgbaBuf,
+                count: byteCount
+            )
+            for i in 0..<pixelCount { rgbaBuf[i * 4 + 3] = 255 }
 
             let colorSpace = CGColorSpaceCreateDeviceRGB()
-            let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
+            let bitmapInfo = CGBitmapInfo(
+                rawValue: CGImageAlphaInfo.premultipliedLast.rawValue
+            )
 
             let orbitPeriod: Double = 7.5  // seconds per full revolution
             let orbitStart = CACurrentMediaTime()
 
             while true {
+                var renderFailure: String?
                 autoreleasepool {
                     let elapsed = CACurrentMediaTime() - orbitStart
                     let angle = Float(elapsed / orbitPeriod) * 2.0 * .pi
@@ -242,9 +291,22 @@ final class Engine: ObservableObject {
                         orbit.eyeCenter.2 + orbit.radius * (cosA * t1.2 + sinA * t2.2)
                     )
 
-                    let pose = lookAtCamToWorld(eye: eye, target: orbit.lookAt, up: orbit.up)
-                    trainer.renderFromPoseToBuffer(camToWorld: pose, rgba: rgbaBuf,
-                                                   width: &imgW, height: &imgH)
+                    let pose = lookAtCamToWorld(
+                        eye: eye,
+                        target: orbit.lookAt,
+                        up: orbit.up
+                    )
+                    do {
+                        try trainer.renderFromPoseToBuffer(
+                            camToWorld: pose,
+                            rgba: rgbaStorage,
+                            width: &imgW,
+                            height: &imgH
+                        )
+                    } catch {
+                        renderFailure = error.localizedDescription
+                        return
+                    }
                     frameCount += 1
 
                     var currentFps: Float = 0
@@ -256,18 +318,20 @@ final class Engine: ObservableObject {
                         fpsTimer = now
                     }
 
-                    // Only push to UI if main thread consumed previous frame
+                    // The render buffer is reused immediately, so publish an owned copy.
                     if OSAtomicCompareAndSwap32(1, 0, &displayReady) {
-                        let provider = CGDataProvider(dataInfo: nil, data: rgbaBuf,
-                                                       size: Int(imgW * imgH) * 4,
-                                                       releaseData: { _, _, _ in })!
+                        let frameData = Data(bytes: rgbaBuf, count: byteCount)
+                        let provider = CGDataProvider(data: frameData as CFData)!
                         let cgImg = CGImage(width: Int(imgW), height: Int(imgH),
                                             bitsPerComponent: 8, bitsPerPixel: 32,
                                             bytesPerRow: Int(imgW) * 4, space: colorSpace,
                                             bitmapInfo: bitmapInfo, provider: provider,
                                             decode: nil, shouldInterpolate: false,
                                             intent: .defaultIntent)!
-                        let img = NSImage(cgImage: cgImg, size: NSSize(width: Int(imgW), height: Int(imgH)))
+                        let img = NSImage(
+                            cgImage: cgImg,
+                            size: NSSize(width: Int(imgW), height: Int(imgH))
+                        )
                         let fpsVal = currentFps
                         DispatchQueue.main.async {
                             self.image = img
@@ -275,6 +339,12 @@ final class Engine: ObservableObject {
                             OSAtomicCompareAndSwap32(0, 1, &displayReady)
                         }
                     }
+                }
+                if let renderFailure {
+                    DispatchQueue.main.async {
+                        self.phase = .failed(renderFailure)
+                    }
+                    return
                 }
             }
           } // autoreleasepool (outer)
@@ -346,6 +416,20 @@ struct ContentView: View {
                     Spacer()
                 }
             }
+
+            if case .failed(let message) = engine.phase {
+                VStack(spacing: 12) {
+                    Text("Training failed")
+                        .font(.title2.bold())
+                    Text(message)
+                        .multilineTextAlignment(.center)
+                }
+                .foregroundStyle(.white)
+                .padding(24)
+                .background(.black.opacity(0.8))
+                .cornerRadius(12)
+                .padding(40)
+            }
         }
         .onAppear {
             engine.start(datasetPath: datasetPath)
@@ -376,7 +460,7 @@ struct ContentView: View {
     private var statsBar: some View {
         HStack(spacing: 32) {
             switch engine.phase {
-            case .countdown, .loading:
+            case .countdown, .loading, .failed:
                 EmptyView()
             case .training:
                 Text("step \(engine.iteration) / \(engine.totalIterations)")

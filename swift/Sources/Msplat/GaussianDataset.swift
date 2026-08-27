@@ -14,8 +14,13 @@ private var metallibResourceName: String {
 }
 
 /// A loaded dataset of camera views for training.
+@available(
+    *,
+    deprecated,
+    message: "Use MsplatSession, which reports initialization failures and enforces exclusive native-engine ownership"
+)
 public class GaussianDataset {
-    let handle: MsplatDataset?
+    let handle: MsplatDataset
 
     /// Load a dataset from disk.
     /// - Parameters:
@@ -24,16 +29,43 @@ public class GaussianDataset {
     ///   - evalMode: If true, split cameras into train/test sets.
     ///   - testEvery: Hold out every Nth image for evaluation.
     public init(path: String, downscaleFactor: Float = 1.0,
-                evalMode: Bool = false, testEvery: Int32 = 8) {
-        try? withConfiguredNativeEngine(metallibResourceName) {}
-        handle = withNativeEngineLock {
-            msplat_dataset_create(path, downscaleFactor, evalMode, testEvery)
+                evalMode: Bool = false, testEvery: Int32 = 8) throws {
+        try reserveNativeSession()
+        let createdHandle: MsplatDataset
+        do {
+            createdHandle = try withConfiguredNativeEngine(metallibResourceName) {
+                var dataset: MsplatDataset?
+                var nativeError = MsplatErrorInfo()
+                let status = msplat_dataset_create_v10(
+                    path,
+                    downscaleFactor,
+                    evalMode,
+                    testEvery,
+                    false,
+                    &dataset,
+                    &nativeError
+                )
+                try checkNativeStatus(status, error: &nativeError)
+                guard let dataset else {
+                    throw MsplatError.internalFailure(
+                        "Native dataset creation returned no handle"
+                    )
+                }
+                return dataset
+            }
+        } catch {
+            releaseNativeSession()
+            throw error
         }
+        handle = createdHandle
     }
 
     deinit {
-        guard let handle else { return }
-        withNativeEngineLock { msplat_dataset_destroy(handle) }
+        withNativeEngineLock {
+            var nativeError = MsplatErrorInfo()
+            _ = msplat_dataset_destroy_v2(handle, &nativeError)
+        }
+        releaseNativeSession()
     }
 
     /// Number of training cameras.

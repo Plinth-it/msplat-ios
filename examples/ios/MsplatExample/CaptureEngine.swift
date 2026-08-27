@@ -6,17 +6,56 @@ import OSLog
 import Synchronization
 import UIKit
 
-enum CaptureEngineEvent: Sendable {
-    case frameCommitted(CaptureCommit)
-    case frameQualityFallback(String)
-    case frameRejected(String)
+enum CaptureEngineControlEvent: Sendable {
+    case frameCommitted(
+        candidateSequence: UInt64,
+        commit: CaptureCommit,
+        qualityFallback: String?
+    )
     case failed(String)
+}
+
+enum CaptureEngineTelemetryEvent: Sendable {
+    case frameRejected(candidateSequence: UInt64, message: String)
+}
+
+/// Retains one synchronized streaming observation without retaining `ARFrame`.
+/// Admission bounds this to one snapshot through high-resolution commit/fallback.
+struct CaptureFrameSnapshot: @unchecked Sendable {
+    let image: CVPixelBuffer
+    let depth: CVPixelBuffer?
+    let confidence: CVPixelBuffer?
+    let displayOrientation: CaptureDisplayOrientation
+    let calibration: CaptureCalibrationRecord
+    let cameraToWorld: simd_float4x4
+    let timestamp: TimeInterval
+    let exposureDuration: TimeInterval
+    let trackingState: String
+    let rawFeaturePoints: [SIMD3<Float>]
+    let subjectWorldPosition: SIMD3<Float>?
+
+    func materialize() throws -> CaptureFrameCandidate {
+        CaptureFrameCandidate(
+            image: try copyPixelBuffer(image),
+            depth: try depth.map(copyPixelBuffer),
+            confidence: try confidence.map(copyPixelBuffer),
+            displayOrientation: displayOrientation,
+            calibration: calibration,
+            cameraToWorld: cameraToWorld,
+            timestamp: timestamp,
+            exposureDuration: exposureDuration,
+            trackingState: trackingState,
+            rawFeaturePoints: rawFeaturePoints,
+            subjectWorldPosition: subjectWorldPosition
+        )
+    }
 }
 
 struct CaptureFrameAdmission: Sendable {
     fileprivate let generation: UInt64
-    fileprivate let candidateID: UInt64
+    let candidateSequence: UInt64
     fileprivate let store: CaptureStore
+    let requestsHighResolutionFrame: Bool
     let displayOrientation: CaptureDisplayOrientation
     fileprivate let cameraToWorld: simd_float4x4
     fileprivate let timestamp: TimeInterval
@@ -49,10 +88,11 @@ final class CaptureHighResolutionRequestGate: Sendable {
 final class CaptureFrameAdmissionController: Sendable {
     private struct State {
         var generation: UInt64 = 0
-        var nextCandidateID: UInt64 = 0
-        var activeCandidateID: UInt64?
+        var nextCandidateSequence: UInt64 = 0
+        var activeCandidateSequence: UInt64?
         var isRecording = false
         var store: CaptureStore?
+        var usesHighResolutionCapture = false
         var subjectWorldPosition: SIMD3<Float>?
         var displayOrientation: CaptureDisplayOrientation?
         var lastAcceptedTransform: simd_float4x4?
@@ -62,14 +102,18 @@ final class CaptureFrameAdmissionController: Sendable {
 
     private let state = Mutex(State())
 
-    func start(store: CaptureStore, subjectWorldPosition: SIMD3<Float>?) {
+    func start(
+        store: CaptureStore,
+        subjectWorldPosition: SIMD3<Float>?,
+        usesHighResolutionCapture: Bool = true
+    ) {
         let previousTask = state.withLock { state in
             let previousTask = state.processingTask
             state.generation &+= 1
-            state.nextCandidateID = 0
-            state.activeCandidateID = nil
+            state.activeCandidateSequence = nil
             state.isRecording = true
             state.store = store
+            state.usesHighResolutionCapture = usesHighResolutionCapture
             state.subjectWorldPosition = subjectWorldPosition
             state.lastAcceptedTransform = nil
             state.lastAcceptedTimestamp = nil
@@ -97,7 +141,7 @@ final class CaptureFrameAdmissionController: Sendable {
     ) -> CaptureFrameAdmission? {
         state.withLock { state in
             guard state.isRecording,
-                  state.activeCandidateID == nil,
+                  state.activeCandidateSequence == nil,
                   let store = state.store,
                   let displayOrientation = state.displayOrientation else {
                 return nil
@@ -120,13 +164,14 @@ final class CaptureFrameAdmissionController: Sendable {
                 }
             }
 
-            state.nextCandidateID &+= 1
-            let candidateID = state.nextCandidateID
-            state.activeCandidateID = candidateID
+            state.nextCandidateSequence &+= 1
+            let candidateSequence = state.nextCandidateSequence
+            state.activeCandidateSequence = candidateSequence
             return CaptureFrameAdmission(
                 generation: state.generation,
-                candidateID: candidateID,
+                candidateSequence: candidateSequence,
                 store: store,
+                requestsHighResolutionFrame: state.usesHighResolutionCapture,
                 displayOrientation: displayOrientation,
                 cameraToWorld: cameraToWorld,
                 timestamp: timestamp,
@@ -141,7 +186,7 @@ final class CaptureFrameAdmissionController: Sendable {
     ) {
         let candidateIsActive = state.withLock { state in
             guard state.generation == admission.generation,
-                  state.activeCandidateID == admission.candidateID else {
+                  state.activeCandidateSequence == admission.candidateSequence else {
                 return false
             }
             state.processingTask = task
@@ -161,7 +206,7 @@ final class CaptureFrameAdmissionController: Sendable {
     ) -> Bool {
         state.withLock { state in
             guard state.generation == admission.generation,
-                  state.activeCandidateID == admission.candidateID else {
+                  state.activeCandidateSequence == admission.candidateSequence else {
                 return false
             }
             if committed {
@@ -170,7 +215,7 @@ final class CaptureFrameAdmissionController: Sendable {
                 state.lastAcceptedTimestamp = acceptedTimestamp
                     ?? admission.timestamp
             }
-            state.activeCandidateID = nil
+            state.activeCandidateSequence = nil
             state.processingTask = nil
             return true
         }
@@ -185,9 +230,10 @@ final class CaptureFrameAdmissionController: Sendable {
         let task = state.withLock { state in
             let task = state.processingTask
             state.generation &+= 1
-            state.activeCandidateID = nil
+            state.activeCandidateSequence = nil
             state.isRecording = false
             state.store = nil
+            state.usesHighResolutionCapture = false
             state.subjectWorldPosition = nil
             state.processingTask = nil
             return task
@@ -209,19 +255,31 @@ private final class CaptureFrameIngestor: NSObject,
         qos: .userInitiated
     )
 
-    private let continuation: AsyncStream<CaptureEngineEvent>.Continuation
+    private let controlContinuation:
+        AsyncStream<CaptureEngineControlEvent>.Continuation
+    private let telemetryContinuation:
+        AsyncStream<CaptureEngineTelemetryEvent>.Continuation
     private let admission = CaptureFrameAdmissionController()
     private let highResolutionRequestGate = CaptureHighResolutionRequestGate()
 
-    init(continuation: AsyncStream<CaptureEngineEvent>.Continuation) {
-        self.continuation = continuation
+    init(
+        controlContinuation: AsyncStream<CaptureEngineControlEvent>.Continuation,
+        telemetryContinuation: AsyncStream<CaptureEngineTelemetryEvent>.Continuation
+    ) {
+        self.controlContinuation = controlContinuation
+        self.telemetryContinuation = telemetryContinuation
         super.init()
     }
 
-    func start(store: CaptureStore, subjectWorldPosition: SIMD3<Float>?) {
+    func start(
+        store: CaptureStore,
+        subjectWorldPosition: SIMD3<Float>?,
+        usesHighResolutionCapture: Bool
+    ) {
         admission.start(
             store: store,
-            subjectWorldPosition: subjectWorldPosition
+            subjectWorldPosition: subjectWorldPosition,
+            usesHighResolutionCapture: usesHighResolutionCapture
         )
     }
 
@@ -262,58 +320,79 @@ private final class CaptureFrameIngestor: NSObject,
         ) else {
             return
         }
-        guard highResolutionRequestGate.reserve() else {
-            admission.complete(ticket, committed: false)
-            return
+        if ticket.requestsHighResolutionFrame {
+            guard highResolutionRequestGate.reserve() else {
+                admission.complete(ticket, committed: false)
+                return
+            }
         }
 
-        let streamingCandidate: CaptureFrameCandidate
+        let streamingSnapshot: CaptureFrameSnapshot
         do {
-            streamingCandidate = try makeCaptureFrameCandidate(
+            streamingSnapshot = try makeCaptureFrameSnapshot(
                 from: frame,
                 displayOrientation: ticket.displayOrientation,
                 subjectWorldPosition: ticket.subjectWorldPosition
             )
         } catch {
-            highResolutionRequestGate.release()
+            if ticket.requestsHighResolutionFrame {
+                highResolutionRequestGate.release()
+            }
             if admission.complete(ticket, committed: false) {
-                continuation.yield(.frameRejected(error.localizedDescription))
+                telemetryContinuation.yield(.frameRejected(
+                    candidateSequence: ticket.candidateSequence,
+                    message: error.localizedDescription
+                ))
             }
             return
         }
 
         let admission = admission
-        let continuation = continuation
+        let controlContinuation = controlContinuation
+        let telemetryContinuation = telemetryContinuation
         let highResolutionRequestGate = highResolutionRequestGate
         let processingTask = Task(priority: .userInitiated) {
             do {
-                let candidate: CaptureFrameCandidate
-                let fallbackMessage: String?
-                do {
-                    let highResolutionCandidate =
-                        try await makeHighResolutionCaptureFrameCandidate(
-                            session: session,
-                            displayOrientation: ticket.displayOrientation,
-                            subjectWorldPosition: ticket.subjectWorldPosition,
-                            requestGate: highResolutionRequestGate
+                var candidate: CaptureFrameCandidate
+                var commitFallback: CaptureFrameSnapshot?
+                var fallbackMessage: String?
+                if ticket.requestsHighResolutionFrame {
+                    do {
+                        let highResolutionCandidate =
+                            try await makeHighResolutionCaptureFrameCandidate(
+                                session: session,
+                                displayOrientation: ticket.displayOrientation,
+                                subjectWorldPosition: ticket.subjectWorldPosition,
+                                requestGate: highResolutionRequestGate
                         )
-                    if captureCandidateHasUsableGeometry(highResolutionCandidate) {
-                        candidate = highResolutionCandidate
-                        fallbackMessage = nil
-                    } else {
-                        candidate = streamingCandidate
-                        fallbackMessage = "The high-resolution frame lacked " +
-                            "usable geometry; captured a camera-stream frame instead."
+                        if captureCandidateHasUsableGeometry(highResolutionCandidate) {
+                            candidate = highResolutionCandidate
+                            commitFallback = streamingSnapshot
+                        } else {
+                            candidate = try streamingSnapshot.materialize()
+                            fallbackMessage = "The high-resolution frame lacked " +
+                                "usable geometry; captured a camera-stream frame instead."
+                        }
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch {
+                        candidate = try streamingSnapshot.materialize()
+                        fallbackMessage = "High-resolution capture failed; captured " +
+                            "a camera-stream frame instead."
                     }
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    candidate = streamingCandidate
-                    fallbackMessage = "High-resolution capture failed; captured " +
-                        "a camera-stream frame instead."
+                } else {
+                    candidate = try streamingSnapshot.materialize()
                 }
                 try Task.checkCancellation()
-                let commit = try await ticket.store.accept(candidate)
+                let acceptance = try await acceptCaptureCandidate(
+                    candidate,
+                    streamingFallback: commitFallback,
+                    in: ticket.store
+                )
+                candidate = acceptance.candidate
+                if let commitFallbackMessage = acceptance.fallbackMessage {
+                    fallbackMessage = commitFallbackMessage
+                }
                 try Task.checkCancellation()
                 if admission.complete(
                     ticket,
@@ -321,16 +400,20 @@ private final class CaptureFrameIngestor: NSObject,
                     acceptedCameraToWorld: candidate.cameraToWorld,
                     acceptedTimestamp: candidate.timestamp
                 ) {
-                    continuation.yield(.frameCommitted(commit))
-                    if let fallbackMessage {
-                        continuation.yield(.frameQualityFallback(fallbackMessage))
-                    }
+                    controlContinuation.yield(.frameCommitted(
+                        candidateSequence: ticket.candidateSequence,
+                        commit: acceptance.commit,
+                        qualityFallback: fallbackMessage
+                    ))
                 }
             } catch is CancellationError {
                 admission.complete(ticket, committed: false)
             } catch {
                 if admission.complete(ticket, committed: false) {
-                    continuation.yield(.frameRejected(error.localizedDescription))
+                    telemetryContinuation.yield(.frameRejected(
+                        candidateSequence: ticket.candidateSequence,
+                        message: error.localizedDescription
+                    ))
                 }
             }
         }
@@ -339,7 +422,7 @@ private final class CaptureFrameIngestor: NSObject,
 
     func session(_ session: ARSession, didFailWithError error: Error) {
         abort()
-        continuation.yield(.failed(error.localizedDescription))
+        controlContinuation.yield(.failed(error.localizedDescription))
     }
 }
 
@@ -351,9 +434,13 @@ final class CaptureEngine: NSObject {
     )
 
     let session = ARSession()
-    let events: AsyncStream<CaptureEngineEvent>
+    let controlEvents: AsyncStream<CaptureEngineControlEvent>
+    let telemetryEvents: AsyncStream<CaptureEngineTelemetryEvent>
 
-    private let continuation: AsyncStream<CaptureEngineEvent>.Continuation
+    private let controlContinuation:
+        AsyncStream<CaptureEngineControlEvent>.Continuation
+    private let telemetryContinuation:
+        AsyncStream<CaptureEngineTelemetryEvent>.Continuation
     private let frameIngestor: CaptureFrameIngestor
     private let subjectSelector = CaptureSubjectSelector()
     private let captureBaseDirectory: URL
@@ -363,16 +450,26 @@ final class CaptureEngine: NSObject {
     private var displayOrientation: CaptureDisplayOrientation?
     private(set) var subjectWorldPosition: SIMD3<Float>?
     private(set) var supportsSceneDepth = false
+    private(set) var supportsHighResolutionCapture = false
     private(set) var isRecording = false
 
     init(captureBaseDirectory: URL = .documentsDirectory) {
-        let stream = AsyncStream.makeStream(
-            of: CaptureEngineEvent.self,
+        let controlStream = AsyncStream.makeStream(
+            of: CaptureEngineControlEvent.self,
+            bufferingPolicy: .unbounded
+        )
+        let telemetryStream = AsyncStream.makeStream(
+            of: CaptureEngineTelemetryEvent.self,
             bufferingPolicy: .bufferingNewest(32)
         )
-        events = stream.stream
-        continuation = stream.continuation
-        frameIngestor = CaptureFrameIngestor(continuation: stream.continuation)
+        controlEvents = controlStream.stream
+        telemetryEvents = telemetryStream.stream
+        controlContinuation = controlStream.continuation
+        telemetryContinuation = telemetryStream.continuation
+        frameIngestor = CaptureFrameIngestor(
+            controlContinuation: controlStream.continuation,
+            telemetryContinuation: telemetryStream.continuation
+        )
         self.captureBaseDirectory = captureBaseDirectory
         super.init()
         session.delegate = frameIngestor
@@ -380,7 +477,8 @@ final class CaptureEngine: NSObject {
     }
 
     deinit {
-        continuation.finish()
+        controlContinuation.finish()
+        telemetryContinuation.finish()
     }
 
     func prepare() async throws {
@@ -404,11 +502,13 @@ final class CaptureEngine: NSObject {
 
         let configuration = ARWorldTrackingConfiguration()
         configuration.worldAlignment = .gravity
-        guard let highResolutionVideoFormat = ARWorldTrackingConfiguration
-            .recommendedVideoFormatForHighResolutionFrameCapturing else {
-            throw CaptureFailure.highResolutionCaptureUnavailable
+        if let highResolutionVideoFormat = ARWorldTrackingConfiguration
+            .recommendedVideoFormatForHighResolutionFrameCapturing {
+            configuration.videoFormat = highResolutionVideoFormat
+            supportsHighResolutionCapture = true
+        } else {
+            supportsHighResolutionCapture = false
         }
-        configuration.videoFormat = highResolutionVideoFormat
         let allDepthSemantics: ARConfiguration.FrameSemantics = [
             .sceneDepth,
             .smoothedSceneDepth,
@@ -485,7 +585,8 @@ final class CaptureEngine: NSObject {
         self.store = store
         frameIngestor.start(
             store: store,
-            subjectWorldPosition: subjectWorldPosition
+            subjectWorldPosition: subjectWorldPosition,
+            usesHighResolutionCapture: supportsHighResolutionCapture
         )
         isRecording = true
     }
@@ -575,6 +676,40 @@ final class CaptureEngine: NSObject {
     }
 }
 
+struct CaptureCandidateAcceptance: Sendable {
+    let commit: CaptureCommit
+    let candidate: CaptureFrameCandidate
+    let fallbackMessage: String?
+}
+
+func acceptCaptureCandidate(
+    _ candidate: CaptureFrameCandidate,
+    streamingFallback: CaptureFrameSnapshot?,
+    in store: CaptureStore
+) async throws -> CaptureCandidateAcceptance {
+    do {
+        let commit = try await store.accept(candidate)
+        return CaptureCandidateAcceptance(
+            commit: commit,
+            candidate: candidate,
+            fallbackMessage: nil
+        )
+    } catch let CaptureFailure.invalidFrame(message) {
+        guard let streamingFallback else {
+            throw CaptureFailure.invalidFrame(message)
+        }
+        try Task.checkCancellation()
+        let fallbackCandidate = try streamingFallback.materialize()
+        let commit = try await store.accept(fallbackCandidate)
+        return CaptureCandidateAcceptance(
+            commit: commit,
+            candidate: fallbackCandidate,
+            fallbackMessage: "The high-resolution frame was rejected; captured " +
+                "a camera-stream frame instead."
+        )
+    }
+}
+
 private func makeHighResolutionCaptureFrameCandidate(
     session: ARSession,
     displayOrientation: CaptureDisplayOrientation,
@@ -611,7 +746,18 @@ private func makeCaptureFrameCandidate(
     displayOrientation: CaptureDisplayOrientation,
     subjectWorldPosition: SIMD3<Float>?
 ) throws -> CaptureFrameCandidate {
-    let image = try copyPixelBuffer(frame.capturedImage)
+    try makeCaptureFrameSnapshot(
+        from: frame,
+        displayOrientation: displayOrientation,
+        subjectWorldPosition: subjectWorldPosition
+    ).materialize()
+}
+
+private func makeCaptureFrameSnapshot(
+    from frame: ARFrame,
+    displayOrientation: CaptureDisplayOrientation,
+    subjectWorldPosition: SIMD3<Float>?
+) throws -> CaptureFrameSnapshot {
     let imageWidth = CVPixelBufferGetWidth(frame.capturedImage)
     let imageHeight = CVPixelBufferGetHeight(frame.capturedImage)
     let resolution = frame.camera.imageResolution
@@ -631,18 +777,16 @@ private func makeCaptureFrameCandidate(
         cy: intrinsics.columns.2.y
     )
     let depthData = frame.sceneDepth ?? frame.smoothedSceneDepth
-    let depth = try depthData.map { try copyPixelBuffer($0.depthMap) }
-    let confidence = try depthData?.confidenceMap.map(copyPixelBuffer)
     let rawFeaturePoints: [SIMD3<Float>]
     if let cloud = frame.rawFeaturePoints {
         rawFeaturePoints = Array(cloud.points)
     } else {
         rawFeaturePoints = []
     }
-    return CaptureFrameCandidate(
-        image: image,
-        depth: depth,
-        confidence: confidence,
+    return CaptureFrameSnapshot(
+        image: frame.capturedImage,
+        depth: depthData?.depthMap,
+        confidence: depthData?.confidenceMap,
         displayOrientation: displayOrientation,
         calibration: calibration,
         cameraToWorld: frame.camera.transform,

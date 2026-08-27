@@ -14,8 +14,12 @@
 #include <cstdlib>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
 #include <future>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <TargetConditionals.h>
 
 namespace fs = std::filesystem;
@@ -1023,6 +1027,81 @@ struct CameraImageCache::PrefetchTask {
           future(std::move(result)) {}
 };
 
+struct CameraImageCache::PrefetchWorker {
+    struct Work {
+        CameraTargetRequest request;
+        std::shared_ptr<std::atomic<size_t>> stagedBytes;
+        std::promise<PreparedCameraTarget> result;
+    };
+
+    std::mutex mutex;
+    std::condition_variable condition;
+    bool stopping = false;
+    std::optional<Work> pending;
+    std::thread thread;
+
+    PrefetchWorker()
+        : thread([this] { run(); }) {}
+
+    ~PrefetchWorker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            stopping = true;
+        }
+        condition.notify_one();
+        if (thread.joinable()) thread.join();
+    }
+
+    PrefetchWorker(const PrefetchWorker &) = delete;
+    PrefetchWorker& operator=(const PrefetchWorker &) = delete;
+
+    std::future<PreparedCameraTarget> submit(
+        CameraTargetRequest request,
+        std::shared_ptr<std::atomic<size_t>> stagedBytes) {
+        Work work{
+            std::move(request),
+            std::move(stagedBytes),
+            std::promise<PreparedCameraTarget>{},
+        };
+        std::future<PreparedCameraTarget> future = work.result.get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stopping || pending) {
+                throw std::logic_error("Camera prefetch worker is busy");
+            }
+            pending.emplace(std::move(work));
+        }
+        condition.notify_one();
+        return future;
+    }
+
+private:
+    void run() noexcept {
+        while (true) {
+            std::optional<Work> work;
+            {
+                std::unique_lock<std::mutex> lock(mutex);
+                condition.wait(lock, [this] { return stopping || pending; });
+                if (!pending) return;
+                work.emplace(std::move(*pending));
+                pending.reset();
+            }
+
+            try {
+                work->result.set_value(prepareCameraTarget(
+                    std::move(work->request), work->stagedBytes));
+            } catch (...) {
+                try {
+                    work->result.set_exception(std::current_exception());
+                } catch (...) {
+                    // The foreground consumer may have released its future
+                    // while this best-effort worker was completing.
+                }
+            }
+        }
+    }
+};
+
 CameraImageCache::CameraImageCache()
     : CameraImageCache(1.0f, 0, defaultPrefetchEnabled()) {}
 
@@ -1102,12 +1181,10 @@ void CameraImageCache::prefetchTrainingTarget(
         request.includeCoverageRenderTiles = includeCoverageRenderTiles;
         request.source = sourceSnapshot(camera);
         auto stagedBytes = std::make_shared<std::atomic<size_t>>(0);
-        auto future = std::async(
-            std::launch::async,
-            [workerRequest = request, stagedBytes]() mutable {
-                return prepareCameraTarget(
-                    std::move(workerRequest), stagedBytes);
-            });
+        if (!_prefetchWorker) {
+            _prefetchWorker = std::make_unique<PrefetchWorker>();
+        }
+        auto future = _prefetchWorker->submit(request, stagedBytes);
         _prefetch = std::make_unique<PrefetchTask>(
             request, std::move(stagedBytes), std::move(future));
         ++_prefetchScheduledCount;

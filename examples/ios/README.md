@@ -36,15 +36,27 @@ images, and Vision can export training masks afterward. This supports aligning
 against the complete images while still making foreground masks available to
 training.
 On a physical device the app requests camera poses and a sparse colored point
-cloud, normalizes the registered images into their encoded raster orientation,
-and atomically publishes a separate COLMAP dataset under
+cloud, exports the registered images in a consistent raster orientation, and
+atomically publishes a separate COLMAP dataset under
 `Documents/RealityKitAlignments`. The result contains `images/` plus text and
 binary `cameras`, `images`, and `points3D` files under `sparse/0`, and can be
-selected immediately for training or shared through the Files sheet.
+selected immediately for training or shared through the Files sheet. An
+up-oriented JPEG or PNG is copied byte-for-byte. Images that require orientation
+or format conversion are written as lossless RGBA8 PNG in explicit sRGB, avoiding
+a second lossy JPEG generation. Each registered image keeps its own COLMAP camera
+record so small per-frame calibration changes are not merged.
+
+This output is a camera-and-point seed for msplat training, not a complete SfM
+reconstruction. Its image observations (`POINTS2D`) and sparse-point tracks are
+intentionally empty, so it is not equivalent to feature-matched,
+bundle-adjusted COLMAP or Metashape output. The exported `sparse/0` directory
+contains `REALITYKIT_SEED_MODEL.md` with that contract. Downstream workflows
+that require observations or tracks must first run feature extraction,
+matching, triangulation, and bundle adjustment.
 
 When **Export Vision masks for training** is enabled, Vision processes only the
 registered, normalized images. It writes a matching 8-bit grayscale PNG for
-each exported JPEG under `masks/`, for example `images/image_000001.jpg` and
+each exported image under `masks/`, for example `images/image_000001.jpg` and
 `masks/image_000001.png`. Foreground is white and background is black. The
 sample app discovers these sidecars automatically when the aligned dataset is
 selected; the later **Use discovered masks** control still decides whether

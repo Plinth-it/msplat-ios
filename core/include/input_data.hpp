@@ -234,6 +234,7 @@ public:
 private:
     void evict(std::vector<Camera> &cameras, size_t protectedIndex);
     struct PrefetchTask;
+    struct PrefetchWorker;
 
     struct Entry {
         uint64_t lastUse = 0;
@@ -249,6 +250,7 @@ private:
     uint64_t _hitCount = 0;
     uint64_t _missCount = 0;
     bool _prefetchEnabled = false;
+    std::unique_ptr<PrefetchWorker> _prefetchWorker;
     std::unique_ptr<PrefetchTask> _prefetch;
     uint64_t _prefetchScheduledCount = 0;
     uint64_t _prefetchUsedCount = 0;

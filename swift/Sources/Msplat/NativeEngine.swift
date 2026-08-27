@@ -21,7 +21,7 @@ func withNativeEngineLock<Result>(_ operation: () throws -> Result) rethrows -> 
 func reserveNativeSession() throws {
     try nativeEngineState.withLock { state in
         guard !state.hasActiveSession else {
-            throw MsplatError.invalidArgument("Another MsplatSession is already active")
+            throw MsplatError.invalidArgument("Another msplat session is already active")
         }
         state.hasActiveSession = true
     }

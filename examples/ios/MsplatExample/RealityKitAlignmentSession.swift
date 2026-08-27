@@ -106,31 +106,43 @@ enum RealityKitAlignmentFailure: LocalizedError, Sendable {
 }
 
 private enum RealityKitAlignmentPreflight {
+    struct Input: Sendable {
+        let imageURLs: [URL]
+        let maximumImageCount: Int
+        let maximumImageDimension: Int
+    }
+
     private static let bytesPerDecodedPixel: UInt64 = 4
     private static let minimumAvailableMemory: UInt64 = 1_250 * 1_024 * 1_024
     private static let fixedSessionOverhead: UInt64 = 512 * 1_024 * 1_024
     private static let perImageFeatureBudget: UInt64 = 12 * 1_024 * 1_024
 
-    static func validate(_ input: RealityKitAlignmentInput) throws {
+    static func validate(_ input: Input) throws {
         let imageCount = input.imageURLs.count
         guard imageCount >= 3 else {
             throw RealityKitAlignmentFailure.tooFewImages(imageCount)
         }
 
-        let limits = PhotogrammetrySession.limits
-        guard imageCount <= limits.maximumNumberOfInputImages else {
+        guard imageCount <= input.maximumImageCount else {
             throw RealityKitAlignmentFailure.tooManyImages(
                 count: imageCount,
-                maximum: limits.maximumNumberOfInputImages
+                maximum: input.maximumImageCount
             )
         }
 
-        let decodedSizes = input.imageURLs.compactMap(imageMetrics)
+        var decodedSizes: [(largestDimension: Int, decodedBytes: UInt64)] = []
+        decodedSizes.reserveCapacity(imageCount)
+        for imageURL in input.imageURLs {
+            try Task.checkCancellation()
+            if let metrics = imageMetrics(at: imageURL) {
+                decodedSizes.append(metrics)
+            }
+        }
         if let largestDimension = decodedSizes.map(\.largestDimension).max(),
-           largestDimension > limits.maximumInputImageDimension {
+           largestDimension > input.maximumImageDimension {
             throw RealityKitAlignmentFailure.imageTooLarge(
                 dimension: largestDimension,
-                maximum: limits.maximumInputImageDimension
+                maximum: input.maximumImageDimension
             )
         }
 
@@ -273,7 +285,20 @@ final class RealityKitAlignmentSession: ObservableObject {
                 throw RealityKitAlignmentFailure.rawImageIntrinsicsRequireNewerOS
             }
         }
-        try RealityKitAlignmentPreflight.validate(input)
+        let limits = PhotogrammetrySession.limits
+        let preflightInput = RealityKitAlignmentPreflight.Input(
+            imageURLs: input.imageURLs,
+            maximumImageCount: limits.maximumNumberOfInputImages,
+            maximumImageDimension: limits.maximumInputImageDimension
+        )
+        let preflightTask = Task.detached(priority: .userInitiated) {
+            try RealityKitAlignmentPreflight.validate(preflightInput)
+        }
+        try await withTaskCancellationHandler {
+            try await preflightTask.value
+        } onCancel: {
+            preflightTask.cancel()
+        }
         try Task.checkCancellation()
         let processed = try await processAlignment(
             input: input,

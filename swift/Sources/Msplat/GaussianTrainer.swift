@@ -2,17 +2,26 @@ import MsplatCore
 import Foundation
 
 /// Trains a 3D Gaussian Splatting scene on a dataset.
+@available(
+    *,
+    deprecated,
+    message: "Use MsplatSession, which reports initialization failures and enforces exclusive native-engine ownership"
+)
 public class GaussianTrainer {
-    private let handle: MsplatTrainer?
+    private let handle: MsplatTrainer
     private let dataset: GaussianDataset
 
     /// Create a trainer.
     /// - Parameters:
     ///   - dataset: The loaded dataset. Retained for the trainer's lifetime.
     ///   - config: Training configuration.
-    public init(dataset: GaussianDataset, config: TrainingConfig = TrainingConfig()) {
+    public init(
+        dataset: GaussianDataset,
+        config: TrainingConfig = TrainingConfig()
+    ) throws {
+        try config.validate()
         self.dataset = dataset
-        handle = withNativeEngineLock {
+        handle = try withNativeEngineLock {
             var nativeConfig = config.toC()
             var limits = msplat_default_training_limits()
             var refinementOptions = config.toRefinementOptionsV8()
@@ -32,14 +41,21 @@ public class GaussianTrainer {
                 &trainer,
                 &nativeError
             )
-            guard status == MSPLAT_STATUS_OK else { return nil }
+            try checkNativeStatus(status, error: &nativeError)
+            guard let trainer else {
+                throw MsplatError.internalFailure(
+                    "Native trainer creation returned no handle"
+                )
+            }
             return trainer
         }
     }
 
     deinit {
-        guard let handle else { return }
-        withNativeEngineLock { msplat_trainer_destroy(handle) }
+        withNativeEngineLock {
+            var nativeError = MsplatErrorInfo()
+            _ = msplat_trainer_destroy_v2(handle, &nativeError)
+        }
     }
 
     /// Run one training step.
@@ -124,11 +140,110 @@ public class GaussianTrainer {
         return PixelData(pixels: data, width: Int(buf.width), height: Int(buf.height))
     }
 
+    /// Zero-copy render from an arbitrary camera pose into capacity-described
+    /// RGBA8 storage.
+    ///
+    /// Pass an empty buffer to query dimensions without rendering. Otherwise,
+    /// the buffer must hold at least `width * height * 4` bytes. An undersized
+    /// buffer throws
+    /// ``MsplatRenderBufferError/insufficientCapacity(required:actual:)``
+    /// before native rendering begins.
+    public func renderFromPoseToBuffer(
+        camToWorld: [Float],
+        refCameraIndex: Int = 0,
+        rgba: UnsafeMutableRawBufferPointer,
+        width: inout Int32,
+        height: inout Int32
+    ) throws {
+        width = 0
+        height = 0
+        guard camToWorld.count == 16, camToWorld.allSatisfy(\.isFinite) else {
+            throw MsplatError.invalidArgument(
+                "A camera pose must contain exactly 16 finite values"
+            )
+        }
+        guard let nativeIndex = Int32(exactly: refCameraIndex) else {
+            throw MsplatError.invalidArgument(
+                "Reference camera index is outside the supported range"
+            )
+        }
+
+        try withNativeEngineLock {
+            var queriedWidth: Int32 = 0
+            var queriedHeight: Int32 = 0
+            var queryError = MsplatErrorInfo()
+            let queryStatus = camToWorld.withUnsafeBufferPointer { pointer in
+                msplat_trainer_render_pose_to_buffer_v2(
+                    handle,
+                    pointer.baseAddress,
+                    nativeIndex,
+                    nil,
+                    0,
+                    &queriedWidth,
+                    &queriedHeight,
+                    &queryError
+                )
+            }
+            try checkNativeStatus(queryStatus, error: &queryError)
+
+            width = queriedWidth
+            height = queriedHeight
+            guard !rgba.isEmpty else { return }
+
+            let layout = try checkedImageLayout(
+                width: Int(queriedWidth),
+                height: Int(queriedHeight),
+                components: 4
+            )
+            guard rgba.count >= layout.elementCount else {
+                throw MsplatRenderBufferError.insufficientCapacity(
+                    required: layout.elementCount,
+                    actual: rgba.count
+                )
+            }
+            guard let destination = rgba.baseAddress else {
+                throw MsplatRenderBufferError.insufficientCapacity(
+                    required: layout.elementCount,
+                    actual: 0
+                )
+            }
+
+            var renderedWidth: Int32 = 0
+            var renderedHeight: Int32 = 0
+            var renderError = MsplatErrorInfo()
+            let renderStatus = camToWorld.withUnsafeBufferPointer { pointer in
+                msplat_trainer_render_pose_to_buffer_v2(
+                    handle,
+                    pointer.baseAddress,
+                    nativeIndex,
+                    destination.assumingMemoryBound(to: UInt8.self),
+                    rgba.count,
+                    &renderedWidth,
+                    &renderedHeight,
+                    &renderError
+                )
+            }
+            try checkNativeStatus(renderStatus, error: &renderError)
+            guard renderedWidth == queriedWidth, renderedHeight == queriedHeight else {
+                throw MsplatError.internalFailure(
+                    "Render dimensions changed while filling the RGBA buffer"
+                )
+            }
+            width = renderedWidth
+            height = renderedHeight
+        }
+    }
+
     /// Zero-copy render from an arbitrary camera pose into a pre-allocated RGBA uint8 buffer.
     /// For real-time display loops where allocation overhead matters.
     ///
     /// Pass `nil` for `rgba` to query dimensions without rendering (for buffer pre-allocation).
     /// Buffer must hold at least `width × height × 4` bytes.
+    @available(
+        *,
+        deprecated,
+        message: "Use the throwing UnsafeMutableRawBufferPointer overload, which validates buffer capacity"
+    )
     public func renderFromPoseToBuffer(camToWorld: [Float], refCameraIndex: Int = 0,
                                        rgba: UnsafeMutablePointer<UInt8>?,
                                        width: inout Int32, height: inout Int32) {
