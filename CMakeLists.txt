@@ -82,18 +82,31 @@ if(NOT DEFINED MSPLAT_METAL_SDK)
 endif()
 
 if(MSPLAT_METAL_SDK STREQUAL "macosx")
+    set(MSPLAT_METAL_DEPLOYMENT_TARGET
+        "${MSPLAT_METAL_MACOS_DEPLOYMENT_TARGET}")
     set(MSPLAT_METAL_DEPLOYMENT_FLAG "-mmacosx-version-min=${MSPLAT_METAL_MACOS_DEPLOYMENT_TARGET}")
 elseif(MSPLAT_METAL_SDK STREQUAL "iphonesimulator")
+    set(MSPLAT_METAL_DEPLOYMENT_TARGET
+        "${MSPLAT_METAL_IOS_DEPLOYMENT_TARGET}")
     set(MSPLAT_METAL_DEPLOYMENT_FLAG "-mios-simulator-version-min=${MSPLAT_METAL_IOS_DEPLOYMENT_TARGET}")
 else()
+    set(MSPLAT_METAL_DEPLOYMENT_TARGET
+        "${MSPLAT_METAL_IOS_DEPLOYMENT_TARGET}")
     set(MSPLAT_METAL_DEPLOYMENT_FLAG "-mios-version-min=${MSPLAT_METAL_IOS_DEPLOYMENT_TARGET}")
 endif()
 
 if(MSPLAT_METAL_LANGUAGE_STANDARD STREQUAL "auto")
+    # Metal 4 requires the 26-generation OS runtime. A compiler-only probe can
+    # otherwise produce a metallib that builds with Xcode 26 but cannot load on
+    # the older deployment target declared above.
+    set(MSPLAT_METAL_LANGUAGE_CANDIDATES metal3.2)
+    if(MSPLAT_METAL_DEPLOYMENT_TARGET VERSION_GREATER_EQUAL "26.0")
+        set(MSPLAT_METAL_LANGUAGE_CANDIDATES metal4.0 metal3.2)
+    endif()
     set(MSPLAT_METAL_LANGUAGE_PROBE
         "${CMAKE_BINARY_DIR}/msplat_metal_language_probe.metal")
     file(WRITE "${MSPLAT_METAL_LANGUAGE_PROBE}" "#include <metal_stdlib>\n")
-    foreach(MSPLAT_METAL_LANGUAGE_CANDIDATE IN ITEMS metal4.0 metal3.2)
+    foreach(MSPLAT_METAL_LANGUAGE_CANDIDATE IN LISTS MSPLAT_METAL_LANGUAGE_CANDIDATES)
         execute_process(
             COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal
                 -std=${MSPLAT_METAL_LANGUAGE_CANDIDATE}
