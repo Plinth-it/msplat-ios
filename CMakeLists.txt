@@ -135,6 +135,40 @@ endif()
 message(STATUS
     "msplat metal SDK: ${MSPLAT_METAL_SDK} ${MSPLAT_METAL_DEPLOYMENT_FLAG} -std=${MSPLAT_EFFECTIVE_METAL_LANGUAGE_STANDARD}")
 
+execute_process(
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} -f metal
+    OUTPUT_VARIABLE MSPLAT_METAL_COMPILER_PATH
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal --version
+    OUTPUT_VARIABLE MSPLAT_METAL_COMPILER_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} -f metallib
+    OUTPUT_VARIABLE MSPLAT_METALLIB_LINKER_PATH
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metallib --version
+    OUTPUT_VARIABLE MSPLAT_METALLIB_LINKER_VERSION
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+execute_process(
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} --show-sdk-path
+    OUTPUT_VARIABLE MSPLAT_METAL_SDK_PATH
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
+set(MSPLAT_METAL_BUILD_SIGNATURE
+    "${CMAKE_BINARY_DIR}/msplat_metal_build_signature.txt")
+string(CONCAT MSPLAT_METAL_BUILD_SIGNATURE_CONTENT
+    "compiler=${MSPLAT_METAL_COMPILER_PATH}\n"
+    "compiler_version=${MSPLAT_METAL_COMPILER_VERSION}\n"
+    "linker=${MSPLAT_METALLIB_LINKER_PATH}\n"
+    "linker_version=${MSPLAT_METALLIB_LINKER_VERSION}\n"
+    "sdk=${MSPLAT_METAL_SDK_PATH}\n"
+    "deployment=${MSPLAT_METAL_DEPLOYMENT_TARGET}\n"
+    "standard=${MSPLAT_EFFECTIVE_METAL_LANGUAGE_STANDARD}\n")
+file(GENERATE
+    OUTPUT "${MSPLAT_METAL_BUILD_SIGNATURE}"
+    CONTENT "${MSPLAT_METAL_BUILD_SIGNATURE_CONTENT}")
+
 set(METAL_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/msplat_metal.metal)
 configure_file(${METAL_SOURCE} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal COPYONLY)
 add_custom_command(
@@ -147,7 +181,7 @@ add_custom_command(
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
     COMMAND rm -f ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
-    DEPENDS ${METAL_SOURCE}
+    DEPENDS ${METAL_SOURCE} ${MSPLAT_METAL_BUILD_SIGNATURE}
     COMMENT "Compiling Metal kernels -> default.metallib"
 )
 add_custom_target(metallib ALL
