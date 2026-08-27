@@ -65,7 +65,7 @@ find_library(ZLIB_LIBRARY z REQUIRED)
 # their own, compiled against their own SDK. CMAKE_SYSTEM_NAME does not
 # distinguish device from simulator, so the sysroot decides and the choice
 # stays overridable for callers that know which slice they are building.
-set(MSPLAT_METAL_LANGUAGE_STANDARD "metal4.0" CACHE STRING "Metal language standard for precompiled shader libraries")
+set(MSPLAT_METAL_LANGUAGE_STANDARD "auto" CACHE STRING "Metal language standard for precompiled shader libraries")
 set(MSPLAT_METAL_IOS_DEPLOYMENT_TARGET "18.0" CACHE STRING "Minimum iOS version for precompiled shader libraries")
 set(MSPLAT_METAL_MACOS_DEPLOYMENT_TARGET "15.0" CACHE STRING "Minimum macOS version for precompiled shader libraries")
 
@@ -88,13 +88,45 @@ elseif(MSPLAT_METAL_SDK STREQUAL "iphonesimulator")
 else()
     set(MSPLAT_METAL_DEPLOYMENT_FLAG "-mios-version-min=${MSPLAT_METAL_IOS_DEPLOYMENT_TARGET}")
 endif()
-message(STATUS "msplat metal SDK: ${MSPLAT_METAL_SDK} ${MSPLAT_METAL_DEPLOYMENT_FLAG}")
+
+if(MSPLAT_METAL_LANGUAGE_STANDARD STREQUAL "auto")
+    set(MSPLAT_METAL_LANGUAGE_PROBE
+        "${CMAKE_BINARY_DIR}/msplat_metal_language_probe.metal")
+    file(WRITE "${MSPLAT_METAL_LANGUAGE_PROBE}" "#include <metal_stdlib>\n")
+    foreach(MSPLAT_METAL_LANGUAGE_CANDIDATE IN ITEMS metal4.0 metal3.2)
+        execute_process(
+            COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal
+                -std=${MSPLAT_METAL_LANGUAGE_CANDIDATE}
+                -fmodules-cache-path=${CMAKE_BINARY_DIR}/metal-module-cache
+                -x metal
+                -fsyntax-only
+                ${MSPLAT_METAL_LANGUAGE_PROBE}
+            RESULT_VARIABLE MSPLAT_METAL_LANGUAGE_PROBE_RESULT
+            OUTPUT_QUIET
+            ERROR_QUIET)
+        if(MSPLAT_METAL_LANGUAGE_PROBE_RESULT EQUAL 0)
+            set(MSPLAT_EFFECTIVE_METAL_LANGUAGE_STANDARD
+                "${MSPLAT_METAL_LANGUAGE_CANDIDATE}")
+            break()
+        endif()
+    endforeach()
+    if(NOT DEFINED MSPLAT_EFFECTIVE_METAL_LANGUAGE_STANDARD)
+        message(FATAL_ERROR
+            "The selected Metal compiler supports neither metal4.0 nor metal3.2")
+    endif()
+else()
+    set(MSPLAT_EFFECTIVE_METAL_LANGUAGE_STANDARD
+        "${MSPLAT_METAL_LANGUAGE_STANDARD}")
+endif()
+
+message(STATUS
+    "msplat metal SDK: ${MSPLAT_METAL_SDK} ${MSPLAT_METAL_DEPLOYMENT_FLAG} -std=${MSPLAT_EFFECTIVE_METAL_LANGUAGE_STANDARD}")
 
 set(METAL_SOURCE ${CMAKE_SOURCE_DIR}/core/metal/msplat_metal.metal)
 configure_file(${METAL_SOURCE} ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal COPYONLY)
 add_custom_command(
     OUTPUT ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib
-    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal -O3 -std=${MSPLAT_METAL_LANGUAGE_STANDARD} ${MSPLAT_METAL_DEPLOYMENT_FLAG} -c
+    COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metal -O3 -std=${MSPLAT_EFFECTIVE_METAL_LANGUAGE_STANDARD} ${MSPLAT_METAL_DEPLOYMENT_FLAG} -c
         ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.metal
         -o ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/msplat_metal.air
     COMMAND xcrun -sdk ${MSPLAT_METAL_SDK} metallib
