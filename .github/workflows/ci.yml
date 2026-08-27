@@ -108,8 +108,6 @@ jobs:
     name: Swift Package
     runs-on: macos-15
     needs: version-check
-    env:
-      DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
     steps:
       - uses: actions/checkout@v4
         with:
@@ -131,6 +129,8 @@ jobs:
           swift test
 
       - name: Build iOS example
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
         run: |
           xcodebuild \
             -project examples/ios/MsplatExample.xcodeproj \
@@ -140,6 +140,8 @@ jobs:
             build
 
       - name: Test pose checkpoint resume on iOS Simulator
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
         run: |
           xcodebuild \
             -project examples/ios/MsplatExample.xcodeproj \
@@ -149,6 +151,8 @@ jobs:
             test
 
       - name: Link iOS device test bundle
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_26.3.app/Contents/Developer
         run: |
           xcodebuild \
             -project examples/ios/MsplatExample.xcodeproj \
