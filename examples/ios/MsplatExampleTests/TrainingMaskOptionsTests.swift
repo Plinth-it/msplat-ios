@@ -890,15 +890,19 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertEqual(secondMatrix[1][3].floatValue, -0.5, accuracy: 1e-6)
         XCTAssertEqual(output.summary.cameraCount, 2)
         XCTAssertEqual(output.summary.maximumTranslationMeters, 0.004, accuracy: 1e-6)
+        let translationSumSquares: Float = 0.003 * 0.003 + 0.004 * 0.004
+        let expectedTranslationRMS = sqrt(translationSumSquares / 2)
         XCTAssertEqual(
             output.summary.rmsTranslationMeters,
-            Float(sqrt((0.003 * 0.003 + 0.004 * 0.004) / 2)),
+            expectedTranslationRMS,
             accuracy: 1e-6
         )
         XCTAssertEqual(output.summary.maximumRotationRadians, 0.02, accuracy: 1e-6)
+        let rotationSumSquares: Float = 0.01 * 0.01 + 0.02 * 0.02
+        let expectedRotationRMS = sqrt(rotationSumSquares / 2)
         XCTAssertEqual(
             output.summary.rmsRotationRadians,
-            Float(sqrt((0.01 * 0.01 + 0.02 * 0.02) / 2)),
+            expectedRotationRMS,
             accuracy: 1e-6
         )
     }
