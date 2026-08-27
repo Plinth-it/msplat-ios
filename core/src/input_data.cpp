@@ -122,9 +122,8 @@ bool isMirroredExifOrientation(int orientation) {
            orientation == 5 || orientation == 7;
 }
 
-} // namespace
-
-CoverageMask buildCoverageRenderTileMap(const CoverageMask &mask) {
+CoverageMask buildCoverageRenderTileMapImpl(
+    const CoverageMask &mask, RGBA8Image *packedImage) {
     const uint64_t expectedSize = static_cast<uint64_t>(mask.width) *
         static_cast<uint64_t>(mask.height);
     if (mask.width <= 0 || mask.height <= 0 ||
@@ -145,7 +144,11 @@ CoverageMask buildCoverageRenderTileMap(const CoverageMask &mask) {
 
     for (int y = 0; y < mask.height; ++y) {
         for (int x = 0; x < mask.width; ++x) {
-            if (mask.data[static_cast<size_t>(y) * mask.width + x] == 0)
+            const size_t pixel = static_cast<size_t>(y) * mask.width + x;
+            const uint8_t coverage = mask.data[pixel];
+            if (packedImage)
+                packedImage->data[pixel * 4u + 3u] = coverage;
+            if (coverage == 0)
                 continue;
 
             const int minTileX = static_cast<int>(
@@ -171,6 +174,12 @@ CoverageMask buildCoverageRenderTileMap(const CoverageMask &mask) {
         }
     }
     return tiles;
+}
+
+} // namespace
+
+CoverageMask buildCoverageRenderTileMap(const CoverageMask &mask) {
+    return buildCoverageRenderTileMapImpl(mask, nullptr);
 }
 
 // ── Image loading ───────────────────────────────────────────────────────────
@@ -310,11 +319,13 @@ void Camera::loadImage(float downscaleFactor) {
     RGBA8Image raw = imreadRGBA8(
         filePath, sourceInfo, targetWidth, targetHeight, normalizeExif);
     CoverageMask rawMask;
+    uint64_t finalCoverageUnits = 0;
     if (trainingMask) {
         rawMask = imreadCoverageMask(
             trainingMask->path, maskSourceInfo, targetWidth, targetHeight,
             normalizeExif, trainingMask->channel);
-        (void)maskCoverageUnits(rawMask, trainingMask->path);
+        finalCoverageUnits = maskCoverageUnits(
+            rawMask, trainingMask->path);
     }
 
     // Scale from the calibration's declared pixel frame directly to the exact
@@ -344,7 +355,8 @@ void Camera::loadImage(float downscaleFactor) {
             fx = result.fx; fy = result.fy;
             cx = result.cx; cy = result.cy;
             width = result.width; height = result.height;
-            (void)maskCoverageUnits(rawMask, trainingMask->path);
+            finalCoverageUnits = maskCoverageUnits(
+                rawMask, trainingMask->path);
         } else {
             auto result = undistortRGBA8Image(
                 raw, fx, fy, cx, cy, k1, k2, p1, p2, k3);
@@ -361,7 +373,7 @@ void Camera::loadImage(float downscaleFactor) {
     decodedTrainingMaskSource = trainingMask;
     if (trainingMask) {
         coverageUnitsByDownscale.emplace(
-            1, maskCoverageUnits(coverageMask, trainingMask->path));
+            1, finalCoverageUnits);
     }
     loadedImageDownscaleFactor = downscaleFactor;
 }
@@ -466,6 +478,19 @@ void packCoverageIntoAlpha(
         image.data[pixel * 4u + 3u] = mask.data[pixel];
 }
 
+CoverageMask packCoverageIntoAlphaAndBuildRenderTiles(
+    RGBA8Image &image, const CoverageMask &mask,
+    const std::string &imagePath, const std::string &maskPath) {
+    validateCoverageStorage(image, mask, maskPath);
+    if (mask.data.size() > std::numeric_limits<size_t>::max() / 4u ||
+        image.data.size() != mask.data.size() * 4u) {
+        throw msplat::InvalidDatasetError(
+            "Training image storage does not match its dimensions for " +
+            imagePath);
+    }
+    return buildCoverageRenderTileMapImpl(mask, &image);
+}
+
 void validateCoverageRenderTiles(
     const RGBA8Image &image, const CoverageMask &tiles,
     const std::string &maskPath) {
@@ -486,7 +511,8 @@ void validateCoverageRenderTiles(
 UploadedTrainingTarget uploadTrainingTarget(
     const RGBA8Image &image, const CoverageMask *mask,
     const CoverageMask *preparedCoverageRenderTiles,
-    bool coverageIsPacked, uint64_t coverageUnits,
+    bool includeCoverageRenderTiles, bool coverageIsPacked,
+    uint64_t coverageUnits,
     const std::string &imagePath, const std::string &maskPath) {
     if (image.empty())
         throw msplat::DatasetIOError("Failed to decode image: " + imagePath);
@@ -506,7 +532,7 @@ UploadedTrainingTarget uploadTrainingTarget(
     if (mask) validateCoverageStorage(image, *mask, maskPath);
     CoverageMask builtCoverageRenderTiles;
     const CoverageMask *coverageRenderTiles = preparedCoverageRenderTiles;
-    if (hasCoverage && !coverageRenderTiles) {
+    if (hasCoverage && includeCoverageRenderTiles && !coverageRenderTiles) {
         if (!mask) {
             throw std::logic_error(
                 "Packed training coverage requires a render-tile map");
@@ -514,9 +540,10 @@ UploadedTrainingTarget uploadTrainingTarget(
         builtCoverageRenderTiles = buildCoverageRenderTileMap(*mask);
         coverageRenderTiles = &builtCoverageRenderTiles;
     }
-    if (!hasCoverage && coverageRenderTiles) {
+    if ((!hasCoverage || !includeCoverageRenderTiles) &&
+        coverageRenderTiles) {
         throw std::logic_error(
-            "Unmasked training target cannot have coverage render tiles");
+            "Training target cannot publish unrequested coverage render tiles");
     }
     if (coverageRenderTiles) {
         validateCoverageRenderTiles(image, *coverageRenderTiles, maskPath);
@@ -553,7 +580,8 @@ UploadedTrainingTarget uploadTrainingTarget(
 
 } // namespace
 
-bool Camera::hasGPUTrainingTarget(int downscaleFactor) const {
+bool Camera::hasGPUTrainingTarget(
+    int downscaleFactor, bool includeCoverageRenderTiles) const {
     const auto imageIt = mtensorImageCache.find(downscaleFactor);
     if (imageIt == mtensorImageCache.end()) return false;
     const auto sourceIt =
@@ -562,13 +590,15 @@ bool Camera::hasGPUTrainingTarget(int downscaleFactor) const {
         !sameTrainingMask(sourceIt->second, trainingMask)) {
         return false;
     }
-    return !trainingMask ||
+    return !trainingMask || !includeCoverageRenderTiles ||
         mtensorCoverageRenderTileCache.find(downscaleFactor) !=
             mtensorCoverageRenderTileCache.end();
 }
 
-CameraTrainingTarget Camera::getGPUTrainingTarget(int downscaleFactor) {
-    if (hasGPUTrainingTarget(downscaleFactor)) {
+CameraTrainingTarget Camera::getGPUTrainingTarget(
+    int downscaleFactor, bool includeCoverageRenderTiles) {
+    if (hasGPUTrainingTarget(
+            downscaleFactor, includeCoverageRenderTiles)) {
         auto imageIt = mtensorImageCache.find(downscaleFactor);
         const uint64_t units = trainingMask
             ? getCoverageUnits(downscaleFactor)
@@ -579,7 +609,7 @@ CameraTrainingTarget Camera::getGPUTrainingTarget(int downscaleFactor) {
             &imageIt->second,
             trainingMask ? &imageIt->second : nullptr,
             units,
-            trainingMask
+            trainingMask && includeCoverageRenderTiles
                 ? &mtensorCoverageRenderTileCache.at(downscaleFactor)
                 : nullptr,
         };
@@ -626,7 +656,7 @@ CameraTrainingTarget Camera::getGPUTrainingTarget(int downscaleFactor) {
 
     const RGBA8Image& img = getImage(downscaleFactor);
     UploadedTrainingTarget uploaded = uploadTrainingTarget(
-        img, mask, nullptr, false, units, filePath,
+        img, mask, nullptr, includeCoverageRenderTiles, false, units, filePath,
         trainingMask ? trainingMask->path : std::string());
 
     try {
@@ -636,7 +666,7 @@ CameraTrainingTarget Camera::getGPUTrainingTarget(int downscaleFactor) {
             throw std::logic_error("Training image cache insertion failed");
         }
         MTensor *coverageRenderTiles = nullptr;
-        if (trainingMask) {
+        if (trainingMask && includeCoverageRenderTiles) {
             auto tilesInserted = mtensorCoverageRenderTileCache.emplace(
                 downscaleFactor, std::move(uploaded.coverageRenderTiles));
             if (!tilesInserted.second) {
@@ -743,6 +773,7 @@ struct CameraTargetRequest {
     size_t cameraIndex = 0;
     int downscaleFactor = 1;
     float inputDownscaleFactor = 1.0f;
+    bool includeCoverageRenderTiles = true;
     CameraSourceSnapshot source;
 };
 
@@ -848,35 +879,43 @@ PreparedCameraTarget prepareCameraTarget(
         if (downscale <= 1) {
             prepared.image = std::move(staging.image);
             if (staging.trainingMask) {
-                prepared.coverageRenderTiles =
-                    buildCoverageRenderTileMap(staging.coverageMask);
+                if (prepared.request.includeCoverageRenderTiles) {
+                    prepared.coverageRenderTiles =
+                        packCoverageIntoAlphaAndBuildRenderTiles(
+                            prepared.image, staging.coverageMask,
+                            staging.filePath, staging.trainingMask->path);
+                } else {
+                    packCoverageIntoAlpha(
+                        prepared.image, staging.coverageMask,
+                        staging.filePath, staging.trainingMask->path);
+                }
                 stagedBytes->store(
                     prepared.image.data.size() +
                         staging.cachedCpuImageBytes() +
                         prepared.coverageRenderTiles.data.size(),
                     std::memory_order_relaxed);
-                packCoverageIntoAlpha(
-                    prepared.image, staging.coverageMask,
-                    staging.filePath,
-                    staging.trainingMask->path);
             }
         } else {
             prepared.image =
                 std::move(staging.imagePyramids.at(downscale));
             if (staging.trainingMask) {
-                prepared.coverageRenderTiles =
-                    buildCoverageRenderTileMap(
-                        staging.coverageMaskPyramids.at(downscale));
+                const CoverageMask &coverage =
+                    staging.coverageMaskPyramids.at(downscale);
+                if (prepared.request.includeCoverageRenderTiles) {
+                    prepared.coverageRenderTiles =
+                        packCoverageIntoAlphaAndBuildRenderTiles(
+                            prepared.image, coverage,
+                            staging.filePath, staging.trainingMask->path);
+                } else {
+                    packCoverageIntoAlpha(
+                        prepared.image, coverage,
+                        staging.filePath, staging.trainingMask->path);
+                }
                 stagedBytes->store(
                     prepared.image.data.size() +
                         staging.cachedCpuImageBytes() +
                         prepared.coverageRenderTiles.data.size(),
                     std::memory_order_relaxed);
-                packCoverageIntoAlpha(
-                    prepared.image,
-                    staging.coverageMaskPyramids.at(downscale),
-                    staging.filePath,
-                    staging.trainingMask->path);
             }
         }
         if (!staging.trainingMask) {
@@ -898,7 +937,10 @@ CameraTrainingTarget publishPreparedTarget(
     const bool hasCoverage = prepared.request.source.trainingMask.has_value();
     UploadedTrainingTarget uploaded = uploadTrainingTarget(
         prepared.image, nullptr,
-        hasCoverage ? &prepared.coverageRenderTiles : nullptr,
+        hasCoverage && prepared.request.includeCoverageRenderTiles
+            ? &prepared.coverageRenderTiles
+            : nullptr,
+        prepared.request.includeCoverageRenderTiles,
         hasCoverage, prepared.coverageUnits,
         prepared.request.source.filePath,
         prepared.request.source.trainingMask
@@ -930,7 +972,7 @@ CameraTrainingTarget publishPreparedTarget(
         throw std::logic_error("Training image cache insertion failed");
 
     MTensor *coverageRenderTiles = nullptr;
-    if (hasCoverage) {
+    if (hasCoverage && prepared.request.includeCoverageRenderTiles) {
         auto tilesInserted = camera.mtensorCoverageRenderTileCache.emplace(
             downscaleFactor, std::move(uploaded.coverageRenderTiles));
         if (!tilesInserted.second) {
@@ -938,6 +980,8 @@ CameraTrainingTarget publishPreparedTarget(
                 "Coverage render-tile cache insertion failed");
         }
         coverageRenderTiles = &tilesInserted.first->second;
+    }
+    if (hasCoverage) {
         camera.coverageUnitsByDownscale.emplace(
             downscaleFactor, uploaded.coverageUnits);
         camera.decodedTrainingMaskSource =
@@ -962,6 +1006,7 @@ CameraTrainingTarget publishPreparedTarget(
 struct CameraImageCache::PrefetchTask {
     size_t cameraIndex;
     int downscaleFactor;
+    bool includeCoverageRenderTiles;
     CameraSourceSnapshot source;
     std::shared_ptr<std::atomic<size_t>> stagedBytes;
     std::future<PreparedCameraTarget> future;
@@ -972,6 +1017,7 @@ struct CameraImageCache::PrefetchTask {
         std::future<PreparedCameraTarget> result)
         : cameraIndex(request.cameraIndex),
           downscaleFactor(request.downscaleFactor),
+          includeCoverageRenderTiles(request.includeCoverageRenderTiles),
           source(request.source),
           stagedBytes(std::move(bytes)),
           future(std::move(result)) {}
@@ -1012,18 +1058,21 @@ bool CameraImageCache::defaultPrefetchEnabled() noexcept {
 
 void CameraImageCache::prefetchTrainingTarget(
     const std::vector<Camera> &cameras, size_t index,
-    int downscaleFactor) noexcept {
+    int downscaleFactor, bool includeCoverageRenderTiles) noexcept {
     if (!_prefetchEnabled || index >= cameras.size() || downscaleFactor < 1)
         return;
 
     try {
         const Camera &camera = cameras[index];
         const bool targetIsResident =
-            camera.hasGPUTrainingTarget(downscaleFactor);
+            camera.hasGPUTrainingTarget(
+                downscaleFactor, includeCoverageRenderTiles);
 
         if (_prefetch) {
             const bool sameKey = _prefetch->cameraIndex == index &&
-                _prefetch->downscaleFactor == downscaleFactor;
+                _prefetch->downscaleFactor == downscaleFactor &&
+                _prefetch->includeCoverageRenderTiles ==
+                    includeCoverageRenderTiles;
             const bool sameSource = sourceMatches(camera, _prefetch->source);
             if (sameKey && sameSource && !targetIsResident)
                 return;
@@ -1050,6 +1099,7 @@ void CameraImageCache::prefetchTrainingTarget(
         request.cameraIndex = index;
         request.downscaleFactor = downscaleFactor;
         request.inputDownscaleFactor = _downscaleFactor;
+        request.includeCoverageRenderTiles = includeCoverageRenderTiles;
         request.source = sourceSnapshot(camera);
         auto stagedBytes = std::make_shared<std::atomic<size_t>>(0);
         auto future = std::async(
@@ -1086,20 +1136,25 @@ MTensor& CameraImageCache::gpuImage(std::vector<Camera> &cameras, size_t index,
 }
 
 CameraTrainingTarget CameraImageCache::gpuTrainingTarget(
-    std::vector<Camera> &cameras, size_t index, int downscaleFactor) {
+    std::vector<Camera> &cameras, size_t index, int downscaleFactor,
+    bool includeCoverageRenderTiles) {
     Camera &cam = cameras[index];
-    const bool targetIsResident = cam.hasGPUTrainingTarget(downscaleFactor);
+    const bool targetIsResident = cam.hasGPUTrainingTarget(
+        downscaleFactor, includeCoverageRenderTiles);
     try {
         CameraTrainingTarget target;
         if (targetIsResident) {
             ++_hitCount;
-            target = cam.getGPUTrainingTarget(downscaleFactor);
+            target = cam.getGPUTrainingTarget(
+                downscaleFactor, includeCoverageRenderTiles);
         } else {
             ++_missCount;
             bool usedPrefetch = false;
             const bool matchingKey = _prefetch &&
                 _prefetch->cameraIndex == index &&
-                _prefetch->downscaleFactor == downscaleFactor;
+                _prefetch->downscaleFactor == downscaleFactor &&
+                _prefetch->includeCoverageRenderTiles ==
+                    includeCoverageRenderTiles;
             const bool matchingPrefetch = matchingKey &&
                 sourceMatches(cam, _prefetch->source);
 
@@ -1120,10 +1175,9 @@ CameraTrainingTarget CameraImageCache::gpuTrainingTarget(
                 ++_prefetchDiscardedCount;
             }
             if (matchingPrefetch) {
-                if (_prefetch->future.wait_for(std::chrono::seconds(0)) !=
-                    std::future_status::ready) {
-                    ++_prefetchWaitCount;
-                }
+                const bool waitedForPrefetch =
+                    _prefetch->future.wait_for(std::chrono::seconds(0)) !=
+                    std::future_status::ready;
 
                 PreparedCameraTarget prepared;
                 try {
@@ -1146,6 +1200,9 @@ CameraTrainingTarget CameraImageCache::gpuTrainingTarget(
                         throw;
                     }
                     ++_prefetchUsedCount;
+                    if (waitedForPrefetch) {
+                        ++_prefetchWaitCount;
+                    }
                     usedPrefetch = true;
                 } else {
                     ++_prefetchDiscardedCount;
@@ -1157,7 +1214,8 @@ CameraTrainingTarget CameraImageCache::gpuTrainingTarget(
 
             if (!usedPrefetch) {
                 cam.loadImage(_downscaleFactor);
-                target = cam.getGPUTrainingTarget(downscaleFactor);
+                target = cam.getGPUTrainingTarget(
+                    downscaleFactor, includeCoverageRenderTiles);
             }
         }
 

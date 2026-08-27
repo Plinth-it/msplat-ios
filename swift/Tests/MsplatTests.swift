@@ -310,7 +310,7 @@ final class MsplatTests: XCTestCase {
     }
 
     func testTrainingMemoryConversionPreservesCountsAndValidity() {
-        var native = MsplatTrainingMemoryMetrics()
+        var native = MsplatTrainingMemoryMetricsV17()
         native.flags = UInt32(MSPLAT_MEMORY_METRICS_PHYS_FOOTPRINT_VALID)
         native.trainerModelBufferBytes = 1
         native.engineSharedTransientBufferBytes = 2
@@ -322,16 +322,28 @@ final class MsplatTests: XCTestCase {
         native.processAvailableBytes = 6_000_000_001
         native.trainingGpuImageCacheHits = 3
         native.trainingGpuImageCacheMisses = 1
+        native.trainingTargetPrefetchScheduled = 8
+        native.trainingTargetPrefetchUsed = 6
+        native.trainingTargetPrefetchWaited = 4
+        native.trainingTargetPrefetchDiscarded = 1
 
         let snapshot = TrainingMemorySnapshot(from: native)
         XCTAssertEqual(snapshot.trackedNativeBufferBytes, 15)
         XCTAssertEqual(snapshot.processPhysicalFootprintBytes, 5_000_000_001)
         XCTAssertNil(snapshot.processAvailableBytes)
         XCTAssertEqual(snapshot.trainingGpuImageCacheHitRate, 0.75)
+        XCTAssertEqual(snapshot.trainingTargetPrefetchReady, 2)
+        XCTAssertEqual(snapshot.trainingTargetPrefetchWaitRate, 2.0 / 3.0)
+        XCTAssertEqual(snapshot.trainingTargetPrefetchDiscarded, 1)
 
         native.trainingGpuImageCacheHits = 0
         native.trainingGpuImageCacheMisses = 0
         XCTAssertNil(TrainingMemorySnapshot(from: native).trainingGpuImageCacheHitRate)
+
+        native.trainingTargetPrefetchUsed = 0
+        native.trainingTargetPrefetchWaited = 0
+        XCTAssertNil(TrainingMemorySnapshot(from: native)
+            .trainingTargetPrefetchWaitRate)
     }
 
     func testLoadDataset() throws {

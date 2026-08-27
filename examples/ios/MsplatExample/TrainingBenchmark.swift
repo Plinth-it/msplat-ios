@@ -165,6 +165,10 @@ struct TrainingBenchmarkMemorySample: Codable, Sendable {
     let processAvailableBytes: UInt64?
     let trainingGPUImageCacheHits: UInt64
     let trainingGPUImageCacheMisses: UInt64
+    let trainingTargetPrefetchScheduled: UInt64
+    let trainingTargetPrefetchUsed: UInt64
+    let trainingTargetPrefetchWaited: UInt64
+    let trainingTargetPrefetchDiscarded: UInt64
 
     init(_ memory: TrainingMemorySnapshot) {
         trainerModelBufferBytes = memory.trainerModelBufferBytes
@@ -179,6 +183,12 @@ struct TrainingBenchmarkMemorySample: Codable, Sendable {
         processAvailableBytes = memory.processAvailableBytes
         trainingGPUImageCacheHits = memory.trainingGpuImageCacheHits
         trainingGPUImageCacheMisses = memory.trainingGpuImageCacheMisses
+        trainingTargetPrefetchScheduled =
+            memory.trainingTargetPrefetchScheduled
+        trainingTargetPrefetchUsed = memory.trainingTargetPrefetchUsed
+        trainingTargetPrefetchWaited = memory.trainingTargetPrefetchWaited
+        trainingTargetPrefetchDiscarded =
+            memory.trainingTargetPrefetchDiscarded
     }
 }
 

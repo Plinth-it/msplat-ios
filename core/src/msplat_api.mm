@@ -60,15 +60,19 @@ struct Dataset::Impl {
     }
 
     CameraTrainingTarget trainingTargetForTrainCamera(
-        size_t trainIndex, int downscaleFactor) {
+        size_t trainIndex, int downscaleFactor,
+        bool includeCoverageRenderTiles) {
         return images.gpuTrainingTarget(
-            data.cameras, trainIndices[trainIndex], downscaleFactor);
+            data.cameras, trainIndices[trainIndex], downscaleFactor,
+            includeCoverageRenderTiles);
     }
 
     CameraTrainingTarget trainingTargetForTestCamera(
-        size_t testIndex, int downscaleFactor) {
+        size_t testIndex, int downscaleFactor,
+        bool includeCoverageRenderTiles) {
         return images.gpuTrainingTarget(
-            data.cameras, testIndices[testIndex], downscaleFactor);
+            data.cameras, testIndices[testIndex], downscaleFactor,
+            includeCoverageRenderTiles);
     }
 };
 
@@ -274,6 +278,10 @@ struct Trainer::Impl {
         std::shuffle(nextIndices.begin(), nextIndices.end(), nextRng);
         return nextIndices.front();
     }
+
+    bool includeCoverageRenderTiles() const {
+        return config.trainingMaskMode != TrainingMaskMode::Transparent;
+    }
 };
 
 Trainer::Trainer(Dataset& dataset, const Config& config)
@@ -315,7 +323,8 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
         impl->ds->images.prefetchTrainingTarget(
             impl->ds->data.cameras,
             impl->ds->trainIndices[firstCamera],
-            impl->model->getDownscaleFactor(1));
+            impl->model->getDownscaleFactor(1),
+            impl->includeCoverageRenderTiles());
     }
 }
 
@@ -338,7 +347,8 @@ Stats Trainer::step() {
         size_t camIdx = impl->currentCamera();
         int ds = impl->model->getDownscaleFactor(nextStep);
         CameraTrainingTarget target =
-            impl->ds->trainingTargetForTrainCamera(camIdx, ds);
+            impl->ds->trainingTargetForTrainCamera(
+                camIdx, ds, impl->includeCoverageRenderTiles());
         if (!target.image)
             throw std::runtime_error("Training target has no RGB image");
         Camera& cam = impl->ds->trainCamera(camIdx);
@@ -369,7 +379,8 @@ Stats Trainer::step() {
             impl->ds->images.prefetchTrainingTarget(
                 impl->ds->data.cameras,
                 impl->ds->trainIndices[nextCamIdx],
-                impl->model->getDownscaleFactor(nextStep + 1));
+                impl->model->getDownscaleFactor(nextStep + 1),
+                impl->includeCoverageRenderTiles());
         }
     } catch (...) {
         msplat_training_step_abort(logicalStep);
@@ -414,7 +425,7 @@ EvalMetrics Trainer::evaluate() {
         MTensor rgbCpu = rgb.cpu();
         int dsf = impl->model->getDownscaleFactor(impl->config.iterations);
         CameraTrainingTarget target =
-            impl->ds->trainingTargetForTestCamera(i, dsf);
+            impl->ds->trainingTargetForTestCamera(i, dsf, false);
         if (!target.image)
             throw std::runtime_error("Evaluation target has no RGB image");
         MTensor gtCpu = target.image->cpu();
@@ -632,7 +643,8 @@ int Trainer::loadCheckpoint(const std::string& path) {
         impl->ds->images.prefetchTrainingTarget(
             impl->ds->data.cameras,
             impl->ds->trainIndices[firstCamera],
-            impl->model->getDownscaleFactor(loadedStep + 1));
+            impl->model->getDownscaleFactor(loadedStep + 1),
+            impl->includeCoverageRenderTiles());
     }
     return impl->currentStep;
 }
@@ -738,6 +750,14 @@ TrainingMemoryMetrics Trainer::memoryMetrics() const {
     metrics.trainerImageCacheBudgetBytes = impl->ds->images.budgetBytes();
     metrics.trainingGpuImageCacheHits = impl->ds->images.hitCount();
     metrics.trainingGpuImageCacheMisses = impl->ds->images.missCount();
+    metrics.trainingTargetPrefetchScheduled =
+        impl->ds->images.prefetchScheduledCount();
+    metrics.trainingTargetPrefetchUsed =
+        impl->ds->images.prefetchUsedCount();
+    metrics.trainingTargetPrefetchWaited =
+        impl->ds->images.prefetchWaitCount();
+    metrics.trainingTargetPrefetchDiscarded =
+        impl->ds->images.prefetchDiscardedCount();
     const ProcessMemorySnapshot processMemory = currentProcessMemory();
     metrics.processPhysFootprintBytes = processMemory.physicalFootprintBytes;
     metrics.processAvailableBytes = processMemory.availableBytes;
@@ -2088,6 +2108,53 @@ MsplatStatus msplat_trainer_memory_metrics_v4(
             metrics.trainingGpuImageCacheHits;
         outMetrics->trainingGpuImageCacheMisses =
             metrics.trainingGpuImageCacheMisses;
+    });
+}
+
+MsplatStatus msplat_trainer_memory_metrics_v17(
+    MsplatTrainer t, MsplatTrainingMemoryMetricsV17* outMetrics,
+    size_t outputSize, MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+        require(outputSize == sizeof(MsplatTrainingMemoryMetricsV17),
+                "Training memory metrics size does not match this msplat ABI");
+        require(outMetrics != nullptr, "outMetrics must not be null");
+        *outMetrics = {};
+        require(t != nullptr, "Trainer handle must not be null");
+
+        const msplat::TrainingMemoryMetrics metrics =
+            trainerHandle(t).trainer->memoryMetrics();
+        if (metrics.hasProcessPhysFootprint)
+            outMetrics->flags |= MSPLAT_MEMORY_METRICS_PHYS_FOOTPRINT_VALID;
+        if (metrics.hasProcessAvailableBytes)
+            outMetrics->flags |= MSPLAT_MEMORY_METRICS_AVAILABLE_VALID;
+        outMetrics->trainerModelBufferBytes = metrics.trainerModelBufferBytes;
+        outMetrics->engineSharedTransientBufferBytes =
+            metrics.engineSharedTransientBufferBytes;
+        outMetrics->engineTrainingTransientBufferBytes =
+            metrics.engineTrainingTransientBufferBytes;
+        outMetrics->trainerTelemetryReadbackBytes =
+            metrics.trainerTelemetryReadbackBytes;
+        outMetrics->trainerImageCacheCpuBytes =
+            metrics.trainerImageCacheCpuBytes;
+        outMetrics->trainerImageCacheGpuBytes =
+            metrics.trainerImageCacheGpuBytes;
+        outMetrics->trainerImageCacheBudgetBytes =
+            metrics.trainerImageCacheBudgetBytes;
+        outMetrics->processPhysFootprintBytes =
+            metrics.processPhysFootprintBytes;
+        outMetrics->processAvailableBytes = metrics.processAvailableBytes;
+        outMetrics->trainingGpuImageCacheHits =
+            metrics.trainingGpuImageCacheHits;
+        outMetrics->trainingGpuImageCacheMisses =
+            metrics.trainingGpuImageCacheMisses;
+        outMetrics->trainingTargetPrefetchScheduled =
+            metrics.trainingTargetPrefetchScheduled;
+        outMetrics->trainingTargetPrefetchUsed =
+            metrics.trainingTargetPrefetchUsed;
+        outMetrics->trainingTargetPrefetchWaited =
+            metrics.trainingTargetPrefetchWaited;
+        outMetrics->trainingTargetPrefetchDiscarded =
+            metrics.trainingTargetPrefetchDiscarded;
     });
 }
 

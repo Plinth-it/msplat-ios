@@ -47,8 +47,10 @@ extern "C" {
 // ABI v16 adds opt-in CamP conditioning to the unchanged v8 refinement options.
 // The global bump lets new clients reject older binaries that would interpret
 // the new capability bit as unknown.
+// ABI v17 adds a size-checked training-memory snapshot that appends target-
+// prefetch effectiveness counters while retaining the v4 layout and query.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 16u
+#define MSPLAT_ABI_VERSION 17u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -323,6 +325,30 @@ typedef struct {
     uint64_t trainingGpuImageCacheHits;
     uint64_t trainingGpuImageCacheMisses;
 } MsplatTrainingMemoryMetrics;
+
+/// ABI v17 extends the unchanged v4 memory/accounting prefix with cumulative
+/// CPU target-prefetch effectiveness counters. `trainingTargetPrefetchWaited`
+/// counts used futures that were not ready when the foreground requested them;
+/// it is a count, not elapsed time.
+typedef struct {
+    uint32_t flags;
+    uint32_t reserved;
+    uint64_t trainerModelBufferBytes;
+    uint64_t engineSharedTransientBufferBytes;
+    uint64_t engineTrainingTransientBufferBytes;
+    uint64_t trainerTelemetryReadbackBytes;
+    uint64_t trainerImageCacheCpuBytes;
+    uint64_t trainerImageCacheGpuBytes;
+    uint64_t trainerImageCacheBudgetBytes;
+    uint64_t processPhysFootprintBytes;
+    uint64_t processAvailableBytes;
+    uint64_t trainingGpuImageCacheHits;
+    uint64_t trainingGpuImageCacheMisses;
+    uint64_t trainingTargetPrefetchScheduled;
+    uint64_t trainingTargetPrefetchUsed;
+    uint64_t trainingTargetPrefetchWaited;
+    uint64_t trainingTargetPrefetchDiscarded;
+} MsplatTrainingMemoryMetricsV17;
 
 #define MSPLAT_POSE_REFINEMENT_STATE_ENABLED (1u << 0)
 #define MSPLAT_POSE_REFINEMENT_STATE_ANCHOR  (1u << 1)
@@ -721,6 +747,9 @@ MsplatStatus msplat_trainer_metrics_v12(
     MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_memory_metrics_v4(
     MsplatTrainer t, MsplatTrainingMemoryMetrics* outMetrics,
+    size_t outputSize, MsplatErrorInfo* error);
+MsplatStatus msplat_trainer_memory_metrics_v17(
+    MsplatTrainer t, MsplatTrainingMemoryMetricsV17* outMetrics,
     size_t outputSize, MsplatErrorInfo* error);
 /// Returns the canonical dataset-camera count when pose refinement is enabled,
 /// or zero when disabled. The count includes the fixed anchor and any held-out

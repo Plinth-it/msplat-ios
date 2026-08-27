@@ -1311,7 +1311,9 @@ kernel void rasterize_backward_kernel(
                 projected_opacities, attribute_layout, idx);
             xy_opacity_batch[tr] = attributes.xy_opacity;
             conic_batch[tr] = attributes.conic;
-            rgbs_batch[tr] = attributes.rgb;
+            // Shift once per loaded Gaussian instead of once per contributing
+            // pixel. The backward clamp and its gate both consume this value.
+            rgbs_batch[tr] = attributes.rgb + 0.5f;
         }
         // wait for other threads to collect the gaussians in batch
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1324,18 +1326,12 @@ kernel void rasterize_backward_kernel(
             // simd_broadcast replaces 32 redundant threadgroup reads.
             float3 b_conic = float3(0.f);
             float3 b_xy_opac = float3(0.f);
-            float3 b_rgb = float3(0.f);
-            int32_t b_id = 0;
             if (wr == 0) {
                 b_conic = conic_batch[t];
                 b_xy_opac = xy_opacity_batch[t];
-                b_rgb = rgbs_batch[t];
-                b_id = id_batch[t];
             }
             b_conic = simd_broadcast(b_conic, 0);
             b_xy_opac = simd_broadcast(b_xy_opac, 0);
-            b_rgb = simd_broadcast(b_rgb, 0);
-            b_id = simd_broadcast(b_id, 0);
 
             int valid = inside;
             if (batch_end - t > bin_final) {
@@ -1366,6 +1362,16 @@ kernel void rasterize_backward_kernel(
                 continue;
             }
 
+            // RGB and the Gaussian ID are unused when the whole SIMDgroup is
+            // inactive. Only RGB is needed outside lane 0.
+            float3 b_rgb = float3(0.f);
+            int32_t b_id = 0;
+            if (wr == 0) {
+                b_rgb = rgbs_batch[t];
+                b_id = id_batch[t];
+            }
+            b_rgb = simd_broadcast(b_rgb, 0);
+
             float3 v_rgb_local = {0.f, 0.f, 0.f};
             float3 v_conic_local = {0.f, 0.f, 0.f};
             float2 v_xy_local = {0.f, 0.f};
@@ -1381,8 +1387,7 @@ kernel void rasterize_backward_kernel(
                 const float fac = alpha * T;
                 v_rgb_local = fac * v_out;
 
-                // b_rgb has raw SH output; clamp inline: max(raw + 0.5, 0)
-                const float3 rgb = max(b_rgb + 0.5f, 0.f);
+                const float3 rgb = max(b_rgb, 0.f);
                 // contribution from this pixel + background
                 const float v_alpha =
                     dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out) +
@@ -1412,10 +1417,10 @@ kernel void rasterize_backward_kernel(
             v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
 
             if (wr == 0) {
-                // Fused clamp_min backward: zero gradient where raw_color + 0.5 < 0
-                if (b_rgb.x + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
-                if (b_rgb.y + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 1, v_rgb_local.y, memory_order_relaxed);
-                if (b_rgb.z + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 2, v_rgb_local.z, memory_order_relaxed);
+                // Fused clamp_min backward: shifted colors below zero have no gradient.
+                if (b_rgb.x >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
+                if (b_rgb.y >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 1, v_rgb_local.y, memory_order_relaxed);
+                if (b_rgb.z >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 2, v_rgb_local.z, memory_order_relaxed);
 
                 atomic_fetch_add_explicit(v_conic + 3*b_id + 0, v_conic_local.x, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_conic + 3*b_id + 1, v_conic_local.y, memory_order_relaxed);
@@ -4312,25 +4317,21 @@ kernel void rasterize_backward_chunked_kernel(
                 projected_opacities, attribute_layout, idx);
             xy_opacity_batch[tr] = attributes.xy_opacity;
             conic_batch[tr] = attributes.conic;
-            rgbs_batch[tr] = attributes.rgb;
+            // Shift once per loaded Gaussian instead of once per contributing
+            // pixel. The backward clamp and its gate both consume this value.
+            rgbs_batch[tr] = attributes.rgb + 0.5f;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         for (int t = max(0, batch_end - warp_bin_final); t < batch_size; ++t) {
             float3 b_conic = float3(0.f);
             float3 b_xy_opac = float3(0.f);
-            float3 b_rgb = float3(0.f);
-            int32_t b_id = 0;
             if (wr == 0) {
                 b_conic = conic_batch[t];
                 b_xy_opac = xy_opacity_batch[t];
-                b_rgb = rgbs_batch[t];
-                b_id = id_batch[t];
             }
             b_conic = simd_broadcast(b_conic, 0);
             b_xy_opac = simd_broadcast(b_xy_opac, 0);
-            b_rgb = simd_broadcast(b_rgb, 0);
-            b_id = simd_broadcast(b_id, 0);
 
             int valid = inside;
             if (batch_end - t > bin_final) valid = 0;
@@ -4356,6 +4357,16 @@ kernel void rasterize_backward_chunked_kernel(
 
             if (!warp_reduce_all_or(valid, warp_size)) continue;
 
+            // RGB and the Gaussian ID are unused when the whole SIMDgroup is
+            // inactive. Only RGB is needed outside lane 0.
+            float3 b_rgb = float3(0.f);
+            int32_t b_id = 0;
+            if (wr == 0) {
+                b_rgb = rgbs_batch[t];
+                b_id = id_batch[t];
+            }
+            b_rgb = simd_broadcast(b_rgb, 0);
+
             float3 v_rgb_local = {0.f, 0.f, 0.f};
             float3 v_conic_local = {0.f, 0.f, 0.f};
             float2 v_xy_local = {0.f, 0.f};
@@ -4369,7 +4380,7 @@ kernel void rasterize_backward_chunked_kernel(
                 const float fac = alpha * T;
                 v_rgb_local = fac * v_out;
 
-                const float3 rgb = max(b_rgb + 0.5f, 0.f);
+                const float3 rgb = max(b_rgb, 0.f);
                 const float v_alpha =
                     dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out) +
                     v_alpha_pixel * T_final * ra;
@@ -4393,9 +4404,9 @@ kernel void rasterize_backward_chunked_kernel(
             v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
 
             if (wr == 0) {
-                if (b_rgb.x + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
-                if (b_rgb.y + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 1, v_rgb_local.y, memory_order_relaxed);
-                if (b_rgb.z + 0.5f >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 2, v_rgb_local.z, memory_order_relaxed);
+                if (b_rgb.x >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
+                if (b_rgb.y >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 1, v_rgb_local.y, memory_order_relaxed);
+                if (b_rgb.z >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 2, v_rgb_local.z, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_conic + 3*b_id + 0, v_conic_local.x, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_conic + 3*b_id + 1, v_conic_local.y, memory_order_relaxed);
                 atomic_fetch_add_explicit(v_conic + 3*b_id + 2, v_conic_local.z, memory_order_relaxed);

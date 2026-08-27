@@ -441,6 +441,17 @@ struct ContentView: View {
                             String(format: "%.0f%%", $0 * 100)
                         } ?? "—"
                     )
+                    LabeledContent(
+                        "Target prefetch waits",
+                        value: memory.trainingTargetPrefetchWaitRate.map {
+                            String(
+                                format: "%.0f%% (%llu/%llu)",
+                                $0 * 100,
+                                memory.trainingTargetPrefetchWaited,
+                                memory.trainingTargetPrefetchUsed
+                            )
+                        } ?? "—"
+                    )
                 }
                 LabeledContent("Thermal", value: session.thermalState)
                 if session.overflowedCompletedSteps > 0 {

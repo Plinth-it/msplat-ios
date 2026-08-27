@@ -85,8 +85,8 @@ require_contains("${input_source}"
     "!decodedTrainingMaskMatches(*this)"
     "coverage lookup rejects a stale decoded mask source")
 require_contains("${input_source}"
-    "camera.hasGPUTrainingTarget(downscaleFactor)"
-    "prefetch residency requires a complete source-matched target")
+    "includeCoverageRenderTiles"
+    "prefetch residency includes the requested coverage-tile capability")
 require_contains("${planner_source}" "[4, pixelCount]"
     "planner budgets four bytes for masked and unmasked targets")
 require_contains("${planner_source}"

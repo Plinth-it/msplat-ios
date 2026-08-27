@@ -591,6 +591,37 @@ void checkFinalColorSaturationBackward() {
     }
 }
 
+void checkProjectedColorClampBackward() {
+    // The raster backward path receives raw SH output and applies a +0.5 bias
+    // before clamping. Exercise both sides and the exact clamp boundary so the
+    // optimized cooperative load cannot change the established derivative.
+    constexpr std::array<float, 3> appearance = {-0.1f, 0.0f, 0.1f};
+    constexpr float fullFrameScale = 100.0f;
+
+    const auto check = [](const StepResult& result, int index) {
+        CHECK(result.colorFirstMoments[index][0] == 0.0f);
+        CHECK(result.colorFirstMoments[index][1] != 0.0f);
+        CHECK(result.colorFirstMoments[index][2] != 0.0f);
+    };
+
+    const StepResult monolithic = runStep(
+        true, 0.0f, 1, 0.9f,
+        false, false, false, false, false,
+        kWidth, kHeight, true, {}, 1, fullFrameScale,
+        {}, {}, appearance);
+    CHECK(monolithic.radius > 0);
+    check(monolithic, 0);
+
+    constexpr int gaussianCount = 513;
+    const StepResult chunked = runStep(
+        true, 0.0f, gaussianCount, 0.005f,
+        false, false, false, false, false,
+        kWidth, kHeight, true, {}, 1, fullFrameScale,
+        {}, {}, appearance);
+    check(chunked, 0);
+    check(chunked, gaussianCount - 1);
+}
+
 void checkPartialSsimThreadgroups() {
     const float initialOpacity = std::log(0.1f / 0.9f);
     const StepResult partial = runStep(
@@ -762,6 +793,7 @@ int main(int argc, char **argv) {
             checkChunkedTransparentAlphaSupervision();
             checkCappedAlphaBackward();
             checkFinalColorSaturationBackward();
+            checkProjectedColorClampBackward();
             checkRetryReadbackPoolReuse();
             checkArenaRetryTransaction();
             checkPartialSsimThreadgroups();

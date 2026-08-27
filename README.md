@@ -280,6 +280,8 @@ Adam moments, visit counts, the anchor, frame IDs, and immutable source poses.
 - ABI v16 opt-in CamP conditioning through a new capability bit in the unchanged
   v8 refinement-options structure. Raw bounded SE(3) remains the default and
   does not allocate CamP matrices; older clients retain their existing path.
+- ABI v17 size-checked training-memory telemetry with target-prefetch scheduled,
+  used, waited, and discarded counters; the ABI v4 snapshot remains unchanged.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
@@ -463,6 +465,34 @@ profiler.
 When `PROFILE_STAGES=1` is enabled, exact-intersection work is reported as
 separate `proj_layout_validate`, `scatter_sort_finalize`, and `pack` stages so
 retry preflight cost is not folded into the asynchronous training tail.
+
+### Command-line GPU capture
+
+macOS 27's `gpucapture` and `gpudebug` can capture and profile the headless Metal
+training workload without Xcode's UI. The helper launches the target with the
+required capture environment, records a bounded command-buffer window, then
+embeds a representative default-state, overlapping replay profile:
+
+```sh
+./scripts/profile-metal.sh --output-dir /private/tmp/msplat-gpu -- \
+  ./build/msplat datasets/mipnerf360/garden -n 80 --save-every=-1 \
+  -o /private/tmp/msplat-gpu-result.ply
+```
+
+The output directory is required to be new so traces and reports are never
+silently overwritten. The default eight-command-buffer window covers four
+current training steps. The report includes the replay summary, encoder
+timeline, and occupancy/ALU counters exposed by the current command-line tools.
+That ratio is an implementation detail of the MPS command-buffer split; adjust
+`--count` when the pipeline changes. Use
+`--gpu-state high --execution serial` only for secondary kernel-isolation
+experiments because it changes normal GPU scheduling.
+
+`metalperftrace` reports `CAMetalLayer` frame metrics. It is useful for a local
+macOS viewer (`metalperftrace listen --process <name>`), but the compute-only
+`msplat` CLI has no layer or present boundary, so it is not a substitute for the
+command-buffer capture above or for physical-iPhone training benchmarks.
+
 With camera prefetch enabled, decode work overlapped with the preceding Metal
 step is outside the next step's `imagePrepareMs`; any remaining wait plus target
 installation and GPU upload is still included.

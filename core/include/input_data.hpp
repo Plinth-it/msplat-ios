@@ -116,8 +116,10 @@ struct Camera {
     const CoverageMask& getCoverageMask(int downscaleFactor);
     uint64_t getCoverageUnits(int downscaleFactor);
     MTensor& getGPUImage(int downscaleFactor);
-    CameraTrainingTarget getGPUTrainingTarget(int downscaleFactor);
-    bool hasGPUTrainingTarget(int downscaleFactor) const;
+    CameraTrainingTarget getGPUTrainingTarget(
+        int downscaleFactor, bool includeCoverageRenderTiles = true);
+    bool hasGPUTrainingTarget(
+        int downscaleFactor, bool includeCoverageRenderTiles = true) const;
     /// Changes the pose and invalidates every derived render matrix.
     void setCameraToWorld(const float pose[16]);
     /// Direct pose writes remain detectable so legacy/internal callers cannot
@@ -192,14 +194,16 @@ public:
     /// Returns the RGB tensor together with optional soft coverage. For a
     /// camera mask, `coverageMask` aliases `image` and alpha stores coverage.
     CameraTrainingTarget gpuTrainingTarget(
-        std::vector<Camera> &cameras, size_t index, int downscaleFactor);
+        std::vector<Camera> &cameras, size_t index, int downscaleFactor,
+        bool includeCoverageRenderTiles = true);
 
     /// Best-effort CPU preparation for one exact future target. The worker
     /// never references or mutates `cameras`; a matching foreground target
     /// request performs the Metal upload and cache publication.
     void prefetchTrainingTarget(
         const std::vector<Camera> &cameras, size_t index,
-        int downscaleFactor) noexcept;
+        int downscaleFactor,
+        bool includeCoverageRenderTiles = true) noexcept;
 
     /// Waits for and discards any staged target. Decode failures are suppressed
     /// because they only become user-visible when the matching target is used.
