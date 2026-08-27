@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreImage
 import CoreVideo
 import Foundation
 import Msplat
@@ -7,6 +8,7 @@ import Msplat
 import simd
 import UIKit
 import UniformTypeIdentifiers
+@preconcurrency import Vision
 import XCTest
 
 final class TrainingMaskOptionsTests: XCTestCase {
@@ -1347,7 +1349,8 @@ final class TrainingMaskOptionsTests: XCTestCase {
                 rawFeaturePoints: [SIMD3<Float>(0, 0, -1)],
                 subjectWorldPosition: nil
             )
-            _ = try await store.accept(candidate)
+            let commit = try await store.accept(candidate)
+            XCTAssertEqual(commit.totalFrameCount, index + 1)
         }
 
         let capture = try await store.finalize()
@@ -1525,6 +1528,87 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: captureDirectory.path))
     }
 
+    func testCaptureTaskGenerationDoesNotLetCancelledWorkFinishReplacement() {
+        var generation = CaptureTaskGeneration()
+        let cancelledOperation = generation.begin()
+        generation.invalidate()
+        let replacementOperation = generation.begin()
+
+        XCTAssertFalse(generation.finish(cancelledOperation))
+        XCTAssertTrue(generation.isActive)
+        XCTAssertEqual(generation.currentID, replacementOperation)
+        XCTAssertTrue(generation.finish(replacementOperation))
+        XCTAssertFalse(generation.isActive)
+    }
+
+    func testCaptureEventOrderingIgnoresRejectionOlderThanCommit() {
+        var ordering = CaptureEventOrdering()
+
+        XCTAssertTrue(ordering.shouldApplyTelemetry(candidateSequence: 1))
+        XCTAssertTrue(ordering.recordCommit(candidateSequence: 2))
+        XCTAssertFalse(ordering.shouldApplyTelemetry(candidateSequence: 1))
+        XCTAssertFalse(ordering.shouldApplyTelemetry(candidateSequence: 2))
+        XCTAssertTrue(ordering.shouldApplyTelemetry(candidateSequence: 3))
+
+        XCTAssertFalse(ordering.recordCommit(candidateSequence: 1))
+        XCTAssertEqual(ordering.latestCommittedCandidateSequence, 2)
+    }
+
+    func testCaptureEventOrderingPreservesNewerRejectionAcrossOlderCommit() {
+        var ordering = CaptureEventOrdering()
+
+        XCTAssertTrue(ordering.shouldApplyTelemetry(candidateSequence: 3))
+        XCTAssertFalse(ordering.recordCommit(candidateSequence: 2))
+        XCTAssertEqual(ordering.latestCommittedCandidateSequence, 2)
+        XCTAssertEqual(ordering.latestMessageCandidateSequence, 3)
+
+        XCTAssertTrue(ordering.recordCommit(candidateSequence: 4))
+        XCTAssertEqual(ordering.latestMessageCandidateSequence, 4)
+    }
+
+    func testCaptureVisionNormalizationOnlyRetriesCandidateLocalErrors() throws {
+        for candidateCode in [
+            VNErrorCode.invalidImage,
+            .invalidFormat,
+            .outOfBoundsError,
+        ] {
+            let candidateError = NSError(
+                domain: VNErrorDomain,
+                code: candidateCode.rawValue
+            )
+            let normalized = normalizeCaptureCandidateVisionError(candidateError)
+            let captureFailure = try XCTUnwrap(normalized as? CaptureFailure)
+            guard case .invalidFrame = captureFailure else {
+                return XCTFail("Expected malformed Vision input to reject the candidate")
+            }
+        }
+
+        let cancellation = NSError(
+            domain: VNErrorDomain,
+            code: VNErrorCode.requestCancelled.rawValue
+        )
+        XCTAssertTrue(
+            normalizeCaptureCandidateVisionError(cancellation) is CancellationError
+        )
+
+        for nonCandidateCode in [
+            VNErrorCode.ioError,
+            .invalidArgument,
+            .internalError,
+            .outOfMemory,
+            .timeout,
+        ] {
+            let nonCandidateError = NSError(
+                domain: VNErrorDomain,
+                code: nonCandidateCode.rawValue
+            )
+            let preserved = normalizeCaptureCandidateVisionError(nonCandidateError)
+                as NSError
+            XCTAssertEqual(preserved.domain, VNErrorDomain)
+            XCTAssertEqual(preserved.code, nonCandidateCode.rawValue)
+        }
+    }
+
     func testCaptureFrameAdmissionStaysBoundedAndReleasesAfterCompletion() throws {
         let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
         let store = try CaptureStore(
@@ -1603,6 +1687,8 @@ final class TrainingMaskOptionsTests: XCTestCase {
             cameraToWorld: matrix_identity_float4x4,
             timestamp: 2
         ))
+
+        XCTAssertGreaterThan(current.candidateSequence, stale.candidateSequence)
 
         XCTAssertFalse(controller.complete(stale, committed: true))
         XCTAssertNil(controller.begin(
@@ -1690,6 +1776,30 @@ final class TrainingMaskOptionsTests: XCTestCase {
         XCTAssertTrue(controller.complete(upsideDown, committed: false))
     }
 
+    func testCaptureFrameAdmissionCanUseStreamingFramesOnly() throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let store = try CaptureStore(
+            mode: .scene,
+            baseDirectory: temporaryDirectory
+        )
+        let controller = CaptureFrameAdmissionController()
+        controller.start(
+            store: store,
+            subjectWorldPosition: nil,
+            usesHighResolutionCapture: false
+        )
+        controller.updateDisplayOrientation(.right)
+        defer { controller.finish() }
+
+        let admission = try XCTUnwrap(controller.begin(
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 1
+        ))
+
+        XCTAssertFalse(admission.requestsHighResolutionFrame)
+        XCTAssertTrue(controller.complete(admission, committed: false))
+    }
+
     func testCaptureHighResolutionRequestGateAllowsOnlyOneInFlightRequest() {
         let gate = CaptureHighResolutionRequestGate()
 
@@ -1750,6 +1860,117 @@ final class TrainingMaskOptionsTests: XCTestCase {
             rawFeaturePoints: [],
             subjectWorldPosition: SIMD3<Float>(0, 0, -1)
         )))
+    }
+
+    func testCaptureAcceptanceRetriesStreamingCandidateAfterLocalRejection() async throws {
+        let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
+        let pixelBuffer = try makeBGRAPixelBuffer(width: 2, height: 2)
+        let validCalibration = CaptureCalibrationRecord(
+            width: 2,
+            height: 2,
+            fx: 2,
+            fy: 2,
+            cx: 1,
+            cy: 1
+        )
+        let invalidCalibration = CaptureCalibrationRecord(
+            width: 3,
+            height: 2,
+            fx: 2,
+            fy: 2,
+            cx: 1,
+            cy: 1
+        )
+        func candidate(
+            image: OwnedPixelBuffer,
+            calibration: CaptureCalibrationRecord
+        ) -> CaptureFrameCandidate {
+            CaptureFrameCandidate(
+                image: image,
+                depth: nil,
+                confidence: nil,
+                displayOrientation: .up,
+                calibration: calibration,
+                cameraToWorld: matrix_identity_float4x4,
+                timestamp: 1,
+                exposureDuration: 0.01,
+                trackingState: "normal",
+                rawFeaturePoints: [SIMD3<Float>(0, 0, -1)],
+                subjectWorldPosition: nil
+            )
+        }
+        let highResolutionCandidate = candidate(
+            image: OwnedPixelBuffer(pixelBuffer),
+            calibration: invalidCalibration
+        )
+        let streamingSnapshot = CaptureFrameSnapshot(
+            image: pixelBuffer,
+            depth: nil,
+            confidence: nil,
+            displayOrientation: .up,
+            calibration: validCalibration,
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 1,
+            exposureDuration: 0.01,
+            trackingState: "normal",
+            rawFeaturePoints: [SIMD3<Float>(0, 0, -1)],
+            subjectWorldPosition: nil
+        )
+        let store = try CaptureStore(
+            mode: .scene,
+            baseDirectory: temporaryDirectory
+        )
+
+        let acceptance = try await acceptCaptureCandidate(
+            highResolutionCandidate,
+            streamingFallback: streamingSnapshot,
+            in: store
+        )
+
+        XCTAssertEqual(acceptance.candidate.calibration, validCalibration)
+        XCTAssertEqual(acceptance.commit.totalFrameCount, 1)
+        XCTAssertNotNil(acceptance.fallbackMessage)
+    }
+
+    func testCaptureFrameSnapshotMaterializesAnOwnedImageCopy() throws {
+        let pixelBuffer = try makeBGRAPixelBuffer(width: 2, height: 2)
+        let snapshot = CaptureFrameSnapshot(
+            image: pixelBuffer,
+            depth: nil,
+            confidence: nil,
+            displayOrientation: .right,
+            calibration: CaptureCalibrationRecord(
+                width: 2,
+                height: 2,
+                fx: 2,
+                fy: 2,
+                cx: 1,
+                cy: 1
+            ),
+            cameraToWorld: matrix_identity_float4x4,
+            timestamp: 12,
+            exposureDuration: 0.02,
+            trackingState: "normal",
+            rawFeaturePoints: [SIMD3<Float>(1, 2, 3)],
+            subjectWorldPosition: nil
+        )
+
+        let candidate = try snapshot.materialize()
+        CVPixelBufferLockBaseAddress(pixelBuffer, [])
+        let source = try XCTUnwrap(CVPixelBufferGetBaseAddress(pixelBuffer))
+            .assumingMemoryBound(to: UInt8.self)
+        source[0] = 255
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, [])
+
+        CVPixelBufferLockBaseAddress(candidate.image.value, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(candidate.image.value, .readOnly)
+        }
+        let copy = try XCTUnwrap(CVPixelBufferGetBaseAddress(candidate.image.value))
+            .assumingMemoryBound(to: UInt8.self)
+        XCTAssertEqual(copy[0], 16)
+        XCTAssertEqual(candidate.timestamp, 12)
+        XCTAssertEqual(candidate.rawFeaturePoints, [SIMD3<Float>(1, 2, 3)])
     }
 
     func testCaptureAdmissionUsesReturnedHighResolutionFrameAsBaseline() throws {
@@ -2087,30 +2308,218 @@ final class RealityKitColmapExportBuilderTests: XCTestCase {
         )
     }
 
-    func testRightOrientedImageRotatesIntrinsicsIntoExportedRaster() {
+    func testImageExportPreservesUpOrientedJPEGAndPNGBytes() throws {
+        let root = try XCTUnwrap(temporaryDirectory)
+        let images = root.appending(
+            path: "preserved-images",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: images,
+            withIntermediateDirectories: true
+        )
+        let formats: [(type: UTType, sourceExtension: String, outputExtension: String)] = [
+            (.jpeg, "jpeg", "jpg"),
+            (.png, "png", "png"),
+        ]
+
+        for (index, format) in formats.enumerated() {
+            let source = root.appending(
+                path: "source-\(index).\(format.sourceExtension)"
+            )
+            try writeImage(to: source, type: format.type, orientation: .up)
+            let sourceBytes = try Data(contentsOf: source)
+
+            let filename = try RealityKitColmapExportBuilder.exportImage(
+                source: source,
+                to: images,
+                imageID: index + 1,
+                orientation: .up,
+                context: CIContext(options: [.cacheIntermediates: false])
+            )
+
+            XCTAssertEqual(
+                filename,
+                String(
+                    format: "image_%06d.%@",
+                    index + 1,
+                    format.outputExtension
+                )
+            )
+            XCTAssertEqual(
+                try Data(contentsOf: images.appending(path: filename)),
+                sourceBytes
+            )
+        }
+    }
+
+    func testImageExportUsesLosslessSRGBPNGWhenOrientationChanges() throws {
+        let root = try XCTUnwrap(temporaryDirectory)
+        let images = root.appending(
+            path: "normalized-images",
+            directoryHint: .isDirectory
+        )
+        try FileManager.default.createDirectory(
+            at: images,
+            withIntermediateDirectories: true
+        )
+        let source = root.appending(path: "rotated.jpeg")
+        try writeImage(
+            to: source,
+            type: .jpeg,
+            width: 64,
+            height: 48,
+            orientation: .right
+        )
+        let sourceBytes = try Data(contentsOf: source)
+
+        let filename = try RealityKitColmapExportBuilder.exportImage(
+            source: source,
+            to: images,
+            imageID: 7,
+            orientation: .right,
+            context: CIContext(options: [.cacheIntermediates: false])
+        )
+
+        XCTAssertEqual(filename, "image_000007.png")
+        XCTAssertEqual(try Data(contentsOf: source), sourceBytes)
+        let destination = images.appending(path: filename)
+        let imageSource = try XCTUnwrap(
+            CGImageSourceCreateWithURL(destination as CFURL, nil)
+        )
+        XCTAssertEqual(
+            CGImageSourceGetType(imageSource) as String?,
+            UTType.png.identifier
+        )
+        let image = try XCTUnwrap(
+            CGImageSourceCreateImageAtIndex(imageSource, 0, nil)
+        )
+        XCTAssertEqual(image.width, 48)
+        XCTAssertEqual(image.height, 64)
+        XCTAssertEqual(image.colorSpace?.name, CGColorSpace.sRGB)
+        let properties = try XCTUnwrap(
+            CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil)
+                as? [CFString: Any]
+        )
+        XCTAssertEqual(
+            (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue ?? 1,
+            RealityKitColmapEXIFOrientation.up.rawValue
+        )
+    }
+
+    func testEXIFOrientationPreservesProjectedRasterCoordinates() {
         let raw = RealityKitColmapCamera(
             width: 4_032,
             height: 3_024,
-            fx: 3_000,
-            fy: 2_990,
-            cx: 2_016,
-            cy: 1_512
+            fx: 3_007.25,
+            fy: 2_983.75,
+            cx: 1_987.5,
+            cy: 1_493.25
         )
+        let cameraPoints = [
+            SIMD3<Double>(-0.42, -0.27, 1.1),
+            SIMD3<Double>(0.31, -0.18, 1.7),
+            SIMD3<Double>(-0.16, 0.39, 2.2),
+            SIMD3<Double>(0.47, 0.29, 1.4),
+        ]
 
-        let camera = RealityKitColmapExportBuilder.camera(
-            raw,
-            applying: .right
-        )
+        for orientation in [
+            RealityKitColmapEXIFOrientation.up,
+            .right,
+            .down,
+            .left,
+        ] {
+            let orientedCamera = RealityKitColmapExportBuilder.camera(
+                raw,
+                applying: orientation
+            )
+            let swapsDimensions = orientation == .right || orientation == .left
+            XCTAssertEqual(
+                orientedCamera.width,
+                swapsDimensions ? raw.height : raw.width
+            )
+            XCTAssertEqual(
+                orientedCamera.height,
+                swapsDimensions ? raw.width : raw.height
+            )
 
-        XCTAssertEqual(camera.width, 3_024)
-        XCTAssertEqual(camera.height, 4_032)
-        XCTAssertEqual(camera.fx, 2_990, accuracy: 0.000_001)
-        XCTAssertEqual(camera.fy, 3_000, accuracy: 0.000_001)
-        XCTAssertEqual(camera.cx, 1_511, accuracy: 0.000_001)
-        XCTAssertEqual(camera.cy, 2_016, accuracy: 0.000_001)
+            for cameraPoint in cameraPoints {
+                let rawPixel = project(cameraPoint, through: raw)
+                let expected = orient(
+                    rawPixel,
+                    sourceWidth: raw.width,
+                    sourceHeight: raw.height,
+                    orientation: orientation
+                )
+                let actual = project(
+                    orient(cameraPoint, orientation: orientation),
+                    through: orientedCamera
+                )
+
+                XCTAssertEqual(
+                    actual.x,
+                    expected.x,
+                    accuracy: 0.000_001,
+                    "x projection for EXIF orientation \(orientation.rawValue)"
+                )
+                XCTAssertEqual(
+                    actual.y,
+                    expected.y,
+                    accuracy: 0.000_001,
+                    "y projection for EXIF orientation \(orientation.rawValue)"
+                )
+            }
+        }
     }
 
-    func testCameraGroupingUsesHalfPixelTolerance() {
+    private func project(
+        _ point: SIMD3<Double>,
+        through camera: RealityKitColmapCamera
+    ) -> SIMD2<Double> {
+        SIMD2<Double>(
+            camera.fx * point.x / point.z + camera.cx,
+            camera.fy * point.y / point.z + camera.cy
+        )
+    }
+
+    private func orient(
+        _ point: SIMD3<Double>,
+        orientation: RealityKitColmapEXIFOrientation
+    ) -> SIMD3<Double> {
+        switch orientation {
+        case .right:
+            SIMD3<Double>(-point.y, point.x, point.z)
+        case .down:
+            SIMD3<Double>(-point.x, -point.y, point.z)
+        case .left:
+            SIMD3<Double>(point.y, -point.x, point.z)
+        default:
+            point
+        }
+    }
+
+    private func orient(
+        _ point: SIMD2<Double>,
+        sourceWidth: Int,
+        sourceHeight: Int,
+        orientation: RealityKitColmapEXIFOrientation
+    ) -> SIMD2<Double> {
+        switch orientation {
+        case .right:
+            SIMD2<Double>(Double(sourceHeight) - point.y, point.x)
+        case .down:
+            SIMD2<Double>(
+                Double(sourceWidth) - point.x,
+                Double(sourceHeight) - point.y
+            )
+        case .left:
+            SIMD2<Double>(point.y, Double(sourceWidth) - point.x)
+        default:
+            point
+        }
+    }
+
+    func testCameraRecordsPreservePerFrameIntrinsics() {
         let entries = [
             imageEntry(id: 1, fx: 1_000, fy: 1_001, cx: 512, cy: 384),
             imageEntry(id: 2, fx: 1_000.4, fy: 1_001.3, cx: 512.5, cy: 383.7),
@@ -2118,12 +2527,12 @@ final class RealityKitColmapExportBuilderTests: XCTestCase {
         ]
 
         let (cameras, assignments) = RealityKitColmapExportBuilder
-            .groupCameras(entries)
+            .cameraRecords(entries)
 
-        XCTAssertEqual(cameras.count, 2)
+        XCTAssertEqual(cameras, entries.map(\.camera))
         XCTAssertEqual(assignments[1], 1)
-        XCTAssertEqual(assignments[2], 1)
-        XCTAssertEqual(assignments[3], 2)
+        XCTAssertEqual(assignments[2], 2)
+        XCTAssertEqual(assignments[3], 3)
     }
 
     func testSparseWriterProducesTrainableColmapLayout() throws {
@@ -2175,8 +2584,107 @@ final class RealityKitColmapExportBuilderTests: XCTestCase {
             contentsOf: sparse.appending(path: "images.txt"),
             encoding: .utf8
         )
+        let camerasText = try String(
+            contentsOf: sparse.appending(path: "cameras.txt"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(camerasText.contains("# Number of cameras: 3"))
         XCTAssertTrue(imagesText.contains("1 0.0 1.0 0.0 0.0"))
         XCTAssertTrue(imagesText.contains("1 image_000001.jpg"))
+    }
+
+    func testSparseWriterDocumentsAndSerializesObservationFreeSeedModel() throws {
+        let sparse = try XCTUnwrap(temporaryDirectory).appending(
+            path: "seed/sparse/0",
+            directoryHint: .isDirectory
+        )
+        let entries = [imageEntry(id: 1), imageEntry(id: 2)]
+        let points = [
+            RealityKitColmapPoint(
+                position: SIMD3<Float>(1, 2, 3),
+                color: SIMD3<Float>(10, 20, 30)
+            ),
+            RealityKitColmapPoint(
+                position: SIMD3<Float>(-1, -2, -3),
+                color: SIMD3<Float>(40, 50, 60)
+            ),
+        ]
+
+        try RealityKitColmapExportBuilder.writeSparseFiles(
+            to: sparse,
+            entries: entries,
+            points: points
+        )
+
+        let notice = try String(
+            contentsOf: sparse.appending(
+                path: RealityKitColmapExportBuilder.seedModelNoticeFilename
+            ),
+            encoding: .utf8
+        )
+        XCTAssertTrue(notice.contains("camera-and-point seed"))
+        XCTAssertTrue(notice.contains("zero `POINTS2D` observations"))
+        XCTAssertTrue(notice.contains("zero tracks"))
+        XCTAssertTrue(notice.contains("not a feature-matched or bundle-adjusted SfM reconstruction"))
+
+        let imagesText = try String(
+            contentsOf: sparse.appending(path: "images.txt"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(imagesText.contains("POINTS2D[] is intentionally empty"))
+        let imageLines = imagesText.components(separatedBy: .newlines)
+        let imageRecordIndexes = imageLines.indices.filter { index in
+            let line = imageLines[index]
+            return !line.isEmpty && !line.hasPrefix("#")
+        }
+        XCTAssertEqual(imageRecordIndexes.count, entries.count)
+        for index in imageRecordIndexes {
+            XCTAssertEqual(imageLines[index + 1], "")
+        }
+
+        let pointsText = try String(
+            contentsOf: sparse.appending(path: "points3D.txt"),
+            encoding: .utf8
+        )
+        XCTAssertTrue(pointsText.contains("TRACK[] is intentionally empty"))
+        let pointRecords = pointsText.split(whereSeparator: \.isNewline)
+            .filter { !$0.hasPrefix("#") }
+        XCTAssertEqual(pointRecords.count, points.count)
+        XCTAssertTrue(pointRecords.allSatisfy { $0.split(separator: " ").count == 8 })
+
+        let imagesBinary = try Data(
+            contentsOf: sparse.appending(path: "images.bin")
+        )
+        var imageOffset = 8
+        XCTAssertEqual(littleEndianUInt64(in: imagesBinary, at: 0), UInt64(entries.count))
+        for _ in entries {
+            imageOffset += 64
+            let filenameEnd = try XCTUnwrap(
+                imagesBinary[imageOffset...].firstIndex(of: 0)
+            )
+            imageOffset = filenameEnd + 1
+            XCTAssertEqual(
+                littleEndianUInt64(in: imagesBinary, at: imageOffset),
+                0
+            )
+            imageOffset += 8
+        }
+        XCTAssertEqual(imageOffset, imagesBinary.count)
+
+        let pointsBinary = try Data(
+            contentsOf: sparse.appending(path: "points3D.bin")
+        )
+        var pointOffset = 8
+        XCTAssertEqual(littleEndianUInt64(in: pointsBinary, at: 0), UInt64(points.count))
+        for _ in points {
+            pointOffset += 43
+            XCTAssertEqual(
+                littleEndianUInt64(in: pointsBinary, at: pointOffset),
+                0
+            )
+            pointOffset += 8
+        }
+        XCTAssertEqual(pointOffset, pointsBinary.count)
     }
 
     func testSparseWriterRejectsEmptyPointCloud() throws {
@@ -2247,24 +2755,54 @@ final class RealityKitColmapExportBuilderTests: XCTestCase {
         )
     }
 
+    private func littleEndianUInt64(in data: Data, at offset: Int) -> UInt64 {
+        guard offset >= data.startIndex,
+              offset + MemoryLayout<UInt64>.size <= data.endIndex else {
+            XCTFail("UInt64 offset \(offset) exceeds \(data.count)-byte buffer")
+            return .max
+        }
+        return (0..<MemoryLayout<UInt64>.size).reduce(into: UInt64(0)) {
+            value, byteOffset in
+            value |= UInt64(data[offset + byteOffset]) << (byteOffset * 8)
+        }
+    }
+
     private func writePNG(to url: URL) throws {
+        try writeImage(to: url, type: .png, orientation: .up)
+    }
+
+    private func writeImage(
+        to url: URL,
+        type: UTType,
+        width: Int = 4,
+        height: Int = 3,
+        orientation: RealityKitColmapEXIFOrientation
+    ) throws {
         let context = try XCTUnwrap(CGContext(
             data: nil,
-            width: 4,
-            height: 3,
+            width: width,
+            height: height,
             bitsPerComponent: 8,
-            bytesPerRow: 16,
+            bytesPerRow: width * 4,
             space: CGColorSpaceCreateDeviceRGB(),
             bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ))
+        context.setFillColor(CGColor(red: 0.15, green: 0.35, blue: 0.75, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: width, height: height))
+        context.setFillColor(CGColor(red: 0.9, green: 0.2, blue: 0.1, alpha: 1))
+        context.fill(CGRect(x: 0, y: 0, width: max(1, width / 2), height: 1))
         let image = try XCTUnwrap(context.makeImage())
         let destination = try XCTUnwrap(CGImageDestinationCreateWithURL(
             url as CFURL,
-            UTType.png.identifier as CFString,
+            type.identifier as CFString,
             1,
             nil
         ))
-        CGImageDestinationAddImage(destination, image, nil)
+        CGImageDestinationAddImage(
+            destination,
+            image,
+            [kCGImagePropertyOrientation: orientation.rawValue] as CFDictionary
+        )
         XCTAssertTrue(CGImageDestinationFinalize(destination))
     }
 }

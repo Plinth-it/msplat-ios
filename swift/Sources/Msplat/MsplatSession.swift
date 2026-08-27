@@ -71,8 +71,8 @@ public struct RGBAFrame: Sendable, Equatable {
 /// An ownership-safe facade over one native dataset and trainer.
 ///
 /// Only one session may be open because the native Metal resources are still
-/// process-global. Legacy `GaussianDataset` and `GaussianTrainer` remain
-/// source-compatible, but must not be used concurrently with this facade.
+/// process-global. Deprecated `GaussianDataset` instances share the same
+/// reservation and cannot coexist with this facade.
 @MsplatRuntimeActor
 public final class MsplatSession {
     private let resources: SessionResources
@@ -883,7 +883,7 @@ private func filePath(_ url: URL) throws -> String {
     return url.path
 }
 
-private func checkedImageLayout(
+func checkedImageLayout(
     width: Int,
     height: Int,
     components: Int

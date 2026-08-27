@@ -246,9 +246,10 @@ private struct RealityKitAlignmentResultSection: View {
                 Label("Share COLMAP folder", systemImage: "square.and.arrow.up")
             }
         } header: {
-            Text("Aligned COLMAP dataset")
+            Text("RealityKit training seed")
         } footer: {
             Text("The original images and ARKit dataset remain unchanged. The aligned output is stored under Documents/RealityKitAlignments.")
+            Text("This is a camera-and-point seed for msplat training. COLMAP image observations and point tracks are intentionally empty; it is not a feature-matched or bundle-adjusted SfM reconstruction.")
         }
     }
 }

@@ -196,7 +196,10 @@
   highest normalized-gradient candidates, and `--max-gaussians` exposes the
   limit in the native CLI and Python CLI.
 - Added the actor-isolated, throwing `MsplatSession` Swift API while preserving
-  the existing Swift and C symbols for source compatibility.
+  the existing Swift and C symbols as migration surfaces. In 2.0 the deprecated
+  `GaussianDataset` and `GaussianTrainer` initializers became throwing and now
+  participate in exclusive native-session ownership, so legacy Swift call sites
+  require source updates.
 - Added Swift `TrainingPlan` validation for input decoding, exact native
   resolution-stage mapping, target SH degree, and the required Gaussian limit.
   Its code-derived peak-memory estimate includes native model/training buffers,

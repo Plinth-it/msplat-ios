@@ -31,6 +31,7 @@ struct CaptureFrameCandidate: Sendable {
 
 struct CaptureCommit: Sendable {
     let record: CaptureFrameRecord
+    let totalFrameCount: Int
     let totalPointCount: Int
 }
 
@@ -352,7 +353,11 @@ actor CaptureStore {
         apply(fusion)
         frames.append(record)
         didCommit = true
-        return CaptureCommit(record: record, totalPointCount: fusedPoints.count)
+        return CaptureCommit(
+            record: record,
+            totalFrameCount: frames.count,
+            totalPointCount: fusedPoints.count
+        )
     }
 
     func finalize() throws -> CapturedDataset {
@@ -473,7 +478,11 @@ actor CaptureStore {
 
         let handler = VNImageRequestHandler(cvPixelBuffer: image, orientation: .up)
         let request = VNGenerateForegroundInstanceMaskRequest()
-        try handler.perform([request])
+        do {
+            try handler.perform([request])
+        } catch {
+            throw normalizeCaptureCandidateVisionError(error)
+        }
         guard let observation = request.results?.first,
               let hit = maskHit(
                 in: observation.instanceMask,
@@ -482,10 +491,15 @@ actor CaptureStore {
             throw CaptureFailure.invalidFrame("Vision could not track the selected subject")
         }
         let selectedInstances = IndexSet(integer: hit.label)
-        let scaledMask = try observation.generateScaledMaskForImage(
-            forInstances: selectedInstances,
-            from: handler
-        )
+        let scaledMask: CVPixelBuffer
+        do {
+            scaledMask = try observation.generateScaledMaskForImage(
+                forInstances: selectedInstances,
+                from: handler
+            )
+        } catch {
+            throw normalizeCaptureCandidateVisionError(error)
+        }
         let width = CVPixelBufferGetWidth(scaledMask)
         let height = CVPixelBufferGetHeight(scaledMask)
         guard width == calibration.width, height == calibration.height else {
@@ -887,6 +901,27 @@ actor CaptureStore {
     private func removeIfPresent(_ url: URL) throws {
         guard FileManager.default.fileExists(atPath: url.path) else { return }
         try FileManager.default.removeItem(at: url)
+    }
+}
+
+func normalizeCaptureCandidateVisionError(_ error: Error) -> Error {
+    if error is CancellationError {
+        return error
+    }
+    let visionError = error as NSError
+    guard visionError.domain == VNErrorDomain,
+          let code = VNErrorCode(rawValue: visionError.code) else {
+        return error
+    }
+    switch code {
+    case .requestCancelled:
+        return CancellationError()
+    case .invalidFormat, .invalidImage, .outOfBoundsError:
+        return CaptureFailure.invalidFrame(
+            "Vision rejected this capture candidate: \(visionError.localizedDescription)"
+        )
+    default:
+        return error
     }
 }
 

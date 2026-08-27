@@ -366,7 +366,9 @@ func train() throws {
 
 `MsplatSession` is the checked, throwing API and serializes the engine's
 process-global Metal state. The legacy `GaussianDataset` and `GaussianTrainer`
-types remain available for source compatibility.
+types remain available as deprecated migration APIs. In 2.0 their initializers
+became throwing and they now share the same exclusive native-session
+reservation, so legacy call sites must adopt error handling.
 
 ABI v13 adds a GPU-native preview path. `MsplatSession.submitPreview(...)`
 returns a `MetalPreviewSubmission`; calling `waitUntilReady()` returns a

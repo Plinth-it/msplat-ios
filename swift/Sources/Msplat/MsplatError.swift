@@ -30,6 +30,18 @@ public enum MsplatError: LocalizedError, Sendable, Equatable {
     }
 }
 
+/// Errors raised before a render writes into caller-owned storage.
+public enum MsplatRenderBufferError: LocalizedError, Sendable, Equatable {
+    case insufficientCapacity(required: Int, actual: Int)
+
+    public var errorDescription: String? {
+        switch self {
+        case .insufficientCapacity(let required, let actual):
+            return "Buffer capacity is \(actual) bytes; \(required) bytes are required"
+        }
+    }
+}
+
 func checkNativeStatus(_ status: MsplatStatus,
                        error nativeError: inout MsplatErrorInfo) throws {
     guard status.rawValue != 0 else { return }

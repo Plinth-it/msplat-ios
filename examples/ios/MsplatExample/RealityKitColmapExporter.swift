@@ -87,7 +87,7 @@ enum RealityKitColmapExportError: LocalizedError, Sendable {
         case .unsupportedOrientation(let filename, let orientation):
             "Mirrored EXIF orientation \(orientation) is unsupported for \(filename)."
         case .imageEncodingFailed(let filename):
-            "The aligned image could not be normalized as JPEG: \(filename)."
+            "The aligned image could not be preserved or converted to lossless sRGB PNG: \(filename)."
         case .invalidCamera(let filename):
             "RealityKit returned invalid camera intrinsics for \(filename)."
         case .maskGenerationFailed(let filename):
@@ -234,10 +234,90 @@ enum RealityKitColmapPoseConverter {
 }
 
 enum RealityKitColmapExportBuilder {
+    static let seedModelNoticeFilename = "REALITYKIT_SEED_MODEL.md"
+
+    static let seedModelNotice = """
+    # RealityKit camera-and-point seed
+
+    This export contains per-frame camera intrinsics, registered poses, and a colored point seed for msplat training.
+
+    The COLMAP `images` records intentionally contain zero `POINTS2D` observations, and the `points3D` records intentionally contain zero tracks. This is not a feature-matched or bundle-adjusted SfM reconstruction. Run feature extraction, matching, triangulation, and bundle adjustment before using workflows that require observations or tracks.
+    """
+
     static func maskFilename(forExportedImage filename: String) -> String {
         URL(fileURLWithPath: filename)
             .deletingPathExtension()
             .lastPathComponent + ".png"
+    }
+
+    static func exportImage(
+        source: URL,
+        to imagesDirectory: URL,
+        imageID: Int,
+        orientation: RealityKitColmapEXIFOrientation,
+        context: CIContext
+    ) throws -> String {
+        let imageSource = CGImageSourceCreateWithURL(source as CFURL, nil)
+        let sourceType = imageSource
+            .flatMap(CGImageSourceGetType)
+            .map { $0 as String }
+
+        let preservedExtension: String? = if orientation == .up,
+                                             sourceType == UTType.jpeg.identifier {
+            "jpg"
+        } else if orientation == .up,
+                  sourceType == UTType.png.identifier {
+            "png"
+        } else {
+            nil
+        }
+        let filename = String(
+            format: "image_%06d.%@",
+            imageID,
+            preservedExtension ?? "png"
+        )
+        let destination = imagesDirectory.appending(path: filename)
+
+        if preservedExtension != nil {
+            do {
+                try FileManager.default.copyItem(at: source, to: destination)
+            } catch {
+                throw RealityKitColmapExportError.imageEncodingFailed(
+                    filename: source.lastPathComponent
+                )
+            }
+            return filename
+        }
+
+        guard let imageSource,
+              let decoded = CGImageSourceCreateImageAtIndex(
+                imageSource,
+                0,
+                [kCGImageSourceShouldCache: false] as CFDictionary
+              ) else {
+            throw RealityKitColmapExportError.imageReadFailed(
+                filename: source.lastPathComponent
+            )
+        }
+        // Build from decoded pixels so the lossless output cannot inherit the
+        // source EXIF orientation after that transform has already been baked.
+        let image = CIImage(cgImage: decoded)
+        let normalized = orientation.needsTransform
+            ? image.oriented(forExifOrientation: Int32(orientation.rawValue))
+            : image
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let data = context.pngRepresentation(
+                of: normalized,
+                format: .RGBA8,
+                colorSpace: colorSpace,
+                options: [:]
+              ) else {
+            throw RealityKitColmapExportError.imageEncodingFailed(
+                filename: source.lastPathComponent
+            )
+        }
+        try data.write(to: destination, options: .atomic)
+        return filename
     }
 
     static func camera(
@@ -251,7 +331,7 @@ enum RealityKitColmapExportBuilder {
                 height: camera.width,
                 fx: camera.fy,
                 fy: camera.fx,
-                cx: Double(camera.height - 1) - camera.cy,
+                cx: Double(camera.height) - camera.cy,
                 cy: camera.cx
             )
         case .left:
@@ -261,7 +341,7 @@ enum RealityKitColmapExportBuilder {
                 fx: camera.fy,
                 fy: camera.fx,
                 cx: camera.cy,
-                cy: Double(camera.width - 1) - camera.cx
+                cy: Double(camera.width) - camera.cx
             )
         case .down:
             RealityKitColmapCamera(
@@ -269,8 +349,8 @@ enum RealityKitColmapExportBuilder {
                 height: camera.height,
                 fx: camera.fx,
                 fy: camera.fy,
-                cx: Double(camera.width - 1) - camera.cx,
-                cy: Double(camera.height - 1) - camera.cy
+                cx: Double(camera.width) - camera.cx,
+                cy: Double(camera.height) - camera.cy
             )
         default:
             camera
@@ -312,30 +392,20 @@ enum RealityKitColmapExportBuilder {
         return conversion
     }
 
-    static func groupCameras(
+    static func cameraRecords(
         _ entries: [RealityKitColmapImageEntry]
     ) -> ([RealityKitColmapCamera], [Int: Int]) {
-        var groups: [(camera: RealityKitColmapCamera, id: Int)] = []
+        var cameras: [RealityKitColmapCamera] = []
+        cameras.reserveCapacity(entries.count)
         var assignments: [Int: Int] = [:]
+        assignments.reserveCapacity(entries.count)
 
-        for entry in entries {
-            if let existing = groups.first(where: { group in
-                group.camera.width == entry.camera.width &&
-                    group.camera.height == entry.camera.height &&
-                    abs(group.camera.fx - entry.camera.fx) <= 0.5 &&
-                    abs(group.camera.fy - entry.camera.fy) <= 0.5 &&
-                    abs(group.camera.cx - entry.camera.cx) <= 0.5 &&
-                    abs(group.camera.cy - entry.camera.cy) <= 0.5
-            }) {
-                assignments[entry.imageID] = existing.id
-            } else {
-                let id = groups.count + 1
-                groups.append((entry.camera, id))
-                assignments[entry.imageID] = id
-            }
+        for (index, entry) in entries.enumerated() {
+            cameras.append(entry.camera)
+            assignments[entry.imageID] = index + 1
         }
 
-        return (groups.map(\.camera), assignments)
+        return (cameras, assignments)
     }
 
     static func writeSparseFiles(
@@ -354,7 +424,7 @@ enum RealityKitColmapExportBuilder {
             at: sparseDirectory,
             withIntermediateDirectories: true
         )
-        let (cameras, assignments) = groupCameras(entries)
+        let (cameras, assignments) = cameraRecords(entries)
         try writeCamerasText(to: sparseDirectory, cameras: cameras)
         try writeImagesText(
             to: sparseDirectory,
@@ -369,6 +439,11 @@ enum RealityKitColmapExportBuilder {
             cameraAssignments: assignments
         )
         try writePointsBinary(to: sparseDirectory, points: points)
+        try (seedModelNotice + "\n").write(
+            to: sparseDirectory.appending(path: seedModelNoticeFilename),
+            atomically: true,
+            encoding: .utf8
+        )
     }
 
     private static func cameraRotation(
@@ -427,6 +502,7 @@ enum RealityKitColmapExportBuilder {
             "# Image list with two lines of data per image:",
             "# IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME",
             "# POINTS2D[] as (X, Y, POINT3D_ID)",
+            "# RealityKit seed model: POINTS2D[] is intentionally empty.",
             "# Number of images: \(entries.count)",
         ]
         for entry in entries {
@@ -450,6 +526,7 @@ enum RealityKitColmapExportBuilder {
         var lines = [
             "# 3D point list with one line of data per point:",
             "# POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[]",
+            "# RealityKit seed model: TRACK[] is intentionally empty.",
         ]
         for (index, point) in points.enumerated() {
             if index.isMultiple(of: 4_096) {
@@ -705,10 +782,10 @@ enum RealityKitColmapExporter {
         for (index, sample) in samples.enumerated() {
             try Task.checkCancellation()
             let imageID = index + 1
-            let filename = String(format: "image_%06d.jpg", imageID)
-            try exportNormalizedImage(
+            let filename = try RealityKitColmapExportBuilder.exportImage(
                 source: sample.sourceURL,
-                destination: imagesDirectory.appending(path: filename),
+                to: imagesDirectory,
+                imageID: imageID,
                 orientation: sample.metadata.orientation,
                 context: context
             )
@@ -745,7 +822,8 @@ enum RealityKitColmapExporter {
                     source: source,
                     destination: destination,
                     expectedWidth: entry.camera.width,
-                    expectedHeight: entry.camera.height
+                    expectedHeight: entry.camera.height,
+                    context: context
                 )
                 completedWorkUnits += 1
                 await progressHandler(
@@ -785,7 +863,7 @@ enum RealityKitColmapExporter {
         return RealityKitColmapExportResult(
             datasetDirectory: datasetDirectory,
             alignedImageCount: entries.count,
-            cameraCount: RealityKitColmapExportBuilder.groupCameras(entries).0.count,
+            cameraCount: entries.count,
             pointCount: points.count,
             maskCount: exportsTrainingMasks ? entries.count : 0
         )
@@ -895,42 +973,12 @@ enum RealityKitColmapExporter {
         }
     }
 
-    private static func exportNormalizedImage(
-        source: URL,
-        destination: URL,
-        orientation: RealityKitColmapEXIFOrientation,
-        context: CIContext
-    ) throws {
-        guard let image = CIImage(contentsOf: source) else {
-            throw RealityKitColmapExportError.imageReadFailed(
-                filename: source.lastPathComponent
-            )
-        }
-        let normalized = orientation.needsTransform
-            ? image.oriented(forExifOrientation: Int32(orientation.rawValue))
-            : image
-        let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)
-            ?? CGColorSpaceCreateDeviceRGB()
-        let options: [CIImageRepresentationOption: Any] = [
-            kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.95,
-        ]
-        guard let data = context.jpegRepresentation(
-            of: normalized,
-            colorSpace: colorSpace,
-            options: options
-        ) else {
-            throw RealityKitColmapExportError.imageEncodingFailed(
-                filename: source.lastPathComponent
-            )
-        }
-        try data.write(to: destination, options: .atomic)
-    }
-
     private static func exportForegroundMask(
         source: URL,
         destination: URL,
         expectedWidth: Int,
-        expectedHeight: Int
+        expectedHeight: Int,
+        context: CIContext
     ) async throws {
         let task = Task.detached(priority: .userInitiated) {
             try Task.checkCancellation()
@@ -994,7 +1042,6 @@ enum RealityKitColmapExporter {
                     "CIColorThreshold",
                     parameters: ["inputThreshold": 0.5]
                 )
-            let context = CIContext(options: [.cacheIntermediates: false])
             guard let renderedMask = context.createCGImage(
                 maskImage,
                 from: maskImage.extent,

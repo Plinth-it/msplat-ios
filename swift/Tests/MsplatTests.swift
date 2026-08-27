@@ -199,6 +199,23 @@ final class MsplatTests: XCTestCase {
         XCTAssertThrowsError(try CameraPose(elements: nonFinite))
     }
 
+    func testCheckedImageLayoutRejectsInvalidAndOverflowingDimensions() throws {
+        let layout = try checkedImageLayout(width: 3, height: 2, components: 4)
+        XCTAssertEqual(layout.elementsPerRow, 12)
+        XCTAssertEqual(layout.elementCount, 24)
+
+        XCTAssertThrowsError(
+            try checkedImageLayout(width: 0, height: 2, components: 4)
+        )
+        XCTAssertThrowsError(
+            try checkedImageLayout(width: Int.max, height: 2, components: 4)
+        ) { error in
+            guard case .outOfMemory = error as? MsplatError else {
+                return XCTFail("Expected outOfMemory, got \(error)")
+            }
+        }
+    }
+
     func testTrainingTelemetryConversionKeepsSubmissionAndCompletionSeparate() {
         var native = MsplatTrainingMetricsV12()
         native.flags = UInt32(MSPLAT_TRAINING_METRICS_HAS_SUBMITTED_STEP)
@@ -346,8 +363,62 @@ final class MsplatTests: XCTestCase {
             .trainingTargetPrefetchWaitRate)
     }
 
+    func testLegacyDatasetInitializationFailureReleasesReservation() throws {
+        let missingPath = NSTemporaryDirectory()
+            + "missing-msplat-dataset-\(UUID().uuidString)"
+        XCTAssertThrowsError(try GaussianDataset(path: missingPath)) { error in
+            XCTAssertNotNil(error as? MsplatError)
+        }
+
+        let dataset = try GaussianDataset(
+            path: Self.gardenPath,
+            downscaleFactor: 4.0
+        )
+        XCTAssertGreaterThan(dataset.numTrain, 0)
+    }
+
+    func testLegacyDatasetOwnsExclusiveNativeReservation() throws {
+        var firstDataset: GaussianDataset? = try GaussianDataset(
+            path: Self.gardenPath,
+            downscaleFactor: 4.0
+        )
+        XCTAssertGreaterThan(try XCTUnwrap(firstDataset).numTrain, 0)
+        XCTAssertThrowsError(
+            try GaussianDataset(path: Self.gardenPath, downscaleFactor: 4.0)
+        ) { error in
+            guard case .invalidArgument(let message) = error as? MsplatError else {
+                return XCTFail("Expected invalidArgument, got \(error)")
+            }
+            XCTAssertEqual(message, "Another msplat session is already active")
+        }
+
+        firstDataset = nil
+        let replacement = try GaussianDataset(
+            path: Self.gardenPath,
+            downscaleFactor: 4.0
+        )
+        XCTAssertGreaterThan(replacement.numTrain, 0)
+    }
+
+    func testLegacyTrainerInitializationPropagatesInvalidConfig() throws {
+        let dataset = try GaussianDataset(
+            path: Self.gardenPath,
+            downscaleFactor: 4.0
+        )
+        var config = TrainingConfig()
+        config.iterations = 0
+
+        XCTAssertThrowsError(
+            try GaussianTrainer(dataset: dataset, config: config)
+        ) { error in
+            guard case .invalidArgument = error as? MsplatError else {
+                return XCTFail("Expected invalidArgument, got \(error)")
+            }
+        }
+    }
+
     func testLoadDataset() throws {
-        let dataset = GaussianDataset(
+        let dataset = try GaussianDataset(
             path: Self.gardenPath,
             downscaleFactor: 4.0,
             evalMode: true,
@@ -358,7 +429,7 @@ final class MsplatTests: XCTestCase {
     }
 
     func testTrainShort() throws {
-        let dataset = GaussianDataset(
+        let dataset = try GaussianDataset(
             path: Self.gardenPath,
             downscaleFactor: 4.0
         )
@@ -366,7 +437,7 @@ final class MsplatTests: XCTestCase {
         config.iterations = 10
         config.numDownscales = 0
 
-        let trainer = GaussianTrainer(dataset: dataset, config: config)
+        let trainer = try GaussianTrainer(dataset: dataset, config: config)
 
         for _ in 0..<10 {
             let stats = trainer.step()
@@ -401,7 +472,7 @@ final class MsplatTests: XCTestCase {
     }
 
     func testRender() throws {
-        let dataset = GaussianDataset(
+        let dataset = try GaussianDataset(
             path: Self.gardenPath,
             downscaleFactor: 4.0
         )
@@ -409,7 +480,7 @@ final class MsplatTests: XCTestCase {
         config.iterations = 5
         config.numDownscales = 0
 
-        let trainer = GaussianTrainer(dataset: dataset, config: config)
+        let trainer = try GaussianTrainer(dataset: dataset, config: config)
         for _ in 0..<5 { trainer.step() }
 
         let rendered = trainer.render(cameraIndex: 0)
@@ -418,8 +489,94 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(rendered.pixels.count, rendered.width * rendered.height * 3)
     }
 
+    func testLegacyCheckedRenderValidatesBufferCapacity() throws {
+        let dataset = try GaussianDataset(
+            path: Self.gardenPath,
+            downscaleFactor: 4.0
+        )
+        var config = TrainingConfig()
+        config.iterations = 1
+        config.numDownscales = 0
+        let trainer = try GaussianTrainer(dataset: dataset, config: config)
+        let pose = dataset.cameraPose(at: 0)
+
+        var invalidWidth: Int32 = -1
+        var invalidHeight: Int32 = -1
+        XCTAssertThrowsError(
+            try trainer.renderFromPoseToBuffer(
+                camToWorld: pose,
+                refCameraIndex: dataset.numTrain,
+                rgba: UnsafeMutableRawBufferPointer(start: nil, count: 0),
+                width: &invalidWidth,
+                height: &invalidHeight
+            )
+        ) { error in
+            guard case .invalidArgument(let message) = error as? MsplatError else {
+                return XCTFail("Expected invalidArgument, got \(error)")
+            }
+            XCTAssertTrue(message.contains("Reference camera index"))
+        }
+        XCTAssertEqual(invalidWidth, 0)
+        XCTAssertEqual(invalidHeight, 0)
+
+        var queriedWidth: Int32 = 0
+        var queriedHeight: Int32 = 0
+        try trainer.renderFromPoseToBuffer(
+            camToWorld: pose,
+            rgba: UnsafeMutableRawBufferPointer(start: nil, count: 0),
+            width: &queriedWidth,
+            height: &queriedHeight
+        )
+        let layout = try checkedImageLayout(
+            width: Int(queriedWidth),
+            height: Int(queriedHeight),
+            components: 4
+        )
+
+        var shortStorage = [UInt8](
+            repeating: 0,
+            count: layout.elementCount - 1
+        )
+        var shortWidth: Int32 = 0
+        var shortHeight: Int32 = 0
+        XCTAssertThrowsError(
+            try shortStorage.withUnsafeMutableBytes { storage in
+                try trainer.renderFromPoseToBuffer(
+                    camToWorld: pose,
+                    rgba: storage,
+                    width: &shortWidth,
+                    height: &shortHeight
+                )
+            }
+        ) { error in
+            XCTAssertEqual(
+                error as? MsplatRenderBufferError,
+                .insufficientCapacity(
+                    required: layout.elementCount,
+                    actual: layout.elementCount - 1
+                )
+            )
+        }
+        XCTAssertEqual(shortWidth, queriedWidth)
+        XCTAssertEqual(shortHeight, queriedHeight)
+
+        var exactStorage = [UInt8](repeating: 0, count: layout.elementCount)
+        var renderedWidth: Int32 = 0
+        var renderedHeight: Int32 = 0
+        try exactStorage.withUnsafeMutableBytes { storage in
+            try trainer.renderFromPoseToBuffer(
+                camToWorld: pose,
+                rgba: storage,
+                width: &renderedWidth,
+                height: &renderedHeight
+            )
+        }
+        XCTAssertEqual(renderedWidth, queriedWidth)
+        XCTAssertEqual(renderedHeight, queriedHeight)
+    }
+
     func testExportPly() throws {
-        let dataset = GaussianDataset(
+        let dataset = try GaussianDataset(
             path: Self.gardenPath,
             downscaleFactor: 4.0
         )
@@ -427,7 +584,7 @@ final class MsplatTests: XCTestCase {
         config.iterations = 5
         config.numDownscales = 0
 
-        let trainer = GaussianTrainer(dataset: dataset, config: config)
+        let trainer = try GaussianTrainer(dataset: dataset, config: config)
         for _ in 0..<5 { trainer.step() }
 
         let tmpPath = NSTemporaryDirectory() + "msplat_test_export.ply"
@@ -441,7 +598,7 @@ final class MsplatTests: XCTestCase {
     }
 
     func testExportSpz() throws {
-        let dataset = GaussianDataset(
+        let dataset = try GaussianDataset(
             path: Self.gardenPath,
             downscaleFactor: 4.0
         )
@@ -449,7 +606,7 @@ final class MsplatTests: XCTestCase {
         config.iterations = 5
         config.numDownscales = 0
 
-        let trainer = GaussianTrainer(dataset: dataset, config: config)
+        let trainer = try GaussianTrainer(dataset: dataset, config: config)
         for _ in 0..<5 { trainer.step() }
 
         let tmpPath = NSTemporaryDirectory() + "msplat_test_export.spz"

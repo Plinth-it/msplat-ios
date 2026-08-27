@@ -97,7 +97,7 @@ struct CaptureRootView: View {
                     Spacer()
                     if isCapturing {
                         Label(
-                            "\(model.frames.count)",
+                            "\(model.frameCount)",
                             systemImage: "circle.fill"
                         )
                         .font(.headline.monospacedDigit())
