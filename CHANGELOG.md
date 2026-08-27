@@ -96,6 +96,13 @@
   retraction, regularization, and bounds. Checkpoint v4 stores the exact matrices
   and readiness state and rejects missing, singular, or mismatched optimizer
   bases; Raw checkpoints remain v3.
+- Added ABI v17 target-prefetch effectiveness counters through a new
+  size-checked memory snapshot while preserving the ABI v4 structure and query.
+  Transparent masked training now skips the Coverage-only render-tile map,
+  while Coverage targets remain reusable by Transparent and tile-less targets
+  are safely upgraded if a later Coverage trainer reuses the dataset. Exact
+  area mask resizing now precomputes repeated source-overlap spans without
+  changing accumulation order or target bytes.
 - Added an exact binary-grayscale PNG mask path for discovered Brush-style
   masks. Eligible 8-bit black/white masks decode into one source byte per pixel
   before the existing area filter; soft, profiled, alpha, and color masks retain

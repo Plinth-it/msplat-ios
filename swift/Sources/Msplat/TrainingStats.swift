@@ -188,6 +188,11 @@ public struct TrainingMemorySnapshot: Sendable, Equatable {
     public let processAvailableBytes: UInt64?
     public let trainingGpuImageCacheHits: UInt64
     public let trainingGpuImageCacheMisses: UInt64
+    public let trainingTargetPrefetchScheduled: UInt64
+    public let trainingTargetPrefetchUsed: UInt64
+    /// Matching prefetched targets that were still running when requested.
+    public let trainingTargetPrefetchWaited: UInt64
+    public let trainingTargetPrefetchDiscarded: UInt64
 
     /// Sum of the native buffers whose ownership is represented above.
     public var trackedNativeBufferBytes: UInt64 {
@@ -204,7 +209,20 @@ public struct TrainingMemorySnapshot: Sendable, Equatable {
         return Double(trainingGpuImageCacheHits) / Double(accesses)
     }
 
-    init(from c: MsplatTrainingMemoryMetrics) {
+    public var trainingTargetPrefetchReady: UInt64 {
+        guard trainingTargetPrefetchUsed >= trainingTargetPrefetchWaited else {
+            return 0
+        }
+        return trainingTargetPrefetchUsed - trainingTargetPrefetchWaited
+    }
+
+    public var trainingTargetPrefetchWaitRate: Double? {
+        guard trainingTargetPrefetchUsed > 0 else { return nil }
+        return Double(trainingTargetPrefetchWaited) /
+            Double(trainingTargetPrefetchUsed)
+    }
+
+    init(from c: MsplatTrainingMemoryMetricsV17) {
         trainerModelBufferBytes = c.trainerModelBufferBytes
         engineSharedTransientBufferBytes = c.engineSharedTransientBufferBytes
         engineTrainingTransientBufferBytes = c.engineTrainingTransientBufferBytes
@@ -220,6 +238,10 @@ public struct TrainingMemorySnapshot: Sendable, Equatable {
             ? c.processAvailableBytes : nil
         trainingGpuImageCacheHits = c.trainingGpuImageCacheHits
         trainingGpuImageCacheMisses = c.trainingGpuImageCacheMisses
+        trainingTargetPrefetchScheduled = c.trainingTargetPrefetchScheduled
+        trainingTargetPrefetchUsed = c.trainingTargetPrefetchUsed
+        trainingTargetPrefetchWaited = c.trainingTargetPrefetchWaited
+        trainingTargetPrefetchDiscarded = c.trainingTargetPrefetchDiscarded
     }
 }
 

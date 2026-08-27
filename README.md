@@ -280,6 +280,8 @@ Adam moments, visit counts, the anchor, frame IDs, and immutable source poses.
 - ABI v16 opt-in CamP conditioning through a new capability bit in the unchanged
   v8 refinement-options structure. Raw bounded SE(3) remains the default and
   does not allocate CamP matrices; older clients retain their existing path.
+- ABI v17 size-checked training-memory telemetry with target-prefetch scheduled,
+  used, waited, and discarded counters; the ABI v4 snapshot remains unchanged.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,

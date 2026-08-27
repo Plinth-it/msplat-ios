@@ -15,6 +15,7 @@
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -714,6 +715,97 @@ void checkCoverageMaskDecodeAndResize(const TempDirectory &temporary) {
                 TrainingMaskChannel::Alpha);
         },
         "no alpha channel");
+}
+
+CoverageMask referenceResizeCoverageArea(
+    const CoverageMask &src, int dstW, int dstH) {
+    CoverageMask dst;
+    dst.width = dstW;
+    dst.height = dstH;
+    dst.data.resize(static_cast<size_t>(dstW) * dstH);
+
+    const double scaleX = static_cast<double>(src.width) / dstW;
+    const double scaleY = static_cast<double>(src.height) / dstH;
+    for (int dy = 0; dy < dstH; ++dy) {
+        const double srcY0 = dy * scaleY;
+        const double srcY1 = (dy + 1) * scaleY;
+        for (int dx = 0; dx < dstW; ++dx) {
+            const double srcX0 = dx * scaleX;
+            const double srcX1 = (dx + 1) * scaleX;
+            double sum = 0.0;
+            double totalArea = 0.0;
+
+            const int iy0 = static_cast<int>(srcY0);
+            const int iy1 = std::min(
+                static_cast<int>(std::ceil(srcY1)), src.height);
+            const int ix0 = static_cast<int>(srcX0);
+            const int ix1 = std::min(
+                static_cast<int>(std::ceil(srcX1)), src.width);
+            for (int iy = iy0; iy < iy1; ++iy) {
+                const double wy =
+                    std::min(static_cast<double>(iy + 1), srcY1) -
+                    std::max(static_cast<double>(iy), srcY0);
+                for (int ix = ix0; ix < ix1; ++ix) {
+                    const double wx =
+                        std::min(static_cast<double>(ix + 1), srcX1) -
+                        std::max(static_cast<double>(ix), srcX0);
+                    const double area = wx * wy;
+                    const size_t sourceIndex =
+                        static_cast<size_t>(iy) * src.width + ix;
+                    sum += src.data[sourceIndex] * area;
+                    totalArea += area;
+                }
+            }
+
+            const long rounded = std::lround(sum / totalArea);
+            dst.data[static_cast<size_t>(dy) * dstW + dx] =
+                static_cast<uint8_t>(std::clamp(rounded, 0L, 255L));
+        }
+    }
+    return dst;
+}
+
+void checkCoverageAreaResizeParity() {
+    std::mt19937 random(0x4d534b31u);
+    std::uniform_int_distribution<int> byteValue(0, 255);
+    const auto checkCase = [&](int srcW, int srcH, int dstW, int dstH) {
+        CoverageMask source;
+        source.width = srcW;
+        source.height = srcH;
+        source.data.resize(static_cast<size_t>(srcW) * srcH);
+        for (uint8_t &value : source.data)
+            value = static_cast<uint8_t>(byteValue(random));
+
+        const CoverageMask expected =
+            referenceResizeCoverageArea(source, dstW, dstH);
+        const CoverageMask actual = resizeCoverageArea(source, dstW, dstH);
+        CHECK(actual.width == expected.width);
+        CHECK(actual.height == expected.height);
+        CHECK(actual.data == expected.data);
+    };
+
+    constexpr std::array<std::array<int, 4>, 8> fixedCases = {{
+        {{1, 1, 1, 1}},
+        {{2, 2, 1, 1}},
+        {{7, 5, 4, 3}},
+        {{13, 11, 17, 19}},
+        {{33, 17, 16, 8}},
+        {{64, 48, 23, 19}},
+        {{302, 403, 120, 160}},
+        {{403, 302, 160, 120}},
+    }};
+    for (const auto &dimensions : fixedCases) {
+        checkCase(
+            dimensions[0], dimensions[1], dimensions[2], dimensions[3]);
+    }
+
+    std::uniform_int_distribution<int> sourceExtent(1, 37);
+    std::uniform_int_distribution<int> destinationExtent(1, 41);
+    for (int iteration = 0; iteration < 300; ++iteration) {
+        checkCase(
+            sourceExtent(random), sourceExtent(random),
+            destinationExtent(random), destinationExtent(random));
+    }
 }
 
 void checkBinaryGrayscalePNGMaskDecode(const TempDirectory &temporary) {
@@ -1476,6 +1568,90 @@ void checkMaskedPrefetchParity(const TempDirectory &temporary) {
     CHECK(cache.cachedCpuBytes() == 0);
 }
 
+void checkTransparentMaskedTargetCapability(const TempDirectory &temporary) {
+    constexpr int width = 33;
+    constexpr int height = 17;
+    const fs::path imagePath =
+        temporary.path / "prefetch-transparent-rgb.tiff";
+    const fs::path maskPath =
+        temporary.path / "prefetch-transparent-mask.tiff";
+    const std::vector<uint8_t> imageRGBA =
+        repeatingGridRGBA(width, height);
+    std::vector<uint8_t> maskRGBA(
+        static_cast<size_t>(width) * height * 4u, 0);
+    maskRGBA[(8u * width + 20u) * 4u + 3u] = 1;
+    maskRGBA[(static_cast<size_t>(height - 1) * width + width - 1) *
+             4u + 3u] = 255;
+    writeTIFF(imagePath, width, height, imageRGBA, 1);
+    writeTIFF(maskPath, width, height, maskRGBA, 1);
+    const TrainingMaskDescriptor mask{
+        maskPath.string(), TrainingMaskChannel::Alpha};
+
+    std::vector<Camera> coverageCameras;
+    coverageCameras.push_back(
+        prefetchTestCamera(imagePath, width, height, mask));
+    CameraImageCache coverageCache(1.0f, 1'024 * 1'024, false);
+    const TrainingTargetSnapshot expectedCoverage = snapshotTarget(
+        coverageCache.gpuTrainingTarget(coverageCameras, 0, 1, true));
+    CHECK(expectedCoverage.coverageRenderTileBytes ==
+          std::optional<std::vector<uint8_t>>(
+              std::vector<uint8_t>({1, 1, 1, 0, 1, 1})));
+
+    std::vector<Camera> transparentCameras;
+    transparentCameras.push_back(
+        prefetchTestCamera(imagePath, width, height, mask));
+    CameraImageCache transparentCache(1.0f, 1'024 * 1'024, false);
+    const TrainingTargetSnapshot expectedTransparent = snapshotTarget(
+        transparentCache.gpuTrainingTarget(
+            transparentCameras, 0, 1, false));
+    CHECK(expectedTransparent.imageBytes == expectedCoverage.imageBytes);
+    CHECK(expectedTransparent.maskBytes == expectedCoverage.maskBytes);
+    CHECK(expectedTransparent.coverageUnits == expectedCoverage.coverageUnits);
+    CHECK(!expectedTransparent.coverageRenderTileBytes.has_value());
+
+    std::vector<Camera> cameras;
+    cameras.push_back(prefetchTestCamera(imagePath, width, height, mask));
+    CameraImageCache cache(1.0f, 1'024 * 1'024, true);
+    cache.prefetchTrainingTarget(cameras, 0, 1, false);
+    waitUntil(
+        [&] { return cache.cachedCpuBytes() == expectedTransparent.byteCount(); },
+        "transparent masked camera prefetch did not finish");
+    const TrainingTargetSnapshot prefetchedTransparent = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 0, 1, false));
+    checkSameTarget(expectedTransparent, prefetchedTransparent);
+    CHECK(cache.prefetchScheduledCount() == 1);
+    CHECK(cache.prefetchUsedCount() == 1);
+    CHECK(cache.prefetchWaitCount() <= cache.prefetchUsedCount());
+    CHECK(cache.cachedGpuBytes() == expectedTransparent.byteCount());
+
+    CHECK(fs::remove(imagePath));
+    CHECK(fs::remove(maskPath));
+    const TrainingTargetSnapshot sourceFreeHit = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 0, 1, false));
+    checkSameTarget(expectedTransparent, sourceFreeHit);
+    CHECK(cache.hitCount() == 1);
+    CHECK(cache.missCount() == 1);
+
+    // A tile-less Transparent target cannot satisfy a later Coverage request.
+    // Recreate the sources, upgrade the resident capability, then verify that
+    // the Coverage superset can still serve Transparent without exposing its
+    // retained tile map.
+    writeTIFF(imagePath, width, height, imageRGBA, 1);
+    writeTIFF(maskPath, width, height, maskRGBA, 1);
+    const TrainingTargetSnapshot upgradedCoverage = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 0, 1, true));
+    checkSameTarget(expectedCoverage, upgradedCoverage);
+    CHECK(cache.hitCount() == 1);
+    CHECK(cache.missCount() == 2);
+    CHECK(cache.cachedGpuBytes() == expectedCoverage.byteCount());
+
+    const TrainingTargetSnapshot coverageSupersetHit = snapshotTarget(
+        cache.gpuTrainingTarget(cameras, 0, 1, false));
+    checkSameTarget(expectedTransparent, coverageSupersetHit);
+    CHECK(cache.hitCount() == 2);
+    CHECK(cache.missCount() == 2);
+}
+
 void checkNonmatchingTargetPreservesPrefetch(
     const TempDirectory &temporary) {
     constexpr int width = 6;
@@ -1947,6 +2123,9 @@ int main() {
         checkStage("coverage mask decode and resize", [&] {
             checkCoverageMaskDecodeAndResize(temporary);
         });
+        checkStage("coverage area resize parity", [&] {
+            checkCoverageAreaResizeParity();
+        });
         checkStage("binary grayscale PNG mask decode", [&] {
             checkBinaryGrayscalePNGMaskDecode(temporary);
         });
@@ -2009,6 +2188,9 @@ int main() {
         });
         checkStage("masked camera prefetch parity", [&] {
             checkMaskedPrefetchParity(temporary);
+        });
+        checkStage("transparent masked target capability", [&] {
+            checkTransparentMaskedTargetCapability(temporary);
         });
         checkStage("nonmatching target preserves camera prefetch", [&] {
             checkNonmatchingTargetPreservesPrefetch(temporary);

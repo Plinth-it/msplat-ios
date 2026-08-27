@@ -22,7 +22,7 @@
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
-static_assert(MSPLAT_ABI_VERSION == 16u);
+static_assert(MSPLAT_ABI_VERSION == 17u);
 static_assert(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS == (1u << 0));
 static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS == (1u << 1));
 static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING == (1u << 2));
@@ -82,6 +82,17 @@ static_assert(sizeof(MsplatTrainingMemoryMetrics) == 96);
 static_assert(alignof(MsplatTrainingMemoryMetrics) == 8);
 static_assert(offsetof(MsplatTrainingMemoryMetrics, trainerModelBufferBytes) == 8);
 static_assert(offsetof(MsplatTrainingMemoryMetrics, trainingGpuImageCacheMisses) == 88);
+static_assert(std::is_standard_layout<MsplatTrainingMemoryMetricsV17>::value);
+static_assert(sizeof(MsplatTrainingMemoryMetricsV17) == 128);
+static_assert(alignof(MsplatTrainingMemoryMetricsV17) == 8);
+static_assert(offsetof(MsplatTrainingMemoryMetricsV17,
+                       trainerModelBufferBytes) == 8);
+static_assert(offsetof(MsplatTrainingMemoryMetricsV17,
+                       trainingGpuImageCacheMisses) == 88);
+static_assert(offsetof(MsplatTrainingMemoryMetricsV17,
+                       trainingTargetPrefetchScheduled) == 96);
+static_assert(offsetof(MsplatTrainingMemoryMetricsV17,
+                       trainingTargetPrefetchDiscarded) == 120);
 static_assert(MSPLAT_POSE_REFINEMENT_STATE_ENABLED == (1u << 0));
 static_assert(MSPLAT_POSE_REFINEMENT_STATE_ANCHOR == (1u << 1));
 static_assert((MSPLAT_POSE_REFINEMENT_STATE_ENABLED &
@@ -1362,6 +1373,32 @@ int main() {
                       sizeof(memoryMetrics)) == 0);
     status = msplat_trainer_memory_metrics_v4(
         nullptr, nullptr, sizeof(memoryMetrics), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+
+    MsplatTrainingMemoryMetricsV17 memoryMetricsV17;
+    std::memset(&memoryMetricsV17, 0x5a, sizeof(memoryMetricsV17));
+    status = msplat_trainer_memory_metrics_v17(
+        nullptr, &memoryMetricsV17, sizeof(memoryMetricsV17), &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    MsplatTrainingMemoryMetricsV17 zeroMemoryMetricsV17{};
+    CHECK(std::memcmp(&memoryMetricsV17, &zeroMemoryMetricsV17,
+                      sizeof(memoryMetricsV17)) == 0);
+
+    std::memset(&memoryMetricsV17, 0x5a, sizeof(memoryMetricsV17));
+    const MsplatTrainingMemoryMetricsV17 unchangedMemoryMetricsV17 =
+        memoryMetricsV17;
+    status = msplat_trainer_memory_metrics_v17(
+        nullptr, &memoryMetricsV17, sizeof(memoryMetricsV17) - 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&memoryMetricsV17, &unchangedMemoryMetricsV17,
+                      sizeof(memoryMetricsV17)) == 0);
+    status = msplat_trainer_memory_metrics_v17(
+        nullptr, &memoryMetricsV17, sizeof(memoryMetricsV17) + 1, &error);
+    CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(std::memcmp(&memoryMetricsV17, &unchangedMemoryMetricsV17,
+                      sizeof(memoryMetricsV17)) == 0);
+    status = msplat_trainer_memory_metrics_v17(
+        nullptr, nullptr, sizeof(memoryMetricsV17), &error);
     CHECK(status == MSPLAT_STATUS_INVALID_ARGUMENT);
 
     uint32_t poseStateCount = 99u;

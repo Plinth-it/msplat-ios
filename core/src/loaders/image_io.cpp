@@ -709,31 +709,55 @@ CoverageMask resizeCoverageArea(const CoverageMask &src, int dstW, int dstH) {
     dst.height = dstH;
     dst.data.resize(destinationElements);
 
-    const double scaleX = static_cast<double>(src.width) / dstW;
-    const double scaleY = static_cast<double>(src.height) / dstH;
+    struct AreaSpan {
+        int sourceBegin = 0;
+        std::vector<double> weights;
+    };
+    const auto buildSpans = [](int sourceExtent, int destinationExtent) {
+        const double scale =
+            static_cast<double>(sourceExtent) / destinationExtent;
+        std::vector<AreaSpan> spans;
+        spans.reserve(static_cast<size_t>(destinationExtent));
+        for (int destination = 0; destination < destinationExtent;
+             ++destination) {
+            const double sourceStart = destination * scale;
+            const double sourceEnd = (destination + 1) * scale;
+            AreaSpan span;
+            span.sourceBegin = static_cast<int>(sourceStart);
+            const int sourceLimit = std::min(
+                static_cast<int>(std::ceil(sourceEnd)), sourceExtent);
+            span.weights.reserve(
+                static_cast<size_t>(sourceLimit - span.sourceBegin));
+            for (int source = span.sourceBegin; source < sourceLimit;
+                 ++source) {
+                span.weights.push_back(
+                    std::min(static_cast<double>(source + 1), sourceEnd) -
+                    std::max(static_cast<double>(source), sourceStart));
+            }
+            spans.push_back(std::move(span));
+        }
+        return spans;
+    };
+
+    const std::vector<AreaSpan> xSpans = buildSpans(src.width, dstW);
+    const std::vector<AreaSpan> ySpans = buildSpans(src.height, dstH);
     for (int dy = 0; dy < dstH; ++dy) {
-        const double srcY0 = dy * scaleY;
-        const double srcY1 = (dy + 1) * scaleY;
+        const AreaSpan &ySpan = ySpans[static_cast<size_t>(dy)];
         for (int dx = 0; dx < dstW; ++dx) {
-            const double srcX0 = dx * scaleX;
-            const double srcX1 = (dx + 1) * scaleX;
+            const AreaSpan &xSpan = xSpans[static_cast<size_t>(dx)];
             double sum = 0.0;
             double totalArea = 0.0;
 
-            const int iy0 = static_cast<int>(srcY0);
-            const int iy1 = std::min(
-                static_cast<int>(std::ceil(srcY1)), src.height);
-            const int ix0 = static_cast<int>(srcX0);
-            const int ix1 = std::min(
-                static_cast<int>(std::ceil(srcX1)), src.width);
-            for (int iy = iy0; iy < iy1; ++iy) {
-                const double wy =
-                    std::min(static_cast<double>(iy + 1), srcY1) -
-                    std::max(static_cast<double>(iy), srcY0);
-                for (int ix = ix0; ix < ix1; ++ix) {
-                    const double wx =
-                        std::min(static_cast<double>(ix + 1), srcX1) -
-                        std::max(static_cast<double>(ix), srcX0);
+            for (size_t yOffset = 0; yOffset < ySpan.weights.size();
+                 ++yOffset) {
+                const int iy = ySpan.sourceBegin +
+                    static_cast<int>(yOffset);
+                const double wy = ySpan.weights[yOffset];
+                for (size_t xOffset = 0; xOffset < xSpan.weights.size();
+                     ++xOffset) {
+                    const int ix = xSpan.sourceBegin +
+                        static_cast<int>(xOffset);
+                    const double wx = xSpan.weights[xOffset];
                     const double area = wx * wy;
                     const size_t sourceIndex =
                         static_cast<size_t>(iy) * src.width + ix;

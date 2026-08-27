@@ -131,6 +131,10 @@ struct TrainingMemoryMetrics {
     size_t processAvailableBytes = 0;
     uint64_t trainingGpuImageCacheHits = 0;
     uint64_t trainingGpuImageCacheMisses = 0;
+    uint64_t trainingTargetPrefetchScheduled = 0;
+    uint64_t trainingTargetPrefetchUsed = 0;
+    uint64_t trainingTargetPrefetchWaited = 0;
+    uint64_t trainingTargetPrefetchDiscarded = 0;
     bool hasProcessPhysFootprint = false;
     bool hasProcessAvailableBytes = false;
 };

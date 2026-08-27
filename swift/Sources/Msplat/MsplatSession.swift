@@ -218,12 +218,12 @@ public final class MsplatSession {
     /// Returns live categorized native-buffer and process-memory measurements.
     public func memoryMetrics() throws -> TrainingMemorySnapshot {
         try withTrainer { trainer in
-            var metrics = MsplatTrainingMemoryMetrics()
+            var metrics = MsplatTrainingMemoryMetricsV17()
             var nativeError = MsplatErrorInfo()
-            let status = msplat_trainer_memory_metrics_v4(
+            let status = msplat_trainer_memory_metrics_v17(
                 trainer,
                 &metrics,
-                MemoryLayout<MsplatTrainingMemoryMetrics>.size,
+                MemoryLayout<MsplatTrainingMemoryMetricsV17>.size,
                 &nativeError
             )
             try checkNativeStatus(status, error: &nativeError)
