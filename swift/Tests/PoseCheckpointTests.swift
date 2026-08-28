@@ -18,6 +18,10 @@ final class PoseCheckpointTests: XCTestCase {
     func testCampPoseCheckpointRoundTripAndModeMismatch() async throws {
         try await runCampPoseCheckpointRegression()
     }
+
+    func testPPISPCheckpointRoundTripAndModeMismatch() async throws {
+        try await runPPISPCheckpointRegression()
+    }
 }
 
 @MsplatRuntimeActor
@@ -294,6 +298,69 @@ private func runCampPoseCheckpointRegression() throws {
         defer { try? session.close() }
         XCTAssertThrowsError(try session.loadCheckpoint(from: checkpointURL))
     }
+}
+
+@MsplatRuntimeActor
+private func runPPISPCheckpointRegression() throws {
+    let fixtureDirectory = FileManager.default.temporaryDirectory
+        .appendingPathComponent("msplat-ppisp-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(
+        at: fixtureDirectory,
+        withIntermediateDirectories: true
+    )
+    defer { try? FileManager.default.removeItem(at: fixtureDirectory) }
+
+    let anchorImageURL = fixtureDirectory.appendingPathComponent("anchor.png")
+    let movableImageURL = fixtureDirectory.appendingPathComponent("movable.png")
+    try writePoseFixturePNG(to: anchorImageURL, horizontalShift: 0)
+    try writePoseFixturePNG(to: movableImageURL, horizontalShift: 3)
+    let descriptor = try makePoseFixtureDescriptor(
+        anchorImageURL: anchorImageURL,
+        movableImageURL: movableImageURL
+    )
+    var config = makePoseFixtureConfig()
+    config.refineCameraPoses = false
+    config.appearanceMode = .ppisp
+
+    let firstURL = fixtureDirectory.appendingPathComponent("first.msplat")
+    let reloadedURL = fixtureDirectory.appendingPathComponent("reloaded.msplat")
+    do {
+        let session = try MsplatSession(
+            dataset: descriptor,
+            config: config,
+            maximumGaussianCount: 5
+        )
+        defer { try? session.close() }
+        _ = try session.step()
+        _ = try session.step()
+        try session.saveCheckpoint(to: firstURL)
+    }
+
+    do {
+        let session = try MsplatSession(
+            dataset: descriptor,
+            config: config,
+            maximumGaussianCount: 5
+        )
+        defer { try? session.close() }
+        XCTAssertEqual(try session.loadCheckpoint(from: firstURL), 2)
+        try session.saveCheckpoint(to: reloadedURL)
+    }
+
+    XCTAssertEqual(
+        try Data(contentsOf: reloadedURL),
+        try Data(contentsOf: firstURL)
+    )
+
+    var mismatchedConfig = config
+    mismatchedConfig.appearanceMode = .none
+    let mismatchedSession = try MsplatSession(
+        dataset: descriptor,
+        config: mismatchedConfig,
+        maximumGaussianCount: 5
+    )
+    defer { try? mismatchedSession.close() }
+    XCTAssertThrowsError(try mismatchedSession.loadCheckpoint(from: firstURL))
 }
 
 @MsplatRuntimeActor

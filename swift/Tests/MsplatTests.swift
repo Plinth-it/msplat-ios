@@ -12,11 +12,16 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(config.shDegree, 3)
         XCTAssertEqual(config.ssimWeight, 0.2, accuracy: 0.001)
         XCTAssertFalse(config.refinePhotometricGains)
+        XCTAssertEqual(config.appearanceMode, .none)
         XCTAssertFalse(config.refineCameraPoses)
         XCTAssertEqual(config.cameraPoseConditioning, .raw)
         XCTAssertEqual(config.trainingMaskMode, .coverage)
         XCTAssertEqual(config.transparentAlphaLossWeight, 0.1, accuracy: 0.001)
         XCTAssertEqual(config.toRefinementOptionsV8().flags, 0)
+        XCTAssertEqual(
+            config.toAppearanceOptionsV18().mode,
+            MSPLAT_APPEARANCE_MODE_NONE.rawValue
+        )
         XCTAssertEqual(
             config.toTrainingMaskOptionsV11().mode,
             MSPLAT_TRAINING_MASK_MODE_COVERAGE.rawValue
@@ -38,7 +43,7 @@ final class MsplatTests: XCTestCase {
         XCTAssertEqual(MemoryLayout<MsplatTrainingMaskOptionsV11>.size, 16)
     }
 
-    func testPhotometricRefinementMapsToVersionedNativeOptions() {
+    func testPhotometricRefinementMapsToVersionedNativeOptions() throws {
         var config = TrainingConfig()
         config.refinePhotometricGains = true
 
@@ -48,6 +53,29 @@ final class MsplatTests: XCTestCase {
             UInt32(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS)
         )
         XCTAssertEqual(MemoryLayout<MsplatRefinementOptionsV8>.size, 16)
+        XCTAssertEqual(try config.resolvedAppearanceMode(), .rgbGains)
+    }
+
+    func testAppearanceModesMapToVersionedNativeOptions() throws {
+        var config = TrainingConfig()
+        config.appearanceMode = .rgbGains
+        XCTAssertEqual(try config.resolvedAppearanceMode(), .rgbGains)
+        XCTAssertEqual(
+            config.toAppearanceOptionsV18().mode,
+            MSPLAT_APPEARANCE_MODE_RGB_GAINS.rawValue
+        )
+
+        config.refinePhotometricGains = true
+        XCTAssertEqual(try config.resolvedAppearanceMode(), .rgbGains)
+
+        config.refinePhotometricGains = false
+        config.appearanceMode = .ppisp
+        XCTAssertEqual(try config.resolvedAppearanceMode(), .ppisp)
+        XCTAssertEqual(
+            config.toAppearanceOptionsV18().mode,
+            MSPLAT_APPEARANCE_MODE_PPISP.rawValue
+        )
+        XCTAssertEqual(MemoryLayout<MsplatAppearanceOptionsV18>.size, 16)
     }
 
     func testCameraPoseRefinementMapsToVersionedNativeOptions() {
@@ -176,6 +204,16 @@ final class MsplatTests: XCTestCase {
         config = TrainingConfig()
         config.trainingMaskMode = .transparent
         config.refinePhotometricGains = true
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.trainingMaskMode = .transparent
+        config.appearanceMode = .ppisp
+        invalidConfigs.append(config)
+
+        config = TrainingConfig()
+        config.refinePhotometricGains = true
+        config.appearanceMode = .ppisp
         invalidConfigs.append(config)
 
         config = TrainingConfig()

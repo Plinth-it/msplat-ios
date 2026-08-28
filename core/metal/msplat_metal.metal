@@ -6,6 +6,7 @@ using namespace metal;
 // both causes when a frame exceeds the tile-local and packed-buffer limits.
 #define MSPLAT_OVERFLOW_TILE_CAP         (1u << 0)
 #define MSPLAT_OVERFLOW_PACKED_CAPACITY  (1u << 1)
+#define MSPLAT_OVERFLOW_APPEARANCE_NONFINITE (1u << 2)
 
 inline bool training_attempt_failed(device atomic_uint* attempt_status) {
     return atomic_load_explicit(
@@ -4867,6 +4868,7 @@ kernel void ssim_fused_v_fwd_bwd_kernel(
     constant float* final_Ts,
     constant float& alpha_loss_weight,
     constant uint& target_pixel_stride_bytes,
+    constant uint& defer_renderer_clamp,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -5069,7 +5071,8 @@ kernel void ssim_fused_v_fwd_bwd_kernel(
                 (1.0f - ssim_weight) * v_l1);
             // The raster forward clamps the final composite to one. Only the
             // renderer cotangent crosses that clamp; gain is applied after it.
-            rendered_gradient[pixel_channel] = rendered_value < 1.0f
+            rendered_gradient[pixel_channel] =
+                (defer_renderer_clamp != 0u || rendered_value < 1.0f)
                 ? adjusted_gradient * gain
                 : 0.0f;
             local_log_gain_gradient[c] = adjusted_gradient * rend_val;
@@ -5223,6 +5226,7 @@ kernel void ssim_v_bwd_kernel(
     constant uint2& alpha_layout,
     constant float* background,
     constant uint& target_pixel_stride_bytes,
+    constant uint& defer_renderer_clamp,
     uint2 gid [[thread_position_in_grid]],
     uint2 lid [[thread_position_in_threadgroup]],
     uint tr [[thread_index_in_threadgroup]],
@@ -5302,7 +5306,8 @@ kernel void ssim_v_bwd_kernel(
             );
             // Match the final upper clamp while leaving post-clamp
             // photometric-gain learning active.
-            rendered_gradient[pixel_channel] = rendered_value < 1.0f
+            rendered_gradient[pixel_channel] =
+                (defer_renderer_clamp != 0u || rendered_value < 1.0f)
                 ? adjusted_gradient * gain
                 : 0.0f;
             local_log_gain_gradient[c] = adjusted_gradient * rend_val;
@@ -5337,6 +5342,532 @@ kernel void ssim_v_bwd_kernel(
                     tg_h1[c][0][0], memory_order_relaxed);
             }
         }
+    }
+}
+
+// -------------------------------------------------------------------------
+// Training-only per-frame PPISP exposure + color homography.
+//
+// This is a direct Metal adaptation of the PPISP math used by Brush PR #483
+// (commit 8c736717): one log2 exposure and four ZCA-mapped chromaticity pairs.
+// The explicit row-major matrix keeps the reference formulas auditable and
+// avoids Metal's column-major matrix convention becoming part of the port.
+// -------------------------------------------------------------------------
+
+struct PpispM3 {
+    float3 r0;
+    float3 r1;
+    float3 r2;
+};
+
+inline PpispM3 ppisp_m3(float3 r0, float3 r1, float3 r2) {
+    PpispM3 result = {r0, r1, r2};
+    return result;
+}
+
+inline PpispM3 ppisp_m3_identity() {
+    return ppisp_m3(
+        float3(1.0f, 0.0f, 0.0f),
+        float3(0.0f, 1.0f, 0.0f),
+        float3(0.0f, 0.0f, 1.0f));
+}
+
+inline PpispM3 ppisp_m3_transpose(PpispM3 m) {
+    return ppisp_m3(
+        float3(m.r0.x, m.r1.x, m.r2.x),
+        float3(m.r0.y, m.r1.y, m.r2.y),
+        float3(m.r0.z, m.r1.z, m.r2.z));
+}
+
+inline float3 ppisp_m3_mul_vec(PpispM3 m, float3 value) {
+    return float3(dot(m.r0, value), dot(m.r1, value), dot(m.r2, value));
+}
+
+inline float3 ppisp_m3_tmul_vec(PpispM3 m, float3 value) {
+    return float3(
+        m.r0.x * value.x + m.r1.x * value.y + m.r2.x * value.z,
+        m.r0.y * value.x + m.r1.y * value.y + m.r2.y * value.z,
+        m.r0.z * value.x + m.r1.z * value.y + m.r2.z * value.z);
+}
+
+inline PpispM3 ppisp_m3_mul(PpispM3 lhs, PpispM3 rhs) {
+    const PpispM3 rhs_t = ppisp_m3_transpose(rhs);
+    return ppisp_m3(
+        float3(dot(lhs.r0, rhs_t.r0), dot(lhs.r0, rhs_t.r1),
+               dot(lhs.r0, rhs_t.r2)),
+        float3(dot(lhs.r1, rhs_t.r0), dot(lhs.r1, rhs_t.r1),
+               dot(lhs.r1, rhs_t.r2)),
+        float3(dot(lhs.r2, rhs_t.r0), dot(lhs.r2, rhs_t.r1),
+               dot(lhs.r2, rhs_t.r2)));
+}
+
+inline PpispM3 ppisp_m3_scale(PpispM3 value, float scale) {
+    return ppisp_m3(value.r0 * scale, value.r1 * scale, value.r2 * scale);
+}
+
+inline PpispM3 ppisp_m3_add(PpispM3 lhs, PpispM3 rhs) {
+    return ppisp_m3(lhs.r0 + rhs.r0, lhs.r1 + rhs.r1, lhs.r2 + rhs.r2);
+}
+
+inline PpispM3 ppisp_outer(float3 lhs, float3 rhs) {
+    return ppisp_m3(rhs * lhs.x, rhs * lhs.y, rhs * lhs.z);
+}
+
+inline bool ppisp_m3_finite(PpispM3 value) {
+    return all(isfinite(value.r0)) && all(isfinite(value.r1)) &&
+        all(isfinite(value.r2));
+}
+
+inline PpispM3 ppisp_s_inv() {
+    return ppisp_m3(
+        float3(-1.0f, -1.0f, 1.0f),
+        float3(1.0f, 0.0f, 0.0f),
+        float3(0.0f, 1.0f, 0.0f));
+}
+
+inline void ppisp_color_targets(
+    thread const float* color,
+    thread float3& target_b,
+    thread float3& target_r,
+    thread float3& target_g,
+    thread float3& target_neutral) {
+    constexpr float B00 = 0.0480542f, B01 = -0.0043631f;
+    constexpr float B10 = -0.0043631f, B11 = 0.0481283f;
+    constexpr float R00 = 0.0580570f, R01 = -0.0179872f;
+    constexpr float R10 = -0.0179872f, R11 = 0.0431061f;
+    constexpr float G00 = 0.0433336f, G01 = -0.0180537f;
+    constexpr float G10 = -0.0180537f, G11 = 0.0580500f;
+    constexpr float N00 = 0.0128369f, N01 = -0.0034654f;
+    constexpr float N10 = -0.0034654f, N11 = 0.0128158f;
+
+    const float bdx = B00 * color[0] + B01 * color[1];
+    const float bdy = B10 * color[0] + B11 * color[1];
+    const float rdx = R00 * color[2] + R01 * color[3];
+    const float rdy = R10 * color[2] + R11 * color[3];
+    const float gdx = G00 * color[4] + G01 * color[5];
+    const float gdy = G10 * color[4] + G11 * color[5];
+    const float ndx = N00 * color[6] + N01 * color[7];
+    const float ndy = N10 * color[6] + N11 * color[7];
+    target_b = float3(bdx, bdy, 1.0f);
+    target_r = float3(1.0f + rdx, rdy, 1.0f);
+    target_g = float3(gdx, 1.0f + gdy, 1.0f);
+    target_neutral = float3(
+        1.0f / 3.0f + ndx, 1.0f / 3.0f + ndy, 1.0f);
+}
+
+inline void ppisp_homography_intermediates(
+    thread const float* color,
+    thread PpispM3& target_matrix,
+    thread PpispM3& skew,
+    thread PpispM3& nullspace_diagonal,
+    thread PpispM3& unnormalized) {
+    float3 target_b, target_r, target_g, target_neutral;
+    ppisp_color_targets(
+        color, target_b, target_r, target_g, target_neutral);
+    target_matrix = ppisp_m3(
+        float3(target_b.x, target_r.x, target_g.x),
+        float3(target_b.y, target_r.y, target_g.y),
+        float3(target_b.z, target_r.z, target_g.z));
+    skew = ppisp_m3(
+        float3(0.0f, -target_neutral.z, target_neutral.y),
+        float3(target_neutral.z, 0.0f, -target_neutral.x),
+        float3(-target_neutral.y, target_neutral.x, 0.0f));
+    const PpispM3 nullspace_matrix = ppisp_m3_mul(skew, target_matrix);
+    float3 lambda = cross(nullspace_matrix.r0, nullspace_matrix.r1);
+    if (dot(lambda, lambda) < 1.0e-20f) {
+        lambda = cross(nullspace_matrix.r0, nullspace_matrix.r2);
+        if (dot(lambda, lambda) < 1.0e-20f)
+            lambda = cross(nullspace_matrix.r1, nullspace_matrix.r2);
+    }
+    nullspace_diagonal = ppisp_m3(
+        float3(lambda.x, 0.0f, 0.0f),
+        float3(0.0f, lambda.y, 0.0f),
+        float3(0.0f, 0.0f, lambda.z));
+    unnormalized = ppisp_m3_mul(
+        ppisp_m3_mul(target_matrix, nullspace_diagonal), ppisp_s_inv());
+}
+
+inline bool ppisp_homography(
+    thread const float* color, thread PpispM3& homography) {
+    PpispM3 target_matrix, skew, nullspace_diagonal, unnormalized;
+    ppisp_homography_intermediates(
+        color, target_matrix, skew, nullspace_diagonal, unnormalized);
+    const float scale = unnormalized.r2.z;
+    // A degenerate normalization is an identity correction. The backward
+    // replays this branch and returns zero latent gradients.
+    if (!ppisp_m3_finite(unnormalized) || !isfinite(scale) ||
+        abs(scale) <= 1.0e-8f) {
+        homography = ppisp_m3_identity();
+        return false;
+    }
+    homography = ppisp_m3_scale(unnormalized, 1.0f / scale);
+    if (!ppisp_m3_finite(homography)) {
+        homography = ppisp_m3_identity();
+        return false;
+    }
+    return true;
+}
+
+inline float3 ppisp_color_correct_forward(
+    float3 rgb, thread const float* color) {
+    PpispM3 homography;
+    if (!ppisp_homography(color, homography)) return rgb;
+    const float intensity = rgb.x + rgb.y + rgb.z;
+    const float3 rgi_input = float3(rgb.x, rgb.y, intensity);
+    const float3 rgi_output = ppisp_m3_mul_vec(homography, rgi_input);
+    const float denominator = rgi_output.z + 1.0e-5f;
+    if (!isfinite(intensity) || !all(isfinite(rgi_output)) ||
+        !isfinite(denominator) || abs(denominator) <= 1.0e-6f) {
+        return rgb;
+    }
+    const float norm = intensity / denominator;
+    const float3 value = rgi_output * norm;
+    const float3 result = float3(value.x, value.y,
+        value.z - value.x - value.y);
+    return all(isfinite(result)) ? result : rgb;
+}
+
+inline void ppisp_homography_backward(
+    thread const float* color,
+    PpispM3 gradient_h,
+    thread float* color_gradient) {
+    PpispM3 target_matrix, skew, diagonal, unnormalized;
+    ppisp_homography_intermediates(
+        color, target_matrix, skew, diagonal, unnormalized);
+    const float scale = unnormalized.r2.z;
+    if (!ppisp_m3_finite(unnormalized) || !isfinite(scale) ||
+        abs(scale) <= 1.0e-8f) return;
+
+    const float inverse_scale = 1.0f / scale;
+    const float gradient_scale = -(
+        dot(gradient_h.r0, unnormalized.r0) +
+        dot(gradient_h.r1, unnormalized.r1) +
+        dot(gradient_h.r2, unnormalized.r2)) *
+        inverse_scale * inverse_scale;
+    PpispM3 gradient_unnormalized =
+        ppisp_m3_scale(gradient_h, inverse_scale);
+    gradient_unnormalized.r2.z += gradient_scale;
+
+    const PpispM3 gradient_td = ppisp_m3_mul(
+        gradient_unnormalized, ppisp_m3_transpose(ppisp_s_inv()));
+    PpispM3 gradient_target = ppisp_m3_mul(
+        gradient_td, ppisp_m3_transpose(diagonal));
+    const PpispM3 gradient_diagonal = ppisp_m3_mul(
+        ppisp_m3_transpose(target_matrix), gradient_td);
+    const float3 gradient_lambda = float3(
+        gradient_diagonal.r0.x,
+        gradient_diagonal.r1.y,
+        gradient_diagonal.r2.z);
+
+    const PpispM3 nullspace_matrix = ppisp_m3_mul(skew, target_matrix);
+    float3 gradient_r0 = float3(0.0f);
+    float3 gradient_r1 = float3(0.0f);
+    float3 gradient_r2 = float3(0.0f);
+    const float3 lambda01 = cross(nullspace_matrix.r0, nullspace_matrix.r1);
+    if (dot(lambda01, lambda01) < 1.0e-20f) {
+        const float3 lambda02 = cross(
+            nullspace_matrix.r0, nullspace_matrix.r2);
+        if (dot(lambda02, lambda02) < 1.0e-20f) {
+            gradient_r1 = cross(nullspace_matrix.r2, gradient_lambda);
+            gradient_r2 = cross(gradient_lambda, nullspace_matrix.r1);
+        } else {
+            gradient_r0 = cross(nullspace_matrix.r2, gradient_lambda);
+            gradient_r2 = cross(gradient_lambda, nullspace_matrix.r0);
+        }
+    } else {
+        gradient_r0 = cross(nullspace_matrix.r1, gradient_lambda);
+        gradient_r1 = cross(gradient_lambda, nullspace_matrix.r0);
+    }
+    const PpispM3 gradient_nullspace = ppisp_m3(
+        gradient_r0, gradient_r1, gradient_r2);
+    const PpispM3 gradient_skew = ppisp_m3_mul(
+        gradient_nullspace, ppisp_m3_transpose(target_matrix));
+    gradient_target = ppisp_m3_add(
+        gradient_target,
+        ppisp_m3_mul(ppisp_m3_transpose(skew), gradient_nullspace));
+    const float3 gradient_neutral = float3(
+        -gradient_skew.r1.z + gradient_skew.r2.y,
+        gradient_skew.r0.z - gradient_skew.r2.x,
+        -gradient_skew.r0.y + gradient_skew.r1.x);
+
+    constexpr float B00 = 0.0480542f, B01 = -0.0043631f;
+    constexpr float B10 = -0.0043631f, B11 = 0.0481283f;
+    constexpr float R00 = 0.0580570f, R01 = -0.0179872f;
+    constexpr float R10 = -0.0179872f, R11 = 0.0431061f;
+    constexpr float G00 = 0.0433336f, G01 = -0.0180537f;
+    constexpr float G10 = -0.0180537f, G11 = 0.0580500f;
+    constexpr float N00 = 0.0128369f, N01 = -0.0034654f;
+    constexpr float N10 = -0.0034654f, N11 = 0.0128158f;
+    const float bdx = gradient_target.r0.x, bdy = gradient_target.r1.x;
+    const float rdx = gradient_target.r0.y, rdy = gradient_target.r1.y;
+    const float gdx = gradient_target.r0.z, gdy = gradient_target.r1.z;
+    color_gradient[0] += B00 * bdx + B10 * bdy;
+    color_gradient[1] += B01 * bdx + B11 * bdy;
+    color_gradient[2] += R00 * rdx + R10 * rdy;
+    color_gradient[3] += R01 * rdx + R11 * rdy;
+    color_gradient[4] += G00 * gdx + G10 * gdy;
+    color_gradient[5] += G01 * gdx + G11 * gdy;
+    color_gradient[6] += N00 * gradient_neutral.x +
+        N10 * gradient_neutral.y;
+    color_gradient[7] += N01 * gradient_neutral.x +
+        N11 * gradient_neutral.y;
+}
+
+inline float3 ppisp_color_correct_backward(
+    float3 rgb,
+    thread const float* color,
+    float3 gradient_output,
+    thread float* color_gradient) {
+    PpispM3 homography;
+    if (!ppisp_homography(color, homography)) return gradient_output;
+    const float intensity = rgb.x + rgb.y + rgb.z;
+    const float3 rgi_input = float3(rgb.x, rgb.y, intensity);
+    const float3 rgi_output = ppisp_m3_mul_vec(homography, rgi_input);
+    const float denominator = rgi_output.z + 1.0e-5f;
+    if (!isfinite(intensity) || !all(isfinite(rgi_output)) ||
+        !isfinite(denominator) || abs(denominator) <= 1.0e-6f) {
+        return gradient_output;
+    }
+    const float norm = intensity / denominator;
+    const float3 value = rgi_output * norm;
+    const float3 result = float3(value.x, value.y,
+        value.z - value.x - value.y);
+    if (!isfinite(norm) || !all(isfinite(result))) return gradient_output;
+
+    const float3 gradient_value = float3(
+        gradient_output.x - gradient_output.z,
+        gradient_output.y - gradient_output.z,
+        gradient_output.z);
+    float3 gradient_rgi_output = gradient_value * norm;
+    const float gradient_norm = dot(gradient_value, rgi_output);
+    gradient_rgi_output.z -= gradient_norm * norm / denominator;
+    const PpispM3 gradient_h = ppisp_outer(
+        gradient_rgi_output, rgi_input);
+    const float3 gradient_rgi_input = ppisp_m3_tmul_vec(
+        homography, gradient_rgi_output);
+    float gradient_intensity = 0.0f;
+    if (intensity > 1.0e-8f)
+        gradient_intensity = gradient_norm * norm / intensity;
+    const float3 gradient_input = float3(
+        gradient_rgi_input.x + gradient_rgi_input.z + gradient_intensity,
+        gradient_rgi_input.y + gradient_rgi_input.z + gradient_intensity,
+        gradient_rgi_input.z + gradient_intensity);
+    ppisp_homography_backward(color, gradient_h, color_gradient);
+    return gradient_input;
+}
+
+inline float ppisp_bounded_parameter(float value, float bound) {
+    return isfinite(value) ? clamp(value, -bound, bound) : 0.0f;
+}
+
+kernel void ppisp_frame_forward_kernel(
+    device const float* renderer_rgb,
+    device float* corrected_rgb,
+    device const float* parameters,
+    constant uint& parameter_offset,
+    constant uint2& img_size,
+    constant float& max_abs_exposure,
+    constant float& max_abs_color_parameter,
+    uint2 gid [[thread_position_in_grid]]) {
+    if (gid.x >= img_size.x || gid.y >= img_size.y) return;
+    const uint pixel = gid.y * img_size.x + gid.x;
+    const uint base = pixel * 3u;
+    const float exposure = ppisp_bounded_parameter(
+        parameters[parameter_offset], max_abs_exposure);
+    thread float color[8];
+    for (uint index = 0; index < 8u; ++index) {
+        color[index] = ppisp_bounded_parameter(
+            parameters[parameter_offset + 1u + index],
+            max_abs_color_parameter);
+    }
+    constexpr float LN2 = 0.6931471805599453f;
+    const float factor = exp(exposure * LN2);
+    const float3 input = float3(
+        renderer_rgb[base], renderer_rgb[base + 1u],
+        renderer_rgb[base + 2u]);
+    const float3 corrected = ppisp_color_correct_forward(input * factor, color);
+    corrected_rgb[base] = corrected.x;
+    corrected_rgb[base + 1u] = corrected.y;
+    corrected_rgb[base + 2u] = corrected.z;
+}
+
+kernel void ppisp_frame_backward_kernel(
+    device float* renderer_rgb_gradient,
+    device const float* corrected_rgb_gradient,
+    device const float* parameters,
+    device atomic_float* parameter_gradient,
+    constant uint& parameter_offset,
+    constant uint2& img_size,
+    constant float& max_abs_exposure,
+    constant float& max_abs_color_parameter,
+    device atomic_uint* attempt_status,
+    uint2 gid [[thread_position_in_grid]],
+    uint2 lid [[thread_position_in_threadgroup]],
+    uint thread_index [[thread_index_in_threadgroup]]) {
+    constexpr uint GROUP_WIDTH = 16u;
+    constexpr uint GROUP_HEIGHT = 8u;
+    constexpr uint GROUP_SIZE = GROUP_WIDTH * GROUP_HEIGHT;
+    constexpr float LN2 = 0.6931471805599453f;
+    threadgroup float reduction[9][GROUP_SIZE];
+    thread float local_gradient[9];
+    for (uint index = 0; index < 9u; ++index)
+        local_gradient[index] = 0.0f;
+
+    const bool active = gid.x < img_size.x && gid.y < img_size.y;
+    if (active) {
+        const uint pixel = gid.y * img_size.x + gid.x;
+        const uint base = pixel * 3u;
+        const float raw_exposure = parameters[parameter_offset];
+        const float exposure = ppisp_bounded_parameter(
+            raw_exposure, max_abs_exposure);
+        const float exposure_gate = isfinite(raw_exposure) &&
+                raw_exposure >= -max_abs_exposure &&
+                raw_exposure <= max_abs_exposure
+            ? 1.0f : 0.0f;
+        thread float color[8];
+        thread float color_gate[8];
+        for (uint index = 0; index < 8u; ++index) {
+            const float raw = parameters[parameter_offset + 1u + index];
+            color[index] = ppisp_bounded_parameter(
+                raw, max_abs_color_parameter);
+            color_gate[index] = isfinite(raw) &&
+                    raw >= -max_abs_color_parameter &&
+                    raw <= max_abs_color_parameter
+                ? 1.0f : 0.0f;
+        }
+        const float factor = exp(exposure * LN2);
+        const float3 renderer_rgb = float3(
+            renderer_rgb_gradient[base],
+            renderer_rgb_gradient[base + 1u],
+            renderer_rgb_gradient[base + 2u]);
+        const float3 after_exposure = renderer_rgb * factor;
+        const float3 gradient_corrected = float3(
+            corrected_rgb_gradient[base],
+            corrected_rgb_gradient[base + 1u],
+            corrected_rgb_gradient[base + 2u]);
+        float3 gradient_after_exposure = ppisp_color_correct_backward(
+            after_exposure, color, gradient_corrected,
+            local_gradient + 1);
+        local_gradient[0] = exposure_gate *
+            dot(gradient_after_exposure, after_exposure) * LN2;
+        for (uint index = 0; index < 8u; ++index)
+            local_gradient[1u + index] *= color_gate[index];
+        const float3 raw_gradient = gradient_after_exposure * factor;
+        renderer_rgb_gradient[base] = renderer_rgb.x < 1.0f
+            ? raw_gradient.x : 0.0f;
+        renderer_rgb_gradient[base + 1u] = renderer_rgb.y < 1.0f
+            ? raw_gradient.y : 0.0f;
+        renderer_rgb_gradient[base + 2u] = renderer_rgb.z < 1.0f
+            ? raw_gradient.z : 0.0f;
+
+        bool finite_gradient = all(isfinite(raw_gradient));
+        for (uint index = 0; index < 9u; ++index)
+            finite_gradient = finite_gradient && isfinite(local_gradient[index]);
+        if (!finite_gradient) {
+            renderer_rgb_gradient[base] = 0.0f;
+            renderer_rgb_gradient[base + 1u] = 0.0f;
+            renderer_rgb_gradient[base + 2u] = 0.0f;
+            for (uint index = 0; index < 9u; ++index)
+                local_gradient[index] = 0.0f;
+            atomic_fetch_or_explicit(
+                attempt_status, MSPLAT_OVERFLOW_APPEARANCE_NONFINITE,
+                memory_order_relaxed);
+        }
+    }
+
+    for (uint index = 0; index < 9u; ++index)
+        reduction[index][thread_index] = local_gradient[index];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = GROUP_SIZE / 2u; stride > 0u; stride >>= 1u) {
+        if (thread_index < stride) {
+            for (uint index = 0; index < 9u; ++index) {
+                reduction[index][thread_index] +=
+                    reduction[index][thread_index + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (thread_index == 0u) {
+        for (uint index = 0; index < 9u; ++index) {
+            atomic_fetch_add_explicit(
+                parameter_gradient + index, reduction[index][0],
+                memory_order_relaxed);
+        }
+    }
+}
+
+kernel void ppisp_frame_adam_kernel(
+    device float* parameters,
+    device const float* parameter_gradient,
+    device float* exp_avg,
+    device float* exp_avg_sq,
+    constant uint& parameter_offset,
+    constant float& step_size,
+    constant float& beta1,
+    constant float& beta2,
+    constant float& bias_correction2_sqrt,
+    constant float& eps,
+    constant float& regularization,
+    constant float& max_abs_exposure,
+    constant float& max_abs_color_parameter,
+    device atomic_uint* attempt_status,
+    constant uint& attempt_gating_enabled,
+    uint index [[thread_position_in_grid]]) {
+    const uint status = atomic_load_explicit(
+        attempt_status, memory_order_relaxed);
+    if (index != 0u ||
+        (status & MSPLAT_OVERFLOW_APPEARANCE_NONFINITE) != 0u ||
+        (attempt_gating_enabled != 0u && status != 0u)) return;
+
+    thread float next_parameter[9];
+    thread float next_first_moment[9];
+    thread float next_second_moment[9];
+    for (uint parameter_index = 0; parameter_index < 9u;
+         ++parameter_index) {
+        const uint storage_index = parameter_offset + parameter_index;
+        const float parameter = parameters[storage_index];
+        const float first_moment = exp_avg[storage_index];
+        const float second_moment = exp_avg_sq[storage_index];
+        const float data_gradient = parameter_gradient[parameter_index];
+        if (!isfinite(parameter) || !isfinite(first_moment) ||
+            !isfinite(second_moment) || !isfinite(data_gradient)) {
+            atomic_fetch_or_explicit(
+                attempt_status, MSPLAT_OVERFLOW_APPEARANCE_NONFINITE,
+                memory_order_relaxed);
+            return;
+        }
+        const float gradient = data_gradient + regularization * parameter;
+        const float updated_first =
+            beta1 * first_moment + (1.0f - beta1) * gradient;
+        const float updated_second = beta2 * second_moment +
+            (1.0f - beta2) * gradient * gradient;
+        const float denominator =
+            sqrt(updated_second) / bias_correction2_sqrt + eps;
+        const float bound = parameter_index == 0u
+            ? max_abs_exposure : max_abs_color_parameter;
+        const float updated_parameter = clamp(
+            parameter - step_size * updated_first / denominator,
+            -bound, bound);
+        if (!isfinite(gradient) || !isfinite(updated_first) ||
+            !isfinite(updated_second) || !isfinite(denominator) ||
+            denominator <= 0.0f || !isfinite(updated_parameter)) {
+            atomic_fetch_or_explicit(
+                attempt_status, MSPLAT_OVERFLOW_APPEARANCE_NONFINITE,
+                memory_order_relaxed);
+            return;
+        }
+        next_parameter[parameter_index] = updated_parameter;
+        next_first_moment[parameter_index] = updated_first;
+        next_second_moment[parameter_index] = updated_second;
+    }
+    // Transactional row update: validation above completes for all nine
+    // values before any persistent parameter or moment is mutated.
+    for (uint parameter_index = 0; parameter_index < 9u;
+         ++parameter_index) {
+        const uint storage_index = parameter_offset + parameter_index;
+        parameters[storage_index] = next_parameter[parameter_index];
+        exp_avg[storage_index] = next_first_moment[parameter_index];
+        exp_avg_sq[storage_index] = next_second_moment[parameter_index];
     }
 }
 

@@ -94,7 +94,13 @@ int main(int argc, char *argv[]) {
     app.add_flag("--keep-crs", keepCrs, "Retain input coordinate reference system");
     bool refinePhotometricGains = false;
     app.add_flag("--refine-photometric-gains", refinePhotometricGains,
-                 "Optimize bounded per-camera RGB gains during training");
+                 "Compatibility alias for --appearance-mode rgb-gains");
+    std::string appearanceModeName = "none";
+    app.add_option(
+           "--appearance-mode", appearanceModeName,
+           "Training-only appearance model: none, rgb-gains, or ppisp "
+           "(per-frame exposure/color stage)")
+        ->check(CLI::IsMember({"none", "rgb-gains", "ppisp"}));
     bool refineCameraPoses = false;
     app.add_flag("--refine-camera-poses", refineCameraPoses,
                  "Optimize small regularized per-camera pose corrections after warm-up");
@@ -109,6 +115,22 @@ int main(int argc, char *argv[]) {
     if (maxGaussians != -1 && maxGaussians <= 0) {
         std::cerr << "--max-gaussians must be -1 or greater than zero" << std::endl;
         return 2;
+    }
+
+    msplat::AppearanceMode appearanceMode = msplat::AppearanceMode::None;
+    if (appearanceModeName == "rgb-gains")
+        appearanceMode = msplat::AppearanceMode::RgbGains;
+    else if (appearanceModeName == "ppisp")
+        appearanceMode = msplat::AppearanceMode::PPISP;
+    if (refinePhotometricGains) {
+        if (appearanceMode == msplat::AppearanceMode::PPISP) {
+            std::cerr
+                << "--refine-photometric-gains cannot be combined with "
+                   "--appearance-mode ppisp"
+                << std::endl;
+            return 2;
+        }
+        appearanceMode = msplat::AppearanceMode::RgbGains;
     }
 
     if (validate || !valRender.empty()) validate = true;
@@ -147,7 +169,11 @@ int main(int argc, char *argv[]) {
                      refineCameraPoses,
                      refineCameraPoses && !cams.empty()
                          ? static_cast<int>(cams.front())
-                         : -1);
+                         : -1,
+                     msplat::CameraPoseConditioning::Raw,
+                     false,
+                     0.1f,
+                     appearanceMode);
 
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);

@@ -185,6 +185,9 @@ public struct TrainingPlan: Sendable, Equatable {
     /// Whether path-based plan sessions discover mask sidecars and whether
     /// decode-transient estimates include their per-frame UInt8 storage.
     public let includesTrainingMasks: Bool
+    /// Training-only appearance compensation included in the configuration
+    /// mapping and peak training-memory estimate.
+    public let appearanceMode: AppearanceMode
     /// Intersection representation included in ``memoryEstimate``.
     public let intersectionAttributeStorage: TrainingIntersectionAttributeStorage
     /// Source dimensions after `inputDecodeScale` is applied.
@@ -206,6 +209,7 @@ public struct TrainingPlan: Sendable, Equatable {
         targetSHDegree: Int32,
         maximumGaussianCount: Int,
         includesTrainingMasks: Bool = false,
+        appearanceMode: AppearanceMode = .none,
         intersectionAttributeStorage: TrainingIntersectionAttributeStorage = .configured
     ) throws {
         guard inputDecodeScale.isFinite, (1...32).contains(inputDecodeScale) else {
@@ -251,6 +255,7 @@ public struct TrainingPlan: Sendable, Equatable {
             targetSHDegree: targetSHDegree,
             maximumGaussianCount: maximumGaussianCount,
             includesTrainingMasks: includesTrainingMasks,
+            appearanceMode: appearanceMode,
             intersectionAttributeStorage: intersectionAttributeStorage,
             imageCacheBudgetBytes: TrainingMemoryEstimate.configuredNativeImageCacheBudgetBytes
         )
@@ -262,6 +267,7 @@ public struct TrainingPlan: Sendable, Equatable {
         self.targetSHDegree = targetSHDegree
         self.maximumGaussianCount = maximumGaussianCount
         self.includesTrainingMasks = includesTrainingMasks
+        self.appearanceMode = appearanceMode
         self.intersectionAttributeStorage = intersectionAttributeStorage
         self.decodedInputDimensions = decodedInputDimensions
         self.resolvedStages = resolvedStages
@@ -309,6 +315,7 @@ public struct TrainingPlan: Sendable, Equatable {
         )
         config.shDegree = targetSHDegree
         config.shDegreeInterval = max(1, iterationBudget / (targetSHDegree + 1))
+        config.appearanceMode = appearanceMode
         config.downscaleFactor = 1
         try config.validate()
         return config
@@ -327,6 +334,7 @@ public struct TrainingPlan: Sendable, Equatable {
             targetSHDegree: targetSHDegree,
             maximumGaussianCount: maximumGaussianCount,
             includesTrainingMasks: includesTrainingMasks,
+            appearanceMode: appearanceMode,
             intersectionAttributeStorage: intersectionAttributeStorage,
             imageCacheBudgetBytes: imageCacheBudgetBytes
         )
@@ -465,6 +473,7 @@ public struct TrainingPlan: Sendable, Equatable {
         targetSHDegree: Int32,
         maximumGaussianCount: Int,
         includesTrainingMasks: Bool,
+        appearanceMode: AppearanceMode,
         intersectionAttributeStorage: TrainingIntersectionAttributeStorage,
         imageCacheBudgetBytes: Int64
     ) throws -> TrainingMemoryEstimate {
@@ -641,6 +650,15 @@ public struct TrainingPlan: Sendable, Equatable {
                     try checkedProduct(
                         [36, chunkCount, pixelCount],
                         component: "chunked training cache"
+                    ),
+                ], component: "training cache")
+            }
+            if appearanceMode == .ppisp {
+                trainingCacheBytes = try checkedSum([
+                    trainingCacheBytes,
+                    try checkedProduct(
+                        [12, pixelCount],
+                        component: "PPISP full-resolution RGB scratch"
                     ),
                 ], component: "training cache")
             }

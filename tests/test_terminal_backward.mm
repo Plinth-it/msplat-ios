@@ -259,6 +259,7 @@ TerminalStepGradients checkTerminalStep(
     photometric.adamStepSize = 0.005f;
     photometric.adamBiasCorrection2Sqrt = std::sqrt(0.001f);
     photometric.maxAbsLogGain = 1.38629436112f; // log(4)
+    MsplatPpispRefinementStep ppisp;
     MTensor poseDeltas = gpu_zeros({1, 6}, DType::Float32);
     MsplatPoseRefinementStep pose;
     pose.deltas = &poseDeltas;
@@ -297,7 +298,7 @@ TerminalStepGradients checkTerminalStep(
         kAdamGroups, params.data(), expAvg.data(), expAvgSq.data(),
         stepSizes, biasCorrection2Sqrts,
         kBeta1, kBeta2, kEpsilon,
-        photometric, pose, collectStats,
+        photometric, ppisp, pose, collectStats,
         visibility, xyGradientNorm, max2DSize, 1.0f / kWidth);
     msplat_gpu_sync();
 
@@ -617,6 +618,7 @@ void checkMinimumFootprintAndScaleGradient() {
     MTensor logRgbGains = gpu_zeros({1, 3}, DType::Float32);
     MsplatPhotometricRefinementStep photometric;
     photometric.logRgbGains = &logRgbGains;
+    MsplatPpispRefinementStep ppisp;
     MTensor poseDeltas = gpu_zeros({1, 6}, DType::Float32);
     MsplatPoseRefinementStep pose;
     pose.deltas = &poseDeltas;
@@ -637,7 +639,7 @@ void checkMinimumFootprintAndScaleGradient() {
         0.0f, lossInvN, false, 0.0f,
         adamGroups, params.data(), expAvg.data(), expAvgSq.data(),
         stepSizes, biasCorrection2Sqrts, kBeta1, kBeta2, kEpsilon,
-        photometric, pose, false,
+        photometric, ppisp, pose, false,
         visibility, xyGradientNorm, max2DSize, 1.0f / width);
     msplat_gpu_sync();
 

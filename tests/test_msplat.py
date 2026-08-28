@@ -32,6 +32,7 @@ def test_training_config_defaults():
     assert cfg.warmup_length == 500
     assert cfg.max_gaussians == -1
     assert cfg.refine_photometric_gains is False
+    assert cfg.appearance_mode == "none"
     assert cfg.refine_camera_poses is False
 
 
@@ -43,13 +44,28 @@ def test_training_config_custom():
         sh_degree=1,
         ssim_weight=0.0,
         refine_photometric_gains=True,
+        appearance_mode="rgb_gains",
         refine_camera_poses=True,
     )
     assert cfg.iterations == 100
     assert cfg.sh_degree == 1
     assert cfg.ssim_weight == 0.0
     assert cfg.refine_photometric_gains is True
+    assert cfg.appearance_mode == "rgb_gains"
     assert cfg.refine_camera_poses is True
+
+
+def test_training_config_appearance_modes():
+    from msplat import TrainingConfig
+
+    assert TrainingConfig(appearance_mode="ppisp").appearance_mode == "ppisp"
+    with pytest.raises(ValueError, match="appearance_mode must be"):
+        TrainingConfig(appearance_mode="bilateral_grid")
+    with pytest.raises(ValueError, match="cannot be combined"):
+        TrainingConfig(
+            refine_photometric_gains=True,
+            appearance_mode="ppisp",
+        )
 
 
 def test_training_config_mutable():
@@ -266,6 +282,52 @@ def test_checkpoint_save_load():
         assert trainer2.splat_count == splats_at_50
     finally:
         os.unlink(ckpt_path)
+
+
+@pytest.mark.skipif(not HAS_GARDEN, reason="garden dataset not found")
+def test_ppisp_checkpoint_exact_round_trip_and_mode_mismatch():
+    """PPISP parameters and optimizer state survive an exact save-load-resave."""
+    from msplat import TrainingConfig, Dataset, GaussianTrainer
+
+    first = tempfile.NamedTemporaryFile(suffix=".msplat", delete=False)
+    reloaded = tempfile.NamedTemporaryFile(suffix=".msplat", delete=False)
+    first.close()
+    reloaded.close()
+    try:
+        cfg = TrainingConfig(
+            iterations=2,
+            num_downscales=0,
+            appearance_mode="ppisp",
+        )
+        trainer = GaussianTrainer(
+            Dataset(GARDEN, downscale_factor=4.0),
+            cfg,
+        )
+        trainer.step()
+        trainer.step()
+        trainer.save_checkpoint(first.name)
+
+        restored = GaussianTrainer(
+            Dataset(GARDEN, downscale_factor=4.0),
+            cfg,
+        )
+        restored.load_checkpoint(first.name)
+        restored.save_checkpoint(reloaded.name)
+        with open(first.name, "rb") as original_file:
+            original = original_file.read()
+        with open(reloaded.name, "rb") as reloaded_file:
+            round_tripped = reloaded_file.read()
+        assert round_tripped == original
+
+        mismatched = GaussianTrainer(
+            Dataset(GARDEN, downscale_factor=4.0),
+            TrainingConfig(iterations=2, num_downscales=0),
+        )
+        with pytest.raises(RuntimeError, match="appearance mode"):
+            mismatched.load_checkpoint(first.name)
+    finally:
+        os.unlink(first.name)
+        os.unlink(reloaded.name)
 
 
 @pytest.mark.skipif(not HAS_GARDEN, reason="garden dataset not found")

@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Added ABI v18 size-checked appearance options with mutually exclusive none,
+  RGB-gain, and PPISP modes. The current PPISP phase covers per-frame log2
+  exposure and color homography only. Existing photometric-gain properties and
+  CLI flags remain compatibility aliases for RGB gains.
 - MsplatExample now accepts root `transforms.json` Nerfstudio datasets in
   addition to COLMAP folders. Its device-memory preflight resolves referenced
   image headers and the manifest PLY (with the native fallback names), preserves

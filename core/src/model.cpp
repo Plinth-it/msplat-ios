@@ -48,6 +48,11 @@ constexpr bool needsDensificationAfterStep(int64_t completedStep,
 constexpr float kPhotometricLearningRate = 1.0e-3f;
 constexpr float kPhotometricRegularization = 1.0e-4f;
 constexpr float kPhotometricMaxAbsLogGain = 1.38629436112f; // log(4)
+constexpr int64_t kPpispParameterCount = 9;
+constexpr float kPpispLearningRate = 2.0e-3f;
+constexpr float kPpispRegularization = 1.0e-4f;
+constexpr float kPpispMaxAbsExposure = 4.0f;
+constexpr float kPpispMaxAbsColorParameter = 4.0f;
 constexpr size_t kPhotometricMaxCameras = 1'000'000;
 constexpr size_t kPhotometricMaxFrameIdBytes = 1U << 20;
 constexpr size_t kPhotometricMaxFrameIdentityBytes = 64U << 20;
@@ -55,6 +60,25 @@ constexpr float kPoseLearningRate = 1.0e-4f;
 constexpr float kPoseRegularization = 1.0e-4f;
 constexpr float kPoseMaxTranslation = 0.05f;
 constexpr float kPoseMaxRotation = 0.05235987756f; // 3 degrees
+
+msplat::AppearanceMode normalizedAppearanceMode(
+    bool refinePhotometricGains, msplat::AppearanceMode appearanceMode) {
+    switch (appearanceMode) {
+        case msplat::AppearanceMode::None:
+            return refinePhotometricGains
+                ? msplat::AppearanceMode::RgbGains
+                : msplat::AppearanceMode::None;
+        case msplat::AppearanceMode::RgbGains:
+            return msplat::AppearanceMode::RgbGains;
+        case msplat::AppearanceMode::PPISP:
+            if (refinePhotometricGains) {
+                throw std::invalid_argument(
+                    "Legacy photometric gain refinement conflicts with PPISP appearance refinement");
+            }
+            return msplat::AppearanceMode::PPISP;
+    }
+    throw std::invalid_argument("Appearance refinement mode is not recognized");
+}
 
 uint64_t stablePoseCameraKey(const std::string& frameId) noexcept {
     uint64_t hash = 1469598103934665603ULL;
@@ -142,7 +166,8 @@ Model::Model(const InputData &inputData, int numCameras,
     int poseAnchorCameraIndex,
     msplat::CameraPoseConditioning cameraPoseConditioning,
     bool transparentTrainingMasks,
-    float transparentAlphaLossWeight)
+    float transparentAlphaLossWeight,
+    msplat::AppearanceMode requestedAppearanceMode)
     : numCameras(numCameras),
       datasetCameraCount(0),
       numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
@@ -152,7 +177,8 @@ Model::Model(const InputData &inputData, int numCameras,
       stopSplitAt(stopDensifyAt >= 0 ? stopDensifyAt : maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
       maxSteps(maxSteps), maxGaussians(maxGaussians),
-      refinePhotometricGains(refinePhotometricGains),
+      appearanceMode(normalizedAppearanceMode(
+          refinePhotometricGains, requestedAppearanceMode)),
       refineCameraPoses(refineCameraPoses),
       poseAnchorCameraIndex(poseAnchorCameraIndex),
       cameraPoseConditioning(cameraPoseConditioning),
@@ -169,9 +195,10 @@ Model::Model(const InputData &inputData, int numCameras,
         throw std::invalid_argument(
             "transparentAlphaLossWeight must be finite and non-negative");
     }
-    if (transparentTrainingMasks && refinePhotometricGains) {
+    if (transparentTrainingMasks &&
+        appearanceMode != msplat::AppearanceMode::None) {
         throw std::invalid_argument(
-            "Transparent training masks cannot be combined with photometric gain refinement");
+            "Transparent training masks cannot be combined with appearance refinement");
     }
     if (inputData.points.count > std::numeric_limits<int>::max())
         throw std::invalid_argument("Dataset contains too many sparse points");
@@ -207,7 +234,7 @@ Model::Model(const InputData &inputData, int numCameras,
         throw std::invalid_argument(
             "CamP conditioning requires camera pose refinement");
     }
-    if (refinePhotometricGains || refineCameraPoses) {
+    if (appearanceMode != msplat::AppearanceMode::None || refineCameraPoses) {
         if (inputData.cameras.size() > kPhotometricMaxCameras) {
             throw std::invalid_argument(
                 "Camera refinement camera count is too large");
@@ -270,7 +297,7 @@ Model::Model(const InputData &inputData, int numCameras,
     }
 
     int64_t numPoints = inputData.points.count;
-    if (refinePhotometricGains || refineCameraPoses)
+    if (appearanceMode != msplat::AppearanceMode::None || refineCameraPoses)
         cameraFrameIds = inputData.metadata.frameIds;
     if (refineCameraPoses) {
         cameraBasePoses.reserve(inputData.cameras.size() * 16);
@@ -414,17 +441,32 @@ void Model::setupOptimizers(){
     means_lr_init = 0.00016f;
     means_lr_final = 0.0000016f;
 
-    const int photometricRows = refinePhotometricGains
+    const bool usesRgbGains =
+        appearanceMode == msplat::AppearanceMode::RgbGains;
+    const int photometricRows = usesRgbGains
         ? datasetCameraCount
         : 1;
     cameraLogGains = gpu_zeros(
         {photometricRows, 3}, DType::Float32);
-    if (refinePhotometricGains) {
+    if (usesRgbGains) {
         cameraLogGainExpAvg = gpu_zeros(
             {photometricRows, 3}, DType::Float32);
         cameraLogGainExpAvgSq = gpu_zeros(
             {photometricRows, 3}, DType::Float32);
         cameraLogGainStepCounts.assign(
+            static_cast<size_t>(datasetCameraCount), 0);
+    }
+
+    const bool usesPpisp = appearanceMode == msplat::AppearanceMode::PPISP;
+    const int ppispRows = usesPpisp ? datasetCameraCount : 1;
+    cameraPpispParameters = gpu_zeros(
+        {ppispRows, kPpispParameterCount}, DType::Float32);
+    if (usesPpisp) {
+        cameraPpispExpAvg = gpu_zeros(
+            {ppispRows, kPpispParameterCount}, DType::Float32);
+        cameraPpispExpAvgSq = gpu_zeros(
+            {ppispRows, kPpispParameterCount}, DType::Float32);
+        cameraPpispStepCounts.assign(
             static_cast<size_t>(datasetCameraCount), 0);
     }
 
@@ -512,6 +554,9 @@ void Model::releaseOptimizers(){
     cameraLogGains.reset();
     cameraLogGainExpAvg.reset(); cameraLogGainExpAvgSq.reset();
     cameraLogGainStepCounts.clear();
+    cameraPpispParameters.reset();
+    cameraPpispExpAvg.reset(); cameraPpispExpAvgSq.reset();
+    cameraPpispStepCounts.clear();
     cameraPoseDeltas.reset();
     cameraPoseExpAvg.reset(); cameraPoseExpAvgSq.reset();
     cameraPosePreconditioners.reset();
@@ -612,6 +657,7 @@ size_t Model::estimatedGpuBytes() const {
         // buffer, so counting it here would report the same allocation twice.
         &xysGradNorm, &visCounts, &max2DSize, &backgroundColor,
         &cameraLogGains, &cameraLogGainExpAvg, &cameraLogGainExpAvgSq,
+        &cameraPpispParameters, &cameraPpispExpAvg, &cameraPpispExpAvgSq,
         &cameraPoseDeltas, &cameraPoseExpAvg, &cameraPoseExpAvgSq,
         &cameraPosePreconditioners
     };
@@ -961,7 +1007,7 @@ int Model::loadPly(const std::string &filename){
 // ── Checkpoint save/load ────────────────────────────────────────────────────
 
 static constexpr uint32_t CKPT_MAGIC = 0x4C50534D; // "MSPL"
-static constexpr uint32_t CKPT_VERSION = 4;
+static constexpr uint32_t CKPT_VERSION = 5;
 static constexpr uint32_t CKPT_MIN_VERSION = 1;
 static constexpr uint32_t CKPT_MAX_CAMERAS =
     static_cast<uint32_t>(kPhotometricMaxCameras);
@@ -1180,6 +1226,11 @@ struct ParsedCheckpoint {
     std::vector<std::string> cameraFrameIds;
     std::vector<uint32_t> cameraStepCounts;
     std::array<CheckpointTensorRecord, 3> photometricTensors;
+    msplat::AppearanceMode appearanceMode = msplat::AppearanceMode::None;
+    uint32_t ppispCameraCount = 0;
+    std::vector<std::string> ppispFrameIds;
+    std::vector<uint32_t> ppispStepCounts;
+    std::array<CheckpointTensorRecord, 3> ppispTensors;
     bool poseEnabled = false;
     uint32_t poseCameraCount = 0;
     uint32_t poseAnchorCameraIndex = 0;
@@ -1345,6 +1396,9 @@ ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
                     reader, photometricShape, photometricNames[tensor]);
             }
         }
+        checkpoint.appearanceMode = checkpoint.photometricEnabled
+            ? msplat::AppearanceMode::RgbGains
+            : msplat::AppearanceMode::None;
     }
 
     if (version >= 3) {
@@ -1353,7 +1407,7 @@ ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
         if (poseEnabled > 1)
             checkpointError("pose enabled flag is invalid");
         checkpoint.poseEnabled = poseEnabled != 0;
-        if (version >= 4 && !checkpoint.poseEnabled) {
+        if (version == 4 && !checkpoint.poseEnabled) {
             checkpointError(
                 "version 4 checkpoints require enabled CamP pose refinement");
         }
@@ -1384,13 +1438,15 @@ ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
                                 minimumPerCameraBytes,
                                 "pose checkpoint minimum") +
                 4 * minimumTensorRecordBytes;
-            if (version >= 4) {
+            if (version == 4) {
                 minimumRemainingBytes += sizeof(uint32_t) +
                     checkedMultiply(
                         checkpoint.poseCameraCount,
                         sizeof(uint8_t) + 36 * sizeof(float),
                         "pose conditioning checkpoint minimum") +
                     minimumTensorRecordBytes;
+            } else if (version >= 5) {
+                minimumRemainingBytes += sizeof(uint32_t);
             }
             if (reader.remaining() < minimumRemainingBytes)
                 checkpointError("truncated pose checkpoint payload");
@@ -1457,40 +1513,50 @@ ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
             if (version >= 4) {
                 const uint32_t conditioning =
                     reader.scalar<uint32_t>("pose conditioning mode");
-                if (conditioning != static_cast<uint32_t>(
+                if (version == 4 && conditioning != static_cast<uint32_t>(
                         msplat::CameraPoseConditioning::CamP)) {
                     checkpointError(
                         "version 4 pose checkpoints require CamP conditioning");
                 }
+                if (version >= 5 &&
+                    conditioning != static_cast<uint32_t>(
+                        msplat::CameraPoseConditioning::Raw) &&
+                    conditioning != static_cast<uint32_t>(
+                        msplat::CameraPoseConditioning::CamP)) {
+                    checkpointError("pose conditioning mode is invalid");
+                }
                 checkpoint.poseConditioning =
                     static_cast<msplat::CameraPoseConditioning>(conditioning);
 
-                checkpoint.posePreconditionerReady.resize(
-                    checkpoint.poseCameraCount);
-                reader.bytes(
-                    checkpoint.posePreconditionerReady.data(),
-                    checkedMultiply(checkpoint.poseCameraCount,
-                                    sizeof(uint8_t),
-                                    "pose preconditioner readiness"),
-                    "pose preconditioner readiness");
-                for (size_t camera = 0;
-                     camera < checkpoint.posePreconditionerReady.size();
-                     ++camera) {
-                    const uint8_t ready =
-                        checkpoint.posePreconditionerReady[camera];
-                    if (ready > 1) {
-                        checkpointError(
-                            "pose preconditioner readiness flag is invalid");
+                if (checkpoint.poseConditioning ==
+                    msplat::CameraPoseConditioning::CamP) {
+                    checkpoint.posePreconditionerReady.resize(
+                        checkpoint.poseCameraCount);
+                    reader.bytes(
+                        checkpoint.posePreconditionerReady.data(),
+                        checkedMultiply(checkpoint.poseCameraCount,
+                                        sizeof(uint8_t),
+                                        "pose preconditioner readiness"),
+                        "pose preconditioner readiness");
+                    for (size_t camera = 0;
+                         camera < checkpoint.posePreconditionerReady.size();
+                         ++camera) {
+                        const uint8_t ready =
+                            checkpoint.posePreconditionerReady[camera];
+                        if (ready > 1) {
+                            checkpointError(
+                                "pose preconditioner readiness flag is invalid");
+                        }
+                        if (ready == 0 &&
+                            checkpoint.poseStepCounts[camera] != 0) {
+                            checkpointError(
+                                "pose preconditioner readiness is inconsistent with optimizer steps");
+                        }
                     }
-                    if (ready == 0 &&
-                        checkpoint.poseStepCounts[camera] != 0) {
-                        checkpointError(
-                            "pose preconditioner readiness is inconsistent with optimizer steps");
-                    }
+                    checkpoint.posePreconditioners = readTensorRecord(
+                        reader, {poseCameraCount, 36},
+                        "pose.preconditioner");
                 }
-                checkpoint.posePreconditioners = readTensorRecord(
-                    reader, {poseCameraCount, 36},
-                    "pose.preconditioner");
             }
             static constexpr const char* poseNames[3] = {
                 "pose.delta",
@@ -1500,6 +1566,106 @@ ParsedCheckpoint parseCheckpointMetadata(CheckpointReader &reader) {
             for (size_t tensor = 0; tensor < 3; ++tensor) {
                 checkpoint.poseTensors[tensor] = readTensorRecord(
                     reader, {poseCameraCount, 6}, poseNames[tensor]);
+            }
+        }
+    }
+
+    if (version >= 5) {
+        const uint32_t rawAppearanceMode =
+            reader.scalar<uint32_t>("appearance mode");
+        if (rawAppearanceMode >
+            static_cast<uint32_t>(msplat::AppearanceMode::PPISP)) {
+            checkpointError("appearance mode is invalid");
+        }
+        checkpoint.appearanceMode =
+            static_cast<msplat::AppearanceMode>(rawAppearanceMode);
+        if ((checkpoint.appearanceMode == msplat::AppearanceMode::RgbGains) !=
+            checkpoint.photometricEnabled) {
+            checkpointError(
+                "appearance mode is inconsistent with photometric state");
+        }
+
+        if (checkpoint.appearanceMode == msplat::AppearanceMode::PPISP) {
+            checkpoint.ppispCameraCount =
+                reader.scalar<uint32_t>("PPISP camera count");
+            if (checkpoint.ppispCameraCount == 0 ||
+                checkpoint.ppispCameraCount > CKPT_MAX_CAMERAS ||
+                checkpoint.ppispCameraCount > static_cast<uint32_t>(
+                    std::numeric_limits<int>::max())) {
+                checkpointError(
+                    "PPISP camera count is outside the supported range");
+            }
+
+            constexpr uint64_t minimumTensorRecordBytes =
+                sizeof(uint32_t) + 2 * sizeof(int64_t) + sizeof(uint64_t);
+            constexpr uint64_t minimumPerCameraBytes =
+                sizeof(uint32_t) + 1 + sizeof(uint32_t) +
+                3 * kPpispParameterCount * sizeof(float);
+            const uint64_t minimumRemainingBytes =
+                checkedMultiply(checkpoint.ppispCameraCount,
+                                minimumPerCameraBytes,
+                                "PPISP checkpoint minimum") +
+                3 * minimumTensorRecordBytes;
+            if (reader.remaining() < minimumRemainingBytes)
+                checkpointError("truncated PPISP checkpoint payload");
+
+            checkpoint.ppispFrameIds.reserve(checkpoint.ppispCameraCount);
+            std::unordered_set<std::string> uniqueFrameIds;
+            uniqueFrameIds.reserve(checkpoint.ppispCameraCount);
+            uint64_t totalFrameIdBytes = 0;
+            for (uint32_t camera = 0;
+                 camera < checkpoint.ppispCameraCount; ++camera) {
+                const uint32_t length =
+                    reader.scalar<uint32_t>("PPISP frame ID length");
+                if (length == 0 || length > CKPT_MAX_FRAME_ID_BYTES)
+                    checkpointError("PPISP frame ID length is invalid");
+                if (length >
+                    CKPT_MAX_FRAME_ID_TOTAL_BYTES - totalFrameIdBytes) {
+                    checkpointError(
+                        "PPISP frame IDs exceed the aggregate size limit");
+                }
+                totalFrameIdBytes += length;
+                std::string frameId(length, '\0');
+                reader.bytes(frameId.data(), length, "PPISP frame ID");
+                if (!uniqueFrameIds.insert(frameId).second)
+                    checkpointError("PPISP frame IDs are not unique");
+                checkpoint.ppispFrameIds.push_back(std::move(frameId));
+            }
+            if (checkpoint.poseEnabled &&
+                (checkpoint.ppispCameraCount != checkpoint.poseCameraCount ||
+                 checkpoint.ppispFrameIds != checkpoint.poseFrameIds)) {
+                checkpointError(
+                    "PPISP and pose camera identities do not match");
+            }
+
+            checkpoint.ppispStepCounts.resize(checkpoint.ppispCameraCount);
+            reader.bytes(
+                checkpoint.ppispStepCounts.data(),
+                checkedMultiply(checkpoint.ppispCameraCount,
+                                sizeof(uint32_t), "PPISP step counts"),
+                "PPISP step counts");
+            uint64_t totalPpispSteps = 0;
+            for (uint32_t count : checkpoint.ppispStepCounts) {
+                if (count > checkpoint.adamSteps ||
+                    totalPpispSteps > static_cast<uint64_t>(
+                        checkpoint.adamSteps - count)) {
+                    checkpointError(
+                        "PPISP step counts are inconsistent with Adam state");
+                }
+                totalPpispSteps += count;
+            }
+
+            const std::vector<int64_t> ppispShape = {
+                static_cast<int64_t>(checkpoint.ppispCameraCount),
+                kPpispParameterCount};
+            static constexpr const char* ppispNames[3] = {
+                "ppisp.parameters",
+                "ppisp.adam_exp_avg",
+                "ppisp.adam_exp_avg_sq",
+            };
+            for (size_t tensor = 0; tensor < 3; ++tensor) {
+                checkpoint.ppispTensors[tensor] = readTensorRecord(
+                    reader, ppispShape, ppispNames[tensor]);
             }
         }
     }
@@ -1628,10 +1794,12 @@ void validateCheckpointFile(const std::string &filename) {
 void Model::saveCheckpoint(const std::string &filename, int step) {
     msplat_gpu_sync();
 
+    const bool savesPpisp = appearanceMode == msplat::AppearanceMode::PPISP;
     const bool savesCampPoseConditioning = refineCameraPoses &&
         cameraPoseConditioning == msplat::CameraPoseConditioning::CamP;
     const uint32_t checkpointVersion =
-        savesCampPoseConditioning ? CKPT_VERSION : 3u;
+        savesPpisp ? CKPT_VERSION :
+        (savesCampPoseConditioning ? 4u : 3u);
 
     msplat::detail::AtomicOutputFile output(filename);
     std::ofstream f(output.temporary(), std::ios::binary | std::ios::trunc);
@@ -1669,9 +1837,11 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
     // Version 2 extension. Gains model the source images only; stable frame
     // identities prevent optimizer rows from silently attaching to a different
     // camera order after resume.
-    u = refinePhotometricGains ? 1u : 0u;
+    const bool savesRgbGains =
+        appearanceMode == msplat::AppearanceMode::RgbGains;
+    u = savesRgbGains ? 1u : 0u;
     f.write(reinterpret_cast<const char*>(&u), sizeof(u));
-    if (refinePhotometricGains) {
+    if (savesRgbGains) {
         auto hasPhotometricShape = [&](const MTensor& tensor) {
             return tensor.defined() && tensor.isGpu() &&
                 tensor.dtype() == DType::Float32 && tensor.ndim() == 2 &&
@@ -1750,7 +1920,8 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
     // Version 3 extension. Pose rows remain relative to the exact imported
     // camera geometry recorded here; resume refuses to attach them to changed
     // poses even when frame names are unchanged. Version 4 additionally saves
-    // CamP's fixed per-camera conditioning state before the optimizer tensors.
+    // CamP's fixed per-camera conditioning state before the optimizer tensors;
+    // version 5 records Raw or CamP explicitly when PPISP requires the v5 tail.
     u = refineCameraPoses ? 1u : 0u;
     f.write(reinterpret_cast<const char*>(&u), sizeof(u));
     if (refineCameraPoses) {
@@ -1897,9 +2068,11 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
         writeFloatTensor(
             f, cameraBasePoses,
             {static_cast<int64_t>(datasetCameraCount), 16});
-        if (savesCampPoseConditioning) {
+        if (checkpointVersion >= 5 || savesCampPoseConditioning) {
             u = static_cast<uint32_t>(cameraPoseConditioning);
             f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+        }
+        if (savesCampPoseConditioning) {
             f.write(
                 reinterpret_cast<const char*>(
                     cameraPosePreconditionerReady.data()),
@@ -1912,6 +2085,92 @@ void Model::saveCheckpoint(const std::string &filename, int step) {
         writeTensor(f, cameraPoseDeltas);
         writeTensor(f, cameraPoseExpAvg);
         writeTensor(f, cameraPoseExpAvgSq);
+    }
+
+    // Version 5 extension. PPISP owns an independent sparse Adam row per stable
+    // frame identity. None/RGB-only checkpoints keep their exact v3/v4 format.
+    if (checkpointVersion >= 5) {
+        u = static_cast<uint32_t>(appearanceMode);
+        f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+        if (savesPpisp) {
+            auto hasPpispShape = [&](const MTensor& tensor) {
+                return tensor.defined() && tensor.isGpu() &&
+                    tensor.dtype() == DType::Float32 && tensor.ndim() == 2 &&
+                    tensor.size(0) == datasetCameraCount &&
+                    tensor.size(1) == kPpispParameterCount;
+            };
+            const size_t cameraCount =
+                static_cast<size_t>(datasetCameraCount);
+            if (datasetCameraCount <= 0 || adam_step_count < 0 ||
+                cameraCount > kPhotometricMaxCameras ||
+                cameraFrameIds.size() != cameraCount ||
+                cameraPpispStepCounts.size() != cameraCount ||
+                !hasPpispShape(cameraPpispParameters) ||
+                !hasPpispShape(cameraPpispExpAvg) ||
+                !hasPpispShape(cameraPpispExpAvgSq)) {
+                throw std::runtime_error(
+                    "PPISP checkpoint state is incomplete");
+            }
+
+            std::unordered_set<std::string> uniqueFrameIds;
+            uniqueFrameIds.reserve(cameraFrameIds.size());
+            size_t totalFrameIdBytes = 0;
+            for (const std::string& frameId : cameraFrameIds) {
+                if (frameId.empty() ||
+                    frameId.size() > kPhotometricMaxFrameIdBytes ||
+                    frameId.size() >
+                        kPhotometricMaxFrameIdentityBytes - totalFrameIdBytes ||
+                    !uniqueFrameIds.insert(frameId).second) {
+                    throw std::runtime_error(
+                        "PPISP checkpoint camera identities are invalid");
+                }
+                totalFrameIdBytes += frameId.size();
+            }
+
+            uint64_t totalPpispSteps = 0;
+            for (uint32_t count : cameraPpispStepCounts) {
+                if (count > static_cast<uint32_t>(adam_step_count) ||
+                    totalPpispSteps > static_cast<uint64_t>(
+                        adam_step_count) - count) {
+                    throw std::runtime_error(
+                        "PPISP checkpoint step counts are invalid");
+                }
+                totalPpispSteps += count;
+            }
+
+            const int64_t valueCount =
+                static_cast<int64_t>(datasetCameraCount) *
+                kPpispParameterCount;
+            const float* parameters = cameraPpispParameters.data<float>();
+            const float* firstMoments = cameraPpispExpAvg.data<float>();
+            const float* secondMoments = cameraPpispExpAvgSq.data<float>();
+            for (int64_t value = 0; value < valueCount; ++value) {
+                const int64_t component = value % kPpispParameterCount;
+                const float bound = component == 0
+                    ? kPpispMaxAbsExposure
+                    : kPpispMaxAbsColorParameter;
+                if (!std::isfinite(parameters[value]) ||
+                    std::abs(parameters[value]) > bound + 1.0e-6f ||
+                    !std::isfinite(firstMoments[value]) ||
+                    !std::isfinite(secondMoments[value]) ||
+                    secondMoments[value] < 0.0f) {
+                    throw std::runtime_error(
+                        "PPISP checkpoint tensor data is invalid");
+                }
+            }
+
+            u = static_cast<uint32_t>(datasetCameraCount);
+            f.write(reinterpret_cast<const char*>(&u), sizeof(u));
+            for (const std::string& frameId : cameraFrameIds)
+                writeCheckpointString(f, frameId);
+            f.write(
+                reinterpret_cast<const char*>(cameraPpispStepCounts.data()),
+                static_cast<std::streamsize>(
+                    cameraPpispStepCounts.size() * sizeof(uint32_t)));
+            writeTensor(f, cameraPpispParameters);
+            writeTensor(f, cameraPpispExpAvg);
+            writeTensor(f, cameraPpispExpAvgSq);
+        }
     }
 
     f.flush();
@@ -1937,14 +2196,22 @@ int Model::loadCheckpoint(const std::string &filename) {
         checkpointError("SH degree does not match the configured training degree");
     if (maxGaussians > 0 && activeCount > maxGaussians)
         checkpointError("Gaussian count exceeds maxGaussians");
-    if (checkpoint.photometricEnabled && !refinePhotometricGains)
+    if (checkpoint.appearanceMode != msplat::AppearanceMode::None &&
+        checkpoint.appearanceMode != appearanceMode) {
         checkpointError(
-            "checkpoint requires photometric refinement to be enabled");
+            "appearance mode does not match the configured mode");
+    }
     if (checkpoint.photometricEnabled &&
         (checkpoint.cameraCount != static_cast<uint32_t>(datasetCameraCount) ||
          checkpoint.cameraFrameIds != cameraFrameIds)) {
         checkpointError(
             "photometric camera identities do not match the dataset");
+    }
+    if (checkpoint.appearanceMode == msplat::AppearanceMode::PPISP &&
+        (checkpoint.ppispCameraCount !=
+             static_cast<uint32_t>(datasetCameraCount) ||
+         checkpoint.ppispFrameIds != cameraFrameIds)) {
+        checkpointError("PPISP camera identities do not match the dataset");
     }
     if (checkpoint.poseEnabled && !refineCameraPoses)
         checkpointError(
@@ -1990,7 +2257,9 @@ int Model::loadCheckpoint(const std::string &filename) {
             std::string("adam_exp_avg_sq.") + parameterNames[group]);
     }
 
-    const int photometricRows = refinePhotometricGains
+    const bool usesRgbGains =
+        appearanceMode == msplat::AppearanceMode::RgbGains;
+    const int photometricRows = usesRgbGains
         ? datasetCameraCount
         : 1;
     MTensor newCameraLogGains;
@@ -2026,12 +2295,62 @@ int Model::loadCheckpoint(const std::string &filename) {
     } else {
         newCameraLogGains = gpu_zeros(
             {photometricRows, 3}, DType::Float32);
-        if (refinePhotometricGains) {
+        if (usesRgbGains) {
             newCameraLogGainExpAvg = gpu_zeros(
                 {photometricRows, 3}, DType::Float32);
             newCameraLogGainExpAvgSq = gpu_zeros(
                 {photometricRows, 3}, DType::Float32);
             newCameraLogGainStepCounts.assign(
+                static_cast<size_t>(datasetCameraCount), 0);
+        }
+    }
+
+    const bool usesPpisp = appearanceMode == msplat::AppearanceMode::PPISP;
+    const int ppispRows = usesPpisp ? datasetCameraCount : 1;
+    MTensor newCameraPpispParameters;
+    MTensor newCameraPpispExpAvg;
+    MTensor newCameraPpispExpAvgSq;
+    std::vector<uint32_t> newCameraPpispStepCounts;
+    if (checkpoint.appearanceMode == msplat::AppearanceMode::PPISP) {
+        newCameraPpispParameters = loadCheckpointBuffer(
+            reader, checkpoint.ppispTensors[0], datasetCameraCount,
+            "ppisp.parameters");
+        newCameraPpispExpAvg = loadCheckpointBuffer(
+            reader, checkpoint.ppispTensors[1], datasetCameraCount,
+            "ppisp.adam_exp_avg");
+        newCameraPpispExpAvgSq = loadCheckpointBuffer(
+            reader, checkpoint.ppispTensors[2], datasetCameraCount,
+            "ppisp.adam_exp_avg_sq");
+        newCameraPpispStepCounts = checkpoint.ppispStepCounts;
+
+        const int64_t valueCount =
+            static_cast<int64_t>(datasetCameraCount) *
+            kPpispParameterCount;
+        const float* parameters = newCameraPpispParameters.data<float>();
+        const float* firstMoments = newCameraPpispExpAvg.data<float>();
+        const float* secondMoments = newCameraPpispExpAvgSq.data<float>();
+        for (int64_t value = 0; value < valueCount; ++value) {
+            const int64_t component = value % kPpispParameterCount;
+            const float bound = component == 0
+                ? kPpispMaxAbsExposure
+                : kPpispMaxAbsColorParameter;
+            if (!std::isfinite(parameters[value]) ||
+                std::abs(parameters[value]) > bound + 1.0e-6f ||
+                !std::isfinite(firstMoments[value]) ||
+                !std::isfinite(secondMoments[value]) ||
+                secondMoments[value] < 0.0f) {
+                checkpointError("PPISP tensor data is invalid");
+            }
+        }
+    } else {
+        newCameraPpispParameters = gpu_zeros(
+            {ppispRows, kPpispParameterCount}, DType::Float32);
+        if (usesPpisp) {
+            newCameraPpispExpAvg = gpu_zeros(
+                {ppispRows, kPpispParameterCount}, DType::Float32);
+            newCameraPpispExpAvgSq = gpu_zeros(
+                {ppispRows, kPpispParameterCount}, DType::Float32);
+            newCameraPpispStepCounts.assign(
                 static_cast<size_t>(datasetCameraCount), 0);
         }
     }
@@ -2056,7 +2375,8 @@ int Model::loadCheckpoint(const std::string &filename) {
         if (checkpointBasePoses != cameraBasePoses)
             checkpointError("pose base camera geometry does not match the dataset");
 
-        if (checkpoint.version >= 4) {
+        if (checkpoint.poseConditioning ==
+            msplat::CameraPoseConditioning::CamP) {
             newCameraPosePreconditionerValues = loadCheckpointFloatVector(
                 reader, checkpoint.posePreconditioners,
                 "pose.preconditioner");
@@ -2212,6 +2532,10 @@ int Model::loadCheckpoint(const std::string &filename) {
     cameraLogGainExpAvg = std::move(newCameraLogGainExpAvg);
     cameraLogGainExpAvgSq = std::move(newCameraLogGainExpAvgSq);
     cameraLogGainStepCounts = std::move(newCameraLogGainStepCounts);
+    cameraPpispParameters = std::move(newCameraPpispParameters);
+    cameraPpispExpAvg = std::move(newCameraPpispExpAvg);
+    cameraPpispExpAvgSq = std::move(newCameraPpispExpAvgSq);
+    cameraPpispStepCounts = std::move(newCameraPpispStepCounts);
     cameraPoseDeltas = std::move(newCameraPoseDeltas);
     cameraPoseExpAvg = std::move(newCameraPoseExpAvg);
     cameraPoseExpAvgSq = std::move(newCameraPoseExpAvgSq);
@@ -2354,7 +2678,7 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
 void Model::fullIteration(Camera& cam, int step,
                           const CameraTrainingTarget& target,
                           float ssimWeight){
-    if (refinePhotometricGains || refineCameraPoses) {
+    if (appearanceMode != msplat::AppearanceMode::None || refineCameraPoses) {
         throw std::invalid_argument(
             "Camera refinement requires a canonical camera index");
     }
@@ -2364,7 +2688,8 @@ void Model::fullIteration(Camera& cam, int step,
 void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
                           const CameraTrainingTarget& target,
                           float ssimWeight){
-    if ((refinePhotometricGains || refineCameraPoses) &&
+    if ((appearanceMode != msplat::AppearanceMode::None ||
+         refineCameraPoses) &&
         cameraIndex >= static_cast<size_t>(datasetCameraCount)) {
         throw std::out_of_range(
             "Camera refinement index is out of range");
@@ -2484,14 +2809,16 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
     }
 
     MsplatPhotometricRefinementStep photometric;
-    photometric.enabled = refinePhotometricGains;
-    photometric.cameraIndex = refinePhotometricGains
+    const bool usesRgbGains =
+        appearanceMode == msplat::AppearanceMode::RgbGains;
+    photometric.enabled = usesRgbGains;
+    photometric.cameraIndex = usesRgbGains
         ? static_cast<uint32_t>(cameraIndex)
         : 0u;
     photometric.logRgbGains = &cameraLogGains;
     uint32_t previousPhotometricStep = 0;
     uint32_t nextPhotometricStep = 0;
-    if (refinePhotometricGains) {
+    if (usesRgbGains) {
         previousPhotometricStep = cameraLogGainStepCounts[cameraIndex];
         if (previousPhotometricStep == std::numeric_limits<uint32_t>::max()) {
             throw std::overflow_error(
@@ -2508,6 +2835,35 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
         photometric.adamBiasCorrection2Sqrt = std::sqrt(photoBc2);
         photometric.regularization = kPhotometricRegularization;
         photometric.maxAbsLogGain = kPhotometricMaxAbsLogGain;
+    }
+
+    MsplatPpispRefinementStep ppisp;
+    const bool usesPpisp = appearanceMode == msplat::AppearanceMode::PPISP;
+    ppisp.enabled = usesPpisp;
+    ppisp.frameIndex = usesPpisp
+        ? static_cast<uint32_t>(cameraIndex)
+        : 0u;
+    ppisp.parameters = &cameraPpispParameters;
+    uint32_t nextPpispStep = 0;
+    if (usesPpisp) {
+        const uint32_t previousPpispStep =
+            cameraPpispStepCounts[cameraIndex];
+        if (previousPpispStep == std::numeric_limits<uint32_t>::max()) {
+            throw std::overflow_error(
+                "PPISP optimizer step count cannot be incremented further");
+        }
+        nextPpispStep = previousPpispStep + 1;
+        const float ppispBc1 = 1.0f -
+            std::pow(adam_beta1, static_cast<float>(nextPpispStep));
+        const float ppispBc2 = 1.0f -
+            std::pow(adam_beta2, static_cast<float>(nextPpispStep));
+        ppisp.expAvg = &cameraPpispExpAvg;
+        ppisp.expAvgSq = &cameraPpispExpAvgSq;
+        ppisp.adamStepSize = kPpispLearningRate / ppispBc1;
+        ppisp.adamBiasCorrection2Sqrt = std::sqrt(ppispBc2);
+        ppisp.regularization = kPpispRegularization;
+        ppisp.maxAbsExposure = kPpispMaxAbsExposure;
+        ppisp.maxAbsColorParameter = kPpispMaxAbsColorParameter;
     }
 
     const bool poseStepEnabled = refineCameraPoses &&
@@ -2573,6 +2929,7 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
         adam_ss, adam_bc2s,
         adam_beta1, adam_beta2, adam_eps,
         photometric,
+        ppisp,
         pose,
         collectDensificationStats,
         visCounts, xysGradNorm, max2DSize, invMaxDim);
@@ -2581,8 +2938,10 @@ void Model::fullIteration(Camera& cam, size_t cameraIndex, int step,
     // encoding failures. The candidate counters above drive this step's bias
     // correction, but become persistent only once the Metal step was accepted.
     adam_step_count = nextAdamStep;
-    if (refinePhotometricGains)
+    if (usesRgbGains)
         cameraLogGainStepCounts[cameraIndex] = nextPhotometricStep;
+    if (usesPpisp)
+        cameraPpispStepCounts[cameraIndex] = nextPpispStep;
     if (poseStepEnabled)
         cameraPoseStepCounts[cameraIndex] = nextPoseStep;
 

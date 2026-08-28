@@ -312,7 +312,8 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
             : -1,
         config.cameraPoseConditioning,
         config.trainingMaskMode == TrainingMaskMode::Transparent,
-        config.transparentAlphaLossWeight
+        config.transparentAlphaLossWeight,
+        config.appearanceMode
     );
 
     impl->camIndices.resize(impl->ds->trainIndices.size());
@@ -1345,6 +1346,35 @@ void validateTrainingMaskOptionsV11(
                 "Training mask options reserved fields must be zero");
 }
 
+void validateAppearanceOptionsV18(
+    const MsplatAppearanceOptionsV18& options) {
+    require(options.mode == MSPLAT_APPEARANCE_MODE_NONE ||
+                options.mode == MSPLAT_APPEARANCE_MODE_RGB_GAINS ||
+                options.mode == MSPLAT_APPEARANCE_MODE_PPISP,
+            "Appearance mode is not recognized");
+    for (uint32_t reserved : options.reserved)
+        require(reserved == 0u,
+                "Appearance options reserved fields must be zero");
+}
+
+msplat::AppearanceMode resolveAppearanceMode(
+    const MsplatRefinementOptionsV8& refinementOptions,
+    const MsplatAppearanceOptionsV18& appearanceOptions) {
+    const bool legacyRgbGains =
+        (refinementOptions.flags &
+         MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS) != 0u;
+    require(!(legacyRgbGains &&
+              appearanceOptions.mode == MSPLAT_APPEARANCE_MODE_PPISP),
+            "Photometric RGB-gain refinement cannot be combined with PPISP appearance mode");
+
+    if (legacyRgbGains ||
+        appearanceOptions.mode == MSPLAT_APPEARANCE_MODE_RGB_GAINS)
+        return msplat::AppearanceMode::RgbGains;
+    if (appearanceOptions.mode == MSPLAT_APPEARANCE_MODE_PPISP)
+        return msplat::AppearanceMode::PPISP;
+    return msplat::AppearanceMode::None;
+}
+
 msplat::Config configFromC(const MsplatConfig& c) {
     msplat::Config cfg;
     cfg.iterations = c.iterations;
@@ -1655,6 +1685,38 @@ MsplatStatus msplat_trainer_create_v11(
     size_t maskOptionsSize,
     MsplatTrainer* outTrainer,
     MsplatErrorInfo* error) {
+    const MsplatAppearanceOptionsV18 appearanceOptions =
+        msplat_default_appearance_options_v18();
+    return msplat_trainer_create_v18(
+        ds, config, configSize, limits, limitsSize,
+        refinementOptions, refinementOptionsSize,
+        maskOptions, maskOptionsSize,
+        &appearanceOptions, sizeof(appearanceOptions), outTrainer, error);
+}
+
+MsplatStatus msplat_appearance_options_validate_v18(
+    const MsplatAppearanceOptionsV18* options, size_t optionsSize,
+    MsplatErrorInfo* error) {
+    return guarded(error, MSPLAT_STATUS_INVALID_ARGUMENT, [&] {
+        require(options != nullptr, "Appearance options must not be null");
+        require(optionsSize == sizeof(MsplatAppearanceOptionsV18),
+                "Appearance options size does not match this msplat ABI");
+        validateAppearanceOptionsV18(*options);
+    });
+}
+
+MsplatStatus msplat_trainer_create_v18(
+    MsplatDataset ds,
+    const MsplatConfig* config, size_t configSize,
+    const MsplatTrainingLimits* limits, size_t limitsSize,
+    const MsplatRefinementOptionsV8* refinementOptions,
+    size_t refinementOptionsSize,
+    const MsplatTrainingMaskOptionsV11* maskOptions,
+    size_t maskOptionsSize,
+    const MsplatAppearanceOptionsV18* appearanceOptions,
+    size_t appearanceOptionsSize,
+    MsplatTrainer* outTrainer,
+    MsplatErrorInfo* error) {
     if (outTrainer) *outTrainer = nullptr;
     return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
         require(ds != nullptr, "Dataset handle must not be null");
@@ -1672,16 +1734,22 @@ MsplatStatus msplat_trainer_create_v11(
                 "Training mask options must not be null");
         require(maskOptionsSize == sizeof(MsplatTrainingMaskOptionsV11),
                 "Training mask options size does not match this msplat ABI");
+        require(appearanceOptions != nullptr,
+                "Appearance options must not be null");
+        require(appearanceOptionsSize == sizeof(MsplatAppearanceOptionsV18),
+                "Appearance options size does not match this msplat ABI");
         require(outTrainer != nullptr, "outTrainer must not be null");
         validateConfig(*config);
         validateTrainingLimits(*limits);
         validateRefinementOptionsV8(*refinementOptions);
         validateTrainingMaskOptionsV11(*maskOptions);
+        validateAppearanceOptionsV18(*appearanceOptions);
+        const msplat::AppearanceMode appearanceMode = resolveAppearanceMode(
+            *refinementOptions, *appearanceOptions);
         require(!(maskOptions->mode ==
                       MSPLAT_TRAINING_MASK_MODE_TRANSPARENT &&
-                  (refinementOptions->flags &
-                   MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS) != 0u),
-                "Transparent training masks cannot be combined with photometric gain refinement");
+                  appearanceMode != msplat::AppearanceMode::None),
+                "Transparent training masks cannot be combined with appearance compensation");
         auto dataset = datasetHandle(ds).dataset;
         require(dataset->numTrain() > 0, "Dataset has no training cameras");
         auto cfg = configFromC(*config);
@@ -1689,6 +1757,7 @@ MsplatStatus msplat_trainer_create_v11(
         cfg.refinePhotometricGains =
             (refinementOptions->flags &
              MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS) != 0u;
+        cfg.appearanceMode = appearanceMode;
         cfg.refineCameraPoses =
             (refinementOptions->flags &
              MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS) != 0u;

@@ -10,6 +10,7 @@
 #include <memory>
 #include <string>
 
+#include "appearance_mode.hpp"
 #include "camera_pose_conditioning.hpp"
 
 struct DatasetDescriptor;
@@ -42,9 +43,8 @@ struct Config {
     int stopDensifyAt = -1;
     // Hard population and backing-buffer ceiling. -1 means unlimited.
     int maxGaussians = -1;
-    // Learn bounded per-camera log-RGB gains during training. Their mean is
-    // exposure-like and their zero-mean residual is channel balance; source
-    // pixels remain sRGB encoded, so this is not a physical exposure model.
+    // Legacy source-compatibility alias. Trainer construction normalizes true
+    // with the appended appearanceMode field below.
     bool refinePhotometricGains = false;
     // Learn small regularized camera-space SE(3) corrections after warm-up.
     // Imported poses and canonical render/evaluation/export remain unchanged.
@@ -60,6 +60,10 @@ struct Config {
     bool keepCrs = false;
     float downscaleFactor = 1.0f; // Legacy field retained for ABI compatibility; unused.
     float bgColor[3] = {0.6130f, 0.0101f, 0.3984f};  // magenta — high contrast for debugging
+    // Appended for aggregate/source compatibility. Selects one mutually
+    // exclusive training-only appearance model. Legacy true plus None maps to
+    // RgbGains; legacy true plus PPISP is rejected as conflicting.
+    AppearanceMode appearanceMode = AppearanceMode::None;
 };
 
 // ── Stats ───────────────────────────────────────────────────────────────────

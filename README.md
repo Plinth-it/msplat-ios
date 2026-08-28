@@ -216,14 +216,21 @@ orientations 2, 4, 5, and 7 because a positive-focal, right-handed camera
 cannot represent that reflection. Normalize such assets before describing
 them, or preserve their encoded raster.
 
-**Photometric refinement.** Training can optionally learn three bounded
-log-domain RGB gains per canonical camera. Their mean is an exposure-like
-offset and their zero-mean residual is a channel-balance correction. The input
-pixels are sRGB encoded, so these are photometric gains rather than physical
-linear-light exposure estimates. They affect training loss only: canonical
-rendering, evaluation, and PLY/SPZ export remain unchanged. Checkpoint v2 keeps
-the gains, Adam moments, per-camera visit counts, and exact frame IDs so a
-resume cannot silently attach corrections to different cameras.
+**Appearance refinement.** `TrainingConfig.appearanceMode` selects one
+mutually exclusive training-only model: `.none`, the established bounded
+per-camera `.rgbGains`, or `.ppisp`. The current PPISP phase learns per-frame
+log2 exposure and an eight-parameter color homography; it does not yet include
+lens vignetting or camera-response curves. RGB-gain means remain
+exposure-like offsets and their zero-mean residuals remain channel-balance
+corrections. Input pixels are sRGB encoded, so these are photometric
+corrections rather than physical linear-light exposure estimates. They affect
+training loss only: canonical rendering, evaluation, and PLY/SPZ export remain
+unchanged. The legacy `refinePhotometricGains` property and
+`--refine-photometric-gains` flags remain aliases for RGB gains; new CLI use
+can select PPISP explicitly with `--appearance-mode ppisp`. Checkpoints
+preserve the selected mode, its parameters and Adam state, per-camera visit
+counts, and exact frame IDs so a resume cannot silently attach corrections to
+different cameras.
 
 **Camera-pose refinement.** Training can optionally learn small, bounded
 camera-space SE(3) corrections after warm-up. The first training camera is a
@@ -282,6 +289,9 @@ Adam moments, visit counts, the anchor, frame IDs, and immutable source poses.
   does not allocate CamP matrices; older clients retain their existing path.
 - ABI v17 size-checked training-memory telemetry with target-prefetch scheduled,
   used, waited, and discarded counters; the ABI v4 snapshot remains unchanged.
+- ABI v18 size-checks mutually exclusive appearance-mode options. The existing
+  ABI v8 RGB-gain bit remains a compatibility alias, while PPISP is an explicit
+  opt-in.
 - Swift `TrainingPlan` validation, resolved per-stage dimensions, and a
   code-derived peak-memory estimate
 - Target-resolution ImageIO thumbnail decoding with checked dimensions,
@@ -406,8 +416,8 @@ loss between the mask and rendered alpha (`1 - transmittance`); the default
 weight is 0.1. This directly penalizes exterior opacity while preserving soft
 silhouette edges. The fixed configured background is used for deterministic,
 race-free asynchronous training. Transparent mask treatment cannot currently be
-combined with per-camera photometric gain refinement because those gains would
-also act on the synthetic background. Frames without a matched mask remain
+combined with appearance refinement because the correction would also act on
+the synthetic background. Frames without a matched mask remain
 ordinary opaque RGB targets. Sidecars must currently match the source image dimensions;
 unlike Brush, MSplat does not resize mismatched masks.
 

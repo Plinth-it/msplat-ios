@@ -149,12 +149,12 @@ require_contains("${model_source}"
     "transparentMask\n        ? fullCoverageUnits\n        : target.coverageUnits"
     "full-frame transparent normalization")
 require_contains("${model_source}"
-    "transparentTrainingMasks && refinePhotometricGains"
-    "C++ transparent and photometric incompatibility")
+    "transparentTrainingMasks &&\n        appearanceMode != msplat::AppearanceMode::None"
+    "C++ transparent and appearance incompatibility")
 require_contains("${api_source}" "msplat_default_training_mask_options_v11()"
     "legacy trainer coverage default")
 require_contains("${api_source}"
-    "config.trainingMaskMode == TrainingMaskMode::Transparent,\n        config.transparentAlphaLossWeight"
+    "config.trainingMaskMode == TrainingMaskMode::Transparent,\n        config.transparentAlphaLossWeight,\n        config.appearanceMode"
     "C++ config to model plumbing")
 require_contains("${api_source}"
     "cfg.trainingMaskMode =\n            maskOptions->mode == MSPLAT_TRAINING_MASK_MODE_TRANSPARENT"
@@ -163,8 +163,8 @@ require_contains("${api_source}"
     "cfg.transparentAlphaLossWeight = maskOptions->alphaLossWeight;"
     "C ABI alpha weight to C++ config mapping")
 require_contains("${api_source}"
-    "MSPLAT_TRAINING_MASK_MODE_TRANSPARENT &&\n                  (refinementOptions->flags &\n                   MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS) != 0u"
-    "C ABI transparent and photometric incompatibility")
+    "MSPLAT_TRAINING_MASK_MODE_TRANSPARENT &&\n                  appearanceMode != msplat::AppearanceMode::None"
+    "C ABI transparent and appearance incompatibility")
 require_contains("${c_api_source}"
     "options.mode = MSPLAT_TRAINING_MASK_MODE_COVERAGE;"
     "C ABI coverage default")
@@ -172,5 +172,5 @@ require_contains("${swift_source}"
     "public var trainingMaskMode: TrainingMaskMode = .coverage"
     "Swift API coverage default")
 require_contains("${swift_source}"
-    "trainingMaskMode != .transparent || !refinePhotometricGains"
-    "Swift transparent and photometric incompatibility")
+    "trainingMaskMode != .transparent || resolvedAppearanceMode == .none"
+    "Swift transparent and appearance incompatibility")

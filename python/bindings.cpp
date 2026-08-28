@@ -42,6 +42,7 @@ struct TrainingConfig {
     float split_screen_size = 0.05f;
     bool keep_crs = false;
     bool refine_photometric_gains = false;
+    std::string appearance_mode = "none";
     bool refine_camera_poses = false;
     float downscale_factor = 1.0f;
     std::string output = "splat.ply";
@@ -50,6 +51,28 @@ struct TrainingConfig {
     // under-reconstructed regions obvious during training.
     std::vector<float> bg_color = {0.6130f, 0.0101f, 0.3984f};
 };
+
+msplat::AppearanceMode resolve_appearance_mode(const TrainingConfig &config) {
+    msplat::AppearanceMode mode;
+    if (config.appearance_mode == "none")
+        mode = msplat::AppearanceMode::None;
+    else if (config.appearance_mode == "rgb_gains")
+        mode = msplat::AppearanceMode::RgbGains;
+    else if (config.appearance_mode == "ppisp")
+        mode = msplat::AppearanceMode::PPISP;
+    else
+        throw std::invalid_argument(
+            "appearance_mode must be 'none', 'rgb_gains', or 'ppisp'");
+
+    if (config.refine_photometric_gains) {
+        if (mode == msplat::AppearanceMode::PPISP) {
+            throw std::invalid_argument(
+                "refine_photometric_gains cannot be combined with appearance_mode='ppisp'");
+        }
+        mode = msplat::AppearanceMode::RgbGains;
+    }
+    return mode;
+}
 
 // ── TrainingStats ───────────────────────────────────────────────────────────
 
@@ -129,6 +152,8 @@ public:
     GaussianTrainer(Dataset &dataset, const TrainingConfig &cfg)
         : config(cfg), dataset_ptr(&dataset)
     {
+        const msplat::AppearanceMode appearance_mode =
+            resolve_appearance_mode(cfg);
         model = std::make_unique<Model>(
             dataset.data,
             dataset.train_cams.size(),
@@ -145,7 +170,11 @@ public:
             cfg.refine_camera_poses,
             cfg.refine_camera_poses && !dataset.train_cams.empty()
                 ? static_cast<int>(dataset.train_cams.front())
-                : -1
+                : -1,
+            msplat::CameraPoseConditioning::Raw,
+            false,
+            0.1f,
+            appearance_mode
         );
 
         cam_indices.resize(dataset.train_cams.size());
@@ -351,7 +380,8 @@ NB_MODULE(_core, m) {
                 const std::string &output, int save_every,
                 std::vector<float> bg_color, int max_gaussians,
                 bool refine_photometric_gains,
-                bool refine_camera_poses) {
+                bool refine_camera_poses,
+                const std::string &appearance_mode) {
             new (cfg) TrainingConfig();
             cfg->iterations = iterations;
             cfg->sh_degree = sh_degree;
@@ -373,9 +403,11 @@ NB_MODULE(_core, m) {
             cfg->max_gaussians = max_gaussians;
             cfg->refine_photometric_gains = refine_photometric_gains;
             cfg->refine_camera_poses = refine_camera_poses;
+            cfg->appearance_mode = appearance_mode;
             if (bg_color.size() != 3)
                 throw std::invalid_argument("bg_color must have exactly 3 elements [R, G, B]");
             cfg->bg_color = bg_color;
+            (void)resolve_appearance_mode(*cfg);
         },
             "iterations"_a = 30000,
             "sh_degree"_a = 3,
@@ -397,7 +429,8 @@ NB_MODULE(_core, m) {
             "bg_color"_a = std::vector<float>{0.6130f, 0.0101f, 0.3984f},
             "max_gaussians"_a = -1,
             "refine_photometric_gains"_a = false,
-            "refine_camera_poses"_a = false)
+            "refine_camera_poses"_a = false,
+            "appearance_mode"_a = "none")
         .def_rw("iterations", &TrainingConfig::iterations)
         .def_rw("sh_degree", &TrainingConfig::sh_degree)
         .def_rw("sh_degree_interval", &TrainingConfig::sh_degree_interval)
@@ -414,7 +447,9 @@ NB_MODULE(_core, m) {
         .def_rw("split_screen_size", &TrainingConfig::split_screen_size)
         .def_rw("keep_crs", &TrainingConfig::keep_crs)
         .def_rw("refine_photometric_gains", &TrainingConfig::refine_photometric_gains,
-            "Optimize bounded per-camera RGB gains during training. Disabled by default.")
+            "Compatibility alias for appearance_mode='rgb_gains'.")
+        .def_rw("appearance_mode", &TrainingConfig::appearance_mode,
+            "Training-only appearance model: 'none', 'rgb_gains', or the current 'ppisp' per-frame exposure/color stage.")
         .def_rw("refine_camera_poses", &TrainingConfig::refine_camera_poses,
             "Optimize small regularized per-camera pose corrections after warm-up. Disabled by default.")
         .def_rw("downscale_factor", &TrainingConfig::downscale_factor)

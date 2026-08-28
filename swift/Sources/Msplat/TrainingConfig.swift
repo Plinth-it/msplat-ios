@@ -17,6 +17,17 @@ public enum CameraPoseConditioning: UInt32, CaseIterable, Sendable {
     case camP = 1
 }
 
+/// Mutually exclusive training-only appearance compensation.
+public enum AppearanceMode: UInt32, CaseIterable, Sendable {
+    /// Train against the canonical model colors without compensation.
+    case none = 0
+    /// Learn the existing bounded per-camera log-RGB gains.
+    case rgbGains = 1
+    /// Learn the current PPISP per-frame exposure and color-homography stage.
+    /// Lens vignetting and response curves are not part of this phase.
+    case ppisp = 2
+}
+
 /// Configuration for Gaussian splatting training.
 public struct TrainingConfig: Sendable {
     public var iterations: Int32 = 30_000
@@ -38,7 +49,12 @@ public struct TrainingConfig: Sendable {
     /// Learn bounded per-camera RGB gains while evaluating the training loss.
     /// The source images are sRGB encoded, so this is a photometric correction,
     /// not a physical linear-light exposure model. Canonical renders are unchanged.
+    /// This compatibility alias resolves `.none` to `.rgbGains`; prefer
+    /// `appearanceMode` in new code.
     public var refinePhotometricGains: Bool = false
+    /// Appearance correction used by the training objective. Modes are
+    /// mutually exclusive and never alter canonical render, evaluation, or export.
+    public var appearanceMode: AppearanceMode = .none
     /// Learn small, regularized camera-space pose corrections after warm-up.
     /// Imported geometry and canonical render, evaluation, and export stay unchanged.
     public var refineCameraPoses: Bool = false
@@ -47,7 +63,7 @@ public struct TrainingConfig: Sendable {
     public var cameraPoseConditioning: CameraPoseConditioning = .raw
     /// Treatment for frames that have a training mask. Frames without a mask
     /// remain ordinary opaque RGB targets in either mode. Transparent mode
-    /// cannot be combined with `refinePhotometricGains`.
+    /// cannot be combined with appearance compensation.
     public var trainingMaskMode: TrainingMaskMode = .coverage
     /// Weight of the full-frame L1 alpha term used by transparent mask mode.
     public var transparentAlphaLossWeight: Float = 0.1
@@ -114,9 +130,10 @@ public struct TrainingConfig: Sendable {
                 "transparentAlphaLossWeight must be finite and non-negative"
             )
         }
-        guard trainingMaskMode != .transparent || !refinePhotometricGains else {
+        let resolvedAppearanceMode = try resolvedAppearanceMode()
+        guard trainingMaskMode != .transparent || resolvedAppearanceMode == .none else {
             throw MsplatError.invalidArgument(
-                "Transparent training masks cannot be combined with photometric gain refinement"
+                "Transparent training masks cannot be combined with appearance compensation"
             )
         }
         guard cameraPoseConditioning == .raw || refineCameraPoses else {
@@ -167,6 +184,24 @@ public struct TrainingConfig: Sendable {
             options.flags |= UInt32(MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING)
         }
         return options
+    }
+
+    func toAppearanceOptionsV18() -> MsplatAppearanceOptionsV18 {
+        var options = msplat_default_appearance_options_v18()
+        options.mode = appearanceMode.rawValue
+        return options
+    }
+
+    func resolvedAppearanceMode() throws -> AppearanceMode {
+        guard !(refinePhotometricGains && appearanceMode == .ppisp) else {
+            throw MsplatError.invalidArgument(
+                "Photometric RGB-gain refinement cannot be combined with PPISP appearance mode"
+            )
+        }
+        if refinePhotometricGains || appearanceMode == .rgbGains {
+            return .rgbGains
+        }
+        return appearanceMode
     }
 
     func toTrainingMaskOptionsV11() -> MsplatTrainingMaskOptionsV11 {

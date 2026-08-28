@@ -22,7 +22,7 @@
 
 #define CHECK(condition) do { if (!(condition)) return __LINE__; } while (false)
 
-static_assert(MSPLAT_ABI_VERSION == 17u);
+static_assert(MSPLAT_ABI_VERSION == 18u);
 static_assert(MSPLAT_REFINEMENT_PHOTOMETRIC_RGB_GAINS == (1u << 0));
 static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_DELTAS == (1u << 1));
 static_assert(MSPLAT_REFINEMENT_CAMERA_POSE_CAMP_CONDITIONING == (1u << 2));
@@ -53,6 +53,14 @@ static_assert(offsetof(MsplatTrainingMaskOptionsV11, alphaLossWeight) == 4);
 static_assert(offsetof(MsplatTrainingMaskOptionsV11, reserved) == 8);
 static_assert(MSPLAT_TRAINING_MASK_MODE_COVERAGE == 0);
 static_assert(MSPLAT_TRAINING_MASK_MODE_TRANSPARENT == 1);
+static_assert(std::is_standard_layout<MsplatAppearanceOptionsV18>::value);
+static_assert(sizeof(MsplatAppearanceOptionsV18) == 16);
+static_assert(alignof(MsplatAppearanceOptionsV18) == 4);
+static_assert(offsetof(MsplatAppearanceOptionsV18, mode) == 0);
+static_assert(offsetof(MsplatAppearanceOptionsV18, reserved) == 4);
+static_assert(MSPLAT_APPEARANCE_MODE_NONE == 0);
+static_assert(MSPLAT_APPEARANCE_MODE_RGB_GAINS == 1);
+static_assert(MSPLAT_APPEARANCE_MODE_PPISP == 2);
 static_assert(sizeof(MsplatSubmittedTrainingStep) == 32);
 static_assert(alignof(MsplatSubmittedTrainingStep) == 4);
 static_assert(sizeof(MsplatCompletedTrainingStep) == 64);
@@ -1559,6 +1567,40 @@ int main() {
               nullptr, sizeof(maskOptions), &error) ==
           MSPLAT_STATUS_INVALID_ARGUMENT);
 
+    MsplatAppearanceOptionsV18 appearanceOptions =
+        msplat_default_appearance_options_v18();
+    CHECK(appearanceOptions.mode == MSPLAT_APPEARANCE_MODE_NONE);
+    CHECK(appearanceOptions.reserved[0] == 0u);
+    CHECK(appearanceOptions.reserved[1] == 0u);
+    CHECK(appearanceOptions.reserved[2] == 0u);
+    CHECK(msplat_appearance_options_validate_v18(
+              &appearanceOptions, sizeof(appearanceOptions), &error) ==
+          MSPLAT_STATUS_OK);
+    appearanceOptions.mode = MSPLAT_APPEARANCE_MODE_RGB_GAINS;
+    CHECK(msplat_appearance_options_validate_v18(
+              &appearanceOptions, sizeof(appearanceOptions), &error) ==
+          MSPLAT_STATUS_OK);
+    appearanceOptions.mode = MSPLAT_APPEARANCE_MODE_PPISP;
+    CHECK(msplat_appearance_options_validate_v18(
+              &appearanceOptions, sizeof(appearanceOptions), &error) ==
+          MSPLAT_STATUS_OK);
+    appearanceOptions.mode = 3u;
+    CHECK(msplat_appearance_options_validate_v18(
+              &appearanceOptions, sizeof(appearanceOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    appearanceOptions = msplat_default_appearance_options_v18();
+    appearanceOptions.reserved[2] = 1u;
+    CHECK(msplat_appearance_options_validate_v18(
+              &appearanceOptions, sizeof(appearanceOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    appearanceOptions = msplat_default_appearance_options_v18();
+    CHECK(msplat_appearance_options_validate_v18(
+              &appearanceOptions, sizeof(appearanceOptions) - 1, &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(msplat_appearance_options_validate_v18(
+              nullptr, sizeof(appearanceOptions), &error) ==
+          MSPLAT_STATUS_INVALID_ARGUMENT);
+
     MsplatTrainer trainer = reinterpret_cast<MsplatTrainer>(1);
     config = msplat_default_config();
     limits = msplat_default_training_limits();
@@ -1579,6 +1621,15 @@ int main() {
               nullptr, &config, sizeof(config), &limits, sizeof(limits),
               &refinementOptions, sizeof(refinementOptions),
               &maskOptions, sizeof(maskOptions), &trainer,
+              &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
+    CHECK(trainer == nullptr);
+    trainer = reinterpret_cast<MsplatTrainer>(1);
+    appearanceOptions = msplat_default_appearance_options_v18();
+    CHECK(msplat_trainer_create_v18(
+              nullptr, &config, sizeof(config), &limits, sizeof(limits),
+              &refinementOptions, sizeof(refinementOptions),
+              &maskOptions, sizeof(maskOptions),
+              &appearanceOptions, sizeof(appearanceOptions), &trainer,
               &error) == MSPLAT_STATUS_INVALID_ARGUMENT);
     CHECK(trainer == nullptr);
     CHECK(msplat_dataset_enable_training_target_prefetch_v14(

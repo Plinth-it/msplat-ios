@@ -189,8 +189,8 @@ require_contains("${host_source}"
     "tile_attempt_dispatch_control =\n            mtensor_empty(dev, {12}, DType::Int32);"
     "three-record indirect-dispatch allocation and scalar controls")
 require_contains("${training_pipeline}"
-    "const uint32_t attemptGatingEnabled =\n        ctx->retry_intersection_attempts ? 1u : 0u;"
-    "default-off persistent-mutation gating")
+    "const uint32_t attemptGatingEnabled =\n        (ctx->retry_intersection_attempts || ppisp.enabled) ? 1u : 0u;"
+    "retry-or-PPISP persistent-mutation gating")
 
 # Rendering is intentionally outside this experiment: it continues to size the
 # exact arena after a synchronized count/layout pass and never consults retry
@@ -635,7 +635,7 @@ require_contains("${retry_replay}"
     "features_rest, opacities, background, gt, coverage_mask,"
     "same model and target replay")
 require_contains("${retry_replay}"
-    "adam_eps, photometric, pose, collect_densification_stats,"
+    "adam_eps, photometric, ppisp, pose, collect_densification_stats,"
     "same optimizer and refinement replay")
 require_contains("${retry_fixture}"
     "constexpr int fallbackGaussianCount = 5'000;"

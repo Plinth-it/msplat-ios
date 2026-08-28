@@ -71,7 +71,10 @@ def main():
         """Keep input coordinate reference system"""
 
         refine_photometric_gains: bool = False
-        """Optimize bounded per-camera RGB gains during training"""
+        """Compatibility alias for --appearance-mode rgb_gains"""
+
+        appearance_mode: str = "none"
+        """Training-only model: none, rgb_gains, or PPISP frame exposure/color"""
 
         refine_camera_poses: bool = False
         """Optimize small regularized per-camera pose corrections after warm-up"""
@@ -106,6 +109,7 @@ def main():
         split_screen_size=args.split_screen_size,
         keep_crs=args.keep_crs,
         refine_photometric_gains=args.refine_photometric_gains,
+        appearance_mode=args.appearance_mode,
         refine_camera_poses=args.refine_camera_poses,
         downscale_factor=args.downscale_factor,
         output=args.output,

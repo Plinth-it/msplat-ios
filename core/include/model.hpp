@@ -4,6 +4,7 @@
 #include "metal_tensor.hpp"
 #include "ssim.hpp"
 #include "input_data.hpp"
+#include "appearance_mode.hpp"
 #include "pose_refinement_state.hpp"
 #include "camera_pose_conditioning.hpp"
 #include <cstddef>
@@ -38,7 +39,9 @@ struct Model{
         msplat::CameraPoseConditioning cameraPoseConditioning =
             msplat::CameraPoseConditioning::Raw,
         bool transparentTrainingMasks = false,
-        float transparentAlphaLossWeight = 0.1f);
+        float transparentAlphaLossWeight = 0.1f,
+        msplat::AppearanceMode appearanceMode =
+            msplat::AppearanceMode::None);
 
   ~Model(){ releaseOptimizers(); }
 
@@ -130,6 +133,12 @@ struct Model{
   MTensor cameraLogGainExpAvg;
   MTensor cameraLogGainExpAvgSq;
   std::vector<uint32_t> cameraLogGainStepCounts;
+  // Per-canonical-camera PPISP frame row:
+  // [log2 exposure, b0, b1, r0, r1, g0, g1, n0, n1]. Zero is identity.
+  MTensor cameraPpispParameters;
+  MTensor cameraPpispExpAvg;
+  MTensor cameraPpispExpAvgSq;
+  std::vector<uint32_t> cameraPpispStepCounts;
   // Optional geometric camera refinement. Rows are indexed by the canonical
   // dataset camera index. Each delta is [camera-space translation, axis-angle]
   // and left-multiplies the immutable renderer view matrix during training.
@@ -164,7 +173,7 @@ struct Model{
   int maxSteps;
   /// Hard population and backing-buffer limit. -1 means unlimited.
   int maxGaussians;
-  bool refinePhotometricGains;
+  msplat::AppearanceMode appearanceMode;
   bool refineCameraPoses;
   int poseAnchorCameraIndex;
   msplat::CameraPoseConditioning cameraPoseConditioning;

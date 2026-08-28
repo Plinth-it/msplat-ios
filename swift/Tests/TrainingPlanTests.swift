@@ -183,6 +183,35 @@ final class TrainingPlanTests: XCTestCase {
         XCTAssertGreaterThan(packed.estimatedPeakMemory, gather.estimatedPeakMemory)
     }
 
+    func testPPISPAppearanceModeAddsFullResolutionRGBScratch() throws {
+        func makePlan(_ appearanceMode: AppearanceMode) throws -> TrainingPlan {
+            try TrainingPlan(
+                inputDimensions: TrainingImageDimensions(width: 960, height: 720),
+                inputDecodeScale: 1,
+                iterationBudget: 100,
+                stages: [
+                    TrainingResolutionStage(iterations: 1...100, downscaleFactor: 1),
+                ],
+                targetSHDegree: 2,
+                maximumGaussianCount: 10_000,
+                appearanceMode: appearanceMode
+            )
+        }
+
+        let none = try makePlan(.none)
+        let ppisp = try makePlan(.ppisp)
+        let expectedScratchBytes = Int64(12 * 960 * 720)
+
+        XCTAssertEqual(none.appearanceMode, .none)
+        XCTAssertEqual(ppisp.appearanceMode, .ppisp)
+        XCTAssertEqual(
+            ppisp.memoryEstimate.peakTrainingCacheBytes
+                - none.memoryEstimate.peakTrainingCacheBytes,
+            expectedScratchBytes
+        )
+        XCTAssertEqual(try ppisp.makeTrainingConfig().appearanceMode, .ppisp)
+    }
+
     func testMaskAwareCoarseOnlyCacheEstimateUsesCompactStageTarget() throws {
         let plan = try TrainingPlan(
             inputDimensions: TrainingImageDimensions(width: 1_920, height: 1_440),

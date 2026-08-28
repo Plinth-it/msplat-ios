@@ -52,6 +52,7 @@ enum MsplatTrainingOverflowReason : uint32_t {
     MSPLAT_TRAINING_OVERFLOW_NONE = 0,
     MSPLAT_TRAINING_OVERFLOW_TILE_CAP = 1u << 0,
     MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY = 1u << 1,
+    MSPLAT_TRAINING_OVERFLOW_APPEARANCE_NONFINITE = 1u << 2,
 };
 
 enum MsplatTrainingTelemetryFlag : uint32_t {
@@ -187,6 +188,23 @@ struct MsplatPhotometricRefinementStep {
     float maxAbsLogGain = 0.0f;
 };
 
+// Training-only per-frame PPISP exposure/color correction. Parameters and
+// Adam moments are Float32 [N,9] tensors with rows laid out as
+// [log2 exposure, b0, b1, r0, r1, g0, g1, n0, n1]. An all-zero row is the
+// identity transform. This mode is mutually exclusive with log-RGB gains.
+struct MsplatPpispRefinementStep {
+    bool enabled = false;
+    uint32_t frameIndex = 0;
+    MTensor* parameters = nullptr;
+    MTensor* expAvg = nullptr;
+    MTensor* expAvgSq = nullptr;
+    float adamStepSize = 0.0f;
+    float adamBiasCorrection2Sqrt = 1.0f;
+    float regularization = 0.0f;
+    float maxAbsExposure = 0.0f;
+    float maxAbsColorParameter = 0.0f;
+};
+
 struct MsplatPoseRefinementStep {
     bool enabled = false;
     bool conditioned = false;
@@ -224,6 +242,7 @@ MTensor msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     const MsplatPhotometricRefinementStep& photometric,
+    const MsplatPpispRefinementStep& ppisp,
     const MsplatPoseRefinementStep& pose,
     bool collect_densification_stats,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,

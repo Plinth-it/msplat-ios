@@ -554,7 +554,8 @@ private:
                 completed.overflowReasons = recoveredOverflowReasons |
                     (words[0] & (
                     MSPLAT_TRAINING_OVERFLOW_TILE_CAP |
-                    MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY));
+                    MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY |
+                    MSPLAT_TRAINING_OVERFLOW_APPEARANCE_NONFINITE));
 
                 float rawLoss = 0.0f;
                 std::memcpy(&rawLoss, &words[1], sizeof(rawLoss));
@@ -1030,6 +1031,9 @@ struct MetalContext {
     id<MTLComputePipelineState> ssim_v_bwd_kernel_cpso = nil;
     bool fused_ssim_backward = true;
     id<MTLComputePipelineState> photometric_adam_kernel_cpso = nil;
+    id<MTLComputePipelineState> ppisp_frame_forward_kernel_cpso = nil;
+    id<MTLComputePipelineState> ppisp_frame_backward_kernel_cpso = nil;
+    id<MTLComputePipelineState> ppisp_frame_adam_kernel_cpso = nil;
     id<MTLComputePipelineState> prepare_camera_pose_kernel_cpso = nil;
     id<MTLComputePipelineState> camera_pose_adam_kernel_cpso = nil;
     // Backward pipeline kernels
@@ -1084,6 +1088,9 @@ struct MetalContext {
             ssim_fused_v_fwd_bwd_kernel_cpso,
             ssim_v_bwd_kernel_cpso,
             photometric_adam_kernel_cpso,
+            ppisp_frame_forward_kernel_cpso,
+            ppisp_frame_backward_kernel_cpso,
+            ppisp_frame_adam_kernel_cpso,
             prepare_camera_pose_kernel_cpso,
             camera_pose_adam_kernel_cpso,
             sh_opacity_backward_adam_kernel_cpso,
@@ -1465,6 +1472,9 @@ MetalContext* init_msplat_metal_context() {
         ctx->ssim_v_bwd_kernel_cpso = load(@"ssim_v_bwd_kernel");
     }
     ctx->photometric_adam_kernel_cpso              = load(@"photometric_adam_kernel");
+    ctx->ppisp_frame_forward_kernel_cpso           = load(@"ppisp_frame_forward_kernel");
+    ctx->ppisp_frame_backward_kernel_cpso          = load(@"ppisp_frame_backward_kernel");
+    ctx->ppisp_frame_adam_kernel_cpso              = load(@"ppisp_frame_adam_kernel");
     ctx->prepare_camera_pose_kernel_cpso            = load(@"prepare_camera_pose_kernel");
     ctx->camera_pose_adam_kernel_cpso               = load(@"camera_pose_adam_kernel");
     // Backward pipeline
@@ -1993,6 +2003,10 @@ struct FusedTensorCache {
     // Training-only image and backward depth-chunked buffers
     MTensor ssim_deriv_h_buf, ssim_h_buf, loss_sum;
     MTensor photometric_gradient;
+    // PPISP keeps the canonical renderer output intact until its separate
+    // backward stage. The corrected image is overwritten in-place by the loss
+    // with dL/d(corrected RGB); ppisp_gradient is the nine-value reduction.
+    MTensor ppisp_corrected_image, ppisp_gradient;
     MTensor pose_viewmat, pose_cam_pos, pose_gradient;
     int backward_chunk_K_max = -1, backward_chunk_height = -1, backward_chunk_width = -1;
     MTensor prefix_T, after_C;
@@ -2022,7 +2036,8 @@ struct FusedTensorCache {
     size_t trainingEstimatedBytes() const {
         const MTensor* tensors[] = {
             &ssim_deriv_h_buf, &ssim_h_buf, &loss_sum,
-            &photometric_gradient, &pose_viewmat, &pose_cam_pos,
+            &photometric_gradient, &ppisp_corrected_image,
+            &ppisp_gradient, &pose_viewmat, &pose_cam_pos,
             &pose_gradient,
             &prefix_T, &after_C,
             &v_xy, &v_conic, &v_colors_rast, &v_opacity
@@ -2245,11 +2260,14 @@ struct FusedTensorCache {
     }
 
     void ensure_training_image(int ih, int iw, bool needsDerivativeBuffer,
-                               id<MTLDevice> dev) {
+                               bool needsPpispImage, id<MTLDevice> dev) {
         const bool derivativeBufferReady =
             !needsDerivativeBuffer || ssim_deriv_h_buf.defined();
+        const bool ppispBuffersReady = !needsPpispImage ||
+            (ppisp_corrected_image.defined() && ppisp_gradient.defined());
         if (ih == training_img_height && iw == training_img_width &&
-            derivativeBufferReady && ssim_h_buf.defined() &&
+            derivativeBufferReady && ppispBuffersReady &&
+            ssim_h_buf.defined() &&
             loss_sum.defined() && photometric_gradient.defined()) {
             return;
         }
@@ -2257,6 +2275,7 @@ struct FusedTensorCache {
         training_img_height = -1; training_img_width = -1;
         ssim_deriv_h_buf.reset(); ssim_h_buf.reset();
         loss_sum.reset(); photometric_gradient.reset();
+        ppisp_corrected_image.reset(); ppisp_gradient.reset();
 
         if (needsDerivativeBuffer) {
             ssim_deriv_h_buf = mtensor_empty(
@@ -2266,6 +2285,11 @@ struct FusedTensorCache {
             dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);
         loss_sum = mtensor_empty(dev, {1}, DType::Float32);
         photometric_gradient = mtensor_empty(dev, {3}, DType::Float32);
+        if (needsPpispImage) {
+            ppisp_corrected_image = mtensor_empty(
+                dev, {(int64_t)ih, (int64_t)iw, 3}, DType::Float32);
+            ppisp_gradient = mtensor_empty(dev, {9}, DType::Float32);
+        }
         training_img_height = ih; training_img_width = iw;
     }
 
@@ -2881,6 +2905,7 @@ static MTensor msplat_train_step_locked(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     const MsplatPhotometricRefinementStep& photometric,
+    const MsplatPpispRefinementStep& ppisp,
     const MsplatPoseRefinementStep& pose,
     bool collect_densification_stats,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
@@ -3015,6 +3040,11 @@ static MTensor msplat_train_step_locked(
         ? alpha_loss_weight / static_cast<float>(pixelCount)
         : 0.0f;
 
+    if (photometric.enabled && ppisp.enabled) {
+        throw std::invalid_argument(
+            "PPISP and log-RGB-gain refinement are mutually exclusive");
+    }
+
     auto validatePhotometricTensor = [](const MTensor* tensor,
                                         const char* name) {
         if (!tensor || !tensor->defined() || !tensor->isGpu() ||
@@ -3071,6 +3101,55 @@ static MTensor msplat_train_step_locked(
         : photometricLogGains;
     const uint32_t cameraGainOffset = photometric.cameraIndex * 3u;
     const uint32_t photometricEnabled = photometric.enabled ? 1u : 0u;
+
+    auto validatePpispTensor = [](const MTensor* tensor,
+                                  const char* name) {
+        if (!tensor || !tensor->defined() || !tensor->isGpu() ||
+            tensor->dtype() != DType::Float32 || tensor->ndim() != 2 ||
+            tensor->size(0) <= 0 || tensor->size(1) != 9) {
+            throw std::invalid_argument(
+                std::string(name) +
+                " must be a non-empty GPU Float32 [N,9] tensor");
+        }
+    };
+    if (ppisp.enabled) {
+        validatePpispTensor(ppisp.parameters, "PPISP parameters");
+        validatePpispTensor(ppisp.expAvg, "PPISP Adam first moment");
+        validatePpispTensor(ppisp.expAvgSq, "PPISP Adam second moment");
+        if (ppisp.frameIndex > std::numeric_limits<uint32_t>::max() / 9u ||
+            static_cast<int64_t>(ppisp.frameIndex) >=
+                ppisp.parameters->size(0)) {
+            throw std::invalid_argument("PPISP frame index is out of range");
+        }
+        if (ppisp.expAvg->size(0) != ppisp.parameters->size(0) ||
+            ppisp.expAvgSq->size(0) != ppisp.parameters->size(0)) {
+            throw std::invalid_argument(
+                "PPISP Adam tensors must match the parameter tensor shape");
+        }
+        constexpr float expectedMaxAbsExposure = 4.0f;
+        constexpr float expectedMaxAbsColorParameter = 4.0f;
+        if (!std::isfinite(ppisp.adamStepSize) ||
+            ppisp.adamStepSize <= 0.0f ||
+            !std::isfinite(ppisp.adamBiasCorrection2Sqrt) ||
+            ppisp.adamBiasCorrection2Sqrt <= 0.0f ||
+            !std::isfinite(ppisp.regularization) ||
+            ppisp.regularization < 0.0f ||
+            !std::isfinite(ppisp.maxAbsExposure) ||
+            std::abs(ppisp.maxAbsExposure - expectedMaxAbsExposure) >
+                1.0e-6f ||
+            !std::isfinite(ppisp.maxAbsColorParameter) ||
+            std::abs(ppisp.maxAbsColorParameter -
+                     expectedMaxAbsColorParameter) > 1.0e-6f) {
+            throw std::invalid_argument("PPISP optimizer parameters are invalid");
+        }
+    }
+    MTensor* ppispParameters = ppisp.enabled ? ppisp.parameters : nullptr;
+    MTensor* ppispExpAvg = ppisp.enabled ? ppisp.expAvg : nullptr;
+    MTensor* ppispExpAvgSq = ppisp.enabled ? ppisp.expAvgSq : nullptr;
+    const uint32_t ppispParameterOffset = ppisp.enabled
+        ? ppisp.frameIndex * 9u
+        : 0u;
+    const uint32_t deferRendererClamp = ppisp.enabled ? 1u : 0u;
 
     auto validatePoseTensor = [](const MTensor* tensor, const char* name) {
         if (!tensor || !tensor->defined() || !tensor->isGpu() ||
@@ -3173,7 +3252,8 @@ static MTensor msplat_train_step_locked(
     g_tcache.ensure_tile_attempt_dispatch_control(
         ctx->retry_intersection_attempts, ctx->device);
     g_tcache.ensure_training_image(
-        img_height, img_width, !ctx->fused_ssim_backward, ctx->device);
+        img_height, img_width, !ctx->fused_ssim_backward, ppisp.enabled,
+        ctx->device);
     g_tcache.ensure_backward(num_points, ctx->device);
     if (pose.enabled) g_tcache.ensure_pose_refinement(ctx->device);
 
@@ -3198,14 +3278,23 @@ static MTensor msplat_train_step_locked(
     MTensor &final_Ts = g_tcache.final_Ts;
     MTensor &final_idx = g_tcache.final_idx;
     MTensor &photometric_gradient = g_tcache.photometric_gradient;
+    MTensor &loss_image = ppisp.enabled
+        ? g_tcache.ppisp_corrected_image
+        : out_img;
+    MTensor &loss_gradient = loss_image;
+    MTensor &renderer_gradient = out_img;
+    MTensor* ppispGradient = ppisp.enabled
+        ? &g_tcache.ppisp_gradient
+        : nullptr;
     MTensor &activeViewmat = pose.enabled ? g_tcache.pose_viewmat : viewmat;
     MTensor &poseGradient = pose.enabled
         ? g_tcache.pose_gradient
         : photometric_gradient;
 
-    // SSIM V-backward reads and writes only the same pixel. Training no longer
-    // needs the rendered image afterward, so reuse it in place for dL/dRGB.
-    MTensor &rendered_gradient = out_img;
+    // The loss overwrites its input image with dL/d(loss RGB). Without PPISP
+    // this remains the established in-place canonical-render path. With PPISP,
+    // the corrected scratch is overwritten first, then the PPISP backward
+    // writes the exact canonical-render cotangent into out_img for raster bwd.
     MTensor &v_xy = g_tcache.v_xy;
     MTensor &v_conic = g_tcache.v_conic;
     MTensor &v_colors_rast = g_tcache.v_colors_rast;
@@ -3220,8 +3309,11 @@ static MTensor msplat_train_step_locked(
     MTensor &max2DSizeBuffer = collect_densification_stats
         ? max_2d_size : v_opacity;
     const uint32_t collectStats = collect_densification_stats ? 1u : 0u;
+    // PPISP can flag a non-finite backward/update from inside the final
+    // command buffer. Gate every downstream model mutation in that mode even
+    // when the intersection arena itself uses the exact (non-retry) path.
     const uint32_t attemptGatingEnabled =
-        ctx->retry_intersection_attempts ? 1u : 0u;
+        (ctx->retry_intersection_attempts || ppisp.enabled) ? 1u : 0u;
 
     // A resolution change deliberately resets the arena high-water mark. That
     // frame uses the established synchronized bootstrap; subsequent retry-mode
@@ -3678,12 +3770,30 @@ static MTensor msplat_train_step_locked(
     // threadgroup and writes only the final gradient. The staged fallback
     // materializes compact horizontal derivatives before its vertical pass.
     auto encode_loss_fwd_bwd = [&](id<MTLComputeCommandEncoder> enc) {
+        if (ppisp.enabled) {
+            // PPISP is training-only: correct a scratch image for the loss and
+            // leave out_img canonical until the exact chain-rule backward.
+            [enc setComputePipelineState:ctx->ppisp_frame_forward_kernel_cpso];
+            ENC_BUF(enc, out_img, 0);
+            ENC_BUF(enc, loss_image, 1);
+            [enc setBuffer:ppispParameters->buffer() offset:0 atIndex:2];
+            ENC_SCALAR(enc, ppispParameterOffset, 3);
+            [enc setBytes:loss_img_size->data()
+                   length:sizeof(*loss_img_size) atIndex:4];
+            ENC_SCALAR(enc, ppisp.maxAbsExposure, 5);
+            ENC_SCALAR(enc, ppisp.maxAbsColorParameter, 6);
+            [enc dispatchThreadgroups:MTLSizeMake(
+                    (img_width + 15) / 16, (img_height + 7) / 8, 1)
+                threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+        }
+
         MTLSize threadgroups = MTLSizeMake(
             (img_width + 15) / 16, (img_height + 15) / 16, 1);
         MTLSize tg = MTLSizeMake(16, 16, 1);
         // Pass 1: H conv on images → ssim_h_buf
         [enc setComputePipelineState:ctx->ssim_h_fwd_kernel_cpso];
-        ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+        ENC_BUF(enc, loss_image, 0); ENC_BUF(enc, gt, 1);
         [enc setBytes:loss_img_size->data() length:sizeof(*loss_img_size) atIndex:2];
         ENC_BUF(enc, g_tcache.ssim_h_buf, 3);
         ENC_BUF(enc, photometricLogGains, 4);
@@ -3701,7 +3811,7 @@ static MTensor msplat_train_step_locked(
             MTLSize fusedTg = MTLSizeMake(16, 8, 1);
             [enc setComputePipelineState:
                 ctx->ssim_fused_v_fwd_bwd_kernel_cpso];
-            ENC_BUF(enc, rendered_gradient, 0); ENC_BUF(enc, gt, 1);
+            ENC_BUF(enc, loss_gradient, 0); ENC_BUF(enc, gt, 1);
             ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
             [enc setBytes:loss_img_size->data()
                    length:sizeof(*loss_img_size) atIndex:3];
@@ -3718,13 +3828,14 @@ static MTensor msplat_train_step_locked(
             ENC_BUF(enc, final_Ts, 15);
             ENC_SCALAR(enc, alpha_loss_weight, 16);
             ENC_SCALAR(enc, target_pixel_stride_bytes, 17);
+            ENC_SCALAR(enc, deferRendererClamp, 18);
             [enc dispatchThreadgroups:fusedThreadgroups
                 threadsPerThreadgroup:fusedTg];
         } else {
             // Pass 2: Fused V fwd + H bwd
             [enc setComputePipelineState:
                 ctx->ssim_fused_v_fwd_h_bwd_kernel_cpso];
-            ENC_BUF(enc, out_img, 0); ENC_BUF(enc, gt, 1);
+            ENC_BUF(enc, loss_image, 0); ENC_BUF(enc, gt, 1);
             ENC_BUF(enc, g_tcache.ssim_h_buf, 2);
             [enc setBytes:loss_img_size->data()
                    length:sizeof(*loss_img_size) atIndex:3];
@@ -3745,7 +3856,7 @@ static MTensor msplat_train_step_locked(
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             // Pass 3: V bwd
             [enc setComputePipelineState:ctx->ssim_v_bwd_kernel_cpso];
-            ENC_BUF(enc, rendered_gradient, 0); ENC_BUF(enc, gt, 1);
+            ENC_BUF(enc, loss_gradient, 0); ENC_BUF(enc, gt, 1);
             ENC_BUF(enc, g_tcache.ssim_deriv_h_buf, 2);
             [enc setBytes:loss_img_size->data()
                    length:sizeof(*loss_img_size) atIndex:3];
@@ -3759,6 +3870,7 @@ static MTensor msplat_train_step_locked(
             ENC_SCALAR(enc, alpha_layout, 12);
             ENC_BUF(enc, background, 13);
             ENC_SCALAR(enc, target_pixel_stride_bytes, 14);
+            ENC_SCALAR(enc, deferRendererClamp, 15);
             [enc dispatchThreadgroups:threadgroups threadsPerThreadgroup:tg];
         }
 
@@ -3782,6 +3894,44 @@ static MTensor msplat_train_step_locked(
             [enc dispatchThreads:MTLSizeMake(3, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(3, 1, 1)];
         }
+
+        if (ppisp.enabled) {
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            [enc setComputePipelineState:ctx->ppisp_frame_backward_kernel_cpso];
+            ENC_BUF(enc, renderer_gradient, 0);
+            ENC_BUF(enc, loss_gradient, 1);
+            [enc setBuffer:ppispParameters->buffer() offset:0 atIndex:2];
+            [enc setBuffer:ppispGradient->buffer() offset:0 atIndex:3];
+            ENC_SCALAR(enc, ppispParameterOffset, 4);
+            [enc setBytes:loss_img_size->data()
+                   length:sizeof(*loss_img_size) atIndex:5];
+            ENC_SCALAR(enc, ppisp.maxAbsExposure, 6);
+            ENC_SCALAR(enc, ppisp.maxAbsColorParameter, 7);
+            ENC_BUF(enc, overflow_flag, 8);
+            [enc dispatchThreadgroups:MTLSizeMake(
+                    (img_width + 15) / 16, (img_height + 7) / 8, 1)
+                threadsPerThreadgroup:MTLSizeMake(16, 8, 1)];
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+            [enc setComputePipelineState:ctx->ppisp_frame_adam_kernel_cpso];
+            [enc setBuffer:ppispParameters->buffer() offset:0 atIndex:0];
+            [enc setBuffer:ppispGradient->buffer() offset:0 atIndex:1];
+            [enc setBuffer:ppispExpAvg->buffer() offset:0 atIndex:2];
+            [enc setBuffer:ppispExpAvgSq->buffer() offset:0 atIndex:3];
+            ENC_SCALAR(enc, ppispParameterOffset, 4);
+            ENC_SCALAR(enc, ppisp.adamStepSize, 5);
+            ENC_SCALAR(enc, adam_beta1, 6);
+            ENC_SCALAR(enc, adam_beta2, 7);
+            ENC_SCALAR(enc, ppisp.adamBiasCorrection2Sqrt, 8);
+            ENC_SCALAR(enc, adam_eps, 9);
+            ENC_SCALAR(enc, ppisp.regularization, 10);
+            ENC_SCALAR(enc, ppisp.maxAbsExposure, 11);
+            ENC_SCALAR(enc, ppisp.maxAbsColorParameter, 12);
+            ENC_BUF(enc, overflow_flag, 13);
+            ENC_SCALAR(enc, attemptGatingEnabled, 14);
+            [enc dispatchThreads:MTLSizeMake(1, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        }
     };
 
     auto encode_rast_bwd = [&](id<MTLComputeCommandEncoder> enc) {
@@ -3797,7 +3947,7 @@ static MTensor msplat_train_step_locked(
             ENC_BUF(enc, raster_conic_attributes, 5);
             ENC_BUF(enc, raster_rgb_attributes, 6);
             ENC_BUF(enc, background, 7); ENC_BUF(enc, final_Ts, 8);
-            ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, rendered_gradient, 10);
+            ENC_BUF(enc, final_idx, 9); ENC_BUF(enc, renderer_gradient, 10);
             ENC_BUF(enc, v_xy, 11); ENC_BUF(enc, v_conic, 12);
             ENC_BUF(enc, v_colors_rast, 13); ENC_BUF(enc, v_opacity, 14);
             ENC_BUF(enc, loss_coverage_buffer, 15);
@@ -3834,7 +3984,7 @@ static MTensor msplat_train_step_locked(
             ENC_BUF(enc, g_tcache.chunk_final_idx, 9);
             ENC_BUF(enc, g_tcache.prefix_T, 10); ENC_BUF(enc, g_tcache.chunk_T, 11);
             ENC_BUF(enc, g_tcache.after_C, 12);
-            ENC_BUF(enc, rendered_gradient, 13);
+            ENC_BUF(enc, renderer_gradient, 13);
             ENC_BUF(enc, v_xy, 14); ENC_BUF(enc, v_conic, 15);
             ENC_BUF(enc, v_colors_rast, 16); ENC_BUF(enc, v_opacity, 17);
             ENC_SCALAR(enc, BWD_CHUNK_SIZE, 18); ENC_SCALAR(enc, bwd_K_max, 19);
@@ -4001,6 +4151,10 @@ static MTensor msplat_train_step_locked(
         [blit fillBuffer:loss_sum.buffer() range:NSMakeRange(0, loss_sum.nbytes()) value:0];
         [blit fillBuffer:photometric_gradient.buffer()
                    range:NSMakeRange(0, photometric_gradient.nbytes()) value:0];
+        if (ppisp.enabled) {
+            [blit fillBuffer:ppispGradient->buffer()
+                       range:NSMakeRange(0, ppispGradient->nbytes()) value:0];
+        }
         if (pose.enabled) {
             [blit fillBuffer:poseGradient.buffer()
                        range:NSMakeRange(0, poseGradient.nbytes()) value:0];
@@ -4062,7 +4216,8 @@ static MTensor msplat_train_step_locked(
     auto inspectCompletedRetryAttempt = [&]() {
         constexpr uint32_t knownAttemptFailures =
             MSPLAT_TRAINING_OVERFLOW_TILE_CAP |
-            MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY;
+            MSPLAT_TRAINING_OVERFLOW_PACKED_CAPACITY |
+            MSPLAT_TRAINING_OVERFLOW_APPEARANCE_NONFINITE;
         const RetryAttemptSnapshot snapshot =
             readCompletedRetryAttemptSnapshot();
         const msplat::TileIntersectionLayout completedLayout =
@@ -4081,6 +4236,12 @@ static MTensor msplat_train_step_locked(
             // by retaining a larger arena.
             throw std::length_error(
                 "GPU intersection attempt exceeds the exact-sort work limit");
+        }
+
+        if ((attemptFailures &
+             MSPLAT_TRAINING_OVERFLOW_APPEARANCE_NONFINITE) != 0u) {
+            throw std::runtime_error(
+                "GPU appearance update reported non-finite state");
         }
 
         if ((attemptFailures &
@@ -4138,7 +4299,7 @@ static MTensor msplat_train_step_locked(
             loss_inv_n, transparent_mask, alpha_loss_weight,
             num_adam_groups, adam_params, adam_exp_avg, adam_exp_avg_sq,
             adam_step_sizes, adam_bc2_sqrts, adam_beta1, adam_beta2,
-            adam_eps, photometric, pose, collect_densification_stats,
+            adam_eps, photometric, ppisp, pose, collect_densification_stats,
             vis_counts, xys_grad_norm, max_2d_size, inv_max_dim);
     };
 
@@ -4439,6 +4600,7 @@ MTensor msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     const MsplatPhotometricRefinementStep& photometric,
+    const MsplatPpispRefinementStep& ppisp,
     const MsplatPoseRefinementStep& pose,
     bool collect_densification_stats,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
@@ -4453,7 +4615,8 @@ MTensor msplat_train_step(
         loss_coverage_units, ssim_weight, loss_inv_n, transparent_mask,
         alpha_loss_weight, num_adam_groups, adam_params, adam_exp_avg,
         adam_exp_avg_sq, adam_step_sizes, adam_bc2_sqrts, adam_beta1,
-        adam_beta2, adam_eps, photometric, pose, collect_densification_stats,
+        adam_beta2, adam_eps, photometric, ppisp, pose,
+        collect_densification_stats,
         vis_counts, xys_grad_norm, max_2d_size, inv_max_dim);
 }
 

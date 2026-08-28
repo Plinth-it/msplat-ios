@@ -20,7 +20,9 @@ class TrainingConfig:
     split_screen_size: float
     keep_crs: bool
     refine_photometric_gains: bool
-    """Optimize bounded per-camera RGB gains during training. Disabled by default."""
+    """Compatibility alias for ``appearance_mode="rgb_gains"``."""
+    appearance_mode: str
+    """Training-only appearance model: ``"none"``, ``"rgb_gains"``, or ``"ppisp"``."""
     refine_camera_poses: bool
     """Optimize small regularized per-camera pose corrections after warm-up."""
     downscale_factor: float
@@ -52,6 +54,7 @@ class TrainingConfig:
         max_gaussians: int = -1,
         refine_photometric_gains: bool = False,
         refine_camera_poses: bool = False,
+        appearance_mode: str = "none",
     ) -> None: ...
 
 class TrainingStats:

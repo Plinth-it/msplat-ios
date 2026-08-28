@@ -26,9 +26,10 @@ public class GaussianTrainer {
             var limits = msplat_default_training_limits()
             var refinementOptions = config.toRefinementOptionsV8()
             var maskOptions = config.toTrainingMaskOptionsV11()
+            var appearanceOptions = config.toAppearanceOptionsV18()
             var trainer: MsplatTrainer?
             var nativeError = MsplatErrorInfo()
-            let status = msplat_trainer_create_v11(
+            let status = msplat_trainer_create_v18(
                 dataset.handle,
                 &nativeConfig,
                 MemoryLayout<MsplatConfig>.size,
@@ -38,6 +39,8 @@ public class GaussianTrainer {
                 MemoryLayout<MsplatRefinementOptionsV8>.size,
                 &maskOptions,
                 MemoryLayout<MsplatTrainingMaskOptionsV11>.size,
+                &appearanceOptions,
+                MemoryLayout<MsplatAppearanceOptionsV18>.size,
                 &trainer,
                 &nativeError
             )

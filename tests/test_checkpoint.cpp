@@ -26,6 +26,7 @@ constexpr uint32_t checkpointVersionV1 = 1;
 constexpr uint32_t checkpointVersionV2 = 2;
 constexpr uint32_t checkpointVersionV3 = 3;
 constexpr uint32_t checkpointVersionV4 = 4;
+constexpr uint32_t checkpointVersionV5 = 5;
 
 template <typename T>
 void appendScalar(std::vector<uint8_t> &bytes, T value) {
@@ -239,6 +240,56 @@ V4CheckpointFixture validV4Checkpoint() {
     return fixture;
 }
 
+struct V5CheckpointFixture {
+    std::vector<uint8_t> bytes;
+    size_t appearanceModeOffset = 0;
+    size_t cameraCountOffset = 0;
+    size_t firstStepOffset = 0;
+    size_t firstTensorByteCountOffset = 0;
+};
+
+V5CheckpointFixture validV5Checkpoint(
+    bool poseEnabled = false,
+    bool campConditioning = false,
+    const std::array<std::string, 2> &ppispFrameIds = {
+        "frame-0", "frame-1"}) {
+    V5CheckpointFixture fixture;
+    if (campConditioning) {
+        fixture.bytes = validV4Checkpoint().bytes;
+    } else {
+        const V3CheckpointFixture v3 =
+            validV3Checkpoint(false, poseEnabled);
+        fixture.bytes = v3.bytes;
+        if (poseEnabled) {
+            std::vector<uint8_t> rawConditioning;
+            appendScalar(rawConditioning, uint32_t{0});
+            fixture.bytes.insert(
+                fixture.bytes.begin() + static_cast<std::ptrdiff_t>(
+                    v3.poseOptimizerPayloadOffset),
+                rawConditioning.begin(), rawConditioning.end());
+        }
+    }
+    std::memcpy(fixture.bytes.data() + sizeof(uint32_t),
+                &checkpointVersionV5, sizeof(checkpointVersionV5));
+
+    fixture.appearanceModeOffset = fixture.bytes.size();
+    appendScalar(fixture.bytes, uint32_t{2});
+    fixture.cameraCountOffset = fixture.bytes.size();
+    appendScalar(fixture.bytes, uint32_t{2});
+    for (const std::string &frameId : ppispFrameIds)
+        appendString(fixture.bytes, frameId);
+    fixture.firstStepOffset = fixture.bytes.size();
+    appendScalar(fixture.bytes, uint32_t{3});
+    appendScalar(fixture.bytes, uint32_t{7});
+    for (int copy = 0; copy < 3; ++copy) {
+        appendTensor(fixture.bytes, {2, 9},
+                     copy == 0
+                         ? &fixture.firstTensorByteCountOffset
+                         : nullptr);
+    }
+    return fixture;
+}
+
 void writeFile(const fs::path &path, const std::vector<uint8_t> &bytes) {
     std::ofstream stream(path, std::ios::binary | std::ios::trunc);
     if (!stream)
@@ -310,6 +361,13 @@ int main() {
         prefix.string() + "-pose-conditioning-corrupt.msplat";
     const fs::path truncatedV4Path =
         prefix.string() + "-pose-conditioning-truncated.msplat";
+    const fs::path validV5PpispPath =
+        prefix.string() + "-valid-v5-ppisp.msplat";
+    const fs::path validV5RawPosePath =
+        prefix.string() + "-valid-v5-raw-pose.msplat";
+    const fs::path validV5CampPosePath =
+        prefix.string() + "-valid-v5-camp-pose.msplat";
+    const fs::path v5CorruptPath = prefix.string() + "-v5-corrupt.msplat";
     const fs::path atomicDestination = prefix.string() + "-atomic.bin";
     const fs::path atomicSentinel = atomicDestination.string() + ".tmp";
     RemoveFiles cleanup{{validPath, truncatedPath, badByteCountPath,
@@ -323,7 +381,9 @@ int main() {
                          validV3BothPath, poseCorruptPath,
                          truncatedPosePayloadPath, trailingV3Path,
                          validV4Path, poseConditioningCorruptPath,
-                         truncatedV4Path,
+                         truncatedV4Path, validV5PpispPath,
+                         validV5RawPosePath, validV5CampPosePath,
+                         v5CorruptPath,
                          atomicDestination, atomicSentinel}};
 
     size_t firstTensorByteCountOffset = 0;
@@ -641,6 +701,83 @@ int main() {
     writeFile(truncatedV4Path, truncatedV4);
     CHECK(rejects(truncatedV4Path,
                   "truncated pose checkpoint payload"));
+
+    // Version 5 adds an explicit appearance mode after the complete pose
+    // section. PPISP-only checkpoints must not inherit v4's CamP requirement;
+    // raw and CamP pose prefixes remain independently valid.
+    const V5CheckpointFixture validV5Ppisp = validV5Checkpoint();
+    writeFile(validV5PpispPath, validV5Ppisp.bytes);
+    validateCheckpointFile(validV5PpispPath.string());
+
+    const V5CheckpointFixture validV5RawPose =
+        validV5Checkpoint(true, false);
+    writeFile(validV5RawPosePath, validV5RawPose.bytes);
+    validateCheckpointFile(validV5RawPosePath.string());
+
+    const V5CheckpointFixture validV5CampPose =
+        validV5Checkpoint(true, true);
+    writeFile(validV5CampPosePath, validV5CampPose.bytes);
+    validateCheckpointFile(validV5CampPosePath.string());
+
+    std::vector<uint8_t> invalidAppearanceMode = validV5Ppisp.bytes;
+    const uint32_t unknownAppearanceMode = 3;
+    std::memcpy(
+        invalidAppearanceMode.data() + validV5Ppisp.appearanceModeOffset,
+        &unknownAppearanceMode, sizeof(unknownAppearanceMode));
+    writeFile(v5CorruptPath, invalidAppearanceMode);
+    CHECK(rejects(v5CorruptPath, "appearance mode"));
+
+    std::vector<uint8_t> inconsistentAppearanceMode = validV5Ppisp.bytes;
+    const uint32_t rgbAppearanceMode = 1;
+    std::memcpy(
+        inconsistentAppearanceMode.data() +
+            validV5Ppisp.appearanceModeOffset,
+        &rgbAppearanceMode, sizeof(rgbAppearanceMode));
+    writeFile(v5CorruptPath, inconsistentAppearanceMode);
+    CHECK(rejects(v5CorruptPath,
+                  "inconsistent with photometric state"));
+
+    std::vector<uint8_t> zeroPpispCount = validV5Ppisp.bytes;
+    std::memcpy(zeroPpispCount.data() + validV5Ppisp.cameraCountOffset,
+                &zeroCount, sizeof(zeroCount));
+    writeFile(v5CorruptPath, zeroPpispCount);
+    CHECK(rejects(v5CorruptPath, "PPISP camera count"));
+
+    const V5CheckpointFixture duplicatePpispId =
+        validV5Checkpoint(false, false, {"same", "same"});
+    writeFile(v5CorruptPath, duplicatePpispId.bytes);
+    CHECK(rejects(v5CorruptPath, "PPISP frame IDs are not unique"));
+
+    const V5CheckpointFixture mismatchedPpispPoseIds =
+        validV5Checkpoint(true, false, {"frame-1", "frame-0"});
+    writeFile(v5CorruptPath, mismatchedPpispPoseIds.bytes);
+    CHECK(rejects(v5CorruptPath, "PPISP and pose camera identities"));
+
+    std::vector<uint8_t> maxPpispStep = validV5Ppisp.bytes;
+    std::memcpy(maxPpispStep.data() + validV5Ppisp.firstStepOffset,
+                &maxPhotoCount, sizeof(maxPhotoCount));
+    writeFile(v5CorruptPath, maxPpispStep);
+    CHECK(rejects(v5CorruptPath, "PPISP step counts"));
+
+    std::vector<uint8_t> badPpispTensor = validV5Ppisp.bytes;
+    uint64_t ppispBytes = 0;
+    std::memcpy(
+        &ppispBytes,
+        badPpispTensor.data() + validV5Ppisp.firstTensorByteCountOffset,
+        sizeof(ppispBytes));
+    ++ppispBytes;
+    std::memcpy(
+        badPpispTensor.data() + validV5Ppisp.firstTensorByteCountOffset,
+        &ppispBytes, sizeof(ppispBytes));
+    writeFile(v5CorruptPath, badPpispTensor);
+    CHECK(rejects(v5CorruptPath, "byte count"));
+
+    std::vector<uint8_t> truncatedPpisp(
+        validV5Ppisp.bytes.begin(),
+        validV5Ppisp.bytes.begin() + static_cast<std::ptrdiff_t>(
+            validV5Ppisp.cameraCountOffset + sizeof(uint32_t)));
+    writeFile(v5CorruptPath, truncatedPpisp);
+    CHECK(rejects(v5CorruptPath, "truncated PPISP checkpoint payload"));
 
     {
         std::ofstream sentinel(atomicSentinel, std::ios::binary | std::ios::trunc);

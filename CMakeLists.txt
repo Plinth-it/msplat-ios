@@ -329,6 +329,17 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             tests/test_photometric_refinement.cpp)
         add_test(NAME msplat_photometric_refinement_math
             COMMAND msplat_photometric_refinement_tests)
+        add_executable(msplat_ppisp_refinement_tests
+            tests/test_ppisp_refinement.mm)
+        target_link_libraries(msplat_ppisp_refinement_tests PRIVATE
+            ${FOUNDATION_LIBRARY}
+            ${METAL_FRAMEWORK})
+        add_dependencies(msplat_ppisp_refinement_tests metallib)
+        add_test(NAME msplat_ppisp_refinement_metal
+            COMMAND msplat_ppisp_refinement_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_ppisp_refinement_metal PROPERTIES
+            SKIP_RETURN_CODE 77)
         add_executable(msplat_pose_refinement_tests
             tests/test_pose_refinement.cpp)
         add_test(NAME msplat_pose_refinement_math

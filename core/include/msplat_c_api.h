@@ -49,8 +49,11 @@ extern "C" {
 // the new capability bit as unknown.
 // ABI v17 adds a size-checked training-memory snapshot that appends target-
 // prefetch effectiveness counters while retaining the v4 layout and query.
+// ABI v18 adds a size-checked appearance-mode option. Existing creation entry
+// points default the explicit mode to none, so the ABI v8 RGB-gain flag keeps
+// its established compatibility behavior.
 // All earlier symbols remain available for existing clients.
-#define MSPLAT_ABI_VERSION 17u
+#define MSPLAT_ABI_VERSION 18u
 #define MSPLAT_ERROR_MESSAGE_CAPACITY 512u
 
 // Checked descriptor input limits. Wrappers should reject larger values before
@@ -188,6 +191,33 @@ msplat_default_training_mask_options_v11(void) {
     options.alphaLossWeight = 0.1f;
     options.reserved[0] = 0u;
     options.reserved[1] = 0u;
+    return options;
+}
+
+/// Mutually exclusive training-only appearance compensation. None preserves
+/// canonical training colors. RGB gains selects the existing bounded
+/// per-camera log-RGB model. PPISP selects the current per-frame exposure and
+/// color-homography stage; lens vignetting and response curves are not part of
+/// this phase.
+/// Canonical rendering, evaluation, and export remain unchanged in every mode.
+typedef enum {
+    MSPLAT_APPEARANCE_MODE_NONE = 0,
+    MSPLAT_APPEARANCE_MODE_RGB_GAINS = 1,
+    MSPLAT_APPEARANCE_MODE_PPISP = 2
+} MsplatAppearanceModeV18;
+
+typedef struct {
+    uint32_t mode;
+    uint32_t reserved[3];
+} MsplatAppearanceOptionsV18;
+
+static inline MsplatAppearanceOptionsV18
+msplat_default_appearance_options_v18(void) {
+    MsplatAppearanceOptionsV18 options;
+    options.mode = MSPLAT_APPEARANCE_MODE_NONE;
+    options.reserved[0] = 0u;
+    options.reserved[1] = 0u;
+    options.reserved[2] = 0u;
     return options;
 }
 
@@ -677,6 +707,25 @@ MsplatStatus msplat_trainer_create_v11(
     size_t refinementOptionsSize,
     const MsplatTrainingMaskOptionsV11* maskOptions,
     size_t maskOptionsSize,
+    MsplatTrainer* outTrainer,
+    MsplatErrorInfo* error);
+// ABI v18 trainer creation. Appearance mode is versioned separately from the
+// locked MsplatConfig and ABI v8 refinement layouts. The legacy RGB-gain flag
+// remains accepted: flag+none resolves to RGB gains, flag+RGB gains is
+// idempotent, and flag+PPISP is rejected as ambiguous.
+MsplatStatus msplat_appearance_options_validate_v18(
+    const MsplatAppearanceOptionsV18* options, size_t optionsSize,
+    MsplatErrorInfo* error);
+MsplatStatus msplat_trainer_create_v18(
+    MsplatDataset ds,
+    const MsplatConfig* config, size_t configSize,
+    const MsplatTrainingLimits* limits, size_t limitsSize,
+    const MsplatRefinementOptionsV8* refinementOptions,
+    size_t refinementOptionsSize,
+    const MsplatTrainingMaskOptionsV11* maskOptions,
+    size_t maskOptionsSize,
+    const MsplatAppearanceOptionsV18* appearanceOptions,
+    size_t appearanceOptionsSize,
     MsplatTrainer* outTrainer,
     MsplatErrorInfo* error);
 MsplatStatus msplat_trainer_destroy_v2(MsplatTrainer t, MsplatErrorInfo* error);

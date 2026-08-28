@@ -101,13 +101,13 @@ require_contains("${training_image_cache}"
     "ssim_h_buf = mtensor_empty(\n            dev, {(int64_t)ih, (int64_t)iw, 15}, DType::Float32);"
     "fifteen-float horizontal workspace")
 require_contains("${host_source}"
-    "img_height, img_width, !ctx->fused_ssim_backward, ctx->device"
-    "fused mode skips derivative storage")
-require_contains("${host_source}" "MTensor &rendered_gradient = out_img;"
-    "in-place rendered-gradient alias")
-require_contains("${host_source}" "ENC_BUF(enc, rendered_gradient, 10);"
+    "img_height, img_width, !ctx->fused_ssim_backward, ppisp.enabled,\n        ctx->device"
+    "fused mode skips derivative storage while PPISP controls its scratch")
+require_contains("${host_source}" "MTensor &renderer_gradient = out_img;"
+    "canonical renderer-gradient alias")
+require_contains("${host_source}" "ENC_BUF(enc, renderer_gradient, 10);"
     "monolithic raster backward gradient input")
-require_contains("${host_source}" "ENC_BUF(enc, rendered_gradient, 13);"
+require_contains("${host_source}" "ENC_BUF(enc, renderer_gradient, 13);"
     "chunked raster backward gradient input")
 require_contains("${metal_source}" "device float* rendered_gradient"
     "single in-place rendered-gradient buffer")
@@ -207,8 +207,8 @@ require_contains("${fused_terminal}" "const float v_l1 = coverage * ("
 require_contains("${fused_terminal}" "const float adjusted_gradient = inv_n * ("
     "fused final loss gradient")
 require_contains("${fused_terminal}"
-    "rendered_gradient[pixel_channel] = rendered_value < 1.0f"
-    "fused upper-clamp render gradient")
+    "(defer_renderer_clamp != 0u || rendered_value < 1.0f)"
+    "fused deferred upper-clamp render gradient")
 require_contains("${fused_terminal}"
     "local_log_gain_gradient[c] = adjusted_gradient * rend_val;"
     "fused photometric chain rule")
@@ -238,7 +238,7 @@ require_barrier_between("${fused_terminal}"
     "const float rendered_value = rendered_gradient[pixel_channel];"
     "fused loss reads before in-place gradient writes")
 require_barrier_between("${fused_terminal}"
-    "rendered_gradient[pixel_channel] = rendered_value < 1.0f"
+    "(defer_renderer_clamp != 0u || rendered_value < 1.0f)"
     "const float loss_contribution ="
     "fused in-place output before next-channel input")
 require_barrier_between("${fused_terminal}"
@@ -248,8 +248,8 @@ require_barrier_between("${fused_terminal}"
 
 extract_section(host_source "auto encode_loss_fwd_bwd ="
     "auto encode_rast_bwd =" host_loss)
-require_contains("${host_loss}" "ENC_BUF(enc, rendered_gradient, 0);"
-    "in-place SSIM input and output")
+require_contains("${host_loss}" "ENC_BUF(enc, loss_gradient, 0);"
+    "in-place selected-loss-image input and output")
 require_contains("${host_loss}"
     "ctx->ssim_fused_v_fwd_bwd_kernel_cpso"
     "fused terminal dispatch")

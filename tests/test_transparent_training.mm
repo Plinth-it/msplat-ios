@@ -221,6 +221,7 @@ StepResult runStep(bool transparent, float alphaLossWeight,
     MTensor logRgbGains = gpu_zeros({1, 3}, DType::Float32);
     MsplatPhotometricRefinementStep photometric;
     photometric.logRgbGains = &logRgbGains;
+    MsplatPpispRefinementStep ppisp;
     MTensor poseDeltas = gpu_zeros({1, 6}, DType::Float32);
     MsplatPoseRefinementStep pose;
     pose.deltas = &poseDeltas;
@@ -261,7 +262,7 @@ StepResult runStep(bool transparent, float alphaLossWeight,
             kAdamGroups, params.data(), expAvg.data(), expAvgSq.data(),
             stepSizes, biasCorrection2Sqrts,
             0.9f, 0.999f, 1.0e-8f,
-            photometric, pose, collectStats,
+            photometric, ppisp, pose, collectStats,
             visibility, xyGradientNorm, max2DSize, 1.0f / float(width));
         if (logicalStep) {
             MsplatTrainingStepDescriptor descriptor;
