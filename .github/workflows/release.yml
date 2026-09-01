@@ -191,13 +191,15 @@ jobs:
             artifacts/release-wheel-py3.12/*.whl \
             artifacts/release-wheel-py3.13/*.whl
 
-      - name: Publish to PyPI
+      - name: Publish to upstream PyPI
+        if: github.repository == 'rayanht/msplat'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: artifacts/release-wheel-py3.12/
           skip-existing: true
 
-      - name: Publish to PyPI (3.13)
+      - name: Publish to upstream PyPI (3.13)
+        if: github.repository == 'rayanht/msplat'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: artifacts/release-wheel-py3.13/
