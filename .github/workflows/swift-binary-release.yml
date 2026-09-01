@@ -1,0 +1,116 @@
+name: Swift Binary Release
+
+on:
+  push:
+    tags: ["binary-v*.*.*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and verify Swift binary payload
+    runs-on: xcode-27
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - name: Verify tag and source version
+        id: version
+        run: |
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          TAG_VERSION="${GITHUB_REF_NAME#binary-v}"
+          if [ "${TAG_VERSION}" != "${VERSION}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match VERSION (${VERSION})"
+            exit 1
+          fi
+          echo "version=${VERSION}" >> "${GITHUB_OUTPUT}"
+
+      - name: Cache CMake dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/macos/_deps
+            build/ios-device/_deps
+            build/ios-simulator/_deps
+          key: swift-binary-cmake-deps-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Install Metal toolchain
+        run: |
+          xcodebuild -downloadComponent MetalToolchain
+          xcrun -sdk macosx metal --version
+
+      - name: Build XCFramework and metallibs
+        env:
+          MSPLAT_RESOURCE_OUTPUT_DIR: ${{ github.workspace }}/build/release-resources
+        run: bash scripts/build-xcframework.sh
+
+      - name: Build and test generated Swift payload
+        run: |
+          cp build/release-resources/*.metallib swift/Sources/Msplat/Resources/
+          swift test --package-path swift
+          git restore --source=HEAD --worktree swift/Sources/Msplat/Resources
+
+      - name: Package exact release payload
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          MSPLAT_RELEASE_RESOURCE_DIR: ${{ github.workspace }}/build/release-resources
+        run: bash scripts/package-xcframework-release.sh build/release-swift
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-swift
+          path: build/release-swift/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish immutable Swift binary payload
+    runs-on: ubuntu-latest
+    needs: build
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-swift
+          path: artifacts/release-swift
+
+      - name: Verify release tag commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_COMMIT="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}" --jq .sha)"
+          test "${TAG_COMMIT}" = "${GITHUB_SHA}"
+
+      - name: Create or resume complete draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if RELEASE_DRAFT="$(gh release view "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            test "${RELEASE_DRAFT}" = true
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --draft \
+              --title "msplat Swift binary ${GITHUB_REF_NAME#binary-v}" \
+              --notes "Immutable XCFramework payload for the matching semantic Swift package release."
+          fi
+          gh release upload "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber \
+            artifacts/release-swift/*
+
+      - name: Publish immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq .immutable)" = true

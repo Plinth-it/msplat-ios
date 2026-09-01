@@ -5,8 +5,7 @@ on:
     tags: ["v*.*.*"]
 
 permissions:
-  contents: write
-  id-token: write
+  contents: read
 
 jobs:
   version-check:
@@ -102,44 +101,58 @@ jobs:
           path: dist/*.whl
           if-no-files-found: error
 
-  build-swift:
-    name: Swift XCFramework
-    runs-on: macos-15
+  verify-swift-package:
+    name: Swift Package
+    runs-on: xcode-27
     needs: version-check
     steps:
       - uses: actions/checkout@v4
         with:
+          fetch-depth: 0
           lfs: true
 
-      - name: Cache CMake deps
-        uses: actions/cache@v4
-        with:
-          path: build/_deps
-          key: cmake-deps-${{ hashFiles('CMakeLists.txt') }}
-
-      - name: Build XCFramework
-        run: bash scripts/build-xcframework.sh
-
-      - name: Build & test
+      - name: Resolve, build, and test immutable package
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          cd swift
+          bash scripts/verify-swift-release-contract.sh
+          swift package resolve
           swift build
           swift test
 
-      - name: Zip XCFramework
-        run: zip -r MsplatCore.xcframework.zip MsplatCore.xcframework
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-xcframework
-          path: MsplatCore.xcframework.zip
-          if-no-files-found: error
+      - name: Link immutable package for iOS
+        run: |
+          PACKAGE_CACHE="${RUNNER_TEMP}/msplat-packages"
+          xcodebuild -resolvePackageDependencies \
+            -scheme Msplat \
+            -clonedSourcePackagesDirPath "${PACKAGE_CACHE}"
+          xcodebuild \
+            -scheme Msplat \
+            -destination 'generic/platform=iOS Simulator' \
+            -derivedDataPath "${RUNNER_TEMP}/msplat-iossim" \
+            -clonedSourcePackagesDirPath "${PACKAGE_CACHE}" \
+            -disableAutomaticPackageResolution \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
+          xcodebuild \
+            -scheme Msplat \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "${RUNNER_TEMP}/msplat-ios" \
+            -clonedSourcePackagesDirPath "${PACKAGE_CACHE}" \
+            -disableAutomaticPackageResolution \
+            CODE_SIGNING_ALLOWED=NO \
+            COMPILER_INDEX_STORE_ENABLE=NO \
+            build
 
   publish:
     name: Publish
     runs-on: ubuntu-latest
-    needs: [version-check, build-cpp, build-python, build-swift]
+    needs: [version-check, build-cpp, build-python, verify-swift-package]
     environment: release
+    permissions:
+      contents: write
+      id-token: write
     env:
       VERSION: ${{ needs.version-check.outputs.version }}
     steps:
@@ -149,24 +162,52 @@ jobs:
           pattern: release-*
           path: artifacts/
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: v${{ env.VERSION }}
-          generate_release_notes: true
-          files: |
-            artifacts/release-cli/msplat
-            artifacts/release-xcframework/MsplatCore.xcframework.zip
-            artifacts/release-wheel-py3.12/*.whl
+      - name: Verify release tag commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG_COMMIT="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_REF_NAME}" --jq .sha)"
+          test "${TAG_COMMIT}" = "${GITHUB_SHA}"
+
+      - name: Create or resume complete draft GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if RELEASE_DRAFT="$(gh release view "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" --json isDraft --jq .isDraft 2>/dev/null)"; then
+            test "${RELEASE_DRAFT}" = true
+          else
+            gh release create "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --verify-tag \
+              --draft \
+              --title "v${VERSION}" \
+              --generate-notes
+          fi
+          gh release upload "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --clobber \
+            artifacts/release-cli/msplat \
+            artifacts/release-wheel-py3.12/*.whl \
             artifacts/release-wheel-py3.13/*.whl
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: artifacts/release-wheel-py3.12/
+          skip-existing: true
 
       - name: Publish to PyPI (3.13)
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: artifacts/release-wheel-py3.13/
+          skip-existing: true
+
+      - name: Publish immutable GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release edit "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --draft=false
+          test "$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}" --jq .immutable)" = true

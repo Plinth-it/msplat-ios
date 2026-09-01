@@ -12,7 +12,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 ROOT_DIR="$(pwd)"
 
-RESOURCE_DIR="$ROOT_DIR/swift/Sources/Msplat/Resources"
+RESOURCE_DIR="${MSPLAT_RESOURCE_OUTPUT_DIR:-$ROOT_DIR/swift/Sources/Msplat/Resources}"
 HEADERS_DIR="$ROOT_DIR/build/xcf-headers"
 XCFRAMEWORK_PATH="$ROOT_DIR/MsplatCore.xcframework"
 IOS_DEPLOYMENT_TARGET="${IOS_DEPLOYMENT_TARGET:-18.0}"

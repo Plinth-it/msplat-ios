@@ -6,6 +6,7 @@ build/
 *.dylib
 *.air
 *.metallib
+!swift/Sources/Msplat/Resources/*.metallib
 
 # Python
 __pycache__/
@@ -17,9 +18,9 @@ dist/
 uv.lock
 
 # Swift
+.build/
 swift/.build/
 MsplatCore.xcframework/
-swift/Sources/Msplat/Resources/
 
 # IDE
 .vscode/

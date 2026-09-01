@@ -1,10 +1,16 @@
+import Foundation
 import XCTest
 @testable import Msplat
 import MsplatCore
 
 final class MsplatTests: XCTestCase {
 
-    static let gardenPath = "../datasets/mipnerf360/garden"
+    static let gardenPath = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .appendingPathComponent("datasets/mipnerf360/garden", isDirectory: true)
+        .path
 
     func testConfigDefaults() {
         let config = TrainingConfig()
