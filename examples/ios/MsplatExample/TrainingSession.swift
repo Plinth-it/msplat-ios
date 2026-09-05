@@ -576,6 +576,7 @@ final class TrainingSession: ObservableObject {
             guard cameras > 0 else {
                 throw MsplatError.invalidDataset("No training cameras in that folder.")
             }
+            try trainingConfig.validateDensificationSchedule(trainingCameraCount: cameras)
             trainingCameras = cameras
             phase = .training
             let previewPose: CameraPose?

@@ -237,6 +237,12 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
     install(TARGETS msplat DESTINATION bin)
 
     if(BUILD_TESTING)
+        add_executable(msplat_densification_schedule_tests
+            tests/test_densification_schedule.cpp)
+        target_include_directories(msplat_densification_schedule_tests PRIVATE
+            ${CMAKE_SOURCE_DIR}/core/include)
+        add_test(NAME msplat_densification_schedule
+            COMMAND msplat_densification_schedule_tests)
         add_executable(msplat_c_api_tests tests/test_c_api.cpp)
         target_link_libraries(msplat_c_api_tests PRIVATE msplat_core)
         add_test(NAME msplat_c_api_errors COMMAND msplat_c_api_tests)
@@ -353,6 +359,14 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
             ${FOUNDATION_LIBRARY})
         add_test(NAME msplat_masked_metrics
             COMMAND msplat_masked_metrics_tests)
+        add_executable(msplat_transparent_evaluation_tests
+            tests/test_transparent_evaluation.mm)
+        target_link_libraries(msplat_transparent_evaluation_tests PRIVATE msplat_core)
+        add_test(NAME msplat_transparent_evaluation
+            COMMAND msplat_transparent_evaluation_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_transparent_evaluation PROPERTIES
+            SKIP_RETURN_CODE 77)
         add_executable(msplat_densification_tests
             tests/test_densification.mm)
         target_link_libraries(msplat_densification_tests PRIVATE msplat_core)

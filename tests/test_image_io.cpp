@@ -1377,6 +1377,126 @@ void checkSameTarget(const TrainingTargetSnapshot &expected,
     CHECK(actual.coverageUnits == expected.coverageUnits);
 }
 
+void checkCapturedSoftMaskNerfstudioRoundTrip(const TempDirectory &temporary) {
+    const fs::path root = temporary.path / "capture-soft-mask";
+    for (const char *directory : {"images", "masks", "masks_soft"})
+        fs::create_directories(root / directory);
+
+    // CaptureStore persists already-rotated pixels and calibration, with no
+    // EXIF rotation. This portrait fixture models a clockwise 12x8 capture.
+    constexpr int width = 8;
+    constexpr int height = 12;
+    const std::array<uint8_t, 7> coverage = {0, 1, 64, 127, 128, 254, 255};
+    std::vector<uint8_t> soft(width * height);
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const int sourcePixel = (width - 1 - x) * height + y;
+            soft[y * width + x] = coverage[sourcePixel % coverage.size()];
+        }
+    }
+    std::vector<uint8_t> binary = soft;
+    for (uint8_t &value : binary) value = value >= 128 ? 255 : 0;
+    const fs::path softPath = root / "masks_soft/frame.png";
+    const fs::path binaryPath = root / "masks/frame.png";
+    writeGrayscalePNG(softPath, width, height, soft);
+    writeGrayscalePNG(binaryPath, width, height, binary);
+    Image image;
+    image.width = width;
+    image.height = height;
+    image.data.resize(width * height * 3);
+    for (size_t pixel = 0; pixel < soft.size(); ++pixel) {
+        for (size_t channel = 0; channel < 3; ++channel)
+            image.data[pixel * 3 + channel] = (31 + pixel + channel * 43) / 255.0f;
+    }
+    imwriteRGB((root / "images/frame.png").string(), image);
+    {
+        std::ofstream points(root / "points.ply");
+        points << "ply\nformat ascii 1.0\nelement vertex 2\n"
+               << "property float x\nproperty float y\nproperty float z\n"
+               << "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+               << "end_header\n0 0 -1 64 128 192\n1 0 -1 192 128 64\n";
+        CHECK(points.good());
+    }
+    {
+        std::ofstream transforms(root / "transforms.json");
+        transforms << R"({
+  "camera_model": "OPENCV", "ply_file_path": "points.ply",
+  "frames": [{
+    "file_path": "images/frame.png", "mask_path": "masks_soft/frame.png",
+    "w": 8, "h": 12, "fl_x": 10, "fl_y": 14, "cx": 3.5, "cy": 5.5,
+    "k1": 0, "k2": 0, "p1": 0, "p2": 0,
+    "transform_matrix": [[0,-1,0,0], [1,0,0,0], [0,0,1,0], [0,0,0,1]]
+  }]
+})";
+        CHECK(transforms.good());
+    }
+
+    const DatasetDescriptor reopened = datasetDescriptorFromX(root.string());
+    CHECK(reopened.frames.size() == 1);
+    CHECK(reopened.frames[0].trainingMask.has_value());
+    CHECK(reopened.frames[0].trainingMask->path == fs::canonical(softPath).string());
+    CHECK(reopened.frames[0].trainingMask->channel == TrainingMaskChannel::Automatic);
+
+    DatasetDescriptor direct;
+    direct.provenance = {"capture-round-trip-test", "synthetic"};
+    DatasetFrameDescriptor frame;
+    frame.id = "frame";
+    frame.calibrationId = "frame";
+    frame.imagePath = (root / "images/frame.png").string();
+    frame.rasterOrientation = RasterOrientation::EncodedPixels;
+    frame.calibration = {width, height, 10.0f, 14.0f, 3.5f, 5.5f};
+    frame.cameraToWorld = {0,-1,0,0, 1,0,0,0, 0,0,1,0, 0,0,0,1};
+    frame.trainingMask = TrainingMaskDescriptor{
+        softPath.string(), TrainingMaskChannel::Luminance};
+    direct.frames.push_back(frame);
+    direct.points = reopened.points;
+
+    // Compare bytes after both initial decode scaling and the progressive
+    // training pyramid. Cover Transparent and Coverage target publication.
+    for (float baseDownscale : {1.0f, 1.5f}) {
+        for (bool includeCoverageTiles : {false, true}) {
+            InputData directData = inputDataFromDescriptor(direct);
+            InputData reopenedData = inputDataFromDescriptor(reopened);
+            Camera &directCamera = directData.cameras[0];
+            Camera &reopenedCamera = reopenedData.cameras[0];
+            directCamera.loadImage(baseDownscale);
+            reopenedCamera.loadImage(baseDownscale);
+            CHECK(directCamera.width == reopenedCamera.width);
+            CHECK(directCamera.height == reopenedCamera.height);
+            CHECK(directCamera.fx == reopenedCamera.fx);
+            CHECK(directCamera.fy == reopenedCamera.fy);
+            CHECK(directCamera.cx == reopenedCamera.cx);
+            CHECK(directCamera.cy == reopenedCamera.cy);
+            CHECK(std::equal(std::begin(directCamera.camToWorld),
+                             std::end(directCamera.camToWorld),
+                             std::begin(reopenedCamera.camToWorld)));
+
+            for (int stage : {4, 2, 1}) {
+                const auto directTarget = snapshotTarget(
+                    directCamera.getGPUTrainingTarget(stage, includeCoverageTiles));
+                const auto reopenedTarget = snapshotTarget(
+                    reopenedCamera.getGPUTrainingTarget(stage, includeCoverageTiles));
+                checkSameTarget(directTarget, reopenedTarget);
+                CHECK(directTarget.maskBytes.has_value());
+                CHECK(std::any_of(directTarget.maskBytes->begin(),
+                                  directTarget.maskBytes->end(),
+                                  [](uint8_t value) { return value > 0 && value < 255; }));
+            }
+        }
+    }
+
+    // A manifest pointing at the retained binary artifact is observably a
+    // different training target; path-only adapter tests would miss this.
+    const ImageSourceInfo maskInfo = inspectImageSource(softPath.string());
+    const auto softDecoded = imreadCoverageMask(
+        softPath.string(), maskInfo, width, height, false,
+        TrainingMaskChannel::Luminance);
+    const auto binaryDecoded = imreadCoverageMask(
+        binaryPath.string(), maskInfo, width, height, false,
+        TrainingMaskChannel::Automatic);
+    CHECK(softDecoded.data != binaryDecoded.data);
+}
+
 void checkCoverageRenderTileMap() {
     CoverageMask mask;
     mask.width = 33;
@@ -2173,6 +2293,9 @@ int main() {
         });
         checkStage("compact GPU training-target upload", [&] {
             checkCompactGPUTrainingTargetUpload(temporary);
+        });
+        checkStage("captured soft-mask Nerfstudio round trip", [&] {
+            checkCapturedSoftMaskNerfstudioRoundTrip(temporary);
         });
         checkStage("compact training-target storage validation", [&] {
             checkCompactTrainingTargetStorageValidation();

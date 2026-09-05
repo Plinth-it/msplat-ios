@@ -134,7 +134,7 @@ actor CaptureStore {
         let addedPointCount: Int
     }
 
-    private struct MaskResult {
+    struct MaskResult: Sendable {
         let bytes: [UInt8]
         let binaryBytes: [UInt8]
         let width: Int
@@ -188,12 +188,18 @@ actor CaptureStore {
     private let rootURL: URL
     private let context = CIContext(options: [.cacheIntermediates: false])
     private let voxelSize: Float
+    private let objectMaskGenerator: (@Sendable (CaptureFrameCandidate) throws -> MaskResult)?
     private var frames: [CaptureFrameRecord] = []
     private var fusedPoints: [VoxelKey: FusedPoint] = [:]
     private var isDiscarded = false
 
-    init(mode: CaptureMode, baseDirectory: URL = .documentsDirectory) throws {
+    init(
+        mode: CaptureMode,
+        baseDirectory: URL = .documentsDirectory,
+        objectMaskGenerator: (@Sendable (CaptureFrameCandidate) throws -> MaskResult)? = nil
+    ) throws {
         self.mode = mode
+        self.objectMaskGenerator = objectMaskGenerator
         captureID = UUID()
         createdAt = Date()
         voxelSize = mode == .object ? 0.005 : 0.02
@@ -246,14 +252,25 @@ actor CaptureStore {
             guard let subjectWorldPosition = candidate.subjectWorldPosition else {
                 throw CaptureFailure.invalidFrame("object capture has no selected subject")
             }
-            mask = try objectMask(
-                image: candidate.image.value,
-                calibration: candidate.calibration,
-                cameraToWorld: candidate.cameraToWorld,
-                subjectWorldPosition: subjectWorldPosition
-            )
+            if let objectMaskGenerator {
+                mask = try objectMaskGenerator(candidate)
+            } else {
+                mask = try objectMask(
+                    image: candidate.image.value,
+                    calibration: candidate.calibration,
+                    cameraToWorld: candidate.cameraToWorld,
+                    subjectWorldPosition: subjectWorldPosition
+                )
+            }
         } else {
             mask = nil
+        }
+        if let mask {
+            guard mask.width == imageWidth, mask.height == imageHeight,
+                  mask.bytes.count == imageWidth * imageHeight,
+                  mask.binaryBytes.count == mask.bytes.count else {
+                throw CaptureFailure.invalidFrame("subject coverage does not match the image")
+            }
         }
 
         let orientedGeometry = CaptureGeometry.orientedGeometry(
@@ -817,7 +834,7 @@ actor CaptureStore {
             }
             return NerfstudioManifest.Frame(
                 filePath: frame.imagePath,
-                maskPath: frame.maskPath,
+                maskPath: frame.softMaskPath,
                 width: frame.calibration.width,
                 height: frame.calibration.height,
                 flX: frame.calibration.fx,

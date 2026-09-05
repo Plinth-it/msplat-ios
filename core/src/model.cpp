@@ -16,6 +16,7 @@
 #include "model.hpp"
 #include "atomic_output.hpp"
 #include "camp_pose_point_sampler.hpp"
+#include "densification_schedule.hpp"
 #include "kdtree_tensor.hpp"
 #include "msplat.hpp"
 #include "loaders.hpp"
@@ -288,6 +289,21 @@ Model::Model(const InputData &inputData, int numCameras,
         throw std::invalid_argument("splitScreenSize must be finite and non-negative");
     if (maxSteps <= 0 || maxSteps > 1000000)
         throw std::invalid_argument("iterations must be in 1...1000000");
+    if (stopSplitAt > 1) {
+        const auto schedule = msplat::densificationSchedule(
+            maxSteps, numCameras, refineEvery, warmupLength,
+            resetAlphaEvery, stopSplitAt);
+        if (schedule.eventCount == 0) {
+            std::cerr << "Warning: no densification opportunities for "
+                      << numCameras << " training cameras in " << maxSteps
+                      << " iterations. Increase the iteration budget or adjust "
+                         "the refinement/reset schedule and densification cutoff; "
+                         "set stopDensifyAt=0 for intentional fixed-population training.\n";
+        } else {
+            std::cout << "Densification schedule: first step " << schedule.firstStep
+                      << ", " << schedule.eventCount << " opportunities\n";
+        }
+    }
     if (bgColor) {
         for (int component = 0; component < 3; ++component) {
             if (!std::isfinite(bgColor[component]) || bgColor[component] < 0.0f ||
@@ -864,8 +880,8 @@ void Model::afterTrain(int step){
 
     if (step % refineEvery == 0 && step > warmupLength){
         int resetInterval = resetAlphaEvery * refineEvery;
-        bool doDensification = step < stopSplitAt &&
-            step % resetInterval > numCameras + refineEvery;
+        bool doDensification = msplat::isDensificationStep(
+            step, numCameras, refineEvery, warmupLength, resetInterval, stopSplitAt);
 
         if (doDensification){
             int numPointsBefore = num_active;

@@ -1426,6 +1426,101 @@ final class TrainingMaskOptionsTests: XCTestCase {
         try await store.discard()
     }
 
+    func testObjectCaptureExportsSoftMasksWithMatchingOrientedGeometry() async throws {
+        let directory = try XCTUnwrap(temporaryDirectory)
+        let image = try makeBGRAPixelBuffer(width: 3, height: 2)
+        let depth = try makeDepthPixelBuffer(width: 3, height: 2)
+        let soft: [UInt8] = [255, 64, 127, 128, 192, 0]
+        let binary = soft.map { $0 >= 128 ? UInt8.max : 0 }
+        let calibration = CaptureCalibrationRecord(
+            width: 3, height: 2, fx: 10, fy: 12, cx: 1.5, cy: 1
+        )
+        let orientations: [(CaptureDisplayOrientation, [Int])] = [
+            (.up, [0, 1, 2, 3, 4, 5]),
+            (.right, [3, 0, 4, 1, 5, 2]),
+            (.down, [5, 4, 3, 2, 1, 0]),
+            (.left, [2, 5, 1, 4, 0, 3]),
+        ]
+        var unrotatedCoverage: [UInt8] = []
+
+        for (orientation, sourceIndices) in orientations {
+            let store = try CaptureStore(
+                mode: .object,
+                baseDirectory: directory,
+                objectMaskGenerator: { _ in
+                    CaptureStore.MaskResult(
+                        bytes: soft, binaryBytes: binary,
+                        width: 3, height: 2, confidence: 0.5
+                    )
+                }
+            )
+            for index in 0..<3 {
+                _ = try await store.accept(CaptureFrameCandidate(
+                    image: OwnedPixelBuffer(image),
+                    depth: OwnedPixelBuffer(depth),
+                    confidence: nil,
+                    displayOrientation: orientation,
+                    calibration: calibration,
+                    cameraToWorld: matrix_identity_float4x4,
+                    timestamp: Double(index),
+                    exposureDuration: 0.01,
+                    trackingState: "normal",
+                    rawFeaturePoints: [],
+                    subjectWorldPosition: SIMD3<Float>(0, 0, -1)
+                ))
+            }
+
+            let capture = try await store.finalize()
+            let folder = try XCTUnwrap(DatasetFolder(picked: capture.rootURL))
+            XCTAssertEqual(folder.kind, .nerfstudio)
+            XCTAssertTrue(folder.hasNerfstudioTrainingMasks)
+            XCTAssertFalse(folder.supportsAutomaticTrainingMaskDiscovery)
+
+            let data = try Data(contentsOf: capture.rootURL.appending(path: "transforms.json"))
+            let manifest = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: data) as? [String: Any]
+            )
+            let exportedFrames = try XCTUnwrap(manifest["frames"] as? [[String: Any]])
+            XCTAssertEqual(exportedFrames.count, capture.descriptor.frames.count)
+
+            for index in exportedFrames.indices {
+                let exported = exportedFrames[index]
+                let record = capture.manifest.frames[index]
+                let direct = capture.descriptor.frames[index]
+                let directMask = try XCTUnwrap(direct.trainingMask)
+                let exportedPath = try XCTUnwrap(exported["mask_path"] as? String)
+                let exportedURL = capture.rootURL.appending(path: exportedPath)
+                XCTAssertEqual(exportedPath, record.softMaskPath)
+                XCTAssertNotEqual(exportedPath, record.maskPath)
+                XCTAssertEqual(exportedURL, directMask.url)
+                XCTAssertEqual(directMask.coverageChannel, .luminance)
+                XCTAssertEqual(exported["w"] as? Int, direct.calibration.width)
+                XCTAssertEqual(exported["h"] as? Int, direct.calibration.height)
+                XCTAssertEqual(exported["fl_x"] as? Float, direct.calibration.fx)
+                XCTAssertEqual(exported["fl_y"] as? Float, direct.calibration.fy)
+                XCTAssertEqual(exported["cx"] as? Float, direct.calibration.cx)
+                XCTAssertEqual(exported["cy"] as? Float, direct.calibration.cy)
+                let transform = try XCTUnwrap(exported["transform_matrix"] as? [[Float]])
+                XCTAssertEqual(transform.flatMap { $0 }, direct.cameraToWorld.elements)
+
+                let softImage = try XCTUnwrap(UIImage(contentsOfFile: exportedURL.path)?.cgImage)
+                let softPixels = try topLeftRGBABytes(from: softImage)
+                    .enumerated().compactMap { $0.offset.isMultiple(of: 4) ? $0.element : nil }
+                XCTAssertTrue(softPixels.contains { $0 > 0 && $0 < 255 })
+                XCTAssertEqual(softImage.width, record.calibration.width)
+                XCTAssertEqual(softImage.height, record.calibration.height)
+                if orientation == .up { unrotatedCoverage = softPixels }
+                XCTAssertEqual(softPixels, sourceIndices.map { unrotatedCoverage[$0] })
+
+                let binaryURL = try XCTUnwrap(record.maskURL(under: capture.rootURL))
+                let binaryImage = try XCTUnwrap(UIImage(contentsOfFile: binaryURL.path)?.cgImage)
+                let binaryPixels = try topLeftRGBABytes(from: binaryImage)
+                    .enumerated().compactMap { $0.offset.isMultiple(of: 4) ? $0.element : nil }
+                XCTAssertEqual(binaryPixels, sourceIndices.map { binary[$0] })
+            }
+        }
+    }
+
     @MainActor
     func testCaptureEngineStopDiscardsUnfinishedStore() async throws {
         let temporaryDirectory = try XCTUnwrap(temporaryDirectory)
@@ -2060,6 +2155,24 @@ final class TrainingMaskOptionsTests: XCTestCase {
                 storage[offset + 2] = value
                 storage[offset + 3] = .max
             }
+        }
+        return result
+    }
+
+    private func makeDepthPixelBuffer(width: Int, height: Int) throws -> CVPixelBuffer {
+        var buffer: CVPixelBuffer?
+        XCTAssertEqual(CVPixelBufferCreate(
+            kCFAllocatorDefault, width, height, kCVPixelFormatType_DepthFloat32,
+            nil, &buffer
+        ), kCVReturnSuccess)
+        let result = try XCTUnwrap(buffer)
+        CVPixelBufferLockBaseAddress(result, [])
+        defer { CVPixelBufferUnlockBaseAddress(result, []) }
+        let rowStride = CVPixelBufferGetBytesPerRow(result) / MemoryLayout<Float>.stride
+        let values = try XCTUnwrap(CVPixelBufferGetBaseAddress(result))
+            .assumingMemoryBound(to: Float.self)
+        for y in 0..<height {
+            for x in 0..<width { values[y * rowStride + x] = 1 }
         }
         return result
     }

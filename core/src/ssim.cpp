@@ -114,6 +114,26 @@ MetricInput validateMetricInput(const MTensor& rendered, const MTensor& gt,
 
 } // namespace
 
+MTensor composite_metric_target(const MTensor& gt, const MTensor& coverageMask,
+                                const float background[3],
+                                uint64_t coverageUnits) {
+    if (gt.ndim() != 3 || gt.size(0) <= 0 || gt.size(1) <= 0)
+        throw std::invalid_argument("Metric target dimensions are invalid");
+    MTensor composited({gt.size(0), gt.size(1), 3}, DType::Float32);
+    const MetricInput input = validateMetricInput(
+        composited, gt, &coverageMask, coverageUnits);
+    float* output = composited.data<float>();
+    for (int64_t pixel = 0; pixel < input.pixels; ++pixel) {
+        const float alpha = coverageAt(input, pixel) / 255.0f;
+        for (int channel = 0; channel < 3; ++channel) {
+            output[pixel * 3 + channel] = std::fma(
+                targetChannel(gt, input, pixel, channel) - background[channel],
+                alpha, background[channel]);
+        }
+    }
+    return composited;
+}
+
 float psnr(const MTensor& rendered, const MTensor& gt,
            const MTensor* coverageMask, uint64_t coverageUnits) {
     const MetricInput input = validateMetricInput(

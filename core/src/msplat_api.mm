@@ -442,12 +442,22 @@ EvalMetrics Trainer::evaluate() {
             }
         }
 
+        uint64_t metricCoverageUnits = target.coverageUnits;
+        if (coverageMask &&
+            impl->config.trainingMaskMode == TrainingMaskMode::Transparent) {
+            gtCpu = composite_metric_target(
+                gtCpu, *coverageMask, impl->config.bgColor,
+                target.coverageUnits);
+            coverageMask = nullptr;
+            metricCoverageUnits = 0;
+        }
+
         sumPsnr += psnr(
-            rgbCpu, gtCpu, coverageMask, target.coverageUnits);
+            rgbCpu, gtCpu, coverageMask, metricCoverageUnits);
         sumSsim += ssim_eval(
-            rgbCpu, gtCpu, coverageMask, target.coverageUnits);
+            rgbCpu, gtCpu, coverageMask, metricCoverageUnits);
         sumL1 += l1_loss(
-            rgbCpu, gtCpu, coverageMask, target.coverageUnits);
+            rgbCpu, gtCpu, coverageMask, metricCoverageUnits);
     }
 
     EvalMetrics m;

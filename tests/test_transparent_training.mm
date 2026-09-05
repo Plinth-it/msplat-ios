@@ -484,6 +484,210 @@ void checkChunkedTransparentAlphaSupervision() {
     CHECK(gather ? packedAttributeBytes == 0 : packedAttributeBytes > 0);
 }
 
+void checkChunkCutoffBackward(const char* metallibPath) {
+    // Three contributing Gaussians occupy three 512-entry chunks; remaining
+    // intersections are below the per-pixel alpha cutoff. Dispatch the real
+    // forward kernels so finite differences include the global cutoff.
+    // A one-pixel image keeps inactive lanes in the cooperative batch loads.
+    id<MTLDevice> device = msplat_device();
+    NSError* error = nil;
+    id<MTLLibrary> library = [device newLibraryWithURL:
+        [NSURL fileURLWithPath:[NSString stringWithUTF8String:metallibPath]]
+        error:&error];
+    CHECK(library != nil);
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    CHECK(queue != nil);
+    const std::array<NSString*, 4> names = {
+        @"rasterize_forward_chunked_kernel",
+        @"rasterize_forward_merge_kernel",
+        @"compute_chunk_prefix_suffix_kernel",
+        @"rasterize_backward_chunked_kernel",
+    };
+    std::array<id<MTLComputePipelineState>, 4> pipelines = {};
+    for (size_t index = 0; index < names.size(); ++index) {
+        id<MTLFunction> function = [library newFunctionWithName:names[index]];
+        CHECK(function != nil);
+        pipelines[index] = [device newComputePipelineStateWithFunction:function
+            error:&error];
+        [function release];
+        CHECK(pipelines[index] != nil);
+    }
+
+    constexpr int gaussianCount = 1025;
+    constexpr int testedIndex = 512;
+    constexpr int lastIndex = 1024;
+    MTensor bins = gpu_empty({1, 2}, DType::Int32);
+    bins.data<int32_t>()[0] = 0;
+    bins.data<int32_t>()[1] = gaussianCount;
+    MTensor keys = gpu_empty({gaussianCount}, DType::Int64);
+    MTensor xyOpacity = gpu_zeros({gaussianCount, 3}, DType::Float32);
+    MTensor conic = gpu_zeros({gaussianCount, 3}, DType::Float32);
+    MTensor rgb = gpu_zeros({gaussianCount, 3}, DType::Float32);
+    // gpu_zeros may queue blits on the engine's command buffer.
+    msplat_gpu_sync();
+    for (int index = 0; index < gaussianCount; ++index) {
+        keys.data<uint64_t>()[index] = index;
+        xyOpacity.data<float>()[3 * index + 2] = 0.001f;
+        conic.data<float>()[3 * index] = 1.0f;
+        conic.data<float>()[3 * index + 2] = 1.0f;
+        std::fill_n(rgb.data<float>() + 3 * index, 3, -0.5f);
+    }
+    xyOpacity.data<float>()[3 * lastIndex + 2] = 0.8f;
+    rgb.data<float>()[3 * testedIndex] = 0.2f - 0.5f;
+    rgb.data<float>()[3 * lastIndex] = 1.0f - 0.5f;
+    MTensor background = gpu_zeros({3}, DType::Float32);
+    MTensor chunkT = gpu_empty({3}, DType::Float32);
+    MTensor chunkC = gpu_empty({3, 3}, DType::Float32);
+    MTensor chunkFinal = gpu_empty({3}, DType::Int32);
+    MTensor finalT = gpu_empty({1}, DType::Float32);
+    MTensor finalIndex = gpu_empty({1}, DType::Int32);
+    MTensor output = gpu_empty({1, 3}, DType::Float32);
+    MTensor prefixT = gpu_empty({3}, DType::Float32);
+    MTensor afterC = gpu_empty({3, 3}, DType::Float32);
+    MTensor outputGradient = gpuFloats({3}, {1, 0, 0});
+    MTensor mask = gpu_zeros({1}, DType::UInt8);
+    MTensor vXY = gpu_zeros({gaussianCount, 2}, DType::Float32);
+    MTensor vConic = gpu_zeros({gaussianCount, 3}, DType::Float32);
+    MTensor vRGB = gpu_zeros({gaussianCount, 3}, DType::Float32);
+    MTensor vOpacity = gpu_zeros({gaussianCount}, DType::Float32);
+    msplat_gpu_sync();
+
+    struct Result {
+        double objective;
+        float opacityGradient;
+        float xGradient;
+    };
+    const auto run = [&](float logit, float x, float backgroundRed,
+                         float alphaWeight, bool cutoff) {
+        xyOpacity.data<float>()[2] = cutoff ? 0.99f : 0.9f;
+        xyOpacity.data<float>()[3 * testedIndex] = x;
+        xyOpacity.data<float>()[3 * testedIndex + 2] =
+            1.0f / (1.0f + std::exp(-logit));
+        background.data<float>()[0] = backgroundRed;
+        for (MTensor* gradient : {&vXY, &vConic, &vRGB, &vOpacity})
+            std::fill_n(gradient->data<float>(), gradient->numel(), 0.0f);
+
+        id<MTLCommandBuffer> command = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+        const auto bind = [&](NSUInteger index, const MTensor& tensor) {
+            [encoder setBuffer:tensor.buffer() offset:0 atIndex:index];
+        };
+        const auto scalar = [&](NSUInteger index, uint32_t value) {
+            [encoder setBytes:&value length:sizeof(value) atIndex:index];
+        };
+        const auto size2 = [&](NSUInteger index, uint32_t x, uint32_t y) {
+            const std::array<uint32_t, 2> value = {x, y};
+            [encoder setBytes:value.data() length:sizeof(value) atIndex:index];
+        };
+        const auto size3 = [&](NSUInteger index) {
+            // Metal uint3 uses a 16-byte argument slot.
+            const std::array<uint32_t, 4> value = {1, 1, 1, 0};
+            [encoder setBytes:value.data() length:sizeof(value) atIndex:index];
+        };
+        [encoder setComputePipelineState:pipelines[0]];
+        size3(0); size3(1); scalar(2, 3);
+        bind(3, bins); bind(4, xyOpacity); bind(5, conic); bind(6, rgb);
+        bind(7, chunkT); bind(8, chunkC); bind(9, chunkFinal);
+        scalar(10, 512); scalar(11, 3); size2(12, 8, 8);
+        bind(13, keys); bind(14, xyOpacity); scalar(15, 0);
+        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 3)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [encoder setComputePipelineState:pipelines[1]];
+        scalar(0, 1); scalar(1, 3);
+        bind(2, chunkT); bind(3, chunkC); bind(4, chunkFinal);
+        bind(5, finalT); bind(6, finalIndex); bind(7, output);
+        bind(8, background); size2(9, 1, 1);
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [encoder setComputePipelineState:pipelines[2]];
+        scalar(0, 1); scalar(1, 3);
+        bind(2, chunkT); bind(3, chunkC); bind(4, chunkFinal);
+        bind(5, prefixT); bind(6, afterC); size2(7, 1, 1);
+        [encoder dispatchThreads:MTLSizeMake(1, 1, 1)
+            threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+        [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+        [encoder setComputePipelineState:pipelines[3]];
+        size3(0); size2(1, 1, 1);
+        bind(2, keys); bind(3, bins); bind(4, xyOpacity);
+        bind(5, conic); bind(6, rgb); bind(7, background);
+        bind(8, finalT); bind(9, chunkFinal); bind(10, prefixT);
+        bind(11, chunkT); bind(12, afterC); bind(13, outputGradient);
+        bind(14, vXY); bind(15, vConic); bind(16, vRGB); bind(17, vOpacity);
+        scalar(18, 512); scalar(19, 3); bind(20, mask);
+        size2(21, alphaWeight == 0.0f ? 0 : 1, 0);
+        [encoder setBytes:&alphaWeight length:sizeof(alphaWeight) atIndex:22];
+        bind(23, xyOpacity); scalar(24, 0);
+        [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 3)
+            threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [encoder endEncoding];
+        [command commit];
+        [command waitUntilCompleted];
+        CHECK(command.status == MTLCommandBufferStatusCompleted);
+
+        CHECK(chunkFinal.data<int32_t>()[1] >= testedIndex);
+        CHECK(chunkT.data<float>()[0] > 1e-4f);
+        CHECK(chunkT.data<float>()[1] > 1e-4f);
+        CHECK(chunkC.data<float>()[6] > 0.0f);
+        CHECK((chunkFinal.data<int32_t>()[2] == -1) == cutoff);
+        if (cutoff) {
+            CHECK(vOpacity.data<float>()[lastIndex] == 0.0f);
+            CHECK(vXY.data<float>()[2 * lastIndex] == 0.0f);
+            CHECK(vRGB.data<float>()[3 * lastIndex] == 0.0f);
+        }
+        // The alpha target is zero, so its L1 term is 1 - finalT.
+        return Result{
+            double(output.data<float>()[0]) +
+                alphaWeight * (1.0 - double(finalT.data<float>()[0])),
+            vOpacity.data<float>()[testedIndex],
+            vXY.data<float>()[2 * testedIndex],
+        };
+    };
+
+    const auto checkGradient = [](double analytic, double finiteDifference) {
+        CHECK(std::isfinite(analytic));
+        CHECK(std::isfinite(finiteDifference));
+        if (std::abs(analytic - finiteDifference) >
+            2e-7 + 0.01 * std::abs(finiteDifference)) {
+            std::cerr << "chunk cutoff gradient=" << analytic
+                << " finite difference=" << finiteDifference << '\n';
+            CHECK(false);
+        }
+    };
+    const float logit = std::log(0.995f / 0.005f);
+    constexpr float x = 0.05f;
+    for (bool cutoff : {true, false}) {
+        for (float backgroundRed : {0.0f, 0.1f}) {
+            for (float alphaWeight : {0.0f, 0.3f}) {
+                const Result baseline = run(
+                    logit, x, backgroundRed, alphaWeight, cutoff);
+                constexpr float opacityEpsilon = 0.02f;
+                const double opacityDifference = (
+                    run(logit + opacityEpsilon, x, backgroundRed,
+                        alphaWeight, cutoff).objective -
+                    run(logit - opacityEpsilon, x, backgroundRed,
+                        alphaWeight, cutoff).objective) /
+                    (2.0 * opacityEpsilon);
+                checkGradient(baseline.opacityGradient, opacityDifference);
+                constexpr float xEpsilon = 0.002f;
+                const double xDifference = (
+                    run(logit, x + xEpsilon, backgroundRed,
+                        alphaWeight, cutoff).objective -
+                    run(logit, x - xEpsilon, backgroundRed,
+                        alphaWeight, cutoff).objective) / (2.0 * xEpsilon);
+                checkGradient(baseline.xGradient, xDifference);
+            }
+        }
+    }
+    for (id<MTLComputePipelineState> pipeline : pipelines) [pipeline release];
+    [queue release];
+    [library release];
+}
+
 void checkCappedAlphaBackward() {
     // A very large Gaussian keeps sigma close enough to zero across the image
     // that opacity * exp(-sigma) always reaches the forward 0.999 alpha cap.
@@ -799,6 +1003,7 @@ int main(int argc, char **argv) {
             checkArenaRetryTransaction();
             checkPartialSsimThreadgroups();
             checkStageProfiling();
+            checkChunkCutoffBackward(argv[1]);
             cleanup_msplat_metal();
             return 0;
         } catch (const std::exception &error) {

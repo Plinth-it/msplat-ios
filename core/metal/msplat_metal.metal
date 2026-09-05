@@ -4156,8 +4156,8 @@ kernel void rasterize_forward_merge_kernel(
 }
 
 // Compute prefix transmittance and suffix color for backward chunked rasterization.
-// prefix_T[k] = product of chunk_T[0..k-1] (transmittance before chunk k)
-// after_C[k] = sum_{j>k} prefix_T[j] * chunk_C[j] (color contribution after chunk k)
+// prefix_T[k] = product of retained chunk_T[0..k-1]
+// after_C[k] = sum_{retained j>k} prefix_T[j] * chunk_C[j]
 kernel void compute_chunk_prefix_suffix_kernel(
     constant uint& num_pixels,
     constant uint& K_max,
@@ -4179,11 +4179,13 @@ kernel void compute_chunk_prefix_suffix_kernel(
     for (uint k = 0; k < K_max; ++k) {
         uint offset = k * num_pixels + pix_id;
         prefix_T[offset] = pT;
-        pT *= chunk_T[offset];
+        // Forward merge marks chunks past the absolute cutoff as discarded.
+        // Their local raster results must not enter the backward recurrence.
+        if (chunk_final_idx[offset] >= 0) pT *= chunk_T[offset];
     }
 
     // Backward scan: compute suffix color contribution
-    // after_C[k] = sum_{j=k+1}^{K-1} prefix_T[j] * chunk_C[j]
+    // after_C[k] includes only chunks retained by the forward merge.
     float3 aC = {0.f, 0.f, 0.f};
     for (int k = (int)K_max - 1; k >= 0; --k) {
         uint offset = (uint)k * num_pixels + pix_id;
@@ -4192,7 +4194,7 @@ kernel void compute_chunk_prefix_suffix_kernel(
         after_C[offset * 3 + 2] = aC.z;
         float pT_k = prefix_T[offset];
         float3 cC = {chunk_C[offset * 3 + 0], chunk_C[offset * 3 + 1], chunk_C[offset * 3 + 2]};
-        aC += pT_k * cC;
+        if (chunk_final_idx[offset] >= 0) aC += pT_k * cC;
     }
 }
 

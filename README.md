@@ -62,6 +62,14 @@ canonical, caller-owned dataset directly through a checked deep-copy boundary.
   the limit. Oversized initial models, PLY imports, and checkpoints are rejected
   before their Gaussian storage is allocated.
 
+The native trainer reports the first eligible densification step and the number
+of growth opportunities for the actual training-camera count. A zero-event
+schedule emits a warning; `stopDensifyAt = 0` explicitly disables growth.
+Swift callers can inspect `TrainingConfig.densificationSchedule(trainingCameraCount:)`
+or require a usable growth window with `validateDensificationSchedule(trainingCameraCount:)`.
+MsplatExample applies this check before its first training step. Increasing
+`maxGaussians` alone does not create a growth opportunity.
+
 `TrainingPlan` derives its estimate from the selected Gaussian ceiling, SH
 degree, source dimensions, resolution stages, an estimated exact-intersection
 arena, native image cache, and an additional headroom allowance. The
@@ -430,6 +438,12 @@ combined with appearance refinement because the correction would also act on
 the synthetic background. Frames without a matched mask remain
 ordinary opaque RGB targets. Sidecars must currently match the source image dimensions;
 unlike Brush, MSplat does not resize mismatched masks.
+
+Held-out evaluation follows the selected mask treatment: Coverage reports
+foreground-weighted RGB metrics; Transparent compares against the composited
+RGB target across the full frame, including background pixels. Capture exports
+reference the same soft masks as direct capture training; binary masks remain
+available separately for depth fusion and consumers that need them.
 
 Plinth can also construct a Swift `DatasetDescriptor` from calibrated frame
 URLs, optional per-frame soft training masks, sparse points, and optional

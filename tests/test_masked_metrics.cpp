@@ -191,6 +191,51 @@ int main() {
     CHECK(nearlyEqual(
         ssim_eval(impulseRendered, impulseGt, &farCenter, 255), 1.0f));
 
+    // Transparent targets composite soft coverage over the configured
+    // background, while their metrics include every pixel in the frame.
+    const float background[3] = {0.2f, 0.4f, 0.6f};
+    MTensor transparentSource = makeImage(1, 3);
+    MTensor transparentRGBA({1, 3, 4}, DType::UInt8);
+    MTensor transparentMask({1, 3}, DType::UInt8);
+    MTensor idealTransparent = makeImage(1, 3);
+    const uint8_t alphaBytes[3] = {255, 128, 0};
+    for (int pixel = 0; pixel < 3; ++pixel) {
+        transparentMask.data<uint8_t>()[pixel] = alphaBytes[pixel];
+        transparentRGBA.data<uint8_t>()[pixel * 4 + 3] = alphaBytes[pixel];
+        const float alpha = alphaBytes[pixel] / 255.0f;
+        for (int channel = 0; channel < 3; ++channel) {
+            transparentSource.data<float>()[pixel * 3 + channel] = 1.0f;
+            transparentRGBA.data<uint8_t>()[pixel * 4 + channel] = 255;
+            idealTransparent.data<float>()[pixel * 3 + channel] =
+                alpha + (1.0f - alpha) * background[channel];
+        }
+    }
+    MTensor compositedFloat = composite_metric_target(
+        transparentSource, transparentMask, background, regionUnits);
+    MTensor compositedRGBA = composite_metric_target(
+        transparentRGBA, transparentMask, background, regionUnits);
+    MTensor compositedPacked = composite_metric_target(
+        transparentRGBA, transparentRGBA, background, regionUnits);
+    for (const MTensor* composited :
+         {&compositedFloat, &compositedRGBA, &compositedPacked}) {
+        CHECK(nearlyEqual(l1_loss(idealTransparent, *composited), 0.0f));
+        CHECK(psnr(idealTransparent, *composited) > 120.0f);
+        CHECK(nearlyEqual(
+            ssim_eval(idealTransparent, *composited), 1.0f, 1e-4f));
+    }
+    // Keep Coverage semantics: the same rendered soft edge is compared with
+    // foreground RGB, not the composited target.
+    CHECK(l1_loss(idealTransparent, transparentSource,
+                  &transparentMask, regionUnits) > 0.05f);
+    idealTransparent.data<float>()[6] += 0.25f;
+    CHECK(nearlyEqual(
+        l1_loss(idealTransparent, compositedPacked), 0.25f / 9.0f));
+    CHECK(psnr(idealTransparent, compositedPacked) < 25.0f);
+    CHECK(ssim_eval(idealTransparent, compositedPacked) < 0.99f);
+    CHECK(nearlyEqual(l1_loss(
+        idealTransparent, compositedPacked, &transparentMask, regionUnits),
+        0.0f));
+
     bool denominatorRejected = false;
     try {
         (void)l1_loss(rendered, gt, &fullMask, fullUnits - 1);
