@@ -10,7 +10,7 @@
 		A1000001000000000000001 /* Msplat in Frameworks */ = {isa = PBXBuildFile; productRef = A1000005000000000000001 /* Msplat */; };
 		A1000020000000000000001 /* PoseCheckpointTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000023000000000000001 /* PoseCheckpointTests.swift */; };
 		A1000021000000000000001 /* Msplat in Frameworks */ = {isa = PBXBuildFile; productRef = A1000005000000000000001 /* Msplat */; };
-		A1000034000000000000001 /* TrainingMaskOptionsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000035000000000000001 /* TrainingMaskOptionsTests.swift */; };
+		A1000034000000000000001 /* MsplatExampleTests/TrainingMaskOptionsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000035000000000000001 /* MsplatExampleTests/TrainingMaskOptionsTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -27,7 +27,7 @@
 		A1000002000000000000001 /* MsplatExample.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = MsplatExample.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A1000022000000000000001 /* MsplatExampleTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MsplatExampleTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A1000023000000000000001 /* PoseCheckpointTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PoseCheckpointTests.swift; path = ../../swift/Tests/PoseCheckpointTests.swift; sourceTree = SOURCE_ROOT; };
-		A1000035000000000000001 /* TrainingMaskOptionsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MsplatExampleTests/TrainingMaskOptionsTests.swift; sourceTree = SOURCE_ROOT; };
+		A1000035000000000000001 /* MsplatExampleTests/TrainingMaskOptionsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MsplatExampleTests/TrainingMaskOptionsTests.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -93,7 +93,7 @@
 			isa = PBXGroup;
 			children = (
 				A1000023000000000000001 /* PoseCheckpointTests.swift */,
-				A1000035000000000000001 /* TrainingMaskOptionsTests.swift */,
+				A1000035000000000000001 /* MsplatExampleTests/TrainingMaskOptionsTests.swift */,
 			);
 			name = MsplatExampleTests;
 			sourceTree = "<group>";
@@ -217,7 +217,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A1000020000000000000001 /* PoseCheckpointTests.swift in Sources */,
-				A1000034000000000000001 /* TrainingMaskOptionsTests.swift in Sources */,
+				A1000034000000000000001 /* MsplatExampleTests/TrainingMaskOptionsTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -271,7 +271,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = "";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 32SCVH99SP;
+				DEVELOPMENT_TEAM = 7U4MTWHDL9;
 				ENABLE_TESTABILITY = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = MsplatExample/Info.plist;
@@ -297,7 +297,7 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = "";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_TEAM = 32SCVH99SP;
+				DEVELOPMENT_TEAM = 7U4MTWHDL9;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = MsplatExample/Info.plist;
 				INFOPLIST_KEY_LSSupportsOpeningDocumentsInPlace = YES;
@@ -321,7 +321,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = 32SCVH99SP;
+				DEVELOPMENT_TEAM = 7U4MTWHDL9;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.msplat.example.tests;
@@ -337,7 +337,7 @@
 			buildSettings = {
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
-				DEVELOPMENT_TEAM = 32SCVH99SP;
+				DEVELOPMENT_TEAM = 7U4MTWHDL9;
 				GENERATE_INFOPLIST_FILE = YES;
 				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				PRODUCT_BUNDLE_IDENTIFIER = io.github.msplat.example.tests;
