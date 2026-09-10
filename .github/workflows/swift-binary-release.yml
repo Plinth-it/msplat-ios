@@ -15,8 +15,6 @@ jobs:
       version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
 
       - name: Verify tag and source version
         id: version
@@ -47,6 +45,11 @@ jobs:
         env:
           MSPLAT_RESOURCE_OUTPUT_DIR: ${{ github.workspace }}/build/release-resources
         run: bash scripts/build-xcframework.sh
+
+      - name: Download benchmark and test datasets
+        run: |
+          git lfs install --local
+          git lfs pull --include='datasets/**' --exclude=''
 
       - name: Build and test generated Swift payload
         run: |

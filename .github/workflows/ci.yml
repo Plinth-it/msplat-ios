@@ -30,6 +30,16 @@ jobs:
             exit 1
           fi
 
+  fresh-package-checkout:
+    name: Fresh package checkout without datasets
+    runs-on: xcode-27
+    needs: version-check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build fresh package checkout without datasets
+        run: bash scripts/verify-package-checkout.sh
+
   build-cpp:
     name: C++ CLI
     runs-on: macos-15
@@ -74,8 +84,6 @@ jobs:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
 
       - uses: astral-sh/setup-uv@v4
         with:
@@ -89,6 +97,11 @@ jobs:
 
       - name: Build wheel
         run: uv build --wheel --python ${{ matrix.python }}
+
+      - name: Download benchmark and test datasets
+        run: |
+          git lfs install --local
+          git lfs pull --include='datasets/**' --exclude=''
 
       - name: Install and test
         run: |
@@ -110,8 +123,6 @@ jobs:
     needs: version-check
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
 
       - name: Cache CMake deps
         uses: actions/cache@v4
@@ -121,6 +132,11 @@ jobs:
 
       - name: Build XCFramework
         run: bash scripts/build-xcframework.sh
+
+      - name: Download benchmark and test datasets
+        run: |
+          git lfs install --local
+          git lfs pull --include='datasets/**' --exclude=''
 
       - name: Build & test
         run: |
