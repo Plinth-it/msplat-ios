@@ -31,11 +31,8 @@ MsplatCore.xcframework/
 # Spec (internal)
 SPEC.md
 
-# Datasets (keep garden for CI, ignore others)
-datasets/*/
-!datasets/mipnerf360/
-datasets/mipnerf360/*/
-!datasets/mipnerf360/garden/
+# Benchmark datasets are downloaded explicitly and never shipped in the package.
+/datasets/
 
 # Training outputs
 *.splat

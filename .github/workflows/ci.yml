@@ -31,13 +31,13 @@ jobs:
           fi
 
   fresh-package-checkout:
-    name: Fresh package checkout without datasets
+    name: Fresh package checkout without Git LFS
     runs-on: xcode-27
     needs: version-check
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build fresh package checkout without datasets
+      - name: Build fresh package checkout without Git LFS
         run: bash scripts/verify-package-checkout.sh
 
   build-cpp:
@@ -99,9 +99,7 @@ jobs:
         run: uv build --wheel --python ${{ matrix.python }}
 
       - name: Download benchmark and test datasets
-        run: |
-          git lfs install --local
-          git lfs pull --include='datasets/**' --exclude=''
+        run: bash scripts/download-datasets.sh
 
       - name: Install and test
         run: |
@@ -134,9 +132,7 @@ jobs:
         run: bash scripts/build-xcframework.sh
 
       - name: Download benchmark and test datasets
-        run: |
-          git lfs install --local
-          git lfs pull --include='datasets/**' --exclude=''
+        run: bash scripts/download-datasets.sh
 
       - name: Build & test
         run: |

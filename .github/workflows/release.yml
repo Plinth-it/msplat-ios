@@ -87,9 +87,7 @@ jobs:
         run: uv build --wheel --python ${{ matrix.python }}
 
       - name: Download benchmark and test datasets
-        run: |
-          git lfs install --local
-          git lfs pull --include='datasets/**' --exclude=''
+        run: bash scripts/download-datasets.sh
 
       - name: Test
         run: |
@@ -113,13 +111,11 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Build fresh package checkout without datasets
+      - name: Build fresh package checkout without Git LFS
         run: bash scripts/verify-package-checkout.sh
 
       - name: Download benchmark and test datasets
-        run: |
-          git lfs install --local
-          git lfs pull --include='datasets/**' --exclude=''
+        run: bash scripts/download-datasets.sh
 
       - name: Resolve, build, and test immutable package
         env:

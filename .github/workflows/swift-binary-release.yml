@@ -47,9 +47,7 @@ jobs:
         run: bash scripts/build-xcframework.sh
 
       - name: Download benchmark and test datasets
-        run: |
-          git lfs install --local
-          git lfs pull --include='datasets/**' --exclude=''
+        run: bash scripts/download-datasets.sh
 
       - name: Build and test generated Swift payload
         run: |
