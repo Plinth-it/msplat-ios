@@ -10,8 +10,8 @@ let package = Package(
     targets: [
         .binaryTarget(
             name: "MsplatCore",
-            url: "https://github.com/Plinth-it/msplat-ios/releases/download/binary-v2.1.1/MsplatCore.xcframework.zip",
-            checksum: "a3dac0f7c7905e72874fd603b98d7f6b9af294584df1007872efd02a4611fbd6"
+            url: "https://github.com/Plinth-it/msplat-ios/releases/download/binary-v2.1.2/MsplatCore.xcframework.zip",
+            checksum: "9f8b93e11498f263c1af81c3416b131c86c03f1da702f6b3dcb374e1ed0e881b"
         ),
         .target(
             name: "Msplat",
