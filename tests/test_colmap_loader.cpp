@@ -7,6 +7,7 @@
 #include <fstream>
 #include <iterator>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -399,7 +400,7 @@ bool checkPlyLinkedObservationRejected() {
 }
 
 template <typename T>
-void writePod(std::ofstream &stream, const T &value) {
+void writePod(std::ostream &stream, const T &value) {
     stream.write(reinterpret_cast<const char *>(&value), sizeof(value));
 }
 
@@ -700,6 +701,64 @@ bool checkBinaryOversizedDimensionsRejected() {
     });
 }
 
+bool checkPlyPayloadValidation() {
+    TempDirectory temporary;
+    const fs::path path = temporary.path / "points.ply";
+    const auto header = [](const std::string &format, int count) {
+        return "ply\nformat " + format + " 1.0\nelement vertex " +
+               std::to_string(count) +
+               "\nproperty float x\nproperty float y\nproperty float z\n"
+               "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+               "end_header\n";
+    };
+    const auto rejects = [&](const std::string &contents) {
+        if (!writeText(path, contents)) return false;
+        try {
+            (void)readPly(path.string());
+            return false;
+        } catch (const std::runtime_error &) {
+            return true;
+        }
+    };
+
+    const std::string asciiHeader = header("ascii", 1);
+    if (!rejects(asciiHeader) ||
+        !rejects(asciiHeader + "1 2\n") ||
+        !rejects(asciiHeader + "1 2 3 255 0\n") ||
+        !rejects(header("ascii", 2) + "1 2 3 255 0 7\n")) {
+        return false;
+    }
+    if (!writeText(path, asciiHeader + "1 2 3 255 0 7\n")) return false;
+    const SparsePointSet ascii = readPly(path.string());
+    if (ascii.xyz != std::vector<float>{1, 2, 3} ||
+        ascii.rgb != std::vector<uint8_t>{255, 0, 7}) return false;
+    std::string faceHeader = asciiHeader;
+    faceHeader.insert(faceHeader.find("end_header"),
+                      "element face 1\nproperty list uchar int vertex_indices\n");
+    if (!writeText(path, faceHeader + "1 2 3 255 0 7\n3 0 0 0\n")) return false;
+    const SparsePointSet withFace = readPly(path.string());
+    if (withFace.xyz != ascii.xyz || withFace.rgb != ascii.rgb) return false;
+
+    std::ostringstream record(std::ios::binary);
+    writePod(record, 1.0f);
+    writePod(record, 2.0f);
+    writePod(record, 3.0f);
+    writePod(record, uint8_t{255});
+    writePod(record, uint8_t{0});
+    writePod(record, uint8_t{7});
+    const std::string bytes = record.str();
+    const std::string binaryHeader = header("binary_little_endian", 1);
+    for (size_t length = 0; length < bytes.size(); ++length) {
+        if (!rejects(binaryHeader + bytes.substr(0, length))) return false;
+    }
+    // A complete first record must not be reused for a truncated second one.
+    if (!rejects(header("binary_little_endian", 2) + bytes +
+                 bytes.substr(0, bytes.size() - 1))) return false;
+    if (!writeText(path, binaryHeader + bytes)) return false;
+    const SparsePointSet binary = readPly(path.string());
+    return binary.xyz == ascii.xyz && binary.rgb == ascii.rgb;
+}
+
 } // namespace
 
 int main() {
@@ -713,6 +772,7 @@ int main() {
     CHECK(checkTextTruncationRejections());
     CHECK(checkOversizedTextRecordRejected());
     CHECK(checkPlyLinkedObservationRejected());
+    CHECK(checkPlyPayloadValidation());
     CHECK(checkBinaryDuplicateIdRejections());
     CHECK(checkBinaryTruncationRejections());
     CHECK(checkEveryBinaryPrefixRejected());

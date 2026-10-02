@@ -43,6 +43,7 @@ SparsePointSet readPly(const std::string &path) {
 
     bool binary = false;
     bool ascii = false;
+    bool vertexElement = false;
     int numVertices = 0;
     std::vector<PlyProp> props;
     int vertexBytes = 0;
@@ -62,10 +63,11 @@ SparsePointSet readPly(const std::string &path) {
         } else if (token == "element") {
             std::string name;
             iss >> name;
-            if (name == "vertex") iss >> numVertices;
+            vertexElement = (name == "vertex");
+            if (vertexElement) iss >> numVertices;
         } else if (token == "property") {
-            // Only collect vertex properties (before any other element)
-            if (numVertices > 0) {
+            // Other elements have their own records after the vertices.
+            if (vertexElement && numVertices > 0) {
                 std::string typeStr, name;
                 iss >> typeStr >> name;
                 PlyType t = parsePlyType(typeStr);
@@ -97,7 +99,9 @@ SparsePointSet readPly(const std::string &path) {
     if (binary) {
         std::vector<char> buf(vertexBytes);
         for (int i = 0; i < numVertices; i++) {
-            f.read(buf.data(), vertexBytes);
+            if (!f.read(buf.data(), vertexBytes))
+                throw std::runtime_error("Truncated binary PLY vertex " +
+                                         std::to_string(i) + ": " + path);
 
             auto readFloat = [&](int pi) -> float {
                 const auto &p = props[pi];
@@ -126,11 +130,16 @@ SparsePointSet readPly(const std::string &path) {
     } else {
         // ASCII
         for (int i = 0; i < numVertices; i++) {
-            std::getline(f, line);
+            if (!std::getline(f, line))
+                throw std::runtime_error("Missing ASCII PLY vertex " +
+                                         std::to_string(i) + ": " + path);
             std::istringstream iss(line);
             std::vector<std::string> tokens;
             std::string tok;
             while (iss >> tok) tokens.push_back(tok);
+            if (tokens.size() < props.size())
+                throw std::runtime_error("Incomplete ASCII PLY vertex " +
+                                         std::to_string(i) + ": " + path);
 
             pts.xyz[i*3+0] = std::stof(tokens[ix]);
             pts.xyz[i*3+1] = std::stof(tokens[iy]);
