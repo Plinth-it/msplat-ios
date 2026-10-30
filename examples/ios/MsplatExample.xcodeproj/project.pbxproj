@@ -11,6 +11,7 @@
 		A1000020000000000000001 /* PoseCheckpointTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000023000000000000001 /* PoseCheckpointTests.swift */; };
 		A1000021000000000000001 /* Msplat in Frameworks */ = {isa = PBXBuildFile; productRef = A1000005000000000000001 /* Msplat */; };
 		A1000034000000000000001 /* MsplatExampleTests/TrainingMaskOptionsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000035000000000000001 /* MsplatExampleTests/TrainingMaskOptionsTests.swift */; };
+		A1000036000000000000001 /* MsplatExampleTests/AppLifecycleTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000037000000000000001 /* MsplatExampleTests/AppLifecycleTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -28,6 +29,7 @@
 		A1000022000000000000001 /* MsplatExampleTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = MsplatExampleTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A1000023000000000000001 /* PoseCheckpointTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = PoseCheckpointTests.swift; path = ../../swift/Tests/PoseCheckpointTests.swift; sourceTree = SOURCE_ROOT; };
 		A1000035000000000000001 /* MsplatExampleTests/TrainingMaskOptionsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MsplatExampleTests/TrainingMaskOptionsTests.swift; sourceTree = SOURCE_ROOT; };
+		A1000037000000000000001 /* MsplatExampleTests/AppLifecycleTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MsplatExampleTests/AppLifecycleTests.swift; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -94,6 +96,7 @@
 			children = (
 				A1000023000000000000001 /* PoseCheckpointTests.swift */,
 				A1000035000000000000001 /* MsplatExampleTests/TrainingMaskOptionsTests.swift */,
+				A1000037000000000000001 /* MsplatExampleTests/AppLifecycleTests.swift */,
 			);
 			name = MsplatExampleTests;
 			sourceTree = "<group>";
@@ -218,6 +221,7 @@
 			files = (
 				A1000020000000000000001 /* PoseCheckpointTests.swift in Sources */,
 				A1000034000000000000001 /* MsplatExampleTests/TrainingMaskOptionsTests.swift in Sources */,
+				A1000036000000000000001 /* MsplatExampleTests/AppLifecycleTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
