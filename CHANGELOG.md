@@ -15,6 +15,9 @@
   Resuming a PLY whose SH degree differs from the configured degree is rejected.
 - A Nerfstudio `transforms.json` without `cx`/`cy` now uses the image center,
   matching the Polycam adapter, instead of a principal point of zero.
+- The CLI and Python bindings train on the masked training target and report
+  masked evaluation metrics, matching the Swift and C APIs. They previously
+  decoded Nerfstudio `mask_path` masks and then ignored them.
 - Added ABI v18 size-checked appearance options with mutually exclusive none,
   RGB-gain, and PPISP modes. The current PPISP phase covers per-frame log2
   exposure and color homography only. Existing photometric-gain properties and

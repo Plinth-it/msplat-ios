@@ -2,6 +2,7 @@
 // Ported from https://github.com/Po-Hsun-Su/pytorch-ssim (MIT)
 
 #include "ssim.hpp"
+#include "input_data.hpp"
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -313,4 +314,27 @@ float ssim_eval(const MTensor& rendered, const MTensor& gt,
         ? static_cast<double>(input.coverageUnits) * C
         : count;
     return static_cast<float>(ssim_sum / denominator);
+}
+
+TargetMetrics coverage_target_metrics(const MTensor& renderedCpu,
+                                      const CameraTrainingTarget& target) {
+    if (!target.image)
+        throw std::runtime_error("Evaluation target has no RGB image");
+    MTensor gtCpu = target.image->cpu();
+    MTensor maskCpu;
+    const MTensor* coverageMask = nullptr;
+    if (target.coverageMask) {
+        if (target.coverageMask == target.image) {
+            // Preserve the packed-alpha marker across the GPU-to-CPU copy.
+            coverageMask = &gtCpu;
+        } else {
+            maskCpu = target.coverageMask->cpu();
+            coverageMask = &maskCpu;
+        }
+    }
+    TargetMetrics metrics;
+    metrics.psnr = psnr(renderedCpu, gtCpu, coverageMask, target.coverageUnits);
+    metrics.ssim = ssim_eval(renderedCpu, gtCpu, coverageMask, target.coverageUnits);
+    metrics.l1 = l1_loss(renderedCpu, gtCpu, coverageMask, target.coverageUnits);
+    return metrics;
 }

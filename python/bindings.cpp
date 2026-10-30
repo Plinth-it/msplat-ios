@@ -113,11 +113,12 @@ public:
     // Both load before returning — the intrinsic correction happens in the decode.
     Camera& train_camera(size_t i) { return images.ensureLoaded(data.cameras, train_cams[i]); }
     Camera& test_camera(size_t i) { return images.ensureLoaded(data.cameras, test_cams[i]); }
-    MTensor& train_image(size_t i, int downscale) {
-        return images.gpuImage(data.cameras, train_cams[i], downscale);
+    // Training targets carry the camera's mask, if any.
+    CameraTrainingTarget train_target(size_t i, int downscale) {
+        return images.gpuTrainingTarget(data.cameras, train_cams[i], downscale);
     }
-    MTensor& test_image(size_t i, int downscale) {
-        return images.gpuImage(data.cameras, test_cams[i], downscale);
+    CameraTrainingTarget test_target(size_t i, int downscale) {
+        return images.gpuTrainingTarget(data.cameras, test_cams[i], downscale, false);
     }
 
     size_t num_train() const { return train_cams.size(); }
@@ -210,13 +211,13 @@ public:
         current_step++;
         size_t cam_idx = next_camera();
         int ds = model->getDownscaleFactor(current_step);
-        MTensor &gt = dataset_ptr->train_image(cam_idx, ds);
+        const CameraTrainingTarget target = dataset_ptr->train_target(cam_idx, ds);
         Camera &cam = dataset_ptr->train_camera(cam_idx);
 
         auto t0 = std::chrono::high_resolution_clock::now();
 
         model->fullIteration(cam, dataset_ptr->train_cams[cam_idx],
-                             current_step, gt, config.ssim_weight);
+                             current_step, target, config.ssim_weight);
         model->schedulersStep(current_step);
         model->afterTrain(current_step);
         msplat_commit();
@@ -271,11 +272,12 @@ public:
 
             MTensor rgb_cpu = rgb.cpu();
             int ds = model->getDownscaleFactor(config.iterations);
-            MTensor gt_cpu = dataset_ptr->test_image(i, ds).cpu();
+            const TargetMetrics metrics =
+                coverage_target_metrics(rgb_cpu, dataset_ptr->test_target(i, ds));
 
-            sum_psnr += psnr(rgb_cpu, gt_cpu);
-            sum_ssim += ssim_eval(rgb_cpu, gt_cpu);
-            sum_l1 += l1_loss(rgb_cpu, gt_cpu);
+            sum_psnr += metrics.psnr;
+            sum_ssim += metrics.ssim;
+            sum_l1 += metrics.l1;
         }
 
         nb::dict result;
