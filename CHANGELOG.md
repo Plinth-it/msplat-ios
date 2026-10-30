@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Hardened the point-cloud PLY reader. Vertex counts are parsed as 64-bit
+  values and bounded by the remaining file bytes before allocation, all eight
+  PLY scalar types advance binary records, elements declared before the
+  vertices are skipped, CRLF headers are accepted, and float colors are clamped
+  and rounded. Previously a short file could declare a count that overflowed
+  the allocation size or reserved gigabytes before the truncation check.
+- `--resume` now restores the saved step. The Gaussian PLY loader read a step
+  comment that the writer never emitted, so every resume restarted at step 1.
+  The loader also locates properties by name, requires float data and a
+  supported SH layout, checks every read, and bounds the count by file size.
+  Resuming a PLY whose SH degree differs from the configured degree is rejected.
 - Added ABI v18 size-checked appearance options with mutually exclusive none,
   RGB-gain, and PPISP modes. The current PPISP phase covers per-frame log2
   exposure and color homography only. Existing photometric-gain properties and

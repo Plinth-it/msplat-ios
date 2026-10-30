@@ -1010,6 +1010,9 @@ int Model::loadPly(const std::string &filename){
         throw std::runtime_error("PLY Gaussian population is outside the supported range");
     if (maxGaussians > 0 && g.means.size(0) > maxGaussians)
         throw std::runtime_error("PLY Gaussian population exceeds maxGaussians");
+    // The kernels index spherical harmonics by the configured degree.
+    if (g.featuresRest.size(1) != numShBases(configuredSHDegree) - 1)
+        throw std::runtime_error("PLY spherical-harmonics degree does not match the configured shDegree");
     means = g.means;
     scales = g.scales;
     quats = g.quats;
