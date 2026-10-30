@@ -324,6 +324,20 @@ foreach(section_name IN ITEMS raster_helper raster_forward_chunked)
     require_absent("${${section_name}}" "if (done || !inside) continue;"
         "${section_name} per-thread skip that bypasses the completion vote")
 endforeach()
+# Every rasterizer stages only Gaussians that can blend a pixel of its block.
+# The shared test is conservative, which keeps forward and backward in
+# agreement about each pixel's contributors.
+foreach(section_name IN ITEMS
+        raster_helper raster_forward_chunked
+        raster_backward raster_backward_chunked)
+    require_contains("${${section_name}}" "keep = raster_may_blend_rect("
+        "${section_name} conservative block culling")
+    require_contains("${${section_name}}"
+        "const uint slot = raster_stage_slot(keep, tr, segment_counts);"
+        "${section_name} in-order staging")
+    require_contains("${${section_name}}" "index_batch[slot] = idx;"
+        "${section_name} original intersection index")
+endforeach()
 foreach(width IN ITEMS "8 * 8" "16 * 8" "16 * 16")
     string(REPLACE " " "" width_label "${width}")
     string(REPLACE "*" "x" width_label "${width_label}")

@@ -12,10 +12,11 @@
 #include <string>
 #include <vector>
 
-// Checks the exact raster footprint shared by tile counting and scatter: every
-// pixel the rasterizers can blend must lie in an emitted tile. The probe kernel
-// is compiled together with the production shader source so it calls the same
-// footprint helpers that both intersection passes use.
+// Checks the exact raster footprint shared by tile counting and scatter, and
+// the 8x8 block culling inside the rasterizers: every pixel the rasterizers can
+// blend must lie in an emitted tile and in a kept block. The probe kernels are
+// compiled together with the production shader source so they call the same
+// helpers as the production kernels.
 
 namespace {
 
@@ -41,6 +42,11 @@ constexpr uint32_t kHeight = 96;
 constexpr uint32_t kTilesX = kWidth / kTileSize;
 constexpr uint32_t kTilesY = kHeight / kTileSize;
 constexpr uint32_t kMaskWords = (kTilesX * kTilesY + 31) / 32;
+// Rasterizer threadgroups cull per 8x8 pixel block.
+constexpr uint32_t kBlockSize = 8;
+constexpr uint32_t kBlocksX = kWidth / kBlockSize;
+constexpr uint32_t kBlocksY = kHeight / kBlockSize;
+constexpr uint32_t kBlockMaskWords = (kBlocksX * kBlocksY + 31) / 32;
 
 constexpr const char* kProbeSource = R"(
 kernel void raster_footprint_probe_kernel(
@@ -73,6 +79,34 @@ kernel void raster_footprint_probe_kernel(
         for (uint tile_x = column_begin; tile_x < column_end; ++tile_x) {
             const uint bit = tile_y * tiles.x + tile_x;
             mask[bit / 32u] |= 1u << (bit % 32u);
+        }
+    }
+}
+
+kernel void raster_block_probe_kernel(
+    constant float* centers   [[buffer(0)]],
+    constant float* conics    [[buffer(1)]],
+    constant float* opacities [[buffer(2)]],
+    constant uint2& blocks    [[buffer(3)]],
+    device uint* masks        [[buffer(4)]],
+    constant uint& count      [[buffer(5)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= count) return;
+    const float2 center = float2(centers[2 * idx], centers[2 * idx + 1]);
+    const float3 conic = float3(
+        conics[3 * idx], conics[3 * idx + 1], conics[3 * idx + 2]);
+    const uint words = (blocks.x * blocks.y + 31u) / 32u;
+    device uint* mask = masks + idx * words;
+    for (uint block_y = 0; block_y < blocks.y; ++block_y) {
+        for (uint block_x = 0; block_x < blocks.x; ++block_x) {
+            const float2 block_min = float2(block_x * 8u, block_y * 8u);
+            if (raster_may_blend_rect(
+                    center, conic, opacities[idx],
+                    block_min, block_min + float2(7.f))) {
+                const uint bit = block_y * blocks.x + block_x;
+                mask[bit / 32u] |= 1u << (bit % 32u);
+            }
         }
     }
 }
@@ -201,6 +235,16 @@ void checkRasterFootprint(id<MTLDevice> device, const char* sourcePath) {
         [device newComputePipelineStateWithFunction:function error:&error];
     if (!pipeline) throw metalError("Failed to create the probe pipeline", error);
     ScopedObjCRelease pipelineOwner{pipeline};
+    id<MTLFunction> blockFunction =
+        [library newFunctionWithName:@"raster_block_probe_kernel"];
+    CHECK(blockFunction != nil);
+    ScopedObjCRelease blockFunctionOwner{blockFunction};
+    id<MTLComputePipelineState> blockPipeline =
+        [device newComputePipelineStateWithFunction:blockFunction error:&error];
+    if (!blockPipeline) {
+        throw metalError("Failed to create the block probe pipeline", error);
+    }
+    ScopedObjCRelease blockPipelineOwner{blockPipeline};
     id<MTLCommandQueue> queue = [device newCommandQueue];
     CHECK(queue != nil);
     ScopedObjCRelease queueOwner{queue};
@@ -235,6 +279,11 @@ void checkRasterFootprint(id<MTLDevice> device, const char* sourcePath) {
     id<MTLBuffer> maskBuffer =
         makeBuffer(zeroMasks.data(), zeroMasks.size() * sizeof(uint32_t));
     ScopedObjCRelease maskOwner{maskBuffer};
+    const std::vector<uint32_t> zeroBlockMasks(
+        static_cast<size_t>(count) * kBlockMaskWords, 0u);
+    id<MTLBuffer> blockMaskBuffer = makeBuffer(
+        zeroBlockMasks.data(), zeroBlockMasks.size() * sizeof(uint32_t));
+    ScopedObjCRelease blockMaskOwner{blockMaskBuffer};
 
     id<MTLCommandBuffer> command = [queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
@@ -246,6 +295,12 @@ void checkRasterFootprint(id<MTLDevice> device, const char* sourcePath) {
     [encoder setBytes:tiles length:sizeof(tiles) atIndex:3];
     [encoder setBuffer:maskBuffer offset:0 atIndex:4];
     [encoder setBytes:&count length:sizeof(count) atIndex:5];
+    [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
+        threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+    [encoder setComputePipelineState:blockPipeline];
+    const uint32_t blocks[2] = {kBlocksX, kBlocksY};
+    [encoder setBytes:blocks length:sizeof(blocks) atIndex:3];
+    [encoder setBuffer:blockMaskBuffer offset:0 atIndex:4];
     [encoder dispatchThreads:MTLSizeMake(count, 1, 1)
         threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
     [encoder endEncoding];
@@ -325,6 +380,47 @@ void checkRasterFootprint(id<MTLDevice> device, const char* sourcePath) {
         thresholdTiles += __builtin_popcount(thresholdMask[word]);
     }
     CHECK(thresholdTiles <= 1);
+
+    // Block culling must keep every 8x8 block holding a blending pixel, or a
+    // forward and backward pass could disagree about a pixel's contributors.
+    const uint32_t* blockMasks =
+        static_cast<const uint32_t*>(blockMaskBuffer.contents);
+    uint64_t keptBlocks = 0;
+    uint64_t blendingBlocks = 0;
+    uint64_t droppedBlocks = 0;
+    for (uint32_t index = 0; index < count; ++index) {
+        const Footprint& footprint = footprints[index];
+        const uint32_t* mask =
+            blockMasks + static_cast<size_t>(index) * kBlockMaskWords;
+        for (uint32_t blockY = 0; blockY < kBlocksY; ++blockY) {
+            for (uint32_t blockX = 0; blockX < kBlocksX; ++blockX) {
+                const uint32_t bit = blockY * kBlocksX + blockX;
+                const bool kept = (mask[bit / 32] >> (bit % 32)) & 1u;
+                keptBlocks += kept;
+                bool blends = false;
+                for (uint32_t y = blockY * kBlockSize;
+                     !blends && y < (blockY + 1) * kBlockSize; ++y) {
+                    for (uint32_t x = blockX * kBlockSize;
+                         x < (blockX + 1) * kBlockSize; ++x) {
+                        if (pixelBlends(footprint, float(x), float(y), 0.0f)) {
+                            blends = true;
+                            break;
+                        }
+                    }
+                }
+                blendingBlocks += blends;
+                if (blends && !kept) {
+                    ++droppedBlocks;
+                    std::cerr << "dropped block (" << blockX << ", " << blockY
+                              << ") for Gaussian " << index << '\n';
+                }
+            }
+        }
+    }
+    std::cout << "block culling: " << keptBlocks << " blocks kept, "
+              << blendingBlocks << " contain a blending pixel\n";
+    CHECK(droppedBlocks == 0);
+    CHECK(keptBlocks <= blendingBlocks + blendingBlocks / 50);
 }
 
 }  // namespace

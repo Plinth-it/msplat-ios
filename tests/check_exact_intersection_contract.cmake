@@ -189,7 +189,7 @@ require_contains("${metal_source}"
     "constant uint64_t* sorted_keys    [[buffer(0)]]"
     "packing sorted-key input")
 string(REGEX MATCHALL
-    "id_batch\\[tr\\] = \\(int32_t\\)\\(sorted_keys\\[idx\\] & 0xFFFFFFFFu\\)"
+    "id_batch\\[slot\\] = \\(int32_t\\)\\(sorted_keys\\[idx\\] & 0xFFFFFFFFu\\)"
     backward_id_extracts "${metal_source}")
 list(LENGTH backward_id_extracts backward_id_extract_count)
 if(NOT backward_id_extract_count EQUAL 2)

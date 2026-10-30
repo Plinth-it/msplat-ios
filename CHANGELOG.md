@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Forward and backward rasterization stage only the Gaussians that can blend a
+  pixel of their own 8x8 block. Each 16x16 tile's list is shared by its four
+  8x8 threadgroups, and on garden fewer than half of a tile's Gaussians reach
+  any given block. The test bounds the per-pixel blend criterion from above with
+  a small slack, so a skipped Gaussian fails at every pixel of the block:
+  rendered output is bit-identical and gradients match to float rounding. Each
+  SIMD-group compacts its kept Gaussians in order within its own batch
+  segment, adding no barrier, and staged entries carry their intersection index
+  so contributor indices are unchanged. On an M4 Pro (garden) `rast_fwd` and
+  `rast_bwd` each fell by about a quarter and the training step from 28.9 to
+  25.2 ms at 1297x840 and from 3.7 to 3.2 ms at 324x210.
 - Forward rasterization, monolithic and chunked, stops loading Gaussian
   batches once every pixel of the threadgroup has saturated or lies outside the
   image. Each SIMD-group publishes a completion vote after its batch, and the
