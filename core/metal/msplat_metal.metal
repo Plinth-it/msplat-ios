@@ -1171,21 +1171,95 @@ inline int warp_reduce_all_or(int val, const int warp_size) {
     return simd_or(val);
 }
 
-inline float3 warpSum3(float3 val, const int warp_size, const uint lane) {
-    val.x = simd_sum(val.x);
-    val.y = simd_sum(val.y);
-    val.z = simd_sum(val.z);
-    return val;
+// Backward raster accumulates nine gradients per Gaussian: RGB (0-2), conic
+// (3-5), mean (6-7) and opacity logit (8).
+constant constexpr uint RASTER_GRADIENT_COUNT = 9;
+
+// One halving step of a 32-lane reduce-scatter. Lanes paired by `mask` split
+// their N live components: the lower lane keeps the first ceil(N/2), the upper
+// lane the rest, and each adds its partner's copy of the half it keeps.
+template <uint N>
+inline void raster_gradient_scatter_step(
+    thread float* values, ushort lane, ushort mask
+) {
+    constexpr uint M = (N + 1) / 2;
+    const bool upper = (lane & mask) != 0;
+    for (uint i = 0; i < M; ++i) {
+        const float low = values[i];
+        const float high = M + i < N ? values[M + i] : 0.0f;
+        values[i] = (upper ? high : low) +
+            simd_shuffle_xor(upper ? low : high, mask);
+    }
 }
 
-inline float2 warpSum2(float2 val, const int warp_size, const uint lane) {
-    val.x = simd_sum(val.x);
-    val.y = simd_sum(val.y);
-    return val;
+// The same lane selection applied to component indices. -1 marks a lane that
+// finishes without a component.
+template <uint N>
+inline void raster_gradient_component_step(
+    thread int* components, ushort lane, ushort mask
+) {
+    constexpr uint M = (N + 1) / 2;
+    const bool upper = (lane & mask) != 0;
+    for (uint i = 0; i < M; ++i) {
+        const int high = M + i < N ? components[M + i] : -1;
+        components[i] = upper ? high : components[i];
+    }
 }
 
-inline float warpSum(float val, const int warp_size, const uint lane) {
-    return simd_sum(val);
+// Component whose SIMD-group total raster_gradient_reduce_scatter leaves on
+// this lane, or -1. Loop-invariant, so kernels compute it once.
+inline int raster_gradient_component(ushort lane) {
+    int components[RASTER_GRADIENT_COUNT] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+    raster_gradient_component_step<9>(components, lane, 16);
+    raster_gradient_component_step<5>(components, lane, 8);
+    raster_gradient_component_step<3>(components, lane, 4);
+    raster_gradient_component_step<2>(components, lane, 2);
+    raster_gradient_component_step<1>(components, lane, 1);
+    return components[0];
+}
+
+// Sums the nine gradients across a 32-lane SIMD-group with 5+3+2+1+1 = 12
+// shuffles instead of nine full reductions, leaving each total on a distinct
+// lane so all nine atomics issue as one SIMD instruction.
+inline float raster_gradient_reduce_scatter(
+    thread float* values, ushort lane
+) {
+    raster_gradient_scatter_step<9>(values, lane, 16);
+    raster_gradient_scatter_step<5>(values, lane, 8);
+    raster_gradient_scatter_step<3>(values, lane, 4);
+    raster_gradient_scatter_step<2>(values, lane, 2);
+    raster_gradient_scatter_step<1>(values, lane, 1);
+    return values[0];
+}
+
+// Gradient array element for `component` of Gaussian 0, plus the per-Gaussian
+// stride. Loop-invariant per lane; a lane without a component gets v_opacity.
+inline device atomic_float* raster_gradient_base(
+    int component,
+    device atomic_float* v_rgb, device atomic_float* v_conic,
+    device atomic_float* v_xy, device atomic_float* v_opacity,
+    thread int& stride
+) {
+    if (component >= 0 && component < 3) {
+        stride = 3;
+        return v_rgb + component;
+    }
+    if (component >= 3 && component < 6) {
+        stride = 3;
+        return v_conic + (component - 3);
+    }
+    if (component >= 6 && component < 8) {
+        stride = 2;
+        return v_xy + (component - 6);
+    }
+    stride = 1;
+    return v_opacity;
+}
+
+// RGB components carry the forward clamp_min gate: a shifted color below zero
+// has no gradient.
+inline bool raster_gradient_lane_writes(int component, float3 shifted_rgb) {
+    return component >= 3 || (component >= 0 && shifted_rgb[component] >= 0.f);
 }
 
 // Mask layout is (byte stride per pixel, coverage byte offset). Camera cache
@@ -1254,8 +1328,9 @@ kernel void rasterize_backward_kernel(
             rendered_alpha > target_alpha ? 1.0f :
             (rendered_alpha < target_alpha ? -1.0f : 0.0f));
     }
-    // the contribution from gaussians behind the current one
-    float3 buffer = {0.f, 0.f, 0.f};
+    // the contribution from gaussians behind the current one, projected onto
+    // v_out: the gradients only consume dot(buffer, v_out)
+    float buffer_dot = 0.f;
     // index of last gaussian to contribute to this pixel
     const int bin_final = inside? final_index[pix_id] : 0;
 
@@ -1274,7 +1349,14 @@ kernel void rasterize_backward_kernel(
     const float3 v_out = read_packed_float3(v_output, pix_id);
     // Hoist loop-invariant background load and T_final * bg product
     const float3 bg = {background[0], background[1], background[2]};
-    const float3 T_final_bg = T_final * bg;
+    const float T_final_bg_dot = dot(T_final * bg, v_out);
+
+    // Each lane owns at most one of the nine SIMD-group gradient totals.
+    const ushort gradient_lane = (ushort)wr;
+    const int gradient_component = raster_gradient_component(gradient_lane);
+    int gradient_stride;
+    device atomic_float* gradient_base = raster_gradient_base(
+        gradient_component, v_rgb, v_conic, v_xy, v_opacity, gradient_stride);
 
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing
@@ -1364,7 +1446,7 @@ kernel void rasterize_backward_kernel(
             }
 
             // RGB and the Gaussian ID are unused when the whole SIMDgroup is
-            // inactive. Only RGB is needed outside lane 0.
+            // inactive. The scattered gradient lanes need both.
             float3 b_rgb = float3(0.f);
             int32_t b_id = 0;
             if (wr == 0) {
@@ -1372,6 +1454,7 @@ kernel void rasterize_backward_kernel(
                 b_id = id_batch[t];
             }
             b_rgb = simd_broadcast(b_rgb, 0);
+            b_id = simd_broadcast(b_id, 0);
 
             float3 v_rgb_local = {0.f, 0.f, 0.f};
             float3 v_conic_local = {0.f, 0.f, 0.f};
@@ -1388,13 +1471,13 @@ kernel void rasterize_backward_kernel(
                 const float fac = alpha * T;
                 v_rgb_local = fac * v_out;
 
-                const float3 rgb = max(b_rgb, 0.f);
+                const float rgb_dot = dot(max(b_rgb, 0.f), v_out);
                 // contribution from this pixel + background
                 const float v_alpha =
-                    dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out) +
+                    fma(rgb_dot, T, -ra * (buffer_dot + T_final_bg_dot)) +
                     v_alpha_pixel * T_final * ra;
                 // update the running sum
-                buffer = fma(rgb, fac, buffer);
+                buffer_dot = fma(rgb_dot, fac, buffer_dot);
 
                 // The cap makes alpha locally constant in sigma and opacity,
                 // but it does not remove the color gradient above.
@@ -1412,25 +1495,18 @@ kernel void rasterize_backward_kernel(
                 }
             }
 
-            v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
-            v_conic_local = warpSum3(v_conic_local, warp_size, wr);
-            v_xy_local = warpSum2(v_xy_local, warp_size, wr);
-            v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
-
-            if (wr == 0) {
-                // Fused clamp_min backward: shifted colors below zero have no gradient.
-                if (b_rgb.x >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
-                if (b_rgb.y >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 1, v_rgb_local.y, memory_order_relaxed);
-                if (b_rgb.z >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 2, v_rgb_local.z, memory_order_relaxed);
-
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 0, v_conic_local.x, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 1, v_conic_local.y, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 2, v_conic_local.z, memory_order_relaxed);
-
-                atomic_fetch_add_explicit(v_xy + 2*b_id + 0, v_xy_local.x, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_xy + 2*b_id + 1, v_xy_local.y, memory_order_relaxed);
-
-                atomic_fetch_add_explicit(v_opacity + b_id, v_opacity_local, memory_order_relaxed);
+            float gradients[RASTER_GRADIENT_COUNT] = {
+                v_rgb_local.x, v_rgb_local.y, v_rgb_local.z,
+                v_conic_local.x, v_conic_local.y, v_conic_local.z,
+                v_xy_local.x, v_xy_local.y, v_opacity_local,
+            };
+            const float gradient_total =
+                raster_gradient_reduce_scatter(gradients, gradient_lane);
+            // Fused clamp_min backward: shifted colors below zero have no gradient.
+            if (raster_gradient_lane_writes(gradient_component, b_rgb)) {
+                atomic_fetch_add_explicit(
+                    gradient_base + gradient_stride * b_id, gradient_total,
+                    memory_order_relaxed);
             }
         }
     }
@@ -4254,9 +4330,6 @@ kernel void rasterize_backward_chunked_kernel(
     // Initialize T and buffer as if monolithic backward just finished all chunks > k
     // T = prefix_T[k] * chunk_T[k] = absolute transmittance after chunk k
     float T = pT_k * cT_k;
-    // buffer = after_C[k] = weighted color contribution from all chunks after k
-    float3 buffer = aC_k;
-
     float T_final = final_Ts[pix_id];
     float v_alpha_pixel = 0.0f;
     if (inside && alpha_layout.x != 0) {
@@ -4268,8 +4341,18 @@ kernel void rasterize_backward_chunked_kernel(
             (rendered_alpha < target_alpha ? -1.0f : 0.0f));
     }
     const float3 bg = {background[0], background[1], background[2]};
-    const float3 T_final_bg = T_final * bg;
     const float3 v_out = read_packed_float3(v_output, pix_id);
+    const float T_final_bg_dot = dot(T_final * bg, v_out);
+    // buffer = after_C[k] = weighted color contribution from all chunks after
+    // k, projected onto v_out: the gradients only consume dot(buffer, v_out)
+    float buffer_dot = dot(aC_k, v_out);
+
+    // Each lane owns at most one of the nine SIMD-group gradient totals.
+    const ushort gradient_lane = (ushort)wr;
+    const int gradient_component = raster_gradient_component(gradient_lane);
+    int gradient_stride;
+    device atomic_float* gradient_base = raster_gradient_base(
+        gradient_component, v_rgb, v_conic, v_xy, v_opacity, gradient_stride);
 
     const int bin_final = inside ? chunk_final_idx[chunk_offset] : -1;
 
@@ -4361,7 +4444,7 @@ kernel void rasterize_backward_chunked_kernel(
             if (!warp_reduce_all_or(valid, warp_size)) continue;
 
             // RGB and the Gaussian ID are unused when the whole SIMDgroup is
-            // inactive. Only RGB is needed outside lane 0.
+            // inactive. The scattered gradient lanes need both.
             float3 b_rgb = float3(0.f);
             int32_t b_id = 0;
             if (wr == 0) {
@@ -4369,6 +4452,7 @@ kernel void rasterize_backward_chunked_kernel(
                 b_id = id_batch[t];
             }
             b_rgb = simd_broadcast(b_rgb, 0);
+            b_id = simd_broadcast(b_id, 0);
 
             float3 v_rgb_local = {0.f, 0.f, 0.f};
             float3 v_conic_local = {0.f, 0.f, 0.f};
@@ -4383,11 +4467,11 @@ kernel void rasterize_backward_chunked_kernel(
                 const float fac = alpha * T;
                 v_rgb_local = fac * v_out;
 
-                const float3 rgb = max(b_rgb, 0.f);
+                const float rgb_dot = dot(max(b_rgb, 0.f), v_out);
                 const float v_alpha =
-                    dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out) +
+                    fma(rgb_dot, T, -ra * (buffer_dot + T_final_bg_dot)) +
                     v_alpha_pixel * T_final * ra;
-                buffer = fma(rgb, fac, buffer);
+                buffer_dot = fma(rgb_dot, fac, buffer_dot);
 
                 if (alpha < 0.999f) {
                     const float v_sigma = -alpha * v_alpha;
@@ -4401,21 +4485,17 @@ kernel void rasterize_backward_chunked_kernel(
                 }
             }
 
-            v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
-            v_conic_local = warpSum3(v_conic_local, warp_size, wr);
-            v_xy_local = warpSum2(v_xy_local, warp_size, wr);
-            v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
-
-            if (wr == 0) {
-                if (b_rgb.x >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
-                if (b_rgb.y >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 1, v_rgb_local.y, memory_order_relaxed);
-                if (b_rgb.z >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 2, v_rgb_local.z, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 0, v_conic_local.x, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 1, v_conic_local.y, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 2, v_conic_local.z, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_xy + 2*b_id + 0, v_xy_local.x, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_xy + 2*b_id + 1, v_xy_local.y, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_opacity + b_id, v_opacity_local, memory_order_relaxed);
+            float gradients[RASTER_GRADIENT_COUNT] = {
+                v_rgb_local.x, v_rgb_local.y, v_rgb_local.z,
+                v_conic_local.x, v_conic_local.y, v_conic_local.z,
+                v_xy_local.x, v_xy_local.y, v_opacity_local,
+            };
+            const float gradient_total =
+                raster_gradient_reduce_scatter(gradients, gradient_lane);
+            if (raster_gradient_lane_writes(gradient_component, b_rgb)) {
+                atomic_fetch_add_explicit(
+                    gradient_base + gradient_stride * b_id, gradient_total,
+                    memory_order_relaxed);
             }
         }
     }

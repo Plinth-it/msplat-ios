@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- Backward rasterization reduces each Gaussian's nine screen-space gradients
+  with a 32-lane halving reduce-scatter (12 SIMD shuffles instead of nine full
+  `simd_sum` reductions), so nine lanes issue the gradient atomics as one
+  instruction instead of lane 0 issuing them serially. The running color of the
+  Gaussians behind each splat is carried as its scalar projection onto the
+  pixel's output gradient. Gradients match the previous kernels to float
+  rounding. On an M4 Pro (garden, 1297x840, 1.6M Gaussians) `rast_bwd` fell from
+  12.6 to 10.7 ms and the training step from 38.2 to 35.8 ms; physical-iPhone
+  throughput has not been measured.
 - Hardened the point-cloud PLY reader. Vertex counts are parsed as 64-bit
   values and bounded by the remaining file bytes before allocation, all eight
   PLY scalar types advance binary records, elements declared before the
