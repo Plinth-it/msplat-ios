@@ -147,6 +147,9 @@ namespace {
 // trainer operation atomic so a second trainer cannot reuse shared outputs
 // between render submission, synchronization, and readback.
 std::mutex g_trainerTransactionMutex;
+// Guarded by g_trainerTransactionMutex. The shared forward/backward GPU cache
+// is kept between trainers for reuse and released when the last one goes.
+int g_liveTrainerCount = 0;
 
 float* allocatePixels(int width, int height) {
     if (width <= 0 || height <= 0)
@@ -327,6 +330,7 @@ Trainer::Trainer(Dataset& dataset, const Config& config)
             impl->model->getDownscaleFactor(1),
             impl->includeCoverageRenderTiles());
     }
+    ++g_liveTrainerCount;
 }
 
 Trainer::~Trainer() {
@@ -334,6 +338,14 @@ Trainer::~Trainer() {
     if (impl && impl->ds)
         impl->ds->images.discardPrefetch();
     impl.reset();
+    if (--g_liveTrainerCount == 0) {
+        try {
+            cleanup_msplat_metal();
+        } catch (...) {
+            // The cache is reset even when the final sync reports a GPU
+            // failure, and a destructor has no caller to report it to.
+        }
+    }
 }
 
 Stats Trainer::step() {
@@ -884,14 +896,21 @@ MsplatStatus classifyException(const std::exception& exception,
     return fallback;
 }
 
-template <typename Fn>
+// Unserialized entry points touch only their own handle's thread-safe state
+// or caller-owned input, so they need not wait behind a training step.
+enum class CApiSerialization { Serialized, Unserialized };
+
+template <CApiSerialization Serialization = CApiSerialization::Serialized,
+          typename Fn>
 MsplatStatus guarded(MsplatErrorInfo* outError, MsplatStatus fallback,
                      Fn&& operation) noexcept {
     @try {
         try {
             // Serialize complete C API transactions.  Acquiring a mutex can
             // itself throw, so keep it inside this exception boundary too.
-            std::lock_guard<std::mutex> lock(g_cApiMutex);
+            std::unique_lock<std::mutex> lock(g_cApiMutex, std::defer_lock);
+            if constexpr (Serialization == CApiSerialization::Serialized)
+                lock.lock();
             clearError(outError);
             operation();
             return MSPLAT_STATUS_OK;
@@ -1518,7 +1537,7 @@ MsplatStatus msplat_dataset_capture_diagnostics_v7(
     size_t frameCount,
     size_t frameElementSize,
     MsplatErrorInfo* error) {
-    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+    return guarded<CApiSerialization::Unserialized>(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
         require(descriptor != nullptr, "Dataset descriptor must not be null");
         require(descriptorSize == sizeof(MsplatDatasetDescriptorV5),
                 "Dataset descriptor size does not match this msplat ABI");
@@ -1897,7 +1916,7 @@ MsplatStatus msplat_trainer_render_pose_preview_v13(
 MsplatStatus msplat_preview_frame_poll_v13(
     MsplatPreviewFrame frame, bool* outReady, MsplatErrorInfo* error) {
     if (outReady) *outReady = false;
-    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+    return guarded<CApiSerialization::Unserialized>(error, MSPLAT_STATUS_GPU_ERROR, [&] {
         require(frame != nullptr, "Preview frame must not be null");
         require(outReady != nullptr, "outReady must not be null");
         *outReady = previewFrameHandle(frame).poll();
@@ -1910,7 +1929,7 @@ MsplatStatus msplat_preview_frame_texture_v13(
     if (outTexture) *outTexture = nil;
     if (outWidth) *outWidth = 0;
     if (outHeight) *outHeight = 0;
-    return guarded(error, MSPLAT_STATUS_GPU_ERROR, [&] {
+    return guarded<CApiSerialization::Unserialized>(error, MSPLAT_STATUS_GPU_ERROR, [&] {
         require(frame != nullptr, "Preview frame must not be null");
         require(outTexture != nullptr, "outTexture must not be null");
         require(outWidth != nullptr && outHeight != nullptr,
@@ -1925,7 +1944,7 @@ MsplatStatus msplat_preview_frame_texture_v13(
 
 MsplatStatus msplat_preview_frame_destroy_v13(
     MsplatPreviewFrame frame, MsplatErrorInfo* error) {
-    return guarded(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
+    return guarded<CApiSerialization::Unserialized>(error, MSPLAT_STATUS_INTERNAL_ERROR, [&] {
         require(frame != nullptr, "Preview frame must not be null");
         delete static_cast<msplat::PreviewFrame*>(frame);
     });

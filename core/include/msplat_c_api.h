@@ -757,6 +757,9 @@ MsplatStatus msplat_trainer_render_pose_to_buffer_v2(
 MsplatStatus msplat_trainer_render_pose_preview_v13(
     MsplatTrainer t, const float camToWorld[16], int refCameraIndex,
     MsplatPreviewFrame* outFrame, MsplatErrorInfo* error);
+/// Frame poll, texture, and destroy calls do not wait for other msplat calls,
+/// so a display thread may use them while a training step is running. Calls on
+/// one frame handle must still not overlap its destroy.
 /// Returns OK with outReady=false while pending, OK/true when complete, or a
 /// structured GPU error when the submitted command buffer failed.
 MsplatStatus msplat_preview_frame_poll_v13(

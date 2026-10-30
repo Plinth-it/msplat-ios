@@ -23,6 +23,12 @@
 - Densification that prunes every Gaussian now fails with an explicit error,
   and rendering or training an empty population is rejected before any GPU
   dispatch instead of encoding zero-width threadgroups.
+- Preview-frame poll, texture, and destroy calls and capture diagnostics no
+  longer wait behind the global C API lock, so releasing a preview on the main
+  thread does not block for a training step.
+- Destroying the last trainer releases the shared GPU transient cache
+  (image-sized SSIM, raster, and intersection buffers) instead of keeping it
+  resident until an explicit `msplatCleanup()`.
 - Added ABI v18 size-checked appearance options with mutually exclusive none,
   RGB-gain, and PPISP modes. The current PPISP phase covers per-frame log2
   exposure and color homography only. Existing photometric-gain properties and

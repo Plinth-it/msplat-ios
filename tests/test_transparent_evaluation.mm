@@ -102,6 +102,7 @@ msplat::EvalMetrics checkEvaluation(
     msplat::Trainer trainer(dataset, config);
     const msplat::PixelBuffer pixels = trainer.render(0, true);
     CHECK(pixels.width == kWidth && pixels.height == kHeight);
+    CHECK(msplat_cached_tensor_bytes() > 0);
     MTensor rendered({kHeight, kWidth, 3}, DType::Float32);
     std::memcpy(rendered.data_ptr(), pixels.data, rendered.nbytes());
 
@@ -154,6 +155,8 @@ void checkTransparentEvaluation() {
             }
         }
     }
+    // The last trainer releases the shared GPU transient cache.
+    CHECK(msplat_cached_tensor_bytes() == 0);
     imwriteRGB(imagePath, source);
     const RGBA8Image decoded = imreadRGBA8(
         imagePath, inspectImageSource(imagePath), kWidth, kHeight, false);
