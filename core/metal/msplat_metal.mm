@@ -2547,6 +2547,7 @@ static void render_pipeline(
         const uint32_t coverageRenderTileStrideDisabled = 0u;
         ENC_SCALAR(enc, coverageRenderTileStrideDisabled, 25);
         ENC_SCALAR(enc, tileCountMode, 26);
+        ENC_BUF(enc, opacities, 27);
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -2662,6 +2663,7 @@ static void render_pipeline(
         ENC_BUF(enc, g_tcache.tile_scatter_counters, 13);
         const uint32_t coverageRenderTileStrideDisabled = 0u;
         ENC_SCALAR(enc, coverageRenderTileStrideDisabled, 14);
+        ENC_BUF(enc, conics, 15);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(scatterTpg, 1, 1)];
 
@@ -3412,6 +3414,7 @@ static MTensor msplat_train_step_locked(
         ENC_BUF(enc, coverageRenderTileBuffer, 24);
         ENC_SCALAR(enc, coverageRenderTileStride, 25);
         ENC_SCALAR(enc, tileCountMode, 26);
+        ENC_BUF(enc, opacities, 27);
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -3597,6 +3600,7 @@ static MTensor msplat_train_step_locked(
         ENC_BUF(enc, projected_opacities, 12);
         ENC_BUF(enc, coverageRenderTileBuffer, 13);
         ENC_SCALAR(enc, coverageRenderTileStride, 14);
+        ENC_BUF(enc, conics, 15);
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(scatterTpg, 1, 1)];
 

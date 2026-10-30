@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -257,6 +258,136 @@ void checkExactSort(id<MTLDevice> device, const char* metallibPath) {
     }
 }
 
+// The radix path skips key bytes that are constant within a tile, so the
+// number of performed passes, and with it the buffer holding the result,
+// depends on the keys. Cover an even and an odd pass count, a tile with no
+// varying byte, and a fully random tile.
+void checkRadixVaryingBytes(id<MTLDevice> device, const char* metallibPath) {
+    constexpr std::array<uint32_t, 4> counts = {5'000, 3'001, 2'049, 9'000};
+    std::array<int32_t, counts.size()> offsets = {};
+    std::array<uint32_t, counts.size()> sortableTiles = {};
+    const msplat::TileIntersectionLayout layout =
+        msplat::buildTileIntersectionLayout(
+            counts.data(), offsets.data(), counts.size(), nullptr,
+            sortableTiles.data());
+    CHECK(layout.largeTileCount == counts.size());
+
+    const auto depthKey = [](float depth, uint32_t id) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &depth, sizeof(bits));
+        return (static_cast<uint64_t>(bits) << 32) | id;
+    };
+    std::vector<uint64_t> keys;
+    for (uint32_t tile = 0; tile < counts.size(); ++tile) {
+        for (uint32_t local = 0; local < counts[tile]; ++local) {
+            const uint64_t mixed = mixedKey(tile, local);
+            switch (tile) {
+            case 0:
+                // Depths in [2, 4) share the exponent byte; IDs below 2^20
+                // leave the top ID byte zero: six varying bytes.
+                keys.push_back(depthKey(
+                    2.0f + float(mixed >> 40) * 0x1p-23f,
+                    uint32_t(mixed) & 0xFFFFFu));
+                break;
+            case 1:
+                // Five varying bytes: the result ends in the scratch range.
+                keys.push_back(depthKey(
+                    2.0f + float(mixed >> 40) * 0x1p-23f,
+                    uint32_t(mixed) & 0xFFFFu));
+                break;
+            case 2:
+                keys.push_back(depthKey(3.0f, 77u));
+                break;
+            default:
+                keys.push_back(mixed);
+                break;
+            }
+        }
+    }
+    std::vector<uint64_t> expectedKeys = keys;
+    size_t start = 0;
+    for (uint32_t count : counts) {
+        std::sort(expectedKeys.begin() + static_cast<ptrdiff_t>(start),
+                  expectedKeys.begin() + static_cast<ptrdiff_t>(start + count));
+        start += count;
+    }
+
+    NSString* path = [NSString stringWithUTF8String:metallibPath];
+    NSError* error = nil;
+    id<MTLLibrary> library =
+        [device newLibraryWithURL:[NSURL fileURLWithPath:path] error:&error];
+    if (!library) throw metalError("Failed to load the test metallib", error);
+    ScopedObjCRelease libraryOwner{library};
+    id<MTLFunction> function =
+        [library newFunctionWithName:@"radix_sort_per_tile_kernel"];
+    CHECK(function != nil);
+    ScopedObjCRelease functionOwner{function};
+    id<MTLComputePipelineState> pipeline =
+        [device newComputePipelineStateWithFunction:function error:&error];
+    if (!pipeline) {
+        throw metalError("Failed to create the general-sort pipeline", error);
+    }
+    ScopedObjCRelease pipelineOwner{pipeline};
+
+    std::vector<uint64_t> scratch(keys.size(), 0xCDCDCDCDCDCDCDCDULL);
+    std::array<int32_t, counts.size() * 2> bins = {};
+    uint32_t overflow = 0;
+    id<MTLBuffer> offsetsBuffer = makeBuffer(
+        device, offsets.data(), offsets.size() * sizeof(offsets[0]));
+    ScopedObjCRelease offsetsBufferOwner{offsetsBuffer};
+    id<MTLBuffer> keysBuffer = makeBuffer(
+        device, keys.data(), keys.size() * sizeof(keys[0]));
+    ScopedObjCRelease keysBufferOwner{keysBuffer};
+    id<MTLBuffer> scratchBuffer = makeBuffer(
+        device, scratch.data(), scratch.size() * sizeof(scratch[0]));
+    ScopedObjCRelease scratchBufferOwner{scratchBuffer};
+    id<MTLBuffer> binsBuffer = makeBuffer(
+        device, bins.data(), bins.size() * sizeof(bins[0]));
+    ScopedObjCRelease binsBufferOwner{binsBuffer};
+    id<MTLBuffer> overflowBuffer =
+        makeBuffer(device, &overflow, sizeof(overflow));
+    ScopedObjCRelease overflowBufferOwner{overflowBuffer};
+    id<MTLBuffer> sortableTilesBuffer = makeBuffer(
+        device, sortableTiles.data(),
+        sortableTiles.size() * sizeof(sortableTiles[0]));
+    ScopedObjCRelease sortableTilesBufferOwner{sortableTilesBuffer};
+
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+    CHECK(queue != nil);
+    ScopedObjCRelease queueOwner{queue};
+    id<MTLCommandBuffer> commandBuffer = [queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder =
+        [commandBuffer computeCommandEncoder];
+    const uint32_t numTiles = static_cast<uint32_t>(counts.size());
+    const uint32_t capacity = layout.totalCount;
+    const uint32_t generalTileCount = layout.largeTileCount;
+    const uint32_t generalTileOffset = 0;
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:offsetsBuffer offset:0 atIndex:0];
+    [encoder setBuffer:keysBuffer offset:0 atIndex:1];
+    [encoder setBuffer:scratchBuffer offset:0 atIndex:2];
+    [encoder setBytes:&numTiles length:sizeof(numTiles) atIndex:3];
+    [encoder setBuffer:binsBuffer offset:0 atIndex:4];
+    [encoder setBytes:&capacity length:sizeof(capacity) atIndex:5];
+    [encoder setBuffer:overflowBuffer offset:0 atIndex:6];
+    [encoder setBuffer:sortableTilesBuffer offset:0 atIndex:7];
+    [encoder setBytes:&generalTileCount
+                length:sizeof(generalTileCount) atIndex:8];
+    [encoder setBytes:&generalTileOffset
+                length:sizeof(generalTileOffset) atIndex:9];
+    [encoder dispatchThreadgroups:MTLSizeMake(generalTileCount, 1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder endEncoding];
+    [commandBuffer commit];
+    [commandBuffer waitUntilCompleted];
+    CHECK(commandBuffer.status == MTLCommandBufferStatusCompleted);
+
+    const auto* sortedKeys =
+        static_cast<const uint64_t*>(keysBuffer.contents);
+    CHECK(std::equal(expectedKeys.begin(), expectedKeys.end(), sortedKeys));
+    CHECK(*static_cast<const uint32_t*>(overflowBuffer.contents) == 0);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -271,6 +402,7 @@ int main(int argc, char** argv) {
                 return 77;
             }
             checkExactSort(device, argv[1]);
+            checkRadixVaryingBytes(device, argv[1]);
             return 0;
         } catch (const std::exception& error) {
             std::cerr << error.what() << '\n';

@@ -2,6 +2,66 @@
 
 ## Unreleased
 
+- Forward and backward rasterization evaluate every staged Gaussian on every
+  lane and blend a missed pixel with alpha 0, which leaves transmittance, the
+  running color, and every gradient unchanged, instead of branching out per
+  lane. Backward keeps its whole-SIMD-group skip. The per-pixel exponent is
+  now one shared helper evaluated in safe math mode: hoisting it in the
+  previous backward kernel alone moved gradients by up to 1.8e-4 relative,
+  because fast math reassociated its products differently around the gradient
+  terms and forward and backward could then disagree on a pixel at the 1/255
+  threshold. Forward output changes only by float rounding (at most 1e-6 in
+  color on random scenes, contributor indices unchanged), and gradients match
+  to float rounding. On an M4 Pro (garden) `rast_bwd` fell by 12% and the step
+  from 25.4 to 24.1 ms at 1297x840, and from 3.23 to 3.12 ms at 324x210.
+- Forward and backward rasterization stage only the Gaussians that can blend a
+  pixel of their own 8x8 block. Each 16x16 tile's list is shared by its four
+  8x8 threadgroups, and on garden fewer than half of a tile's Gaussians reach
+  any given block. The test bounds the per-pixel blend criterion from above with
+  a small slack, so a skipped Gaussian fails at every pixel of the block:
+  rendered output is bit-identical and gradients match to float rounding. Each
+  SIMD-group compacts its kept Gaussians in order within its own batch
+  segment, adding no barrier, and staged entries carry their intersection index
+  so contributor indices are unchanged. On an M4 Pro (garden) `rast_fwd` and
+  `rast_bwd` each fell by about a quarter and the training step from 28.9 to
+  25.2 ms at 1297x840 and from 3.7 to 3.2 ms at 324x210.
+- Forward rasterization, monolithic and chunked, stops loading Gaussian
+  batches once every pixel of the threadgroup has saturated or lies outside the
+  image. Each SIMD-group publishes a completion vote after its batch, and the
+  next batch's existing barrier makes the threadgroup leave together, so no
+  barrier is added. Rendered color, transmittance, and contributor indices are
+  bit-identical. On an M4 Pro (garden, 1297x840) `rast_fwd` fell from 3.9 to
+  3.7 ms; the 324x210 chunked path is unchanged.
+- Tiles with more than 2,048 intersections sort with SIMD-group slices: each
+  SIMD-group ranks 32 keys at a time with ballots instead of the previous
+  per-key loop over every earlier key in its 256-key wave, and passes skip key
+  bytes that are constant within the tile (the Gaussian ID's high byte and
+  usually the depth exponent). The radix path reuses the bitonic threadgroup
+  storage, cutting the general sort kernel from 21 KB to 16 KB of threadgroup
+  memory, which also speeds the bitonic path. On an M4 Pro (garden) the sort
+  stage fell from 2.4 to 0.26 ms and the step from 5.8 to 3.7 ms at 324x210,
+  where a few crowded tiles held nearly half of all intersections, and the step
+  fell from 30.8 to 29.4 ms at 1297x840.
+- Tile counting and scatter emit each Gaussian's exact raster footprint: the
+  ellipse where opacity * exp(-sigma) can reach the 1/255 blend threshold below
+  the 5.55 sigma cutoff, walked row by row. The per-axis 3-sigma box emitted
+  empty corner tiles of tilted ellipses, ignored opacity, and clipped opaque
+  Gaussians that still blend between 3 and 3.33 sigma. Visibility, radii,
+  densification statistics, and optimizer gating keep the 3-sigma box.
+  Projection stores the footprint extents in the existing per-Gaussian extent
+  buffer, and both passes derive every tile from the same stored values. A new
+  probe test checks every blending pixel against the emitted tiles. On an M4 Pro
+  (garden, 1.6M Gaussians) the training step fell from 34.7 to 29.5 ms at
+  1297x840 and from 6.6 to 5.7 ms at 324x210; held-out PSNR is unchanged.
+- Backward rasterization reduces each Gaussian's nine screen-space gradients
+  with a 32-lane halving reduce-scatter (12 SIMD shuffles instead of nine full
+  `simd_sum` reductions), so nine lanes issue the gradient atomics as one
+  instruction instead of lane 0 issuing them serially. The running color of the
+  Gaussians behind each splat is carried as its scalar projection onto the
+  pixel's output gradient. Gradients match the previous kernels to float
+  rounding. On an M4 Pro (garden, 1297x840, 1.6M Gaussians) `rast_bwd` fell from
+  12.6 to 10.7 ms and the training step from 38.2 to 35.8 ms; physical-iPhone
+  throughput has not been measured.
 - Hardened the point-cloud PLY reader. Vertex counts are parsed as 64-bit
   values and bounded by the remaining file bytes before allocation, all eight
   PLY scalar types advance binary records, elements declared before the

@@ -311,6 +311,18 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
                 "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
         set_tests_properties(msplat_tile_count_difference PROPERTIES
             SKIP_RETURN_CODE 77)
+        # Compiles the shader source with a probe kernel at runtime so it can
+        # call the footprint helpers the intersection kernels share.
+        add_executable(msplat_raster_footprint_tests
+            tests/test_raster_footprint.mm)
+        target_link_libraries(msplat_raster_footprint_tests PRIVATE
+            ${FOUNDATION_LIBRARY}
+            ${METAL_FRAMEWORK})
+        add_test(NAME msplat_raster_footprint
+            COMMAND msplat_raster_footprint_tests
+                "${CMAKE_SOURCE_DIR}/core/metal/msplat_metal.metal")
+        set_tests_properties(msplat_raster_footprint PROPERTIES
+            SKIP_RETURN_CODE 77)
         add_executable(msplat_gpu_tile_layout_tests
             tests/test_gpu_tile_layout.mm)
         target_include_directories(msplat_gpu_tile_layout_tests PRIVATE

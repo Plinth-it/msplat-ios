@@ -119,6 +119,79 @@ inline void get_tile_bbox(
     get_bbox(tile_center, tile_radius, tile_bounds, tile_min, tile_max);
 }
 
+// Exact raster footprint. The rasterizers blend a pixel only while
+// sigma = 0.5 * d^T conic d < 5.55 and opacity * exp(-sigma) >= 1/255, so a
+// Gaussian can reach only the ellipse d^T conic d <= q with
+// q = min(2 ln(255 opacity), 11.1). Tile counting and scatter both walk this
+// ellipse row by row, which drops the empty corner tiles of the 3-sigma box,
+// shrinks faint Gaussians, and keeps the 3-3.33 sigma rim of opaque ones.
+//
+// Returns the ellipse's per-axis pixel half extents, or -1 when the Gaussian
+// never reaches the blending threshold. Counting and scatter must derive every
+// tile from these stored extents so both passes see bit-identical inputs.
+inline float2 raster_footprint_extents(float3 conic, float opacity) {
+    const float q = min(2.f * log(255.f * opacity), 11.1f);
+    const float det = conic.x * conic.z - conic.y * conic.y;
+    if (!(q >= 0.f) || !(det > 0.f)) return float2(-1.f);
+    return float2(sqrt(q * conic.z / det), sqrt(q * conic.x / det));
+}
+
+// Tile rows [row_begin, row_end) holding a pixel center inside the footprint.
+inline bool raster_footprint_rows(
+    float2 center, float2 extents, uint tiles_y,
+    thread uint& row_begin, thread uint& row_end
+) {
+    if (!(extents.y >= 0.f)) return false;
+    const float first = max(
+        ceil((center.y - extents.y - float(BLOCK_Y - 1)) / float(BLOCK_Y)),
+        0.f);
+    const float last = min(
+        floor((center.y + extents.y) / float(BLOCK_Y)), float(tiles_y) - 1.f);
+    if (!(first <= last)) return false;
+    row_begin = uint(first);
+    row_end = uint(last) + 1u;
+    return true;
+}
+
+// Tile columns [column_begin, column_end) of tile row `tile_y` holding a pixel
+// center inside the footprint. Across the row's pixel band the left edge of
+// the ellipse is convex and the right edge concave, so each extreme lies at a
+// band end or at the ellipse's leftmost/rightmost point.
+inline bool raster_footprint_row_span(
+    float2 center, float3 conic, float2 extents, uint tile_y, uint tiles_x,
+    thread uint& column_begin, thread uint& column_end
+) {
+    const float band_top = float(tile_y * BLOCK_Y) - center.y;
+    const float lo = max(band_top, -extents.y);
+    const float hi = min(band_top + float(BLOCK_Y - 1), extents.y);
+    if (!(lo <= hi)) return false;
+
+    // At vertical offset dy the ellipse spans
+    // slope * dy +- width * sqrt(extents.y^2 - dy^2).
+    const float slope = -conic.y / conic.x;
+    const float width =
+        sqrt(conic.x * conic.z - conic.y * conic.y) / conic.x;
+    const float half_lo =
+        width * sqrt(max(0.f, (extents.y - lo) * (extents.y + lo)));
+    const float half_hi =
+        width * sqrt(max(0.f, (extents.y - hi) * (extents.y + hi)));
+    float left = min(fma(slope, lo, -half_lo), fma(slope, hi, -half_hi));
+    float right = max(fma(slope, lo, half_lo), fma(slope, hi, half_hi));
+    // The rightmost point sits at dy = extreme_dy, the leftmost at -extreme_dy.
+    const float extreme_dy = -conic.y * extents.x / conic.z;
+    if (lo <= extreme_dy && extreme_dy <= hi) right = extents.x;
+    if (lo <= -extreme_dy && -extreme_dy <= hi) left = -extents.x;
+
+    const float first = max(
+        ceil((center.x + left - float(BLOCK_X - 1)) / float(BLOCK_X)), 0.f);
+    const float last = min(
+        floor((center.x + right) / float(BLOCK_X)), float(tiles_x) - 1.f);
+    if (!(first <= last)) return false;
+    column_begin = uint(first);
+    column_end = uint(last) + 1u;
+    return true;
+}
+
 // Affine transform: mat (row-major 4x3) applied to point p.
 inline float3 transform_4x3(constant float *mat, const float3 p) {
     float3 out = {
@@ -657,6 +730,94 @@ kernel void project_gaussians_forward_kernel(
     aabb[idx * 2 + 1] = aabb_y;
 }
 
+// Per-pixel exponent sigma = 0.5 * d^T conic d. Forward and backward must
+// classify every pixel identically (sigma < 5.55, alpha >= 1/255), or the
+// backward transmittance recovery divides by a factor the forward pass never
+// applied. Fast math would let each kernel reassociate this product chain
+// differently around its other uses of delta, so it is evaluated in safe mode.
+inline float raster_pixel_sigma(float3 conic, float2 delta) {
+#pragma METAL fp math_mode(safe)
+    return fma(0.5f,
+        fma(conic.x, delta.x * delta.x, conic.z * delta.y * delta.y),
+        conic.y * delta.x * delta.y);
+}
+
+// Rasterizer threadgroups cover a block of their 16x16 parent tile and stage
+// only the Gaussians that can blend one of its pixels. The test bounds the
+// per-pixel acceptance (sigma < 5.55 and opacity * exp(-sigma) >= 1/255) from
+// above with a little slack, so a skipped Gaussian fails that test at every
+// pixel of the block and forward and backward still agree pixel for pixel.
+
+inline float raster_conic_quadratic(float3 conic, float2 d) {
+    return fma(conic.x, d.x * d.x,
+               fma(2.f * conic.y, d.x * d.y, conic.z * d.y * d.y));
+}
+
+// Smallest d^T conic d over the pixel rectangle [rect_min, rect_max], with d
+// measured from `center`. A convex quadratic whose minimum lies outside the
+// rectangle attains its rectangle minimum on an edge, where it is a clamped
+// one-dimensional minimum.
+inline float raster_conic_rect_min(
+    float2 center, float3 conic, float2 rect_min, float2 rect_max
+) {
+    const float2 lo = rect_min - center;
+    const float2 hi = rect_max - center;
+    if (lo.x <= 0.f && 0.f <= hi.x && lo.y <= 0.f && 0.f <= hi.y) return 0.f;
+    const float dy_per_dx = -conic.y / conic.z;
+    const float dx_per_dy = -conic.y / conic.x;
+    const float left = raster_conic_quadratic(
+        conic, float2(lo.x, clamp(dy_per_dx * lo.x, lo.y, hi.y)));
+    const float right = raster_conic_quadratic(
+        conic, float2(hi.x, clamp(dy_per_dx * hi.x, lo.y, hi.y)));
+    const float top = raster_conic_quadratic(
+        conic, float2(clamp(dx_per_dy * lo.y, lo.x, hi.x), lo.y));
+    const float bottom = raster_conic_quadratic(
+        conic, float2(clamp(dx_per_dy * hi.y, lo.x, hi.x), hi.y));
+    return min(min(left, right), min(top, bottom));
+}
+
+inline bool raster_may_blend_rect(
+    float2 center, float3 conic, float opacity,
+    float2 rect_min, float2 rect_max
+) {
+    const float q = min(2.f * log(max(255.f * opacity, 1e-30f)), 11.1f);
+    return !(raster_conic_rect_min(center, conic, rect_min, rect_max) >
+             fma(q, 1.001f, 1e-3f));
+}
+
+// Stages kept Gaussians in input order within this SIMD-group's 32-slot
+// segment of the batch and records the segment's count. Every lane must call
+// it; the caller writes the batch arrays at the returned slot.
+inline uint raster_stage_slot(
+    bool keep, uint tr, threadgroup uint* segment_counts
+) {
+    const uint kept = keep ? 1u : 0u;
+    const uint rank = simd_prefix_exclusive_sum(kept);
+    const uint count = simd_sum(kept);
+    if ((tr & 31u) == 0u) segment_counts[tr >> 5] = count;
+    return (tr & ~31u) + rank;
+}
+
+// Forward rasterizers stop loading batches once every pixel of the
+// threadgroup has saturated or lies outside the image. Each 32-lane
+// SIMD-group publishes its state at the end of a batch; the next batch's
+// opening barrier makes the flags visible, so every thread leaves together.
+inline void raster_publish_simd_done(
+    threadgroup uint* simd_done, uint tr, bool finished
+) {
+    const bool simd_finished = simd_all(finished);
+    if ((tr & 31u) == 0u) simd_done[tr >> 5] = simd_finished ? 1u : 0u;
+}
+
+inline bool raster_threadgroup_done(
+    threadgroup const uint* simd_done, uint simd_groups
+) {
+    for (uint group = 0; group < simd_groups; ++group) {
+        if (simd_done[group] == 0u) return false;
+    }
+    return true;
+}
+
 inline void nd_rasterize_forward_impl(
     constant uint3& tile_bounds,
     constant uint3& img_size,
@@ -679,7 +840,10 @@ inline void nd_rasterize_forward_impl(
     const uint raster_block_size,
     threadgroup float3* xy_opacity_batch,
     threadgroup float3* conic_batch,
-    threadgroup float3* rgbs_batch
+    threadgroup float3* rgbs_batch,
+    threadgroup uint* simd_done,
+    threadgroup int* index_batch,
+    threadgroup uint* segment_counts
 ) {
     // Threadgroup-batched forward rasterization: all threads in a tile
     // cooperatively load Gaussian data into shared memory, then read from it.
@@ -699,6 +863,12 @@ inline void nd_rasterize_forward_impl(
         (range.y - range.x + (int)raster_block_size - 1) /
         (int)raster_block_size;
 
+    const float2 block_min = float2(
+        float(blockIdx.x * blockDim.x), float(blockIdx.y * blockDim.y));
+    const float2 block_max =
+        block_min + float2(float(blockDim.x) - 1.f, float(blockDim.y) - 1.f);
+    const uint segments = raster_block_size / 32u;
+
     float T = 1.f;
     float3 pix_out = {0.f, 0.f, 0.f};
     int last_contributor = range.x - 1;
@@ -707,63 +877,68 @@ inline void nd_rasterize_forward_impl(
     for (int b = 0; b < num_batches; ++b) {
         // sync before loading next batch
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (b > 0 && raster_threadgroup_done(
+                simd_done, raster_block_size / 32u)) {
+            break;
+        }
 
-        // each thread loads one gaussian into shared memory
+        // each thread loads one gaussian and stages it in shared memory
+        // only if it can blend a pixel of this block
         int batch_start = range.x + (int)raster_block_size * b;
         int idx = batch_start + tr;
+        RasterIntersectionAttributes attributes;
+        bool keep = false;
         if (idx < range.y) {
-            const RasterIntersectionAttributes attributes =
-                load_raster_intersection_attributes(
+            attributes = load_raster_intersection_attributes(
                 sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
                 projected_opacities, attribute_layout, idx);
-            xy_opacity_batch[tr] = attributes.xy_opacity;
-            conic_batch[tr] = attributes.conic;
+            keep = raster_may_blend_rect(
+                attributes.xy_opacity.xy, attributes.conic,
+                attributes.xy_opacity.z, block_min, block_max);
+        }
+        const uint slot = raster_stage_slot(keep, tr, segment_counts);
+        if (keep) {
+            xy_opacity_batch[slot] = attributes.xy_opacity;
+            conic_batch[slot] = attributes.conic;
             // packed_rgb has raw SH output — clamp_min(raw + 0.5, 0)
-            rgbs_batch[tr] = max(attributes.rgb + 0.5f, 0.0f);
+            rgbs_batch[slot] = max(attributes.rgb + 0.5f, 0.0f);
+            index_batch[slot] = idx;
         }
         // wait for all threads to finish loading
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (done || !inside) continue;
+        // process the staged gaussians of each segment in order
+        for (uint segment = 0; segment < segments && !done && inside;
+             ++segment) {
+            const uint segment_end = segment * 32u + segment_counts[segment];
+            for (uint t = segment * 32u; t < segment_end; ++t) {
+                const float3 conic_local = conic_batch[t];
+                const float3 xy_opac = xy_opacity_batch[t];
+                const float2 delta = {xy_opac.x - px, xy_opac.y - py};
 
-        int batch_size = min((int)raster_block_size, range.y - batch_start);
+                const float sigma = raster_pixel_sigma(conic_local, delta);
+                // Every staged Gaussian reaches this block, so most SIMD-groups
+                // have some lane to blend. A miss blends with alpha 0, which
+                // leaves T and the color bit-identical, instead of diverging.
+                // sigma >= 5.55 already implies alpha < 1/255 for opacity <= 1.
+                const float raw_alpha = min(0.999f, xy_opac.z * exp(-sigma));
+                const bool hit = sigma >= 0.f && sigma < 5.55f &&
+                    raw_alpha >= 1.f / 255.f;
+                const float alpha = hit ? raw_alpha : 0.f;
 
-        // process gaussians in this batch
-        for (int t = 0; t < batch_size; ++t) {
-            const float3 conic_local = conic_batch[t];
-            const float3 xy_opac = xy_opacity_batch[t];
-            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+                const float next_T = T * (1.f - alpha);
+                if (next_T <= 1e-4f) {
+                    last_contributor = index_batch[t] - 1;
+                    done = true;
+                    break;
+                }
 
-            const float sigma = fma(0.5f,
-                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
-                conic_local.y * delta.x * delta.y);
-            // Early-out: skip exp() when the result is guaranteed to be discarded.
-            // alpha = min(0.999, opacity * exp(-sigma)), discarded when alpha < 1/255.
-            // opacity = sigmoid(raw) ∈ [0,1], so alpha ≤ exp(-sigma).
-            // exp(-5.55) ≈ 0.00389 < 1/255 ≈ 0.00392, so sigma ≥ 5.55 ⟹ alpha < 1/255.
-            // Empirically 94% of evaluations have sigma ≥ 5.55 (garden scene, mipnerf360).
-            if (sigma < 0.f || sigma >= 5.55f) {
-                continue;
+                pix_out = fma(rgbs_batch[t], alpha * T, pix_out);
+                T = next_T;
+                last_contributor = hit ? index_batch[t] : last_contributor;
             }
-
-            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
-            if (alpha < 1.f / 255.f) {
-                continue;
-            }
-
-            const float next_T = T * (1.f - alpha);
-            if (next_T <= 1e-4f) {
-                last_contributor = batch_start + t - 1;
-                done = true;
-                break;
-            }
-
-            const float vis = alpha * T;
-            const float3 rgb = rgbs_batch[t];
-            pix_out = fma(rgb, vis, pix_out);
-            T = next_T;
-            last_contributor = batch_start + t;
         }
+        raster_publish_simd_done(simd_done, tr, done || !inside);
     }
 
     if (inside) {
@@ -805,12 +980,16 @@ kernel void nd_rasterize_forward_kernel(
     threadgroup float3 xy_opacity_batch[8 * 8];
     threadgroup float3 conic_batch[8 * 8];
     threadgroup float3 rgbs_batch[8 * 8];
+    threadgroup uint simd_done[8 * 8 / 32];
+    threadgroup int index_batch[8 * 8];
+    threadgroup uint segment_counts[8 * 8 / 32];
     nd_rasterize_forward_impl(
         tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
         packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
         blockDim, sorted_keys, projected_opacities, attribute_layout,
         blockIdx, threadIdx, tr, 8 * 8,
-        xy_opacity_batch, conic_batch, rgbs_batch);
+        xy_opacity_batch, conic_batch, rgbs_batch, simd_done,
+        index_batch, segment_counts);
 }
 
 kernel void nd_rasterize_forward_16x8_kernel(
@@ -836,12 +1015,16 @@ kernel void nd_rasterize_forward_16x8_kernel(
     threadgroup float3 xy_opacity_batch[16 * 8];
     threadgroup float3 conic_batch[16 * 8];
     threadgroup float3 rgbs_batch[16 * 8];
+    threadgroup uint simd_done[16 * 8 / 32];
+    threadgroup int index_batch[16 * 8];
+    threadgroup uint segment_counts[16 * 8 / 32];
     nd_rasterize_forward_impl(
         tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
         packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
         blockDim, sorted_keys, projected_opacities, attribute_layout,
         blockIdx, threadIdx, tr, 16 * 8,
-        xy_opacity_batch, conic_batch, rgbs_batch);
+        xy_opacity_batch, conic_batch, rgbs_batch, simd_done,
+        index_batch, segment_counts);
 }
 
 kernel void nd_rasterize_forward_16x16_kernel(
@@ -867,12 +1050,16 @@ kernel void nd_rasterize_forward_16x16_kernel(
     threadgroup float3 xy_opacity_batch[16 * 16];
     threadgroup float3 conic_batch[16 * 16];
     threadgroup float3 rgbs_batch[16 * 16];
+    threadgroup uint simd_done[16 * 16 / 32];
+    threadgroup int index_batch[16 * 16];
+    threadgroup uint segment_counts[16 * 16 / 32];
     nd_rasterize_forward_impl(
         tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
         packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
         blockDim, sorted_keys, projected_opacities, attribute_layout,
         blockIdx, threadIdx, tr, 16 * 16,
-        xy_opacity_batch, conic_batch, rgbs_batch);
+        xy_opacity_batch, conic_batch, rgbs_batch, simd_done,
+        index_batch, segment_counts);
 }
 
 void sh_coeffs_to_color(
@@ -1171,21 +1358,95 @@ inline int warp_reduce_all_or(int val, const int warp_size) {
     return simd_or(val);
 }
 
-inline float3 warpSum3(float3 val, const int warp_size, const uint lane) {
-    val.x = simd_sum(val.x);
-    val.y = simd_sum(val.y);
-    val.z = simd_sum(val.z);
-    return val;
+// Backward raster accumulates nine gradients per Gaussian: RGB (0-2), conic
+// (3-5), mean (6-7) and opacity logit (8).
+constant constexpr uint RASTER_GRADIENT_COUNT = 9;
+
+// One halving step of a 32-lane reduce-scatter. Lanes paired by `mask` split
+// their N live components: the lower lane keeps the first ceil(N/2), the upper
+// lane the rest, and each adds its partner's copy of the half it keeps.
+template <uint N>
+inline void raster_gradient_scatter_step(
+    thread float* values, ushort lane, ushort mask
+) {
+    constexpr uint M = (N + 1) / 2;
+    const bool upper = (lane & mask) != 0;
+    for (uint i = 0; i < M; ++i) {
+        const float low = values[i];
+        const float high = M + i < N ? values[M + i] : 0.0f;
+        values[i] = (upper ? high : low) +
+            simd_shuffle_xor(upper ? low : high, mask);
+    }
 }
 
-inline float2 warpSum2(float2 val, const int warp_size, const uint lane) {
-    val.x = simd_sum(val.x);
-    val.y = simd_sum(val.y);
-    return val;
+// The same lane selection applied to component indices. -1 marks a lane that
+// finishes without a component.
+template <uint N>
+inline void raster_gradient_component_step(
+    thread int* components, ushort lane, ushort mask
+) {
+    constexpr uint M = (N + 1) / 2;
+    const bool upper = (lane & mask) != 0;
+    for (uint i = 0; i < M; ++i) {
+        const int high = M + i < N ? components[M + i] : -1;
+        components[i] = upper ? high : components[i];
+    }
 }
 
-inline float warpSum(float val, const int warp_size, const uint lane) {
-    return simd_sum(val);
+// Component whose SIMD-group total raster_gradient_reduce_scatter leaves on
+// this lane, or -1. Loop-invariant, so kernels compute it once.
+inline int raster_gradient_component(ushort lane) {
+    int components[RASTER_GRADIENT_COUNT] = {0, 1, 2, 3, 4, 5, 6, 7, 8};
+    raster_gradient_component_step<9>(components, lane, 16);
+    raster_gradient_component_step<5>(components, lane, 8);
+    raster_gradient_component_step<3>(components, lane, 4);
+    raster_gradient_component_step<2>(components, lane, 2);
+    raster_gradient_component_step<1>(components, lane, 1);
+    return components[0];
+}
+
+// Sums the nine gradients across a 32-lane SIMD-group with 5+3+2+1+1 = 12
+// shuffles instead of nine full reductions, leaving each total on a distinct
+// lane so all nine atomics issue as one SIMD instruction.
+inline float raster_gradient_reduce_scatter(
+    thread float* values, ushort lane
+) {
+    raster_gradient_scatter_step<9>(values, lane, 16);
+    raster_gradient_scatter_step<5>(values, lane, 8);
+    raster_gradient_scatter_step<3>(values, lane, 4);
+    raster_gradient_scatter_step<2>(values, lane, 2);
+    raster_gradient_scatter_step<1>(values, lane, 1);
+    return values[0];
+}
+
+// Gradient array element for `component` of Gaussian 0, plus the per-Gaussian
+// stride. Loop-invariant per lane; a lane without a component gets v_opacity.
+inline device atomic_float* raster_gradient_base(
+    int component,
+    device atomic_float* v_rgb, device atomic_float* v_conic,
+    device atomic_float* v_xy, device atomic_float* v_opacity,
+    thread int& stride
+) {
+    if (component >= 0 && component < 3) {
+        stride = 3;
+        return v_rgb + component;
+    }
+    if (component >= 3 && component < 6) {
+        stride = 3;
+        return v_conic + (component - 3);
+    }
+    if (component >= 6 && component < 8) {
+        stride = 2;
+        return v_xy + (component - 6);
+    }
+    stride = 1;
+    return v_opacity;
+}
+
+// RGB components carry the forward clamp_min gate: a shifted color below zero
+// has no gradient.
+inline bool raster_gradient_lane_writes(int component, float3 shifted_rgb) {
+    return component >= 3 || (component >= 0 && shifted_rgb[component] >= 0.f);
 }
 
 // Mask layout is (byte stride per pixel, coverage byte offset). Camera cache
@@ -1254,8 +1515,9 @@ kernel void rasterize_backward_kernel(
             rendered_alpha > target_alpha ? 1.0f :
             (rendered_alpha < target_alpha ? -1.0f : 0.0f));
     }
-    // the contribution from gaussians behind the current one
-    float3 buffer = {0.f, 0.f, 0.f};
+    // the contribution from gaussians behind the current one, projected onto
+    // v_out: the gradients only consume dot(buffer, v_out)
+    float buffer_dot = 0.f;
     // index of last gaussian to contribute to this pixel
     const int bin_final = inside? final_index[pix_id] : 0;
 
@@ -1269,12 +1531,25 @@ kernel void rasterize_backward_kernel(
     threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
     threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
     threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    threadgroup int index_batch[RAST_BLOCK_SIZE];
+    threadgroup uint segment_counts[RAST_BLOCK_SIZE / 32];
+    const float2 block_min = float2(
+        float(blockIdx.x * RAST_BLOCK_X), float(blockIdx.y * RAST_BLOCK_Y));
+    const float2 block_max =
+        block_min + float2(float(RAST_BLOCK_X - 1), float(RAST_BLOCK_Y - 1));
 
     // df/d_out for this pixel
     const float3 v_out = read_packed_float3(v_output, pix_id);
     // Hoist loop-invariant background load and T_final * bg product
     const float3 bg = {background[0], background[1], background[2]};
-    const float3 T_final_bg = T_final * bg;
+    const float T_final_bg_dot = dot(T_final * bg, v_out);
+
+    // Each lane owns at most one of the nine SIMD-group gradient totals.
+    const ushort gradient_lane = (ushort)wr;
+    const int gradient_component = raster_gradient_component(gradient_lane);
+    int gradient_stride;
+    device atomic_float* gradient_base = raster_gradient_base(
+        gradient_component, v_rgb, v_conic, v_xy, v_opacity, gradient_stride);
 
     // collect and process batches of gaussians
     // each thread loads one gaussian at a time before rasterizing
@@ -1284,6 +1559,8 @@ kernel void rasterize_backward_kernel(
     // skip leading batches where all gaussians are beyond any pixel's bin_final.
     const uint warp_id = tr / warp_size;
     constexpr uint NUM_WARPS = RAST_BLOCK_SIZE / 32;
+    static_assert(NUM_WARPS == 2,
+                  "staged batches are walked as two SIMD-group segments");
     threadgroup int warp_max_finals[NUM_WARPS];
     if (wr == 0) warp_max_finals[warp_id] = warp_bin_final;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -1302,26 +1579,42 @@ kernel void rasterize_backward_kernel(
         // index of gaussian to load
         // batch end is the index of the last gaussian in the batch
         const int batch_end = range.y - 1 - RAST_BLOCK_SIZE * b;
-        int batch_size = min(RAST_BLOCK_SIZE, batch_end + 1 - range.x);
         const int idx = batch_end - tr;
+        // Stage only Gaussians that can blend a pixel of this block, in
+        // back-to-front order within each SIMD-group's segment.
+        RasterIntersectionAttributes attributes;
+        bool keep = false;
         if (idx >= range.x) {
-            id_batch[tr] = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
-            const RasterIntersectionAttributes attributes =
-                load_raster_intersection_attributes(
+            attributes = load_raster_intersection_attributes(
                 sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
                 projected_opacities, attribute_layout, idx);
-            xy_opacity_batch[tr] = attributes.xy_opacity;
-            conic_batch[tr] = attributes.conic;
+            keep = raster_may_blend_rect(
+                attributes.xy_opacity.xy, attributes.conic,
+                attributes.xy_opacity.z, block_min, block_max);
+        }
+        const uint slot = raster_stage_slot(keep, tr, segment_counts);
+        if (keep) {
+            id_batch[slot] = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
+            xy_opacity_batch[slot] = attributes.xy_opacity;
+            conic_batch[slot] = attributes.conic;
             // Shift once per loaded Gaussian instead of once per contributing
             // pixel. The backward clamp and its gate both consume this value.
-            rgbs_batch[tr] = attributes.rgb + 0.5f;
+            rgbs_batch[slot] = attributes.rgb + 0.5f;
+            index_batch[slot] = idx;
         }
-        // wait for other threads to collect the gaussians in batch
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // process gaussians in the current batch for this pixel
-        // 0 index is the furthest back gaussian in the batch
-        for (int t = max(0,batch_end - warp_bin_final); t < batch_size; ++t) {
+        // process the staged gaussians back to front: the first segment's,
+        // then the second's (an 8x8 block has two 32-lane segments)
+        const uint staged_front = segment_counts[0];
+        const uint staged_count = staged_front + segment_counts[1];
+        for (uint staged = 0; staged < staged_count; ++staged) {
+            const uint t = staged < staged_front
+                ? staged
+                : 32u + (staged - staged_front);
+            // Gaussians behind every pixel of this SIMD-group come first.
+            const int index = index_batch[t];
+            if (index > warp_bin_final) continue;
             // Broadcast batch data from lane 0 → all lanes in SIMD group.
             // All threads read the same index t, so one threadgroup read +
             // simd_broadcast replaces 32 redundant threadgroup reads.
@@ -1334,37 +1627,23 @@ kernel void rasterize_backward_kernel(
             b_conic = simd_broadcast(b_conic, 0);
             b_xy_opac = simd_broadcast(b_xy_opac, 0);
 
-            int valid = inside;
-            if (batch_end - t > bin_final) {
-                valid = 0;
-            }
-            float alpha;
-            float opac;
-            float2 delta;
-            float vis;
-            if(valid){
-                opac = b_xy_opac.z;
-                delta = {b_xy_opac.x - px, b_xy_opac.y - py};
-                float sigma = fma(0.5f,
-                    fma(b_conic.x, delta.x * delta.x, b_conic.z * delta.y * delta.y),
-                    b_conic.y * delta.x * delta.y);
-                if (sigma < 0.f || sigma >= 5.55f) {
-                    valid = 0;
-                } else {
-                    vis = exp(-sigma);
-                    alpha = min(0.999f, opac * vis);
-                    if (alpha < 1.f / 255.f) {
-                        valid = 0;
-                    }
-                }
-            }
+            // Every lane evaluates the Gaussian. Lanes it misses carry alpha 0
+            // through the same arithmetic, which leaves T and buffer_dot
+            // bit-identical and every gradient zero, so the SIMD-group stays
+            // on one path.
+            const float opac = b_xy_opac.z;
+            const float2 delta = {b_xy_opac.x - px, b_xy_opac.y - py};
+            const float sigma = raster_pixel_sigma(b_conic, delta);
+            const float raw_alpha = min(0.999f, opac * exp(-sigma));
+            const bool valid = inside && index <= bin_final &&
+                sigma >= 0.f && sigma < 5.55f && raw_alpha >= 1.f / 255.f;
             // if all threads are inactive in this warp, skip this loop
             if (!warp_reduce_all_or(valid, warp_size)) {
                 continue;
             }
 
             // RGB and the Gaussian ID are unused when the whole SIMDgroup is
-            // inactive. Only RGB is needed outside lane 0.
+            // inactive. The scattered gradient lanes need both.
             float3 b_rgb = float3(0.f);
             int32_t b_id = 0;
             if (wr == 0) {
@@ -1372,65 +1651,50 @@ kernel void rasterize_backward_kernel(
                 b_id = id_batch[t];
             }
             b_rgb = simd_broadcast(b_rgb, 0);
+            b_id = simd_broadcast(b_id, 0);
 
-            float3 v_rgb_local = {0.f, 0.f, 0.f};
-            float3 v_conic_local = {0.f, 0.f, 0.f};
-            float2 v_xy_local = {0.f, 0.f};
-            float v_opacity_local = 0.f;
-            //initialize everything to 0, only set if the lane is valid
-            if (valid) {
-                // Recover the transmittance before this Gaussian. Forward uses
-                // the same capped alpha, so this must also run when the 0.999
-                // cap binds or every nearer Gaussian receives a T that is
-                // 1000x too small.
-                float ra = 1.f / (1.f - alpha);
-                T *= ra;
-                const float fac = alpha * T;
-                v_rgb_local = fac * v_out;
+            // Recover the transmittance before this Gaussian. Forward uses
+            // the same capped alpha, so this must also run when the 0.999
+            // cap binds or every nearer Gaussian receives a T that is
+            // 1000x too small.
+            const float alpha = valid ? raw_alpha : 0.f;
+            const float ra = 1.f / (1.f - alpha);
+            if (valid) T *= ra;
+            const float fac = alpha * T;
+            const float3 v_rgb_local = fac * v_out;
 
-                const float3 rgb = max(b_rgb, 0.f);
-                // contribution from this pixel + background
-                const float v_alpha =
-                    dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out) +
-                    v_alpha_pixel * T_final * ra;
-                // update the running sum
-                buffer = fma(rgb, fac, buffer);
+            const float rgb_dot = dot(max(b_rgb, 0.f), v_out);
+            // contribution from this pixel + background
+            const float v_alpha =
+                fma(rgb_dot, T, -ra * (buffer_dot + T_final_bg_dot)) +
+                v_alpha_pixel * T_final * ra;
+            // update the running sum
+            buffer_dot = fma(rgb_dot, fac, buffer_dot);
 
-                // The cap makes alpha locally constant in sigma and opacity,
-                // but it does not remove the color gradient above.
-                if (alpha < 0.999f) {
-                    // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
-                    const float v_sigma = -alpha * v_alpha;
-                    v_conic_local = (0.5f * v_sigma) * float3(
-                        delta.x * delta.x, delta.x * delta.y,
-                        delta.y * delta.y);
-                    v_xy_local = v_sigma * float2(
-                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
-                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
-                    // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
-                    v_opacity_local = -v_sigma * (1.f - opac);
-                }
-            }
+            // The cap makes alpha locally constant in sigma and opacity,
+            // but it does not remove the color gradient above.
+            // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
+            const float v_sigma = alpha < 0.999f ? -alpha * v_alpha : 0.f;
+            const float3 v_conic_local = (0.5f * v_sigma) * float3(
+                delta.x * delta.x, delta.x * delta.y, delta.y * delta.y);
+            const float2 v_xy_local = v_sigma * float2(
+                fma(b_conic.x, delta.x, b_conic.y * delta.y),
+                fma(b_conic.y, delta.x, b_conic.z * delta.y));
+            // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
+            const float v_opacity_local = -v_sigma * (1.f - opac);
 
-            v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
-            v_conic_local = warpSum3(v_conic_local, warp_size, wr);
-            v_xy_local = warpSum2(v_xy_local, warp_size, wr);
-            v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
-
-            if (wr == 0) {
-                // Fused clamp_min backward: shifted colors below zero have no gradient.
-                if (b_rgb.x >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
-                if (b_rgb.y >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 1, v_rgb_local.y, memory_order_relaxed);
-                if (b_rgb.z >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 2, v_rgb_local.z, memory_order_relaxed);
-
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 0, v_conic_local.x, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 1, v_conic_local.y, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 2, v_conic_local.z, memory_order_relaxed);
-
-                atomic_fetch_add_explicit(v_xy + 2*b_id + 0, v_xy_local.x, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_xy + 2*b_id + 1, v_xy_local.y, memory_order_relaxed);
-
-                atomic_fetch_add_explicit(v_opacity + b_id, v_opacity_local, memory_order_relaxed);
+            float gradients[RASTER_GRADIENT_COUNT] = {
+                v_rgb_local.x, v_rgb_local.y, v_rgb_local.z,
+                v_conic_local.x, v_conic_local.y, v_conic_local.z,
+                v_xy_local.x, v_xy_local.y, v_opacity_local,
+            };
+            const float gradient_total =
+                raster_gradient_reduce_scatter(gradients, gradient_lane);
+            // Fused clamp_min backward: shifted colors below zero have no gradient.
+            if (raster_gradient_lane_writes(gradient_component, b_rgb)) {
+                atomic_fetch_add_explicit(
+                    gradient_base + gradient_stride * b_id, gradient_total,
+                    memory_order_relaxed);
             }
         }
     }
@@ -2283,11 +2547,12 @@ kernel void project_and_sh_forward_kernel(
     constant float* features_dc,
     constant float* features_rest,
     device float* colors,
-    device float* aabb, // float2: per-axis pixel extents
+    device float* aabb, // float2: exact raster footprint half extents
     constant uint& pose_enabled,
     constant uchar* coverage_render_tiles,
     constant uint& coverage_render_tile_stride,
     constant uint& tile_count_mode,
+    constant float* opacities, // logits; bound the exact raster footprint
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -2333,6 +2598,9 @@ kernel void project_and_sh_forward_kernel(
         ? project_view_pix(p_view, fx, fy, cx, cy)
         : project_pix(projmat, p_world, img_size, {cx, cy});
 
+    // Visibility, and with it radii, densification statistics, and optimizer
+    // gating, keeps the established 3-sigma box. Only tile emission uses the
+    // exact opacity-aware footprint below.
     float aabb_x = ceil(3.0f * sqrt(cov2d.x));
     float aabb_y = ceil(3.0f * sqrt(cov2d.z));
     uint2 tile_min, tile_max;
@@ -2346,16 +2614,31 @@ kernel void project_and_sh_forward_kernel(
     depths[idx] = p_view.z;
     radii[idx] = (int)radius;
     write_packed_float2(xys, idx, center);
-    aabb[idx * 2] = aabb_x;
-    aabb[idx * 2 + 1] = aabb_y;
+    // Scatter re-derives the tiles from these stored extents, the stored
+    // center, and the stored conic.
+    const float2 extents = raster_footprint_extents(
+        conic, 1.f / (1.f + exp(-opacities[idx])));
+    write_packed_float2(aabb, idx, extents);
 
     // Phase one of the exact intersection pipeline. The established mode
-    // enumerates every covered tile. The difference-grid A/B records four
-    // signed rectangle corners and defers whole-tile coverage masking until
-    // after the horizontal and vertical scans.
+    // enumerates every covered tile. The difference-grid A/B records the four
+    // signed corners of each run of rows with an identical tile span and
+    // defers whole-tile coverage masking until after the horizontal and
+    // vertical scans.
+    uint row_begin, row_end;
+    if (!raster_footprint_rows(
+            center, extents, tile_bounds.y, row_begin, row_end)) {
+        row_begin = row_end = 0u;
+    }
     if (tile_count_mode == 0u) {
-        for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
-            for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
+        for (uint tile_y = row_begin; tile_y < row_end; ++tile_y) {
+            uint column_begin, column_end;
+            if (!raster_footprint_row_span(
+                    center, conic, extents, tile_y, tile_bounds.x,
+                    column_begin, column_end)) {
+                continue;
+            }
+            for (uint tile_x = column_begin; tile_x < column_end; ++tile_x) {
                 if (!training_render_tile_active(
                         coverage_render_tiles, coverage_render_tile_stride,
                         tile_x, tile_y)) {
@@ -2368,18 +2651,37 @@ kernel void project_and_sh_forward_kernel(
         }
     } else {
         const uint diff_width = tile_bounds.x + 1u;
-        const uint top_left = tile_min.y * diff_width + tile_min.x;
-        const uint top_right = tile_min.y * diff_width + tile_max.x;
-        const uint bottom_left = tile_max.y * diff_width + tile_min.x;
-        const uint bottom_right = tile_max.y * diff_width + tile_max.x;
-        atomic_fetch_add_explicit(
-            &tile_count_storage[top_left], 1u, memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            &tile_count_storage[top_right], uint(-1), memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            &tile_count_storage[bottom_left], uint(-1), memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            &tile_count_storage[bottom_right], 1u, memory_order_relaxed);
+        // One extra iteration past row_end closes the final run.
+        bool run_open = false;
+        for (uint tile_y = row_begin; tile_y <= row_end; ++tile_y) {
+            uint column_begin = 0u, column_end = 0u;
+            const bool row_covered = tile_y < row_end &&
+                raster_footprint_row_span(
+                    center, conic, extents, tile_y, tile_bounds.x,
+                    column_begin, column_end);
+            if (run_open && row_covered && column_begin == tile_min.x &&
+                column_end == tile_max.x) {
+                tile_max.y = tile_y + 1u;
+                continue;
+            }
+            if (run_open) {
+                const uint top_left = tile_min.y * diff_width + tile_min.x;
+                const uint top_right = tile_min.y * diff_width + tile_max.x;
+                const uint bottom_left = tile_max.y * diff_width + tile_min.x;
+                const uint bottom_right = tile_max.y * diff_width + tile_max.x;
+                atomic_fetch_add_explicit(
+                    &tile_count_storage[top_left], 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &tile_count_storage[top_right], uint(-1), memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &tile_count_storage[bottom_left], uint(-1), memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &tile_count_storage[bottom_right], 1u, memory_order_relaxed);
+            }
+            run_open = row_covered;
+            tile_min = uint2(column_begin, tile_y);
+            tile_max = uint2(column_end, tile_y + 1u);
+        }
     }
 
     // SH: compute colors for non-culled gaussians (reuse p_world from registers)
@@ -2858,6 +3160,8 @@ kernel void project_backward_adam_kernel(
 #define EXACT_BITONIC_FAST_PATH 2048
 #define EXACT_SMALL_SORT_TG_SIZE 32
 #define EXACT_SMALL_TILE_MAX 32
+#define EXACT_SORT_SIMD_WIDTH 32
+#define EXACT_SORT_SIMD_GROUPS (EXACT_SORT_TG_SIZE / EXACT_SORT_SIMD_WIDTH)
 
 // GPU counterpart of buildTileIntersectionLayout. Keep these metadata indices
 // synchronized with the host ABI; word 9 is a bitmask so later layout checks
@@ -3114,7 +3418,7 @@ kernel void scatter_to_exact_bins_kernel(
     constant float* xys                     [[buffer(1)]],
     constant float* depths                  [[buffer(2)]],
     constant int* radii                     [[buffer(3)]],
-    constant float* aabb                    [[buffer(4)]],
+    constant float* aabb                    [[buffer(4)]], // footprint half extents
     constant uint3& tile_bounds             [[buffer(5)]],
     constant int* tile_offsets              [[buffer(6)]],
     device atomic_uint* tile_cursors        [[buffer(7)]],
@@ -3125,22 +3429,34 @@ kernel void scatter_to_exact_bins_kernel(
     device float* projected_opacities       [[buffer(12)]],
     constant uchar* coverage_render_tiles   [[buffer(13)]],
     constant uint& coverage_render_tile_stride [[buffer(14)]],
+    constant float* conics                  [[buffer(15)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= num_points || radii[idx] <= 0) return;
 
     projected_opacities[idx] = 1.f / (1.f + exp(-opacities[idx]));
+    // Walk the same exact footprint the projection pass counted, from the
+    // same stored center, conic, and extents.
     const float2 center = read_packed_float2(xys, idx);
-    uint2 tile_min, tile_max;
-    get_tile_bbox(
-        center, read_packed_float2(aabb, idx), (int3)tile_bounds,
-        tile_min, tile_max);
+    const float3 conic = read_packed_float3(conics, idx);
+    const float2 extents = read_packed_float2(aabb, idx);
+    uint row_begin, row_end;
+    if (!raster_footprint_rows(
+            center, extents, tile_bounds.y, row_begin, row_end)) {
+        return;
+    }
 
     const uint64_t key =
         ((uint64_t)as_type<uint>(depths[idx]) << 32) | (uint64_t)idx;
 
-    for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
-        for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
+    for (uint tile_y = row_begin; tile_y < row_end; ++tile_y) {
+        uint column_begin, column_end;
+        if (!raster_footprint_row_span(
+                center, conic, extents, tile_y, tile_bounds.x,
+                column_begin, column_end)) {
+            continue;
+        }
+        for (uint tile_x = column_begin; tile_x < column_end; ++tile_x) {
             if (!training_render_tile_active(
                     coverage_render_tiles, coverage_render_tile_stride,
                     tile_x, tile_y)) {
@@ -3267,17 +3583,29 @@ kernel void small_sort_per_tile_kernel(
     }
 }
 
+// Lanes of this 32-lane SIMD-group, valid lanes only, that share `digit`.
+inline uint radix_digit_match(uint digit, bool valid) {
+    uint match = uint(simd_vote::vote_t(simd_ballot(valid)));
+    for (uint bit = 0; bit < 8u; ++bit) {
+        const bool set = ((digit >> bit) & 1u) != 0u;
+        const uint votes = uint(simd_vote::vote_t(simd_ballot(set)));
+        match &= set ? votes : ~votes;
+    }
+    return match;
+}
+
 // Exact segmented sort. The common <=2,048-entry case keeps the previous
 // threadgroup bitonic performance, but reads the exact compact range rather than
-// a fixed per-tile allocation. Larger tiles use stable LSD radix passes over
-// 256-entry waves. The host imposes an explicit work limit before dispatch so a
-// pathological tile fails the step instead of monopolizing a threadgroup.
+// a fixed per-tile allocation. Larger tiles use stable LSD radix passes over the
+// key bytes that vary within the tile, ranked per SIMD-group slice. The host
+// imposes an explicit work limit before dispatch so a pathological tile fails
+// the step instead of monopolizing a threadgroup.
 //
 // Projection clips Gaussians behind the near plane, so positive float depth
 // bits sort in the same order as their numeric values. The full 64-bit key is
 // sorted so Gaussian ID deterministically breaks equal-depth ties.
-// The host must dispatch exactly EXACT_SORT_TG_SIZE threads: one thread owns
-// each radix bucket and each slot in the shared wave metadata.
+// The host must dispatch exactly EXACT_SORT_TG_SIZE threads in 32-lane
+// SIMD-groups: one thread owns each radix bucket during the digit scan.
 kernel void radix_sort_per_tile_kernel(
     constant int* tile_offsets       [[buffer(0)]],
     device uint64_t* keys_a          [[buffer(1)]],
@@ -3292,8 +3620,7 @@ kernel void radix_sort_per_tile_kernel(
     uint sort_index [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_width [[threads_per_simdgroup]]
+    uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     if (sort_index >= sortable_tile_count) return;
     if (sortable_tile_offset > num_tiles ||
@@ -3375,89 +3702,130 @@ kernel void radix_sort_per_tile_kernel(
         return;
     }
 
-    threadgroup atomic_uint digit_histogram[EXACT_SORT_RADIX];
-    threadgroup atomic_uint wave_histogram[EXACT_SORT_RADIX];
-    threadgroup uint digit_offsets[EXACT_SORT_RADIX];
-    threadgroup uint processed_digits[EXACT_SORT_RADIX];
-    threadgroup ushort wave_digits[EXACT_SORT_TG_SIZE];
+    // The radix path reuses the bitonic storage, so the kernel reserves one
+    // 16 KB threadgroup allocation for either path.
+    threadgroup uint* radix_scratch =
+        reinterpret_cast<threadgroup uint*>(bitonic_data);
+    // Per SIMD-group digit counts, then per SIMD-group output cursors.
+    threadgroup uint* simd_cursors = radix_scratch;
+    threadgroup uint* simd_totals =
+        radix_scratch + EXACT_SORT_SIMD_GROUPS * EXACT_SORT_RADIX;
+    threadgroup uint* key_bounds = simd_totals + EXACT_SORT_SIMD_GROUPS;
 
+    // Only bytes that vary within the tile can reorder it: the Gaussian ID's
+    // high byte and usually the depth exponent are constant and skip their
+    // passes entirely.
+    uint2 key_or = uint2(0u);
+    uint2 key_and = uint2(0xFFFFFFFFu);
+    for (uint index = tid; index < count; index += EXACT_SORT_TG_SIZE) {
+        const uint64_t key = keys_a[start + index];
+        const uint2 halves = uint2(uint(key), uint(key >> 32));
+        key_or |= halves;
+        key_and &= halves;
+    }
+    key_or = uint2(simd_or(key_or.x), simd_or(key_or.y));
+    key_and = uint2(simd_and(key_and.x), simd_and(key_and.y));
+    if (simd_lane == 0) {
+        key_bounds[4 * simd_group + 0] = key_or.x;
+        key_bounds[4 * simd_group + 1] = key_or.y;
+        key_bounds[4 * simd_group + 2] = key_and.x;
+        key_bounds[4 * simd_group + 3] = key_and.y;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    key_or = uint2(0u);
+    key_and = uint2(0xFFFFFFFFu);
+    for (uint group = 0; group < EXACT_SORT_SIMD_GROUPS; ++group) {
+        key_or |= uint2(key_bounds[4 * group], key_bounds[4 * group + 1]);
+        key_and &= uint2(key_bounds[4 * group + 2], key_bounds[4 * group + 3]);
+    }
+    const uint64_t varying_bits =
+        (uint64_t(key_or.y ^ key_and.y) << 32) | uint64_t(key_or.x ^ key_and.x);
+
+    // Stable LSD radix passes. Each SIMD-group owns one contiguous slice of
+    // the range and ranks 32 keys at a time with ballots, so a pass needs
+    // threadgroup barriers only around its digit scan. Slices keep input
+    // order, and each SIMD-group's cursors start after every earlier slice's
+    // keys with the same digit.
+    const uint slice = (count + EXACT_SORT_SIMD_GROUPS - 1) /
+        EXACT_SORT_SIMD_GROUPS;
+    const uint slice_begin = min(count, simd_group * slice);
+    const uint slice_end = min(count, slice_begin + slice);
+    threadgroup uint* cursors = simd_cursors + simd_group * EXACT_SORT_RADIX;
+    const uint lanes_below = (1u << simd_lane) - 1u;
+    device uint64_t* source = keys_a;
+    device uint64_t* destination = keys_b;
     for (uint pass = 0; pass < 8; ++pass) {
-        device uint64_t* source = (pass & 1u) == 0u ? keys_a : keys_b;
-        device uint64_t* destination = (pass & 1u) == 0u ? keys_b : keys_a;
         const uint shift = pass * 8u;
+        if (((varying_bits >> shift) & 0xFFu) == 0u) continue;
 
-        atomic_store_explicit(
-            &digit_histogram[tid], 0u, memory_order_relaxed);
-        processed_digits[tid] = 0u;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint local_index = tid; local_index < count;
-             local_index += EXACT_SORT_TG_SIZE) {
-            const uint digit =
-                (uint)((source[start + local_index] >> shift) & 0xFFu);
-            atomic_fetch_add_explicit(
-                &digit_histogram[digit], 1u, memory_order_relaxed);
+        for (uint digit = simd_lane; digit < EXACT_SORT_RADIX;
+             digit += EXACT_SORT_SIMD_WIDTH) {
+            cursors[digit] = 0u;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint base = slice_begin; base < slice_end;
+             base += EXACT_SORT_SIMD_WIDTH) {
+            const uint index = base + simd_lane;
+            const bool valid = index < slice_end;
+            const uint digit = valid
+                ? uint(source[start + index] >> shift) & 0xFFu
+                : 0u;
+            const uint match = radix_digit_match(digit, valid);
+            if (valid && (match & lanes_below) == 0u) {
+                cursors[digit] += popcount(match);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (tid == 0) {
-            uint running = 0;
-            for (uint digit = 0; digit < EXACT_SORT_RADIX; ++digit) {
-                digit_offsets[digit] = running;
-                running += atomic_load_explicit(
-                    &digit_histogram[digit], memory_order_relaxed);
-            }
+        // Thread `tid` owns digit `tid`: its exclusive start across all
+        // digits, then one cursor per SIMD-group slice in slice order.
+        uint digit_total = 0u;
+        for (uint group = 0; group < EXACT_SORT_SIMD_GROUPS; ++group) {
+            digit_total += simd_cursors[group * EXACT_SORT_RADIX + tid];
+        }
+        uint cursor = simd_prefix_exclusive_sum(digit_total);
+        const uint group_total = simd_sum(digit_total);
+        if (simd_lane == 0) simd_totals[simd_group] = group_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint group = 0; group < simd_group; ++group) {
+            cursor += simd_totals[group];
+        }
+        for (uint group = 0; group < EXACT_SORT_SIMD_GROUPS; ++group) {
+            const uint slot = group * EXACT_SORT_RADIX + tid;
+            const uint group_count = simd_cursors[slot];
+            simd_cursors[slot] = cursor;
+            cursor += group_count;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint wave_start = 0; wave_start < count;
-             wave_start += EXACT_SORT_TG_SIZE) {
-            atomic_store_explicit(
-                &wave_histogram[tid], 0u, memory_order_relaxed);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            const uint local_index = wave_start + tid;
-            const bool valid = local_index < count;
-            uint64_t key = 0;
-            uint digit = EXACT_SORT_RADIX;
-            if (valid) {
-                key = source[start + local_index];
-                digit = (uint)((key >> shift) & 0xFFu);
-                atomic_fetch_add_explicit(
-                    &wave_histogram[digit], 1u, memory_order_relaxed);
-            }
-            wave_digits[tid] = (ushort)digit;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Stable rank within this wave. SIMD broadcast handles preceding
-            // lanes in the current SIMD-group; shared digits cover preceding
-            // SIMD-groups. Invalid lanes carry sentinel 256 and never match.
-            uint rank = 0;
-            for (ushort lane = 0; lane < (ushort)simd_width; ++lane) {
-                const uint other = simd_broadcast(digit, lane);
-                if ((uint)lane < simd_lane && other == digit) ++rank;
-            }
-            const uint preceding_simd_entries = simd_group * simd_width;
-            for (uint preceding = 0; preceding < preceding_simd_entries;
-                 ++preceding) {
-                if ((uint)wave_digits[preceding] == digit) ++rank;
-            }
-
-            if (valid) {
-                const uint output_index = digit_offsets[digit] +
-                    processed_digits[digit] + rank;
-                destination[start + output_index] = key;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            processed_digits[tid] += atomic_load_explicit(
-                &wave_histogram[tid], memory_order_relaxed);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint base = slice_begin; base < slice_end;
+             base += EXACT_SORT_SIMD_WIDTH) {
+            const uint index = base + simd_lane;
+            const bool valid = index < slice_end;
+            const uint64_t key = valid ? source[start + index] : 0;
+            const uint digit = uint(key >> shift) & 0xFFu;
+            const uint match = radix_digit_match(digit, valid);
+            const uint rank = popcount(match & lanes_below);
+            if (valid) destination[start + cursors[digit] + rank] = key;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            if (valid && rank == 0u) cursors[digit] += popcount(match);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        // The next pass reads the device-memory writes made above. A single
+        // The next pass reads every slice's device-memory writes. A single
         // threadgroup owns each tile's disjoint source/destination range.
         threadgroup_barrier(mem_flags::mem_device);
+        device uint64_t* sorted = destination;
+        destination = source;
+        source = sorted;
+    }
+
+    // An odd number of performed passes leaves the result in the scratch.
+    if (source != keys_a) {
+        for (uint index = tid; index < count; index += EXACT_SORT_TG_SIZE) {
+            keys_a[start + index] = source[start + index];
+        }
     }
 }
 
@@ -4041,6 +4409,13 @@ kernel void rasterize_forward_chunked_kernel(
     threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
     threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
     threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    threadgroup uint simd_done[RAST_BLOCK_SIZE / 32];
+    threadgroup int index_batch[RAST_BLOCK_SIZE];
+    threadgroup uint segment_counts[RAST_BLOCK_SIZE / 32];
+    const float2 block_min = float2(
+        float(blockIdx.x * RAST_BLOCK_X), float(blockIdx.y * RAST_BLOCK_Y));
+    const float2 block_max =
+        block_min + float2(float(RAST_BLOCK_X - 1), float(RAST_BLOCK_Y - 1));
 
     float T = 1.f;
     float3 pix_out = {0.f, 0.f, 0.f};
@@ -4049,43 +4424,57 @@ kernel void rasterize_forward_chunked_kernel(
 
     for (int b = 0; b < num_batches; ++b) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (b > 0 && raster_threadgroup_done(
+                simd_done, RAST_BLOCK_SIZE / 32u)) {
+            break;
+        }
         int batch_start = chunk_start + RAST_BLOCK_SIZE * b;
         int idx = batch_start + tr;
+        RasterIntersectionAttributes attributes;
+        bool keep = false;
         if (idx < chunk_end) {
-            const RasterIntersectionAttributes attributes =
-                load_raster_intersection_attributes(
+            attributes = load_raster_intersection_attributes(
                 sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
                 projected_opacities, attribute_layout, idx);
-            xy_opacity_batch[tr] = attributes.xy_opacity;
-            conic_batch[tr] = attributes.conic;
-            rgbs_batch[tr] = max(attributes.rgb + 0.5f, 0.0f);
+            keep = raster_may_blend_rect(
+                attributes.xy_opacity.xy, attributes.conic,
+                attributes.xy_opacity.z, block_min, block_max);
+        }
+        const uint slot = raster_stage_slot(keep, tr, segment_counts);
+        if (keep) {
+            xy_opacity_batch[slot] = attributes.xy_opacity;
+            conic_batch[slot] = attributes.conic;
+            rgbs_batch[slot] = max(attributes.rgb + 0.5f, 0.0f);
+            index_batch[slot] = idx;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (done || !inside) continue;
-
-        int batch_size = min(RAST_BLOCK_SIZE, chunk_end - batch_start);
-        for (int t = 0; t < batch_size; ++t) {
-            const float3 conic_local = conic_batch[t];
-            const float3 xy_opac = xy_opacity_batch[t];
-            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
-            const float sigma = fma(0.5f,
-                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
-                conic_local.y * delta.x * delta.y);
-            if (sigma < 0.f || sigma >= 5.55f) continue;
-            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
-            if (alpha < 1.f / 255.f) continue;
-            const float next_T = T * (1.f - alpha);
-            if (next_T <= 1e-4f) {
-                last_contributor = batch_start + t - 1;
-                done = true;
-                break;
+        for (uint segment = 0; segment < RAST_BLOCK_SIZE / 32 && !done && inside;
+             ++segment) {
+            const uint segment_end = segment * 32u + segment_counts[segment];
+            for (uint t = segment * 32u; t < segment_end; ++t) {
+                const float3 conic_local = conic_batch[t];
+                const float3 xy_opac = xy_opacity_batch[t];
+                const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+                const float sigma = raster_pixel_sigma(conic_local, delta);
+                // A miss blends with alpha 0, leaving T and the color
+                // bit-identical, so the SIMD-group stays on one path.
+                const float raw_alpha = min(0.999f, xy_opac.z * exp(-sigma));
+                const bool hit = sigma >= 0.f && sigma < 5.55f &&
+                    raw_alpha >= 1.f / 255.f;
+                const float alpha = hit ? raw_alpha : 0.f;
+                const float next_T = T * (1.f - alpha);
+                if (next_T <= 1e-4f) {
+                    last_contributor = index_batch[t] - 1;
+                    done = true;
+                    break;
+                }
+                pix_out = fma(rgbs_batch[t], alpha * T, pix_out);
+                T = next_T;
+                last_contributor = hit ? index_batch[t] : last_contributor;
             }
-            const float vis = alpha * T;
-            pix_out = fma(rgbs_batch[t], vis, pix_out);
-            T = next_T;
-            last_contributor = batch_start + t;
         }
+        raster_publish_simd_done(simd_done, tr, done || !inside);
     }
 
     if (inside) {
@@ -4254,9 +4643,6 @@ kernel void rasterize_backward_chunked_kernel(
     // Initialize T and buffer as if monolithic backward just finished all chunks > k
     // T = prefix_T[k] * chunk_T[k] = absolute transmittance after chunk k
     float T = pT_k * cT_k;
-    // buffer = after_C[k] = weighted color contribution from all chunks after k
-    float3 buffer = aC_k;
-
     float T_final = final_Ts[pix_id];
     float v_alpha_pixel = 0.0f;
     if (inside && alpha_layout.x != 0) {
@@ -4268,8 +4654,18 @@ kernel void rasterize_backward_chunked_kernel(
             (rendered_alpha < target_alpha ? -1.0f : 0.0f));
     }
     const float3 bg = {background[0], background[1], background[2]};
-    const float3 T_final_bg = T_final * bg;
     const float3 v_out = read_packed_float3(v_output, pix_id);
+    const float T_final_bg_dot = dot(T_final * bg, v_out);
+    // buffer = after_C[k] = weighted color contribution from all chunks after
+    // k, projected onto v_out: the gradients only consume dot(buffer, v_out)
+    float buffer_dot = dot(aC_k, v_out);
+
+    // Each lane owns at most one of the nine SIMD-group gradient totals.
+    const ushort gradient_lane = (ushort)wr;
+    const int gradient_component = raster_gradient_component(gradient_lane);
+    int gradient_stride;
+    device atomic_float* gradient_base = raster_gradient_base(
+        gradient_component, v_rgb, v_conic, v_xy, v_opacity, gradient_stride);
 
     const int bin_final = inside ? chunk_final_idx[chunk_offset] : -1;
 
@@ -4289,6 +4685,12 @@ kernel void rasterize_backward_chunked_kernel(
     threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
     threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
     threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    threadgroup int index_batch[RAST_BLOCK_SIZE];
+    threadgroup uint segment_counts[RAST_BLOCK_SIZE / 32];
+    const float2 block_min = float2(
+        float(blockIdx.x * RAST_BLOCK_X), float(blockIdx.y * RAST_BLOCK_Y));
+    const float2 block_max =
+        block_min + float2(float(RAST_BLOCK_X - 1), float(RAST_BLOCK_Y - 1));
 
     // Warp-level early exit
     const int warp_bin_final = warp_reduce_all_max(bin_final, warp_size);
@@ -4296,6 +4698,8 @@ kernel void rasterize_backward_chunked_kernel(
     // Subtile-level early exit: skip leading batches beyond any pixel's bin_final
     const uint warp_id = tr / warp_size;
     constexpr uint NUM_WARPS = RAST_BLOCK_SIZE / 32;
+    static_assert(NUM_WARPS == 2,
+                  "staged batches are walked as two SIMD-group segments");
     threadgroup int warp_max_finals[NUM_WARPS];
     if (wr == 0) warp_max_finals[warp_id] = warp_bin_final;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -4310,23 +4714,42 @@ kernel void rasterize_backward_chunked_kernel(
 
         // Load batch from back to front within this chunk
         const int batch_end = chunk_end - 1 - RAST_BLOCK_SIZE * b;
-        int batch_size = min(RAST_BLOCK_SIZE, batch_end + 1 - chunk_start);
         const int idx = batch_end - tr;
+        // Stage only Gaussians that can blend a pixel of this block, in
+        // back-to-front order within each SIMD-group's segment.
+        RasterIntersectionAttributes attributes;
+        bool keep = false;
         if (idx >= chunk_start) {
-            id_batch[tr] = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
-            const RasterIntersectionAttributes attributes =
-                load_raster_intersection_attributes(
+            attributes = load_raster_intersection_attributes(
                 sorted_keys, packed_xy_opac, packed_conic, packed_rgb,
                 projected_opacities, attribute_layout, idx);
-            xy_opacity_batch[tr] = attributes.xy_opacity;
-            conic_batch[tr] = attributes.conic;
+            keep = raster_may_blend_rect(
+                attributes.xy_opacity.xy, attributes.conic,
+                attributes.xy_opacity.z, block_min, block_max);
+        }
+        const uint slot = raster_stage_slot(keep, tr, segment_counts);
+        if (keep) {
+            id_batch[slot] = (int32_t)(sorted_keys[idx] & 0xFFFFFFFFu);
+            xy_opacity_batch[slot] = attributes.xy_opacity;
+            conic_batch[slot] = attributes.conic;
             // Shift once per loaded Gaussian instead of once per contributing
             // pixel. The backward clamp and its gate both consume this value.
-            rgbs_batch[tr] = attributes.rgb + 0.5f;
+            rgbs_batch[slot] = attributes.rgb + 0.5f;
+            index_batch[slot] = idx;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (int t = max(0, batch_end - warp_bin_final); t < batch_size; ++t) {
+        // process the staged gaussians back to front: the first segment's,
+        // then the second's (an 8x8 block has two 32-lane segments)
+        const uint staged_front = segment_counts[0];
+        const uint staged_count = staged_front + segment_counts[1];
+        for (uint staged = 0; staged < staged_count; ++staged) {
+            const uint t = staged < staged_front
+                ? staged
+                : 32u + (staged - staged_front);
+            // Gaussians behind every pixel of this SIMD-group come first.
+            const int index = index_batch[t];
+            if (index > warp_bin_final) continue;
             float3 b_conic = float3(0.f);
             float3 b_xy_opac = float3(0.f);
             if (wr == 0) {
@@ -4336,32 +4759,23 @@ kernel void rasterize_backward_chunked_kernel(
             b_conic = simd_broadcast(b_conic, 0);
             b_xy_opac = simd_broadcast(b_xy_opac, 0);
 
-            int valid = inside;
-            if (batch_end - t > bin_final) valid = 0;
-
-            float alpha;
-            float opac;
-            float2 delta;
-            float vis;
-            if (valid) {
-                opac = b_xy_opac.z;
-                delta = {b_xy_opac.x - px, b_xy_opac.y - py};
-                float sigma = fma(0.5f,
-                    fma(b_conic.x, delta.x * delta.x, b_conic.z * delta.y * delta.y),
-                    b_conic.y * delta.x * delta.y);
-                if (sigma < 0.f || sigma >= 5.55f) {
-                    valid = 0;
-                } else {
-                    vis = exp(-sigma);
-                    alpha = min(0.999f, opac * vis);
-                    if (alpha < 1.f / 255.f) valid = 0;
-                }
+            // Every lane evaluates the Gaussian. Lanes it misses carry alpha 0
+            // through the same arithmetic, which leaves T and buffer_dot
+            // bit-identical and every gradient zero, so the SIMD-group stays
+            // on one path.
+            const float opac = b_xy_opac.z;
+            const float2 delta = {b_xy_opac.x - px, b_xy_opac.y - py};
+            const float sigma = raster_pixel_sigma(b_conic, delta);
+            const float raw_alpha = min(0.999f, opac * exp(-sigma));
+            const bool valid = inside && index <= bin_final &&
+                sigma >= 0.f && sigma < 5.55f && raw_alpha >= 1.f / 255.f;
+            // if all threads are inactive in this warp, skip this loop
+            if (!warp_reduce_all_or(valid, warp_size)) {
+                continue;
             }
 
-            if (!warp_reduce_all_or(valid, warp_size)) continue;
-
             // RGB and the Gaussian ID are unused when the whole SIMDgroup is
-            // inactive. Only RGB is needed outside lane 0.
+            // inactive. The scattered gradient lanes need both.
             float3 b_rgb = float3(0.f);
             int32_t b_id = 0;
             if (wr == 0) {
@@ -4369,53 +4783,49 @@ kernel void rasterize_backward_chunked_kernel(
                 b_id = id_batch[t];
             }
             b_rgb = simd_broadcast(b_rgb, 0);
+            b_id = simd_broadcast(b_id, 0);
 
-            float3 v_rgb_local = {0.f, 0.f, 0.f};
-            float3 v_conic_local = {0.f, 0.f, 0.f};
-            float2 v_xy_local = {0.f, 0.f};
-            float v_opacity_local = 0.f;
+            // Recover the transmittance before this Gaussian. Forward uses
+            // the same capped alpha, so this must also run when the 0.999
+            // cap binds or every nearer Gaussian receives a T that is
+            // 1000x too small.
+            const float alpha = valid ? raw_alpha : 0.f;
+            const float ra = 1.f / (1.f - alpha);
+            if (valid) T *= ra;
+            const float fac = alpha * T;
+            const float3 v_rgb_local = fac * v_out;
 
-            if (valid) {
-                // Match the monolithic backward recurrence: the forward pass
-                // multiplied T by (1 - alpha) even when alpha hit its cap.
-                float ra = 1.f / (1.f - alpha);
-                T *= ra;
-                const float fac = alpha * T;
-                v_rgb_local = fac * v_out;
+            const float rgb_dot = dot(max(b_rgb, 0.f), v_out);
+            // contribution from this pixel + background
+            const float v_alpha =
+                fma(rgb_dot, T, -ra * (buffer_dot + T_final_bg_dot)) +
+                v_alpha_pixel * T_final * ra;
+            // update the running sum
+            buffer_dot = fma(rgb_dot, fac, buffer_dot);
 
-                const float3 rgb = max(b_rgb, 0.f);
-                const float v_alpha =
-                    dot(fma(rgb, T, fma(-buffer, ra, -ra * T_final_bg)), v_out) +
-                    v_alpha_pixel * T_final * ra;
-                buffer = fma(rgb, fac, buffer);
+            // The cap makes alpha locally constant in sigma and opacity,
+            // but it does not remove the color gradient above.
+            // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
+            const float v_sigma = alpha < 0.999f ? -alpha * v_alpha : 0.f;
+            const float3 v_conic_local = (0.5f * v_sigma) * float3(
+                delta.x * delta.x, delta.x * delta.y, delta.y * delta.y);
+            const float2 v_xy_local = v_sigma * float2(
+                fma(b_conic.x, delta.x, b_conic.y * delta.y),
+                fma(b_conic.y, delta.x, b_conic.z * delta.y));
+            // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
+            const float v_opacity_local = -v_sigma * (1.f - opac);
 
-                if (alpha < 0.999f) {
-                    const float v_sigma = -alpha * v_alpha;
-                    v_conic_local = (0.5f * v_sigma) * float3(
-                        delta.x * delta.x, delta.x * delta.y,
-                        delta.y * delta.y);
-                    v_xy_local = v_sigma * float2(
-                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
-                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
-                    v_opacity_local = -v_sigma * (1.f - opac);
-                }
-            }
-
-            v_rgb_local = warpSum3(v_rgb_local, warp_size, wr);
-            v_conic_local = warpSum3(v_conic_local, warp_size, wr);
-            v_xy_local = warpSum2(v_xy_local, warp_size, wr);
-            v_opacity_local = warpSum(v_opacity_local, warp_size, wr);
-
-            if (wr == 0) {
-                if (b_rgb.x >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 0, v_rgb_local.x, memory_order_relaxed);
-                if (b_rgb.y >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 1, v_rgb_local.y, memory_order_relaxed);
-                if (b_rgb.z >= 0.f) atomic_fetch_add_explicit(v_rgb + 3*b_id + 2, v_rgb_local.z, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 0, v_conic_local.x, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 1, v_conic_local.y, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_conic + 3*b_id + 2, v_conic_local.z, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_xy + 2*b_id + 0, v_xy_local.x, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_xy + 2*b_id + 1, v_xy_local.y, memory_order_relaxed);
-                atomic_fetch_add_explicit(v_opacity + b_id, v_opacity_local, memory_order_relaxed);
+            float gradients[RASTER_GRADIENT_COUNT] = {
+                v_rgb_local.x, v_rgb_local.y, v_rgb_local.z,
+                v_conic_local.x, v_conic_local.y, v_conic_local.z,
+                v_xy_local.x, v_xy_local.y, v_opacity_local,
+            };
+            const float gradient_total =
+                raster_gradient_reduce_scatter(gradients, gradient_lane);
+            if (raster_gradient_lane_writes(gradient_component, b_rgb)) {
+                atomic_fetch_add_explicit(
+                    gradient_base + gradient_stride * b_id, gradient_total,
+                    memory_order_relaxed);
             }
         }
     }
