@@ -251,6 +251,14 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "iOS")
         target_link_libraries(msplat_checkpoint_tests PRIVATE msplat_core)
         add_test(NAME msplat_checkpoint_validation COMMAND msplat_checkpoint_tests)
 
+        add_executable(msplat_gaussian_ply_tests tests/test_gaussian_ply.mm)
+        target_link_libraries(msplat_gaussian_ply_tests PRIVATE msplat_core)
+        add_test(NAME msplat_gaussian_ply
+            COMMAND msplat_gaussian_ply_tests
+                "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/default.metallib")
+        set_tests_properties(msplat_gaussian_ply PROPERTIES
+            SKIP_RETURN_CODE 77)
+
         add_executable(msplat_image_io_tests tests/test_image_io.cpp)
         target_link_libraries(msplat_image_io_tests PRIVATE msplat_core)
         add_test(NAME msplat_image_io COMMAND msplat_image_io_tests)

@@ -13,6 +13,7 @@
 #include "loaders.hpp"
 #include "msplat.hpp"
 #include "bindings.h"
+#include "ssim.hpp"
 
 namespace fs = std::filesystem;
 
@@ -198,9 +199,10 @@ int main(int argc, char *argv[]) {
             Camera &cam = inputData.cameras[cams[camIdx]];
 
             auto iter_start = cpu_now();
-            MTensor gt = images.gpuImage(inputData.cameras, cams[camIdx],
-                                         model.getDownscaleFactor(step));
-            model.fullIteration(cam, cams[camIdx], step, gt, ssimWeight);
+            // The target carries the camera's training mask, if any.
+            const CameraTrainingTarget target = images.gpuTrainingTarget(
+                inputData.cameras, cams[camIdx], model.getDownscaleFactor(step));
+            model.fullIteration(cam, cams[camIdx], step, target, ssimWeight);
             model.schedulersStep(step);
             model.afterTrain(step);
             msplat_commit();
@@ -343,12 +345,14 @@ int main(int argc, char *argv[]) {
                 MTensor rgb = model.render(testCam, numIters);
                 msplat_gpu_sync();
                 MTensor rgb_cpu = rgb.cpu();
-                MTensor gt_cpu = images.gpuImage(inputData.cameras, testCams[i],
-                                                 model.getDownscaleFactor(numIters)).cpu();
+                const TargetMetrics metrics = coverage_target_metrics(
+                    rgb_cpu, images.gpuTrainingTarget(
+                        inputData.cameras, testCams[i],
+                        model.getDownscaleFactor(numIters), false));
 
-                float p = psnr(rgb_cpu, gt_cpu);
-                float s = ssim_eval(rgb_cpu, gt_cpu);
-                float l = l1_loss(rgb_cpu, gt_cpu);
+                float p = metrics.psnr;
+                float s = metrics.ssim;
+                float l = metrics.l1;
                 sumPsnr += p; sumSsim += s; sumL1 += l;
 
                 std::cout << "  [" << (i+1) << "/" << nTest << "] "
@@ -367,13 +371,15 @@ int main(int argc, char *argv[]) {
             MTensor rgb = model.render(validationCam, numIters);
             msplat_gpu_sync();
             MTensor rgb_cpu = rgb.cpu();
-            MTensor gt_cpu = images.gpuImage(inputData.cameras, (size_t)valCamIndex,
-                                             model.getDownscaleFactor(numIters)).cpu();
+            const TargetMetrics metrics = coverage_target_metrics(
+                rgb_cpu, images.gpuTrainingTarget(
+                    inputData.cameras, (size_t)valCamIndex,
+                    model.getDownscaleFactor(numIters), false));
 
             std::cout << "\n=== Validation (" << validationCam.filePath << ") ===" << std::endl;
-            std::cout << "  PSNR:  " << psnr(rgb_cpu, gt_cpu)
-                      << "  SSIM:  " << ssim_eval(rgb_cpu, gt_cpu)
-                      << "  L1:  " << l1_loss(rgb_cpu, gt_cpu)
+            std::cout << "  PSNR:  " << metrics.psnr
+                      << "  SSIM:  " << metrics.ssim
+                      << "  L1:  " << metrics.l1
                       << "  Gaussians: " << model.means.size(0) << std::endl;
         }
 

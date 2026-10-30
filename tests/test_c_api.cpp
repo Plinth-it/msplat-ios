@@ -683,6 +683,9 @@ int main() {
 
     MsplatErrorInfo error{};
 
+    // The legacy loader reports failure as -1, never as a step-0 resume.
+    CHECK(msplat_trainer_load_checkpoint(nullptr, "/nonexistent.msplat") == -1);
+
     // ABI v5 accepts stack-backed storage and synchronously deep-copies it.
     MsplatDataset copiedDataset = nullptr;
     CHECK(createFromStackAndOverwriteInputs(&copiedDataset, &error) ==

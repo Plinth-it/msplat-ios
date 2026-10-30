@@ -80,6 +80,9 @@ struct ContentView: View {
                 startBenchmarkIfReady()
             }
             .onChange(of: scenePhase) { _, newPhase in
+                // Pause before `.background`: iOS rejects Metal work from a
+                // backgrounded app, which would otherwise fail the whole run.
+                session.updateSceneActivity(isActive: newPhase == .active)
                 if newPhase == .active {
                     startBenchmarkIfReady()
                 }
@@ -365,12 +368,18 @@ struct ContentView: View {
             case .planning:
                 LabeledContent("Status", value: "Planning device-safe training…")
             case .loading:
-                LabeledContent("Status", value: "Loading dataset…")
+                LabeledContent(
+                    "Status",
+                    value: session.isPaused ? pausedStatus : "Loading dataset…"
+                )
             case .cancelled:
                 LabeledContent("Status", value: "Cancelled")
             case .failed(let message):
                 Text(message).foregroundStyle(.red)
             default:
+                if session.isPaused {
+                    LabeledContent("Status", value: pausedStatus)
+                }
                 if let preview = session.preview {
                     MetalPreviewView(surface: preview)
                         .aspectRatio(
@@ -474,6 +483,10 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    private var pausedStatus: String {
+        "Paused until msplat is back in the foreground"
     }
 
     private func duration(_ milliseconds: Float?) -> String {

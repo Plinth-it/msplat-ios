@@ -30,6 +30,19 @@ float l1_loss(const MTensor& rendered, const MTensor& gt,
               const MTensor* coverageMask = nullptr,
               uint64_t coverageUnits = 0);
 
+struct CameraTrainingTarget;
+
+struct TargetMetrics {
+    float psnr = 0.0f;
+    float ssim = 0.0f;
+    float l1 = 0.0f;
+};
+
+// Coverage-mode metrics against a CameraImageCache training target. A masked
+// camera's RGBA target carries its own coverage in alpha.
+TargetMetrics coverage_target_metrics(const MTensor& renderedCpu,
+                                      const CameraTrainingTarget& target);
+
 // Create 11x11 Gaussian window for Metal SSIM loss kernel.
 // Returns flat float vector (121 elements).
 std::vector<float> createSSIMWindow(int windowSize = 11, float sigma = 1.5f);

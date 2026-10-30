@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+- Hardened the point-cloud PLY reader. Vertex counts are parsed as 64-bit
+  values and bounded by the remaining file bytes before allocation, all eight
+  PLY scalar types advance binary records, elements declared before the
+  vertices are skipped, CRLF headers are accepted, and float colors are clamped
+  and rounded. Previously a short file could declare a count that overflowed
+  the allocation size or reserved gigabytes before the truncation check.
+- `--resume` now restores the saved step. The Gaussian PLY loader read a step
+  comment that the writer never emitted, so every resume restarted at step 1.
+  The loader also locates properties by name, requires float data and a
+  supported SH layout, checks every read, and bounds the count by file size.
+  Resuming a PLY whose SH degree differs from the configured degree is rejected.
+- A Nerfstudio `transforms.json` without `cx`/`cy` now uses the image center,
+  matching the Polycam adapter, instead of a principal point of zero.
+- The CLI and Python bindings train on the masked training target and report
+  masked evaluation metrics, matching the Swift and C APIs. They previously
+  decoded Nerfstudio `mask_path` masks and then ignored them.
+- The legacy `msplat_trainer_load_checkpoint` returns -1 on failure instead
+  of 0, which was indistinguishable from a step-0 checkpoint.
+- Densification that prunes every Gaussian now fails with an explicit error,
+  and rendering or training an empty population is rejected before any GPU
+  dispatch instead of encoding zero-width threadgroups.
+- Preview-frame poll, texture, and destroy calls and capture diagnostics no
+  longer wait behind the global C API lock, so releasing a preview on the main
+  thread does not block for a training step.
+- Destroying the last trainer releases the shared GPU transient cache
+  (image-sized SSIM, raster, and intersection buffers) instead of keeping it
+  resident until an explicit `msplatCleanup()`.
 - Added ABI v18 size-checked appearance options with mutually exclusive none,
   RGB-gain, and PPISP modes. The current PPISP phase covers per-frame log2
   exposure and color homography only. Existing photometric-gain properties and

@@ -12,7 +12,41 @@ enum CaptureEngineControlEvent: Sendable {
         commit: CaptureCommit,
         qualityFallback: String?
     )
+    case trackingContinuityChanged(CaptureTrackingContinuity)
     case failed(String)
+}
+
+/// Whether frames recorded after an ARKit interruption share the world frame
+/// of the frames recorded before it.
+enum CaptureTrackingContinuity: Sendable, Equatable {
+    /// No interruption since recording started, or ARKit relocalized after one.
+    case continuous
+    /// ARKit stopped delivering frames, for example after a lock or a call.
+    case interrupted
+    /// The interruption ended; ARKit is relocalizing into the original world.
+    case relocalizing
+    /// ARKit restarted world tracking, so this recording cannot continue.
+    case lost
+}
+
+/// The part of `ARCamera.TrackingState` that decides relocalization.
+enum CaptureTrackingObservation: Sendable, Equatable {
+    case normal
+    case relocalizing
+    case initializing
+    case other
+
+    init(_ trackingState: ARCamera.TrackingState) {
+        if case .normal = trackingState {
+            self = .normal
+        } else if case .limited(.relocalizing) = trackingState {
+            self = .relocalizing
+        } else if case .limited(.initializing) = trackingState {
+            self = .initializing
+        } else {
+            self = .other
+        }
+    }
 }
 
 enum CaptureEngineTelemetryEvent: Sendable {
@@ -53,6 +87,7 @@ struct CaptureFrameSnapshot: @unchecked Sendable {
 
 struct CaptureFrameAdmission: Sendable {
     fileprivate let generation: UInt64
+    fileprivate let interruptionCount: UInt64
     let candidateSequence: UInt64
     fileprivate let store: CaptureStore
     let requestsHighResolutionFrame: Bool
@@ -98,6 +133,8 @@ final class CaptureFrameAdmissionController: Sendable {
         var lastAcceptedTransform: simd_float4x4?
         var lastAcceptedTimestamp: TimeInterval?
         var processingTask: Task<Void, Never>?
+        var continuity = CaptureTrackingContinuity.continuous
+        var interruptionCount: UInt64 = 0
     }
 
     private let state = Mutex(State())
@@ -118,9 +155,74 @@ final class CaptureFrameAdmissionController: Sendable {
             state.lastAcceptedTransform = nil
             state.lastAcceptedTimestamp = nil
             state.processingTask = nil
+            state.continuity = .continuous
             return previousTask
         }
         previousTask?.cancel()
+    }
+
+    var continuity: CaptureTrackingContinuity {
+        state.withLock { state in state.continuity }
+    }
+
+    /// Stops admission as soon as ARKit reports an interruption. Returns the
+    /// new continuity when it changed during a recording.
+    func interrupt() -> CaptureTrackingContinuity? {
+        state.withLock { state in
+            state.interruptionCount &+= 1
+            guard state.isRecording,
+                  state.continuity == .continuous ||
+                    state.continuity == .relocalizing else {
+                return nil
+            }
+            state.continuity = .interrupted
+            return .interrupted
+        }
+    }
+
+    /// Keeps admission closed after the interruption until tracking proves
+    /// ARKit relocalized into the pre-interruption world frame.
+    func endInterruption() -> CaptureTrackingContinuity? {
+        state.withLock { state in
+            guard state.isRecording, state.continuity == .interrupted else {
+                return nil
+            }
+            state.continuity = .relocalizing
+            return .relocalizing
+        }
+    }
+
+    /// Resumes admission only on normal tracking after an interruption ended.
+    /// Reinitialized tracking means a new world origin, so the recording ends.
+    func observeTracking(
+        _ observation: CaptureTrackingObservation
+    ) -> CaptureTrackingContinuity? {
+        state.withLock { state in
+            guard state.isRecording else { return nil }
+            switch (state.continuity, observation) {
+            case (.interrupted, .relocalizing):
+                // Frames are flowing again even if the end callback is late.
+                state.continuity = .relocalizing
+            case (.relocalizing, .normal):
+                state.continuity = .continuous
+            case (.interrupted, .initializing), (.relocalizing, .initializing):
+                state.continuity = .lost
+            default:
+                // Normal tracking before the interruption has ended, or other
+                // limited tracking while relocalizing, proves nothing.
+                return nil
+            }
+            return state.continuity
+        }
+    }
+
+    /// Whether ARKit reported no interruption since `admission` was issued.
+    /// Its streaming snapshot predates any later interruption, but a
+    /// high-resolution frame delivered afterwards may not.
+    func hasUninterruptedTracking(since admission: CaptureFrameAdmission) -> Bool {
+        state.withLock { state in
+            state.interruptionCount == admission.interruptionCount
+        }
     }
 
     func updateDisplayOrientation(_ displayOrientation: CaptureDisplayOrientation) {
@@ -141,6 +243,7 @@ final class CaptureFrameAdmissionController: Sendable {
     ) -> CaptureFrameAdmission? {
         state.withLock { state in
             guard state.isRecording,
+                  state.continuity == .continuous,
                   state.activeCandidateSequence == nil,
                   let store = state.store,
                   let displayOrientation = state.displayOrientation else {
@@ -169,6 +272,7 @@ final class CaptureFrameAdmissionController: Sendable {
             state.activeCandidateSequence = candidateSequence
             return CaptureFrameAdmission(
                 generation: state.generation,
+                interruptionCount: state.interruptionCount,
                 candidateSequence: candidateSequence,
                 store: store,
                 requestsHighResolutionFrame: state.usesHighResolutionCapture,
@@ -312,7 +416,33 @@ private final class CaptureFrameIngestor: NSObject,
         }
     }
 
+    // ARKit delivers every observer callback on `queue`, so interruption and
+    // frame updates are ordered; only `Sendable` events reach the main actor.
+
+    func sessionWasInterrupted(_ session: ARSession) {
+        if let continuity = admission.interrupt() {
+            controlContinuation.yield(.trackingContinuityChanged(continuity))
+        }
+    }
+
+    func sessionInterruptionEnded(_ session: ARSession) {
+        if let continuity = admission.endInterruption() {
+            controlContinuation.yield(.trackingContinuityChanged(continuity))
+        }
+    }
+
+    /// Without relocalization ARKit restarts tracking at a new world origin,
+    /// and frames after the interruption would not align with earlier ones.
+    func sessionShouldAttemptRelocalization(_ session: ARSession) -> Bool {
+        true
+    }
+
     func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        if let continuity = admission.observeTracking(
+            CaptureTrackingObservation(frame.camera.trackingState)
+        ) {
+            controlContinuation.yield(.trackingContinuityChanged(continuity))
+        }
         guard case .normal = frame.camera.trackingState else { return }
         guard let ticket = admission.begin(
             cameraToWorld: frame.camera.transform,
@@ -365,7 +495,13 @@ private final class CaptureFrameIngestor: NSObject,
                                 subjectWorldPosition: ticket.subjectWorldPosition,
                                 requestGate: highResolutionRequestGate
                         )
-                        if captureCandidateHasUsableGeometry(highResolutionCandidate) {
+                        if !admission.hasUninterruptedTracking(since: ticket) {
+                            // The streaming snapshot predates the interruption;
+                            // this frame may come from a relocalized or reset world.
+                            candidate = try streamingSnapshot.materialize()
+                            fallbackMessage = "Tracking was interrupted during " +
+                                "high-resolution capture; captured a camera-stream frame instead."
+                        } else if captureCandidateHasUsableGeometry(highResolutionCandidate) {
                             candidate = highResolutionCandidate
                             commitFallback = streamingSnapshot
                         } else {
@@ -509,25 +645,29 @@ final class CaptureEngine: NSObject {
         } else {
             supportsHighResolutionCapture = false
         }
-        let allDepthSemantics: ARConfiguration.FrameSemantics = [
-            .sceneDepth,
-            .smoothedSceneDepth,
-        ]
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(allDepthSemantics) {
-            configuration.frameSemantics.formUnion(allDepthSemantics)
-            supportsSceneDepth = true
-        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            configuration.frameSemantics.insert(.sceneDepth)
-            supportsSceneDepth = true
-        } else if ARWorldTrackingConfiguration.supportsFrameSemantics(
-            .smoothedSceneDepth
+        if let depthSemantics = Self.depthFrameSemantics(
+            isSupported: ARWorldTrackingConfiguration.supportsFrameSemantics
         ) {
-            configuration.frameSemantics.insert(.smoothedSceneDepth)
+            configuration.frameSemantics.insert(depthSemantics)
             supportsSceneDepth = true
         } else {
             supportsSceneDepth = false
         }
         session.run(configuration, options: [.resetTracking, .removeExistingAnchors])
+    }
+
+    /// Requests a single depth stream. Snapshots read `sceneDepth` first, so
+    /// also enabling `smoothedSceneDepth` would only add per-frame work.
+    nonisolated static func depthFrameSemantics(
+        isSupported: (ARConfiguration.FrameSemantics) -> Bool
+    ) -> ARConfiguration.FrameSemantics? {
+        if isSupported(.sceneDepth) {
+            return .sceneDepth
+        }
+        if isSupported(.smoothedSceneDepth) {
+            return .smoothedSceneDepth
+        }
+        return nil
     }
 
     func selectSubject(at viewPoint: CGPoint, viewportSize: CGSize) async throws {

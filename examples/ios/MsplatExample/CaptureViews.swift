@@ -96,12 +96,13 @@ struct CaptureRootView: View {
                     closeButton
                     Spacer()
                     if isCapturing {
+                        let isAdmitting = model.trackingContinuity == .continuous
                         Label(
                             "\(model.frameCount)",
-                            systemImage: "circle.fill"
+                            systemImage: isAdmitting ? "circle.fill" : "pause.circle.fill"
                         )
                         .font(.headline.monospacedDigit())
-                        .foregroundStyle(.white, .red)
+                        .foregroundStyle(.white, isAdmitting ? Color.red : Color.orange)
                         .padding(.horizontal, 12)
                         .padding(.vertical, 8)
                         .background(.black.opacity(0.65), in: Capsule())

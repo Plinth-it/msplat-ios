@@ -254,6 +254,63 @@ enum RefinedCaptureManifestExporter {
     }
 }
 
+/// Holds the training loop at a step boundary while the scene is not active.
+/// iOS rejects Metal command buffers from a backgrounded app, so new work has
+/// to stop before the scene reaches `.background` rather than fail the run.
+@MainActor
+final class TrainingPauseGate {
+    private(set) var isPaused = false
+    private var waiters: [UInt64: CheckedContinuation<Void, any Error>] = [:]
+    private var nextWaiterID: UInt64 = 0
+
+    var waiterCount: Int { waiters.count }
+
+    func pause() {
+        isPaused = true
+    }
+
+    func resume() {
+        isPaused = false
+        let resumedWaiters = waiters.values
+        waiters.removeAll()
+        for waiter in resumedWaiters {
+            waiter.resume()
+        }
+    }
+
+    /// Returns immediately unless paused. A cancelled waiter throws
+    /// `CancellationError` without resuming the gate for anyone else.
+    func waitUntilResumed() async throws {
+        guard isPaused else { return }
+        nextWaiterID &+= 1
+        let id = nextWaiterID
+        try await withTaskCancellationHandler {
+            try await suspendUntilResumed(id: id)
+        } onCancel: {
+            Task { @MainActor in
+                self.cancelWaiter(id)
+            }
+        }
+    }
+
+    private func suspendUntilResumed(id: UInt64) async throws {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            if Task.isCancelled {
+                continuation.resume(throwing: CancellationError())
+            } else if !isPaused {
+                continuation.resume()
+            } else {
+                waiters[id] = continuation
+            }
+        }
+    }
+
+    private func cancelWaiter(_ id: UInt64) {
+        waiters.removeValue(forKey: id)?.resume(throwing: CancellationError())
+    }
+}
+
 @MainActor
 final class TrainingSession: ObservableObject {
     enum QualityProfile: String, CaseIterable, Identifiable {
@@ -288,7 +345,12 @@ final class TrainingSession: ObservableObject {
         case idle, planning, loading, training, cancelled, finished, failed(String)
     }
 
-    @Published private(set) var phase: Phase = .idle
+    @Published private(set) var phase: Phase = .idle {
+        didSet { screenAwake.isActive = isRunning }
+    }
+    /// True while a run holds at a step boundary because the scene left
+    /// `.active`; it continues from the same step when the scene returns.
+    @Published private(set) var isPaused = false
     @Published private(set) var submittedIteration = 0
     @Published private(set) var completedIteration = 0
     @Published private(set) var splatCount = 0
@@ -343,6 +405,18 @@ final class TrainingSession: ObservableObject {
     private var nextPreviewID: UInt64 = 0
     private var previewGeneration: UInt64 = 0
     private var benchmarkRequestHandled = false
+    private let pauseGate = TrainingPauseGate()
+    private let screenAwake = ScreenAwakeController.shared.makeAssertion()
+
+    /// Mirrors the scene phase. Leaving `.active` stops new GPU submissions at
+    /// the next step boundary; returning resumes the same run.
+    func updateSceneActivity(isActive: Bool) {
+        if isActive {
+            pauseGate.resume()
+        } else {
+            pauseGate.pause()
+        }
+    }
 
     func start(source: TrainingDatasetSource) {
         start(
@@ -465,6 +539,13 @@ final class TrainingSession: ObservableObject {
 
     private var isFailed: Bool { if case .failed = phase { return true }; return false }
 
+    private var isRunning: Bool {
+        switch phase {
+        case .planning, .loading, .training: true
+        default: false
+        }
+    }
+
     private func run(
         source: TrainingDatasetSource,
         steps: Int,
@@ -549,6 +630,7 @@ final class TrainingSession: ObservableObject {
 
             phase = .loading
             try Task.checkCancellation()
+            try await holdWhileSceneInactive(drainingGPU: false)
 
             let activeSession: MsplatSession
             switch source {
@@ -593,10 +675,15 @@ final class TrainingSession: ObservableObject {
             let telemetryEvery = max(steps / 40, 10)
             var latestStats: TrainingStats?
             var measuredStartedAt: TimeInterval?
+            var measuredPausedSeconds: TimeInterval = 0
 
             for i in 0..<steps {
                 try Task.checkCancellation()
                 try throwPendingPreviewFailure()
+                let pausedSeconds = try await holdWhileSceneInactive()
+                if measuredStartedAt != nil {
+                    measuredPausedSeconds += pausedSeconds
+                }
                 if let benchmark, i == benchmark.warmupIterations {
                     // Drain warm-up work so this interval measures only steady-state
                     // submissions through completion, without setup or export time.
@@ -674,10 +761,14 @@ final class TrainingSession: ObservableObject {
             let measuredElapsedSeconds: TimeInterval?
             if benchmark != nil, let measuredStartedAt {
                 msplatSync()
-                measuredElapsedSeconds = ProcessInfo.processInfo.systemUptime - measuredStartedAt
+                // A background pause is not training time.
+                measuredElapsedSeconds = ProcessInfo.processInfo.systemUptime -
+                    measuredStartedAt - measuredPausedSeconds
             } else {
                 measuredElapsedSeconds = nil
             }
+            // Export and pose readback may still encode GPU work.
+            try await holdWhileSceneInactive()
             if benchmark == nil {
                 let url = source.capturedDataset?.rootURL.appending(
                     path: "trained-scene.ply"
@@ -879,10 +970,36 @@ final class TrainingSession: ObservableObject {
         return total
     }
 
+    /// Waits at a submission boundary while the scene is not active, returning
+    /// how long the run was held after its work drained. Work already encoded
+    /// or in flight is drained first, while the app may still use the GPU, so
+    /// nothing is committed or left executing after the scene reaches
+    /// `.background`.
+    @discardableResult
+    private func holdWhileSceneInactive(
+        drainingGPU: Bool = true
+    ) async throws -> TimeInterval {
+        guard pauseGate.isPaused else { return 0 }
+        isPaused = true
+        defer { isPaused = false }
+        if drainingGPU {
+            // Deliberately synchronous on the main actor, like the benchmark
+            // drains: UIKit cannot deliver the background transition until the
+            // queue, including any in-flight preview, has completed.
+            msplatSync()
+            await drainPendingPreview()
+            try throwPendingPreviewFailure()
+        }
+        let pausedAt = ProcessInfo.processInfo.systemUptime
+        try await pauseGate.waitUntilResumed()
+        return ProcessInfo.processInfo.systemUptime - pausedAt
+    }
+
     private func submitPreviewIfIdle(
         session: MsplatSession,
         pose: CameraPose
     ) async throws {
+        try await holdWhileSceneInactive()
         try throwPendingPreviewFailure()
         guard pendingPreview == nil else { return }
 

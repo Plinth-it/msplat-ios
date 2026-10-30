@@ -10,6 +10,15 @@ enum CaptureFlowState {
     case finalizing
     case review(CapturedDataset)
     case failed(String)
+
+    /// The camera flow, where the user may walk around without touching the
+    /// screen; auto-lock would interrupt ARKit.
+    var keepsScreenAwake: Bool {
+        switch self {
+        case .preflight, .capturing, .finalizing: true
+        case .preparing, .review, .failed: false
+        }
+    }
 }
 
 struct CaptureTaskGeneration {
@@ -66,13 +75,16 @@ struct CaptureEventOrdering {
 
 @MainActor
 final class CaptureViewModel: ObservableObject {
-    @Published private(set) var state: CaptureFlowState = .preparing
+    @Published private(set) var state: CaptureFlowState = .preparing {
+        didSet { screenAwake.isActive = state.keepsScreenAwake }
+    }
     @Published private(set) var frames: [CaptureFrameRecord] = []
     @Published private(set) var frameCount = 0
     @Published private(set) var pointCount = 0
     @Published private(set) var subjectSelected = false
     @Published private(set) var statusMessage = "Starting ARKit…"
     @Published private(set) var latestRejection: String?
+    @Published private(set) var trackingContinuity = CaptureTrackingContinuity.continuous
     @Published var mode: CaptureMode = .object {
         didSet {
             guard oldValue != mode else { return }
@@ -85,6 +97,7 @@ final class CaptureViewModel: ObservableObject {
     }
 
     let engine: CaptureEngine
+    private let screenAwake = ScreenAwakeController.shared.makeAssertion()
     private var eventTask: Task<Void, Never>?
     private var telemetryTask: Task<Void, Never>?
     private var prepareTask: Task<Void, Never>?
@@ -191,6 +204,7 @@ final class CaptureViewModel: ObservableObject {
             frameCount = 0
             pointCount = 0
             latestRejection = nil
+            trackingContinuity = .continuous
             statusMessage = captureStatusMessage
             state = .capturing
         } catch {
@@ -226,6 +240,7 @@ final class CaptureViewModel: ObservableObject {
         cancelPrepareTask()
         cancelActionTask()
         engine.stop()
+        screenAwake.isActive = false
     }
 
     private func handle(_ event: CaptureEngineControlEvent) {
@@ -244,7 +259,11 @@ final class CaptureViewModel: ObservableObject {
             if shouldUpdateMessage {
                 latestRejection = qualityFallback
             }
-            statusMessage = "Captured \(frameCount) frame\(frameCount == 1 ? "" : "s")."
+            statusMessage = recordingStatusMessage
+        case .trackingContinuityChanged(let continuity):
+            guard case .capturing = state else { return }
+            trackingContinuity = continuity
+            statusMessage = recordingStatusMessage
         case .failed(let message):
             cancelPrepareTask()
             cancelActionTask()
@@ -273,6 +292,28 @@ final class CaptureViewModel: ObservableObject {
             return "Move slowly, then start high-resolution capture."
         }
         return "High-resolution capture is unavailable. Move slowly, then start capture."
+    }
+
+    /// A frame already in flight may still commit during an interruption; it
+    /// was observed before it, so the pause message stays in place.
+    private var recordingStatusMessage: String {
+        switch trackingContinuity {
+        case .continuous:
+            frameCount == 0
+                ? captureStatusMessage
+                : "Captured \(frameCount) frame\(frameCount == 1 ? "" : "s")."
+        case .interrupted:
+            "Capture paused because ARKit tracking was interrupted."
+        case .relocalizing:
+            "Point the camera at an area you already captured. " +
+                "Capture resumes once ARKit relocalizes."
+        case .lost:
+            canStop
+                ? "Tracking could not be restored, so recording ended. " +
+                    "Stop and review keeps the frames captured before the interruption."
+                : "Tracking could not be restored, so recording ended. " +
+                    "Close and start a new capture."
+        }
     }
 
     private var captureStatusMessage: String {

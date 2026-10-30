@@ -327,6 +327,37 @@ bool checkNerfstudioAdapter() {
            std::abs(materialized.scale - 0.5f) < 1e-6f;
 }
 
+bool checkNerfstudioDefaultsPrincipalPointToImageCenter() {
+    TempDirectory temporary;
+    {
+        std::ofstream transforms(temporary.path / "transforms.json");
+        transforms << R"({
+  "w": 4,
+  "h": 3,
+  "fl_x": 2.0,
+  "fl_y": 2.5,
+  "ply_file_path": "points3D.ply",
+  "frames": [
+    {"file_path": "./images/a.png", "transform_matrix":
+      [[1,0,0,-2], [0,1,0,0], [0,0,1,0], [0,0,0,1]]},
+    {"file_path": "./images/b.png", "w": 8, "h": 6, "cy": 1.0,
+     "transform_matrix":
+      [[1,0,0,2], [0,1,0,0], [0,0,1,0], [0,0,0,1]]}
+  ]
+})";
+        if (!transforms) return false;
+    }
+    if (!writePointPly(temporary.path / "points3D.ply")) return false;
+
+    const DatasetDescriptor descriptor =
+        datasetDescriptorFromX(temporary.path.string());
+    return descriptor.frames.size() == 2 &&
+           sameCalibration(descriptor.frames[0].calibration, CameraCalibration{
+               4, 3, 2.0f, 2.5f, 2.0f, 1.5f, 0, 0, 0, 0, 0}) &&
+           sameCalibration(descriptor.frames[1].calibration, CameraCalibration{
+               8, 6, 2.0f, 2.5f, 4.0f, 1.0f, 0, 0, 0, 0, 0});
+}
+
 bool checkNerfstudioSupportedCameraModels() {
     for (const char *cameraModel : {
              "PINHOLE", "PERSPECTIVE", "OPENCV", "opencv"}) {
@@ -757,6 +788,7 @@ int main() {
     CHECK(checkColmapTextAdapter());
     CHECK(checkColmapBinaryAdapter());
     CHECK(checkNerfstudioAdapter());
+    CHECK(checkNerfstudioDefaultsPrincipalPointToImageCenter());
     CHECK(checkNerfstudioSupportedCameraModels());
     CHECK(checkNerfstudioCameraModelRejected(
         "OPENCV_FISHEYE", nullptr, "dataset", "OPENCV_FISHEYE"));

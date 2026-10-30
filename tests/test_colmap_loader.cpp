@@ -732,6 +732,15 @@ bool checkPlyPayloadValidation() {
     const SparsePointSet ascii = readPly(path.string());
     if (ascii.xyz != std::vector<float>{1, 2, 3} ||
         ascii.rgb != std::vector<uint8_t>{255, 0, 7}) return false;
+    // The last ASCII record may end at EOF without a newline, including the
+    // shortest possible payload.
+    if (!writeText(path, asciiHeader + "1 2 3 255 0 7")) return false;
+    const SparsePointSet noFinalNewline = readPly(path.string());
+    if (noFinalNewline.xyz != ascii.xyz || noFinalNewline.rgb != ascii.rgb) return false;
+    if (!writeText(path, "ply\nformat ascii 1.0\nelement vertex 1\n"
+                         "property float x\nproperty float y\nproperty float z\n"
+                         "end_header\n0 0 0")) return false;
+    if (readPly(path.string()).xyz != std::vector<float>{0, 0, 0}) return false;
     std::string faceHeader = asciiHeader;
     faceHeader.insert(faceHeader.find("end_header"),
                       "element face 1\nproperty list uchar int vertex_indices\n");
@@ -756,7 +765,78 @@ bool checkPlyPayloadValidation() {
                  bytes.substr(0, bytes.size() - 1))) return false;
     if (!writeText(path, binaryHeader + bytes)) return false;
     const SparsePointSet binary = readPly(path.string());
-    return binary.xyz == ascii.xyz && binary.rgb == ascii.rgb;
+    if (binary.xyz != ascii.xyz || binary.rgb != ascii.rgb) return false;
+
+    // Declared counts that overflow or exceed the payload are rejected before
+    // any vertex storage is allocated.
+    if (!rejects(header("binary_little_endian", 1431655766) + bytes) ||
+        !rejects(header("ascii", 1000) + "1 2 3 255 0 7\n") ||
+        !rejects("ply\nformat ascii 1.0\nelement vertex -1\n"
+                 "property float x\nproperty float y\nproperty float z\n"
+                 "end_header\n1 2 3\n") ||
+        !rejects("ply\nformat ascii 1.0\nelement vertex 1\n"
+                 "property float x\nproperty float y\nproperty float z\n"
+                 "1 2 3\n") ||
+        !rejects("ply\nformat binary_little_endian 1.0\nelement vertex 1\n"
+                 "property list uchar float x\nproperty float y\nproperty float z\n"
+                 "end_header\n") ||
+        !rejects("ply\nformat binary_little_endian 1.0\nelement vertex 1\n"
+                 "property int64 x\nproperty float y\nproperty float z\n"
+                 "end_header\n")) {
+        return false;
+    }
+
+    // Every scalar type advances the binary record, so a leading short does
+    // not shift x/y/z.
+    std::ostringstream shortRecord(std::ios::binary);
+    writePod(shortRecord, int16_t{-5});
+    writePod(shortRecord, 1.0f);
+    writePod(shortRecord, 2.0f);
+    writePod(shortRecord, 3.0f);
+    writePod(shortRecord, uint8_t{255});
+    writePod(shortRecord, uint8_t{0});
+    writePod(shortRecord, uint8_t{7});
+    std::string shortHeader = binaryHeader;
+    shortHeader.insert(shortHeader.find("property float x"), "property short s\n");
+    if (!writeText(path, shortHeader + shortRecord.str())) return false;
+    const SparsePointSet withShort = readPly(path.string());
+    if (withShort.xyz != ascii.xyz || withShort.rgb != ascii.rgb) return false;
+
+    // Elements declared before the vertices are skipped, including binary
+    // list records.
+    std::string faceFirst = "ply\nformat ascii 1.0\nelement face 1\n"
+                            "property list uchar int vertex_indices\n" +
+                            asciiHeader.substr(asciiHeader.find("element vertex"));
+    if (!writeText(path, faceFirst + "3 0 0 0\n1 2 3 255 0 7\n")) return false;
+    const SparsePointSet faceFirstAscii = readPly(path.string());
+    if (faceFirstAscii.xyz != ascii.xyz || faceFirstAscii.rgb != ascii.rgb) return false;
+    std::ostringstream face(std::ios::binary);
+    writePod(face, uint8_t{3});
+    writePod(face, int32_t{0});
+    writePod(face, int32_t{0});
+    writePod(face, int32_t{0});
+    std::string binaryFaceFirst = faceFirst;
+    binaryFaceFirst.replace(binaryFaceFirst.find("ascii"), 5, "binary_little_endian");
+    if (!writeText(path, binaryFaceFirst + face.str() + bytes)) return false;
+    const SparsePointSet faceFirstBinary = readPly(path.string());
+    if (faceFirstBinary.xyz != ascii.xyz || faceFirstBinary.rgb != ascii.rgb) return false;
+    if (!rejects(binaryFaceFirst + face.str().substr(0, 5))) return false;
+
+    // CRLF headers, and float colors in [0, 1] clamp and round to bytes.
+    std::string crlf;
+    const std::string floatColorHeader =
+        "ply\nformat ascii 1.0\nelement vertex 1\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property float red\nproperty float green\nproperty float blue\n"
+        "end_header\n";
+    for (char ch : floatColorHeader) {
+        if (ch == '\n') crlf += '\r';
+        crlf += ch;
+    }
+    if (!writeText(path, crlf + "1 2 3 1.5 -0.25 0.5\r\n")) return false;
+    const SparsePointSet floatColors = readPly(path.string());
+    return floatColors.xyz == ascii.xyz &&
+           floatColors.rgb == std::vector<uint8_t>{255, 0, 128};
 }
 
 } // namespace

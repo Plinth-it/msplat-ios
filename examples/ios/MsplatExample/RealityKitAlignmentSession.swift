@@ -207,10 +207,15 @@ final class RealityKitAlignmentSession: ObservableObject {
         case failed(String)
     }
 
-    @Published private(set) var phase: Phase = .idle
+    // PhotogrammetrySession has no pause point, so backgrounding is left to
+    // RealityKit; keeping the screen awake avoids auto-lock causing one.
+    @Published private(set) var phase: Phase = .idle {
+        didSet { screenAwake.isActive = isBusy }
+    }
     @Published private(set) var progress = 0.0
     @Published private(set) var statusMessage = "Ready to align images."
 
+    private let screenAwake = ScreenAwakeController.shared.makeAssertion()
     private var workTask: Task<Void, Never>?
 #if !targetEnvironment(simulator)
     private var photogrammetrySession: PhotogrammetrySession?
