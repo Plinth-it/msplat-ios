@@ -732,6 +732,15 @@ bool checkPlyPayloadValidation() {
     const SparsePointSet ascii = readPly(path.string());
     if (ascii.xyz != std::vector<float>{1, 2, 3} ||
         ascii.rgb != std::vector<uint8_t>{255, 0, 7}) return false;
+    // The last ASCII record may end at EOF without a newline, including the
+    // shortest possible payload.
+    if (!writeText(path, asciiHeader + "1 2 3 255 0 7")) return false;
+    const SparsePointSet noFinalNewline = readPly(path.string());
+    if (noFinalNewline.xyz != ascii.xyz || noFinalNewline.rgb != ascii.rgb) return false;
+    if (!writeText(path, "ply\nformat ascii 1.0\nelement vertex 1\n"
+                         "property float x\nproperty float y\nproperty float z\n"
+                         "end_header\n0 0 0")) return false;
+    if (readPly(path.string()).xyz != std::vector<float>{0, 0, 0}) return false;
     std::string faceHeader = asciiHeader;
     faceHeader.insert(faceHeader.find("end_header"),
                       "element face 1\nproperty list uchar int vertex_indices\n");

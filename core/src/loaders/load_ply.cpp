@@ -267,8 +267,10 @@ SparsePointSet readPly(const std::string &path) {
 
     // Bound the allocation by the bytes that could hold the records: a binary
     // record is fixed-size, and an ASCII value needs a digit and a separator.
+    // The last ASCII record may end at EOF without its newline.
     const uint64_t minimumRecordBytes = binary ? vertexBytes : props.size() * 2;
-    if (vertex.count > remaining / minimumRecordBytes)
+    const uint64_t boundedBytes = binary ? remaining : remaining + 1;
+    if (vertex.count > boundedBytes / minimumRecordBytes)
         malformedPly(path, "vertex count exceeds the file size");
     const size_t numVertices = static_cast<size_t>(vertex.count);
 
