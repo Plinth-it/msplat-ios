@@ -326,12 +326,12 @@ open examples/ios/MsplatExample.xcodeproj
 See [examples/ios/README.md](examples/ios/README.md).
 
 For production, add the repository as a Swift package and pin the exact
-release. Version `2.0.0` resolves an immutable, checksum-verified XCFramework:
+release. Version `3.0.0` resolves an immutable, checksum-verified XCFramework:
 
 ```swift
 .package(
     url: "https://github.com/Plinth-it/msplat-ios",
-    exact: "2.0.0"
+    exact: "3.0.0"
 )
 ```
 
