@@ -2398,8 +2398,12 @@ void msplat_trainer_save_checkpoint(MsplatTrainer t, const char* path) {
 }
 
 int msplat_trainer_load_checkpoint(MsplatTrainer t, const char* path) {
-    int iteration = -1;
-    msplat_trainer_load_checkpoint_v2(t, path, &iteration, nullptr);
+    // The checked entry point zeroes its output before failing, and step 0 is
+    // a valid checkpoint, so the status decides.
+    int iteration = 0;
+    if (msplat_trainer_load_checkpoint_v2(t, path, &iteration, nullptr) !=
+        MSPLAT_STATUS_OK)
+        return -1;
     return iteration;
 }
 

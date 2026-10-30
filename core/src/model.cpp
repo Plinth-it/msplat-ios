@@ -930,6 +930,10 @@ void Model::afterTrain(int step){
                 (maxGaussians > 0 && densifiedCount > maxGaussians)) {
                 throw std::runtime_error("Densification returned an invalid Gaussian count");
             }
+            if (densifiedCount == 0) {
+                throw std::runtime_error(
+                    "Densification pruned every Gaussian; training cannot continue");
+            }
             num_active = densifiedCount;
 
             refreshViews();

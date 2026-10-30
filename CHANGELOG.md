@@ -18,6 +18,11 @@
 - The CLI and Python bindings train on the masked training target and report
   masked evaluation metrics, matching the Swift and C APIs. They previously
   decoded Nerfstudio `mask_path` masks and then ignored them.
+- The legacy `msplat_trainer_load_checkpoint` returns -1 on failure instead
+  of 0, which was indistinguishable from a step-0 checkpoint.
+- Densification that prunes every Gaussian now fails with an explicit error,
+  and rendering or training an empty population is rejected before any GPU
+  dispatch instead of encoding zero-width threadgroups.
 - Added ABI v18 size-checked appearance options with mutually exclusive none,
   RGB-gain, and PPISP modes. The current PPISP phase covers per-frame log2
   exposure and color homography only. Existing photometric-gain properties and

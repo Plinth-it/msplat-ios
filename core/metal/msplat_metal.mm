@@ -2463,6 +2463,9 @@ static void render_pipeline(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background
 ) {
+    // Per-Gaussian dispatches clamp their width to num_points.
+    if (num_points <= 0)
+        throw std::invalid_argument("msplat: rendering requires at least one Gaussian");
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
     int tile_bounds_y = std::get<1>(tile_bounds);
@@ -2911,6 +2914,8 @@ static MTensor msplat_train_step_locked(
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
     float inv_max_dim
 ) {
+    if (num_points <= 0)
+        throw std::invalid_argument("msplat: training requires at least one Gaussian");
     MetalContext* ctx = get_global_context();
     auto logicalStep = ctx->activeTrainingStep;
     constexpr int kExpectedAdamGroups = 6;
