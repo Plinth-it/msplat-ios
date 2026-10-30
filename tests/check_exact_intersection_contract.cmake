@@ -37,6 +37,45 @@ endforeach()
 
 require_contains("${metal_source}" "device atomic_uint* tile_count_storage"
     "selected atomic projection-count storage")
+
+# Counting and scatter must walk the same exact footprint from the same stored
+# center, conic, and extents, or the scatter could overflow or leave holes in a
+# tile's counted range.
+string(FIND "${metal_source}" "kernel void project_and_sh_forward_kernel("
+    projection_start)
+string(FIND "${metal_source}" "kernel void tile_count_diff_horizontal_kernel("
+    projection_end)
+string(FIND "${metal_source}" "kernel void scatter_to_exact_bins_kernel("
+    scatter_start)
+string(FIND "${metal_source}" "kernel void small_sort_per_tile_kernel("
+    scatter_end)
+math(EXPR projection_length "${projection_end} - ${projection_start}")
+math(EXPR scatter_length "${scatter_end} - ${scatter_start}")
+string(SUBSTRING "${metal_source}" ${projection_start} ${projection_length}
+    projection_section)
+string(SUBSTRING "${metal_source}" ${scatter_start} ${scatter_length}
+    scatter_section)
+foreach(section IN ITEMS projection_section scatter_section)
+    require_contains("${${section}}" "raster_footprint_rows("
+        "${section} exact footprint rows")
+    require_contains("${${section}}" "raster_footprint_row_span("
+        "${section} exact footprint row spans")
+    require_absent("${${section}}" "for (uint tile_y = tile_min.y;"
+        "${section} 3-sigma box tile enumeration")
+endforeach()
+require_contains("${projection_section}"
+    "write_packed_float2(aabb, idx, extents);"
+    "projection stores the footprint extents scatter reuses")
+require_contains("${scatter_section}"
+    "const float2 extents = read_packed_float2(aabb, idx);"
+    "scatter reads the stored footprint extents")
+require_contains("${scatter_section}"
+    "constant float* conics                  [[buffer(15)]]"
+    "scatter conic binding")
+require_contains("${host_source}" "ENC_BUF(enc, conics, 15);"
+    "scatter conic encode")
+require_contains("${host_source}" "ENC_BUF(enc, opacities, 27);"
+    "projection opacity encode")
 require_contains("${metal_source}"
     "inline bool training_render_tile_active("
     "shared coverage render-tile predicate")

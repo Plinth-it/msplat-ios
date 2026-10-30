@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Tile counting and scatter emit each Gaussian's exact raster footprint: the
+  ellipse where opacity * exp(-sigma) can reach the 1/255 blend threshold below
+  the 5.55 sigma cutoff, walked row by row. The per-axis 3-sigma box emitted
+  empty corner tiles of tilted ellipses, ignored opacity, and clipped opaque
+  Gaussians that still blend between 3 and 3.33 sigma. Visibility, radii,
+  densification statistics, and optimizer gating keep the 3-sigma box.
+  Projection stores the footprint extents in the existing per-Gaussian extent
+  buffer, and both passes derive every tile from the same stored values. A new
+  probe test checks every blending pixel against the emitted tiles. On an M4 Pro
+  (garden, 1.6M Gaussians) the training step fell from 34.7 to 29.5 ms at
+  1297x840 and from 6.6 to 5.7 ms at 324x210; held-out PSNR is unchanged.
 - Backward rasterization reduces each Gaussian's nine screen-space gradients
   with a 32-lane halving reduce-scatter (12 SIMD shuffles instead of nine full
   `simd_sum` reductions), so nine lanes issue the gradient atomics as one

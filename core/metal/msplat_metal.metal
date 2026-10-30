@@ -119,6 +119,79 @@ inline void get_tile_bbox(
     get_bbox(tile_center, tile_radius, tile_bounds, tile_min, tile_max);
 }
 
+// Exact raster footprint. The rasterizers blend a pixel only while
+// sigma = 0.5 * d^T conic d < 5.55 and opacity * exp(-sigma) >= 1/255, so a
+// Gaussian can reach only the ellipse d^T conic d <= q with
+// q = min(2 ln(255 opacity), 11.1). Tile counting and scatter both walk this
+// ellipse row by row, which drops the empty corner tiles of the 3-sigma box,
+// shrinks faint Gaussians, and keeps the 3-3.33 sigma rim of opaque ones.
+//
+// Returns the ellipse's per-axis pixel half extents, or -1 when the Gaussian
+// never reaches the blending threshold. Counting and scatter must derive every
+// tile from these stored extents so both passes see bit-identical inputs.
+inline float2 raster_footprint_extents(float3 conic, float opacity) {
+    const float q = min(2.f * log(255.f * opacity), 11.1f);
+    const float det = conic.x * conic.z - conic.y * conic.y;
+    if (!(q >= 0.f) || !(det > 0.f)) return float2(-1.f);
+    return float2(sqrt(q * conic.z / det), sqrt(q * conic.x / det));
+}
+
+// Tile rows [row_begin, row_end) holding a pixel center inside the footprint.
+inline bool raster_footprint_rows(
+    float2 center, float2 extents, uint tiles_y,
+    thread uint& row_begin, thread uint& row_end
+) {
+    if (!(extents.y >= 0.f)) return false;
+    const float first = max(
+        ceil((center.y - extents.y - float(BLOCK_Y - 1)) / float(BLOCK_Y)),
+        0.f);
+    const float last = min(
+        floor((center.y + extents.y) / float(BLOCK_Y)), float(tiles_y) - 1.f);
+    if (!(first <= last)) return false;
+    row_begin = uint(first);
+    row_end = uint(last) + 1u;
+    return true;
+}
+
+// Tile columns [column_begin, column_end) of tile row `tile_y` holding a pixel
+// center inside the footprint. Across the row's pixel band the left edge of
+// the ellipse is convex and the right edge concave, so each extreme lies at a
+// band end or at the ellipse's leftmost/rightmost point.
+inline bool raster_footprint_row_span(
+    float2 center, float3 conic, float2 extents, uint tile_y, uint tiles_x,
+    thread uint& column_begin, thread uint& column_end
+) {
+    const float band_top = float(tile_y * BLOCK_Y) - center.y;
+    const float lo = max(band_top, -extents.y);
+    const float hi = min(band_top + float(BLOCK_Y - 1), extents.y);
+    if (!(lo <= hi)) return false;
+
+    // At vertical offset dy the ellipse spans
+    // slope * dy +- width * sqrt(extents.y^2 - dy^2).
+    const float slope = -conic.y / conic.x;
+    const float width =
+        sqrt(conic.x * conic.z - conic.y * conic.y) / conic.x;
+    const float half_lo =
+        width * sqrt(max(0.f, (extents.y - lo) * (extents.y + lo)));
+    const float half_hi =
+        width * sqrt(max(0.f, (extents.y - hi) * (extents.y + hi)));
+    float left = min(fma(slope, lo, -half_lo), fma(slope, hi, -half_hi));
+    float right = max(fma(slope, lo, half_lo), fma(slope, hi, half_hi));
+    // The rightmost point sits at dy = extreme_dy, the leftmost at -extreme_dy.
+    const float extreme_dy = -conic.y * extents.x / conic.z;
+    if (lo <= extreme_dy && extreme_dy <= hi) right = extents.x;
+    if (lo <= -extreme_dy && -extreme_dy <= hi) left = -extents.x;
+
+    const float first = max(
+        ceil((center.x + left - float(BLOCK_X - 1)) / float(BLOCK_X)), 0.f);
+    const float last = min(
+        floor((center.x + right) / float(BLOCK_X)), float(tiles_x) - 1.f);
+    if (!(first <= last)) return false;
+    column_begin = uint(first);
+    column_end = uint(last) + 1u;
+    return true;
+}
+
 // Affine transform: mat (row-major 4x3) applied to point p.
 inline float3 transform_4x3(constant float *mat, const float3 p) {
     float3 out = {
@@ -2359,11 +2432,12 @@ kernel void project_and_sh_forward_kernel(
     constant float* features_dc,
     constant float* features_rest,
     device float* colors,
-    device float* aabb, // float2: per-axis pixel extents
+    device float* aabb, // float2: exact raster footprint half extents
     constant uint& pose_enabled,
     constant uchar* coverage_render_tiles,
     constant uint& coverage_render_tile_stride,
     constant uint& tile_count_mode,
+    constant float* opacities, // logits; bound the exact raster footprint
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -2409,6 +2483,9 @@ kernel void project_and_sh_forward_kernel(
         ? project_view_pix(p_view, fx, fy, cx, cy)
         : project_pix(projmat, p_world, img_size, {cx, cy});
 
+    // Visibility, and with it radii, densification statistics, and optimizer
+    // gating, keeps the established 3-sigma box. Only tile emission uses the
+    // exact opacity-aware footprint below.
     float aabb_x = ceil(3.0f * sqrt(cov2d.x));
     float aabb_y = ceil(3.0f * sqrt(cov2d.z));
     uint2 tile_min, tile_max;
@@ -2422,16 +2499,31 @@ kernel void project_and_sh_forward_kernel(
     depths[idx] = p_view.z;
     radii[idx] = (int)radius;
     write_packed_float2(xys, idx, center);
-    aabb[idx * 2] = aabb_x;
-    aabb[idx * 2 + 1] = aabb_y;
+    // Scatter re-derives the tiles from these stored extents, the stored
+    // center, and the stored conic.
+    const float2 extents = raster_footprint_extents(
+        conic, 1.f / (1.f + exp(-opacities[idx])));
+    write_packed_float2(aabb, idx, extents);
 
     // Phase one of the exact intersection pipeline. The established mode
-    // enumerates every covered tile. The difference-grid A/B records four
-    // signed rectangle corners and defers whole-tile coverage masking until
-    // after the horizontal and vertical scans.
+    // enumerates every covered tile. The difference-grid A/B records the four
+    // signed corners of each run of rows with an identical tile span and
+    // defers whole-tile coverage masking until after the horizontal and
+    // vertical scans.
+    uint row_begin, row_end;
+    if (!raster_footprint_rows(
+            center, extents, tile_bounds.y, row_begin, row_end)) {
+        row_begin = row_end = 0u;
+    }
     if (tile_count_mode == 0u) {
-        for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
-            for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
+        for (uint tile_y = row_begin; tile_y < row_end; ++tile_y) {
+            uint column_begin, column_end;
+            if (!raster_footprint_row_span(
+                    center, conic, extents, tile_y, tile_bounds.x,
+                    column_begin, column_end)) {
+                continue;
+            }
+            for (uint tile_x = column_begin; tile_x < column_end; ++tile_x) {
                 if (!training_render_tile_active(
                         coverage_render_tiles, coverage_render_tile_stride,
                         tile_x, tile_y)) {
@@ -2444,18 +2536,37 @@ kernel void project_and_sh_forward_kernel(
         }
     } else {
         const uint diff_width = tile_bounds.x + 1u;
-        const uint top_left = tile_min.y * diff_width + tile_min.x;
-        const uint top_right = tile_min.y * diff_width + tile_max.x;
-        const uint bottom_left = tile_max.y * diff_width + tile_min.x;
-        const uint bottom_right = tile_max.y * diff_width + tile_max.x;
-        atomic_fetch_add_explicit(
-            &tile_count_storage[top_left], 1u, memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            &tile_count_storage[top_right], uint(-1), memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            &tile_count_storage[bottom_left], uint(-1), memory_order_relaxed);
-        atomic_fetch_add_explicit(
-            &tile_count_storage[bottom_right], 1u, memory_order_relaxed);
+        // One extra iteration past row_end closes the final run.
+        bool run_open = false;
+        for (uint tile_y = row_begin; tile_y <= row_end; ++tile_y) {
+            uint column_begin = 0u, column_end = 0u;
+            const bool row_covered = tile_y < row_end &&
+                raster_footprint_row_span(
+                    center, conic, extents, tile_y, tile_bounds.x,
+                    column_begin, column_end);
+            if (run_open && row_covered && column_begin == tile_min.x &&
+                column_end == tile_max.x) {
+                tile_max.y = tile_y + 1u;
+                continue;
+            }
+            if (run_open) {
+                const uint top_left = tile_min.y * diff_width + tile_min.x;
+                const uint top_right = tile_min.y * diff_width + tile_max.x;
+                const uint bottom_left = tile_max.y * diff_width + tile_min.x;
+                const uint bottom_right = tile_max.y * diff_width + tile_max.x;
+                atomic_fetch_add_explicit(
+                    &tile_count_storage[top_left], 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &tile_count_storage[top_right], uint(-1), memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &tile_count_storage[bottom_left], uint(-1), memory_order_relaxed);
+                atomic_fetch_add_explicit(
+                    &tile_count_storage[bottom_right], 1u, memory_order_relaxed);
+            }
+            run_open = row_covered;
+            tile_min = uint2(column_begin, tile_y);
+            tile_max = uint2(column_end, tile_y + 1u);
+        }
     }
 
     // SH: compute colors for non-culled gaussians (reuse p_world from registers)
@@ -3190,7 +3301,7 @@ kernel void scatter_to_exact_bins_kernel(
     constant float* xys                     [[buffer(1)]],
     constant float* depths                  [[buffer(2)]],
     constant int* radii                     [[buffer(3)]],
-    constant float* aabb                    [[buffer(4)]],
+    constant float* aabb                    [[buffer(4)]], // footprint half extents
     constant uint3& tile_bounds             [[buffer(5)]],
     constant int* tile_offsets              [[buffer(6)]],
     device atomic_uint* tile_cursors        [[buffer(7)]],
@@ -3201,22 +3312,34 @@ kernel void scatter_to_exact_bins_kernel(
     device float* projected_opacities       [[buffer(12)]],
     constant uchar* coverage_render_tiles   [[buffer(13)]],
     constant uint& coverage_render_tile_stride [[buffer(14)]],
+    constant float* conics                  [[buffer(15)]],
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= num_points || radii[idx] <= 0) return;
 
     projected_opacities[idx] = 1.f / (1.f + exp(-opacities[idx]));
+    // Walk the same exact footprint the projection pass counted, from the
+    // same stored center, conic, and extents.
     const float2 center = read_packed_float2(xys, idx);
-    uint2 tile_min, tile_max;
-    get_tile_bbox(
-        center, read_packed_float2(aabb, idx), (int3)tile_bounds,
-        tile_min, tile_max);
+    const float3 conic = read_packed_float3(conics, idx);
+    const float2 extents = read_packed_float2(aabb, idx);
+    uint row_begin, row_end;
+    if (!raster_footprint_rows(
+            center, extents, tile_bounds.y, row_begin, row_end)) {
+        return;
+    }
 
     const uint64_t key =
         ((uint64_t)as_type<uint>(depths[idx]) << 32) | (uint64_t)idx;
 
-    for (uint tile_y = tile_min.y; tile_y < tile_max.y; ++tile_y) {
-        for (uint tile_x = tile_min.x; tile_x < tile_max.x; ++tile_x) {
+    for (uint tile_y = row_begin; tile_y < row_end; ++tile_y) {
+        uint column_begin, column_end;
+        if (!raster_footprint_row_span(
+                center, conic, extents, tile_y, tile_bounds.x,
+                column_begin, column_end)) {
+            continue;
+        }
+        for (uint tile_x = column_begin; tile_x < column_end; ++tile_x) {
             if (!training_render_tile_active(
                     coverage_render_tiles, coverage_render_tile_stride,
                     tile_x, tile_y)) {

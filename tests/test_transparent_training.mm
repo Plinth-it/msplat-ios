@@ -848,9 +848,12 @@ void checkArenaRetryTransaction() {
     // radix scratch. First force the synchronous, engine-lock-held fallback
     // used by direct native callers that do not collect telemetry. Its rejected
     // attempt must not collect statistics; only its replay may mutate state.
+    // Each Gaussian's opacity must clear the 1/255 blend threshold, or the
+    // exact raster footprint emits no intersections to overflow the arena.
+    constexpr float stackedOpacity = 0.005f;
     constexpr int fallbackGaussianCount = 5'000;
     const StepResult fallback = runStep(
-        false, 0.0f, fallbackGaussianCount, 0.001f,
+        false, 0.0f, fallbackGaussianCount, stackedOpacity,
         false, false, false, true, false);
     CHECK(fallback.radius > 0);
     CHECK(fallback.visibilityCount == 1.0f);
@@ -860,7 +863,7 @@ void checkArenaRetryTransaction() {
     // the step-owned readback path through the same retry transaction.
     constexpr int gaussianCount = 10'000;
     const StepResult retried = runStep(
-        false, 0.0f, gaussianCount, 0.001f,
+        false, 0.0f, gaussianCount, stackedOpacity,
         false, false, false, true, true);
 
     CHECK(retried.radius > 0);
