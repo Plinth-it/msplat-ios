@@ -3045,6 +3045,8 @@ kernel void project_backward_adam_kernel(
 #define EXACT_BITONIC_FAST_PATH 2048
 #define EXACT_SMALL_SORT_TG_SIZE 32
 #define EXACT_SMALL_TILE_MAX 32
+#define EXACT_SORT_SIMD_WIDTH 32
+#define EXACT_SORT_SIMD_GROUPS (EXACT_SORT_TG_SIZE / EXACT_SORT_SIMD_WIDTH)
 
 // GPU counterpart of buildTileIntersectionLayout. Keep these metadata indices
 // synchronized with the host ABI; word 9 is a bitmask so later layout checks
@@ -3466,17 +3468,29 @@ kernel void small_sort_per_tile_kernel(
     }
 }
 
+// Lanes of this 32-lane SIMD-group, valid lanes only, that share `digit`.
+inline uint radix_digit_match(uint digit, bool valid) {
+    uint match = uint(simd_vote::vote_t(simd_ballot(valid)));
+    for (uint bit = 0; bit < 8u; ++bit) {
+        const bool set = ((digit >> bit) & 1u) != 0u;
+        const uint votes = uint(simd_vote::vote_t(simd_ballot(set)));
+        match &= set ? votes : ~votes;
+    }
+    return match;
+}
+
 // Exact segmented sort. The common <=2,048-entry case keeps the previous
 // threadgroup bitonic performance, but reads the exact compact range rather than
-// a fixed per-tile allocation. Larger tiles use stable LSD radix passes over
-// 256-entry waves. The host imposes an explicit work limit before dispatch so a
-// pathological tile fails the step instead of monopolizing a threadgroup.
+// a fixed per-tile allocation. Larger tiles use stable LSD radix passes over the
+// key bytes that vary within the tile, ranked per SIMD-group slice. The host
+// imposes an explicit work limit before dispatch so a pathological tile fails
+// the step instead of monopolizing a threadgroup.
 //
 // Projection clips Gaussians behind the near plane, so positive float depth
 // bits sort in the same order as their numeric values. The full 64-bit key is
 // sorted so Gaussian ID deterministically breaks equal-depth ties.
-// The host must dispatch exactly EXACT_SORT_TG_SIZE threads: one thread owns
-// each radix bucket and each slot in the shared wave metadata.
+// The host must dispatch exactly EXACT_SORT_TG_SIZE threads in 32-lane
+// SIMD-groups: one thread owns each radix bucket during the digit scan.
 kernel void radix_sort_per_tile_kernel(
     constant int* tile_offsets       [[buffer(0)]],
     device uint64_t* keys_a          [[buffer(1)]],
@@ -3491,8 +3505,7 @@ kernel void radix_sort_per_tile_kernel(
     uint sort_index [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]],
-    uint simd_lane [[thread_index_in_simdgroup]],
-    uint simd_width [[threads_per_simdgroup]]
+    uint simd_lane [[thread_index_in_simdgroup]]
 ) {
     if (sort_index >= sortable_tile_count) return;
     if (sortable_tile_offset > num_tiles ||
@@ -3574,89 +3587,130 @@ kernel void radix_sort_per_tile_kernel(
         return;
     }
 
-    threadgroup atomic_uint digit_histogram[EXACT_SORT_RADIX];
-    threadgroup atomic_uint wave_histogram[EXACT_SORT_RADIX];
-    threadgroup uint digit_offsets[EXACT_SORT_RADIX];
-    threadgroup uint processed_digits[EXACT_SORT_RADIX];
-    threadgroup ushort wave_digits[EXACT_SORT_TG_SIZE];
+    // The radix path reuses the bitonic storage, so the kernel reserves one
+    // 16 KB threadgroup allocation for either path.
+    threadgroup uint* radix_scratch =
+        reinterpret_cast<threadgroup uint*>(bitonic_data);
+    // Per SIMD-group digit counts, then per SIMD-group output cursors.
+    threadgroup uint* simd_cursors = radix_scratch;
+    threadgroup uint* simd_totals =
+        radix_scratch + EXACT_SORT_SIMD_GROUPS * EXACT_SORT_RADIX;
+    threadgroup uint* key_bounds = simd_totals + EXACT_SORT_SIMD_GROUPS;
 
+    // Only bytes that vary within the tile can reorder it: the Gaussian ID's
+    // high byte and usually the depth exponent are constant and skip their
+    // passes entirely.
+    uint2 key_or = uint2(0u);
+    uint2 key_and = uint2(0xFFFFFFFFu);
+    for (uint index = tid; index < count; index += EXACT_SORT_TG_SIZE) {
+        const uint64_t key = keys_a[start + index];
+        const uint2 halves = uint2(uint(key), uint(key >> 32));
+        key_or |= halves;
+        key_and &= halves;
+    }
+    key_or = uint2(simd_or(key_or.x), simd_or(key_or.y));
+    key_and = uint2(simd_and(key_and.x), simd_and(key_and.y));
+    if (simd_lane == 0) {
+        key_bounds[4 * simd_group + 0] = key_or.x;
+        key_bounds[4 * simd_group + 1] = key_or.y;
+        key_bounds[4 * simd_group + 2] = key_and.x;
+        key_bounds[4 * simd_group + 3] = key_and.y;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    key_or = uint2(0u);
+    key_and = uint2(0xFFFFFFFFu);
+    for (uint group = 0; group < EXACT_SORT_SIMD_GROUPS; ++group) {
+        key_or |= uint2(key_bounds[4 * group], key_bounds[4 * group + 1]);
+        key_and &= uint2(key_bounds[4 * group + 2], key_bounds[4 * group + 3]);
+    }
+    const uint64_t varying_bits =
+        (uint64_t(key_or.y ^ key_and.y) << 32) | uint64_t(key_or.x ^ key_and.x);
+
+    // Stable LSD radix passes. Each SIMD-group owns one contiguous slice of
+    // the range and ranks 32 keys at a time with ballots, so a pass needs
+    // threadgroup barriers only around its digit scan. Slices keep input
+    // order, and each SIMD-group's cursors start after every earlier slice's
+    // keys with the same digit.
+    const uint slice = (count + EXACT_SORT_SIMD_GROUPS - 1) /
+        EXACT_SORT_SIMD_GROUPS;
+    const uint slice_begin = min(count, simd_group * slice);
+    const uint slice_end = min(count, slice_begin + slice);
+    threadgroup uint* cursors = simd_cursors + simd_group * EXACT_SORT_RADIX;
+    const uint lanes_below = (1u << simd_lane) - 1u;
+    device uint64_t* source = keys_a;
+    device uint64_t* destination = keys_b;
     for (uint pass = 0; pass < 8; ++pass) {
-        device uint64_t* source = (pass & 1u) == 0u ? keys_a : keys_b;
-        device uint64_t* destination = (pass & 1u) == 0u ? keys_b : keys_a;
         const uint shift = pass * 8u;
+        if (((varying_bits >> shift) & 0xFFu) == 0u) continue;
 
-        atomic_store_explicit(
-            &digit_histogram[tid], 0u, memory_order_relaxed);
-        processed_digits[tid] = 0u;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        for (uint local_index = tid; local_index < count;
-             local_index += EXACT_SORT_TG_SIZE) {
-            const uint digit =
-                (uint)((source[start + local_index] >> shift) & 0xFFu);
-            atomic_fetch_add_explicit(
-                &digit_histogram[digit], 1u, memory_order_relaxed);
+        for (uint digit = simd_lane; digit < EXACT_SORT_RADIX;
+             digit += EXACT_SORT_SIMD_WIDTH) {
+            cursors[digit] = 0u;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint base = slice_begin; base < slice_end;
+             base += EXACT_SORT_SIMD_WIDTH) {
+            const uint index = base + simd_lane;
+            const bool valid = index < slice_end;
+            const uint digit = valid
+                ? uint(source[start + index] >> shift) & 0xFFu
+                : 0u;
+            const uint match = radix_digit_match(digit, valid);
+            if (valid && (match & lanes_below) == 0u) {
+                cursors[digit] += popcount(match);
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (tid == 0) {
-            uint running = 0;
-            for (uint digit = 0; digit < EXACT_SORT_RADIX; ++digit) {
-                digit_offsets[digit] = running;
-                running += atomic_load_explicit(
-                    &digit_histogram[digit], memory_order_relaxed);
-            }
+        // Thread `tid` owns digit `tid`: its exclusive start across all
+        // digits, then one cursor per SIMD-group slice in slice order.
+        uint digit_total = 0u;
+        for (uint group = 0; group < EXACT_SORT_SIMD_GROUPS; ++group) {
+            digit_total += simd_cursors[group * EXACT_SORT_RADIX + tid];
+        }
+        uint cursor = simd_prefix_exclusive_sum(digit_total);
+        const uint group_total = simd_sum(digit_total);
+        if (simd_lane == 0) simd_totals[simd_group] = group_total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint group = 0; group < simd_group; ++group) {
+            cursor += simd_totals[group];
+        }
+        for (uint group = 0; group < EXACT_SORT_SIMD_GROUPS; ++group) {
+            const uint slot = group * EXACT_SORT_RADIX + tid;
+            const uint group_count = simd_cursors[slot];
+            simd_cursors[slot] = cursor;
+            cursor += group_count;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        for (uint wave_start = 0; wave_start < count;
-             wave_start += EXACT_SORT_TG_SIZE) {
-            atomic_store_explicit(
-                &wave_histogram[tid], 0u, memory_order_relaxed);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            const uint local_index = wave_start + tid;
-            const bool valid = local_index < count;
-            uint64_t key = 0;
-            uint digit = EXACT_SORT_RADIX;
-            if (valid) {
-                key = source[start + local_index];
-                digit = (uint)((key >> shift) & 0xFFu);
-                atomic_fetch_add_explicit(
-                    &wave_histogram[digit], 1u, memory_order_relaxed);
-            }
-            wave_digits[tid] = (ushort)digit;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Stable rank within this wave. SIMD broadcast handles preceding
-            // lanes in the current SIMD-group; shared digits cover preceding
-            // SIMD-groups. Invalid lanes carry sentinel 256 and never match.
-            uint rank = 0;
-            for (ushort lane = 0; lane < (ushort)simd_width; ++lane) {
-                const uint other = simd_broadcast(digit, lane);
-                if ((uint)lane < simd_lane && other == digit) ++rank;
-            }
-            const uint preceding_simd_entries = simd_group * simd_width;
-            for (uint preceding = 0; preceding < preceding_simd_entries;
-                 ++preceding) {
-                if ((uint)wave_digits[preceding] == digit) ++rank;
-            }
-
-            if (valid) {
-                const uint output_index = digit_offsets[digit] +
-                    processed_digits[digit] + rank;
-                destination[start + output_index] = key;
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            processed_digits[tid] += atomic_load_explicit(
-                &wave_histogram[tid], memory_order_relaxed);
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint base = slice_begin; base < slice_end;
+             base += EXACT_SORT_SIMD_WIDTH) {
+            const uint index = base + simd_lane;
+            const bool valid = index < slice_end;
+            const uint64_t key = valid ? source[start + index] : 0;
+            const uint digit = uint(key >> shift) & 0xFFu;
+            const uint match = radix_digit_match(digit, valid);
+            const uint rank = popcount(match & lanes_below);
+            if (valid) destination[start + cursors[digit] + rank] = key;
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            if (valid && rank == 0u) cursors[digit] += popcount(match);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        // The next pass reads the device-memory writes made above. A single
+        // The next pass reads every slice's device-memory writes. A single
         // threadgroup owns each tile's disjoint source/destination range.
         threadgroup_barrier(mem_flags::mem_device);
+        device uint64_t* sorted = destination;
+        destination = source;
+        source = sorted;
+    }
+
+    // An odd number of performed passes leaves the result in the scratch.
+    if (source != keys_a) {
+        for (uint index = tid; index < count; index += EXACT_SORT_TG_SIZE) {
+            keys_a[start + index] = source[start + index];
+        }
     }
 }
 

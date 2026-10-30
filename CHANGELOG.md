@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Tiles with more than 2,048 intersections sort with SIMD-group slices: each
+  SIMD-group ranks 32 keys at a time with ballots instead of the previous
+  per-key loop over every earlier key in its 256-key wave, and passes skip key
+  bytes that are constant within the tile (the Gaussian ID's high byte and
+  usually the depth exponent). The radix path reuses the bitonic threadgroup
+  storage, cutting the general sort kernel from 21 KB to 16 KB of threadgroup
+  memory, which also speeds the bitonic path. On an M4 Pro (garden) the sort
+  stage fell from 2.4 to 0.26 ms and the step from 5.8 to 3.7 ms at 324x210,
+  where a few crowded tiles held nearly half of all intersections, and the step
+  fell from 30.8 to 29.4 ms at 1297x840.
 - Tile counting and scatter emit each Gaussian's exact raster footprint: the
   ellipse where opacity * exp(-sigma) can reach the 1/255 blend threshold below
   the 5.55 sigma cutoff, walked row by row. The per-axis 3-sigma box emitted

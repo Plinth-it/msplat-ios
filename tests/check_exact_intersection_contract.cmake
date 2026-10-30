@@ -265,11 +265,17 @@ if(NOT radix_scratch_invariant_count EQUAL 2)
         "Expected render and training radix-scratch invariants, found ${radix_scratch_invariant_count}")
 endif()
 require_contains("${metal_source}"
-    "        return;\n    }\n\n    threadgroup atomic_uint digit_histogram"
+    "        return;\n    }\n\n    // The radix path reuses the bitonic storage"
     "bitonic return before radix scratch use")
 require_contains("${metal_source}"
-    "device uint64_t* source = (pass & 1u) == 0u ? keys_a : keys_b;"
+    "device uint64_t* destination = keys_b;"
     "radix scratch runtime use")
+require_contains("${metal_source}"
+    "if (((varying_bits >> shift) & 0xFFu) == 0u) continue;"
+    "radix passes skip key bytes constant within the tile")
+require_contains("${metal_source}"
+    "    if (source != keys_a) {"
+    "odd radix pass counts copy the result back to the primary keys")
 require_contains("${metal_source}"
     "constant uint* sortable_tile_indices [[buffer(7)]]"
     "general-sort compact-tile shader input")
