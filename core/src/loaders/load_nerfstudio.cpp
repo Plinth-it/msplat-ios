@@ -86,7 +86,6 @@ DatasetDescriptor loaders::loadNerfstudio(const std::string &projectRoot) {
     // Global defaults (overridden per-frame if present)
     int gW = j.value("w", 0), gH = j.value("h", 0);
     float gFx = j.value("fl_x", 0.0f), gFy = j.value("fl_y", 0.0f);
-    float gCx = j.value("cx", 0.0f), gCy = j.value("cy", 0.0f);
     float gK1 = j.value("k1", 0.0f), gK2 = j.value("k2", 0.0f), gK3 = j.value("k3", 0.0f);
     float gP1 = j.value("p1", 0.0f), gP2 = j.value("p2", 0.0f);
 
@@ -106,8 +105,12 @@ DatasetDescriptor loaders::loadNerfstudio(const std::string &projectRoot) {
         frame.calibration.height = frameJson.value("h", gH);
         frame.calibration.fx = frameJson.value("fl_x", gFx);
         frame.calibration.fy = frameJson.value("fl_y", gFy);
-        frame.calibration.cx = frameJson.value("cx", gCx);
-        frame.calibration.cy = frameJson.value("cy", gCy);
+        // A missing principal point means the image center, as in the
+        // Instant-NGP format and the Polycam adapter.
+        frame.calibration.cx = frameJson.value(
+            "cx", j.value("cx", frame.calibration.width * 0.5f));
+        frame.calibration.cy = frameJson.value(
+            "cy", j.value("cy", frame.calibration.height * 0.5f));
         frame.calibration.k1 = frameJson.value("k1", gK1);
         frame.calibration.k2 = frameJson.value("k2", gK2);
         frame.calibration.k3 = frameJson.value("k3", gK3);

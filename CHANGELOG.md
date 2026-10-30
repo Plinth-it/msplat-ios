@@ -13,6 +13,8 @@
   The loader also locates properties by name, requires float data and a
   supported SH layout, checks every read, and bounds the count by file size.
   Resuming a PLY whose SH degree differs from the configured degree is rejected.
+- A Nerfstudio `transforms.json` without `cx`/`cy` now uses the image center,
+  matching the Polycam adapter, instead of a principal point of zero.
 - Added ABI v18 size-checked appearance options with mutually exclusive none,
   RGB-gain, and PPISP modes. The current PPISP phase covers per-frame log2
   exposure and color homography only. Existing photometric-gain properties and
