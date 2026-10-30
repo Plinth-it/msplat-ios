@@ -309,6 +309,28 @@ require_contains("${raster_forward_chunked}" "tr % RAST_BLOCK_X"
     "chunked forward fixed thread width")
 require_contains("${raster_forward_chunked}" "tr / RAST_BLOCK_X"
     "chunked forward fixed thread height")
+
+# Both forward rasterizers stop loading batches once every pixel of the
+# threadgroup is finished. The SIMD-wide vote must run once per batch after
+# the per-pixel loop has reconverged, and the uniform exit must follow the
+# opening barrier that publishes it.
+foreach(section_name IN ITEMS raster_helper raster_forward_chunked)
+    require_substring_count("${${section_name}}"
+        "raster_publish_simd_done(simd_done, tr, done || !inside);" 1
+        "${section_name} single per-batch completion vote")
+    require_contains("${${section_name}}"
+        "threadgroup_barrier(mem_flags::mem_threadgroup);\n        if (b > 0 && raster_threadgroup_done("
+        "${section_name} completion check after the opening barrier")
+    require_absent("${${section_name}}" "if (done || !inside) continue;"
+        "${section_name} per-thread skip that bypasses the completion vote")
+endforeach()
+foreach(width IN ITEMS "8 * 8" "16 * 8" "16 * 16")
+    string(REPLACE " " "" width_label "${width}")
+    string(REPLACE "*" "x" width_label "${width_label}")
+    require_contains("${raster_${width_label}}"
+        "threadgroup uint simd_done[${width} / 32];"
+        "${width_label} completion flags")
+endforeach()
 foreach(section_name IN ITEMS raster_backward raster_backward_chunked)
     require_contains("${${section_name}}"
         "constexpr uint NUM_WARPS = RAST_BLOCK_SIZE / 32;"

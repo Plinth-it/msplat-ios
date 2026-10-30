@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- Forward rasterization, monolithic and chunked, stops loading Gaussian
+  batches once every pixel of the threadgroup has saturated or lies outside the
+  image. Each SIMD-group publishes a completion vote after its batch, and the
+  next batch's existing barrier makes the threadgroup leave together, so no
+  barrier is added. Rendered color, transmittance, and contributor indices are
+  bit-identical. On an M4 Pro (garden, 1297x840) `rast_fwd` fell from 3.9 to
+  3.7 ms; the 324x210 chunked path is unchanged.
 - Tiles with more than 2,048 intersections sort with SIMD-group slices: each
   SIMD-group ranks 32 keys at a time with ballots instead of the previous
   per-key loop over every earlier key in its 256-key wave, and passes skip key

@@ -730,6 +730,26 @@ kernel void project_gaussians_forward_kernel(
     aabb[idx * 2 + 1] = aabb_y;
 }
 
+// Forward rasterizers stop loading batches once every pixel of the
+// threadgroup has saturated or lies outside the image. Each 32-lane
+// SIMD-group publishes its state at the end of a batch; the next batch's
+// opening barrier makes the flags visible, so every thread leaves together.
+inline void raster_publish_simd_done(
+    threadgroup uint* simd_done, uint tr, bool finished
+) {
+    const bool simd_finished = simd_all(finished);
+    if ((tr & 31u) == 0u) simd_done[tr >> 5] = simd_finished ? 1u : 0u;
+}
+
+inline bool raster_threadgroup_done(
+    threadgroup const uint* simd_done, uint simd_groups
+) {
+    for (uint group = 0; group < simd_groups; ++group) {
+        if (simd_done[group] == 0u) return false;
+    }
+    return true;
+}
+
 inline void nd_rasterize_forward_impl(
     constant uint3& tile_bounds,
     constant uint3& img_size,
@@ -752,7 +772,8 @@ inline void nd_rasterize_forward_impl(
     const uint raster_block_size,
     threadgroup float3* xy_opacity_batch,
     threadgroup float3* conic_batch,
-    threadgroup float3* rgbs_batch
+    threadgroup float3* rgbs_batch,
+    threadgroup uint* simd_done
 ) {
     // Threadgroup-batched forward rasterization: all threads in a tile
     // cooperatively load Gaussian data into shared memory, then read from it.
@@ -780,6 +801,10 @@ inline void nd_rasterize_forward_impl(
     for (int b = 0; b < num_batches; ++b) {
         // sync before loading next batch
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (b > 0 && raster_threadgroup_done(
+                simd_done, raster_block_size / 32u)) {
+            break;
+        }
 
         // each thread loads one gaussian into shared memory
         int batch_start = range.x + (int)raster_block_size * b;
@@ -797,46 +822,47 @@ inline void nd_rasterize_forward_impl(
         // wait for all threads to finish loading
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (done || !inside) continue;
+        if (!done && inside) {
+            int batch_size = min((int)raster_block_size, range.y - batch_start);
 
-        int batch_size = min((int)raster_block_size, range.y - batch_start);
+            // process gaussians in this batch
+            for (int t = 0; t < batch_size; ++t) {
+                const float3 conic_local = conic_batch[t];
+                const float3 xy_opac = xy_opacity_batch[t];
+                const float2 delta = {xy_opac.x - px, xy_opac.y - py};
 
-        // process gaussians in this batch
-        for (int t = 0; t < batch_size; ++t) {
-            const float3 conic_local = conic_batch[t];
-            const float3 xy_opac = xy_opacity_batch[t];
-            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+                const float sigma = fma(0.5f,
+                    fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+                    conic_local.y * delta.x * delta.y);
+                // Early-out: skip exp() when the result is guaranteed to be discarded.
+                // alpha = min(0.999, opacity * exp(-sigma)), discarded when alpha < 1/255.
+                // opacity = sigmoid(raw) ∈ [0,1], so alpha ≤ exp(-sigma).
+                // exp(-5.55) ≈ 0.00389 < 1/255 ≈ 0.00392, so sigma ≥ 5.55 ⟹ alpha < 1/255.
+                // Empirically 94% of evaluations have sigma ≥ 5.55 (garden scene, mipnerf360).
+                if (sigma < 0.f || sigma >= 5.55f) {
+                    continue;
+                }
 
-            const float sigma = fma(0.5f,
-                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
-                conic_local.y * delta.x * delta.y);
-            // Early-out: skip exp() when the result is guaranteed to be discarded.
-            // alpha = min(0.999, opacity * exp(-sigma)), discarded when alpha < 1/255.
-            // opacity = sigmoid(raw) ∈ [0,1], so alpha ≤ exp(-sigma).
-            // exp(-5.55) ≈ 0.00389 < 1/255 ≈ 0.00392, so sigma ≥ 5.55 ⟹ alpha < 1/255.
-            // Empirically 94% of evaluations have sigma ≥ 5.55 (garden scene, mipnerf360).
-            if (sigma < 0.f || sigma >= 5.55f) {
-                continue;
+                const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+                if (alpha < 1.f / 255.f) {
+                    continue;
+                }
+
+                const float next_T = T * (1.f - alpha);
+                if (next_T <= 1e-4f) {
+                    last_contributor = batch_start + t - 1;
+                    done = true;
+                    break;
+                }
+
+                const float vis = alpha * T;
+                const float3 rgb = rgbs_batch[t];
+                pix_out = fma(rgb, vis, pix_out);
+                T = next_T;
+                last_contributor = batch_start + t;
             }
-
-            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
-            if (alpha < 1.f / 255.f) {
-                continue;
-            }
-
-            const float next_T = T * (1.f - alpha);
-            if (next_T <= 1e-4f) {
-                last_contributor = batch_start + t - 1;
-                done = true;
-                break;
-            }
-
-            const float vis = alpha * T;
-            const float3 rgb = rgbs_batch[t];
-            pix_out = fma(rgb, vis, pix_out);
-            T = next_T;
-            last_contributor = batch_start + t;
         }
+        raster_publish_simd_done(simd_done, tr, done || !inside);
     }
 
     if (inside) {
@@ -878,12 +904,13 @@ kernel void nd_rasterize_forward_kernel(
     threadgroup float3 xy_opacity_batch[8 * 8];
     threadgroup float3 conic_batch[8 * 8];
     threadgroup float3 rgbs_batch[8 * 8];
+    threadgroup uint simd_done[8 * 8 / 32];
     nd_rasterize_forward_impl(
         tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
         packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
         blockDim, sorted_keys, projected_opacities, attribute_layout,
         blockIdx, threadIdx, tr, 8 * 8,
-        xy_opacity_batch, conic_batch, rgbs_batch);
+        xy_opacity_batch, conic_batch, rgbs_batch, simd_done);
 }
 
 kernel void nd_rasterize_forward_16x8_kernel(
@@ -909,12 +936,13 @@ kernel void nd_rasterize_forward_16x8_kernel(
     threadgroup float3 xy_opacity_batch[16 * 8];
     threadgroup float3 conic_batch[16 * 8];
     threadgroup float3 rgbs_batch[16 * 8];
+    threadgroup uint simd_done[16 * 8 / 32];
     nd_rasterize_forward_impl(
         tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
         packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
         blockDim, sorted_keys, projected_opacities, attribute_layout,
         blockIdx, threadIdx, tr, 16 * 8,
-        xy_opacity_batch, conic_batch, rgbs_batch);
+        xy_opacity_batch, conic_batch, rgbs_batch, simd_done);
 }
 
 kernel void nd_rasterize_forward_16x16_kernel(
@@ -940,12 +968,13 @@ kernel void nd_rasterize_forward_16x16_kernel(
     threadgroup float3 xy_opacity_batch[16 * 16];
     threadgroup float3 conic_batch[16 * 16];
     threadgroup float3 rgbs_batch[16 * 16];
+    threadgroup uint simd_done[16 * 16 / 32];
     nd_rasterize_forward_impl(
         tile_bounds, img_size, channels, tile_bins, packed_xy_opac,
         packed_conic, packed_rgb, final_Ts, final_index, out_img, background,
         blockDim, sorted_keys, projected_opacities, attribute_layout,
         blockIdx, threadIdx, tr, 16 * 16,
-        xy_opacity_batch, conic_batch, rgbs_batch);
+        xy_opacity_batch, conic_batch, rgbs_batch, simd_done);
 }
 
 void sh_coeffs_to_color(
@@ -4294,6 +4323,7 @@ kernel void rasterize_forward_chunked_kernel(
     threadgroup float3 xy_opacity_batch[RAST_BLOCK_SIZE];
     threadgroup float3 conic_batch[RAST_BLOCK_SIZE];
     threadgroup float3 rgbs_batch[RAST_BLOCK_SIZE];
+    threadgroup uint simd_done[RAST_BLOCK_SIZE / 32];
 
     float T = 1.f;
     float3 pix_out = {0.f, 0.f, 0.f};
@@ -4302,6 +4332,10 @@ kernel void rasterize_forward_chunked_kernel(
 
     for (int b = 0; b < num_batches; ++b) {
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (b > 0 && raster_threadgroup_done(
+                simd_done, RAST_BLOCK_SIZE / 32u)) {
+            break;
+        }
         int batch_start = chunk_start + RAST_BLOCK_SIZE * b;
         int idx = batch_start + tr;
         if (idx < chunk_end) {
@@ -4315,30 +4349,31 @@ kernel void rasterize_forward_chunked_kernel(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (done || !inside) continue;
-
-        int batch_size = min(RAST_BLOCK_SIZE, chunk_end - batch_start);
-        for (int t = 0; t < batch_size; ++t) {
-            const float3 conic_local = conic_batch[t];
-            const float3 xy_opac = xy_opacity_batch[t];
-            const float2 delta = {xy_opac.x - px, xy_opac.y - py};
-            const float sigma = fma(0.5f,
-                fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
-                conic_local.y * delta.x * delta.y);
-            if (sigma < 0.f || sigma >= 5.55f) continue;
-            const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
-            if (alpha < 1.f / 255.f) continue;
-            const float next_T = T * (1.f - alpha);
-            if (next_T <= 1e-4f) {
-                last_contributor = batch_start + t - 1;
-                done = true;
-                break;
+        if (!done && inside) {
+            int batch_size = min(RAST_BLOCK_SIZE, chunk_end - batch_start);
+            for (int t = 0; t < batch_size; ++t) {
+                const float3 conic_local = conic_batch[t];
+                const float3 xy_opac = xy_opacity_batch[t];
+                const float2 delta = {xy_opac.x - px, xy_opac.y - py};
+                const float sigma = fma(0.5f,
+                    fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
+                    conic_local.y * delta.x * delta.y);
+                if (sigma < 0.f || sigma >= 5.55f) continue;
+                const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
+                if (alpha < 1.f / 255.f) continue;
+                const float next_T = T * (1.f - alpha);
+                if (next_T <= 1e-4f) {
+                    last_contributor = batch_start + t - 1;
+                    done = true;
+                    break;
+                }
+                const float vis = alpha * T;
+                pix_out = fma(rgbs_batch[t], vis, pix_out);
+                T = next_T;
+                last_contributor = batch_start + t;
             }
-            const float vis = alpha * T;
-            pix_out = fma(rgbs_batch[t], vis, pix_out);
-            T = next_T;
-            last_contributor = batch_start + t;
         }
+        raster_publish_simd_done(simd_done, tr, done || !inside);
     }
 
     if (inside) {
