@@ -730,6 +730,18 @@ kernel void project_gaussians_forward_kernel(
     aabb[idx * 2 + 1] = aabb_y;
 }
 
+// Per-pixel exponent sigma = 0.5 * d^T conic d. Forward and backward must
+// classify every pixel identically (sigma < 5.55, alpha >= 1/255), or the
+// backward transmittance recovery divides by a factor the forward pass never
+// applied. Fast math would let each kernel reassociate this product chain
+// differently around its other uses of delta, so it is evaluated in safe mode.
+inline float raster_pixel_sigma(float3 conic, float2 delta) {
+#pragma METAL fp math_mode(safe)
+    return fma(0.5f,
+        fma(conic.x, delta.x * delta.x, conic.z * delta.y * delta.y),
+        conic.y * delta.x * delta.y);
+}
+
 // Rasterizer threadgroups cover a block of their 16x16 parent tile and stage
 // only the Gaussians that can blend one of its pixels. The test bounds the
 // per-pixel acceptance (sigma < 5.55 and opacity * exp(-sigma) >= 1/255) from
@@ -904,21 +916,15 @@ inline void nd_rasterize_forward_impl(
                 const float3 xy_opac = xy_opacity_batch[t];
                 const float2 delta = {xy_opac.x - px, xy_opac.y - py};
 
-                const float sigma = fma(0.5f,
-                    fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
-                    conic_local.y * delta.x * delta.y);
-                // Early-out: skip exp() when the result is guaranteed to be discarded.
-                // alpha = min(0.999, opacity * exp(-sigma)), discarded when alpha < 1/255.
-                // opacity = sigmoid(raw) ∈ [0,1], so alpha ≤ exp(-sigma).
-                // exp(-5.55) ≈ 0.00389 < 1/255 ≈ 0.00392, so sigma ≥ 5.55 ⟹ alpha < 1/255.
-                if (sigma < 0.f || sigma >= 5.55f) {
-                    continue;
-                }
-
-                const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
-                if (alpha < 1.f / 255.f) {
-                    continue;
-                }
+                const float sigma = raster_pixel_sigma(conic_local, delta);
+                // Every staged Gaussian reaches this block, so most SIMD-groups
+                // have some lane to blend. A miss blends with alpha 0, which
+                // leaves T and the color bit-identical, instead of diverging.
+                // sigma >= 5.55 already implies alpha < 1/255 for opacity <= 1.
+                const float raw_alpha = min(0.999f, xy_opac.z * exp(-sigma));
+                const bool hit = sigma >= 0.f && sigma < 5.55f &&
+                    raw_alpha >= 1.f / 255.f;
+                const float alpha = hit ? raw_alpha : 0.f;
 
                 const float next_T = T * (1.f - alpha);
                 if (next_T <= 1e-4f) {
@@ -927,11 +933,9 @@ inline void nd_rasterize_forward_impl(
                     break;
                 }
 
-                const float vis = alpha * T;
-                const float3 rgb = rgbs_batch[t];
-                pix_out = fma(rgb, vis, pix_out);
+                pix_out = fma(rgbs_batch[t], alpha * T, pix_out);
                 T = next_T;
-                last_contributor = index_batch[t];
+                last_contributor = hit ? index_batch[t] : last_contributor;
             }
         }
         raster_publish_simd_done(simd_done, tr, done || !inside);
@@ -1623,30 +1627,16 @@ kernel void rasterize_backward_kernel(
             b_conic = simd_broadcast(b_conic, 0);
             b_xy_opac = simd_broadcast(b_xy_opac, 0);
 
-            int valid = inside;
-            if (index > bin_final) {
-                valid = 0;
-            }
-            float alpha;
-            float opac;
-            float2 delta;
-            float vis;
-            if(valid){
-                opac = b_xy_opac.z;
-                delta = {b_xy_opac.x - px, b_xy_opac.y - py};
-                float sigma = fma(0.5f,
-                    fma(b_conic.x, delta.x * delta.x, b_conic.z * delta.y * delta.y),
-                    b_conic.y * delta.x * delta.y);
-                if (sigma < 0.f || sigma >= 5.55f) {
-                    valid = 0;
-                } else {
-                    vis = exp(-sigma);
-                    alpha = min(0.999f, opac * vis);
-                    if (alpha < 1.f / 255.f) {
-                        valid = 0;
-                    }
-                }
-            }
+            // Every lane evaluates the Gaussian. Lanes it misses carry alpha 0
+            // through the same arithmetic, which leaves T and buffer_dot
+            // bit-identical and every gradient zero, so the SIMD-group stays
+            // on one path.
+            const float opac = b_xy_opac.z;
+            const float2 delta = {b_xy_opac.x - px, b_xy_opac.y - py};
+            const float sigma = raster_pixel_sigma(b_conic, delta);
+            const float raw_alpha = min(0.999f, opac * exp(-sigma));
+            const bool valid = inside && index <= bin_final &&
+                sigma >= 0.f && sigma < 5.55f && raw_alpha >= 1.f / 255.f;
             // if all threads are inactive in this warp, skip this loop
             if (!warp_reduce_all_or(valid, warp_size)) {
                 continue;
@@ -1663,44 +1653,35 @@ kernel void rasterize_backward_kernel(
             b_rgb = simd_broadcast(b_rgb, 0);
             b_id = simd_broadcast(b_id, 0);
 
-            float3 v_rgb_local = {0.f, 0.f, 0.f};
-            float3 v_conic_local = {0.f, 0.f, 0.f};
-            float2 v_xy_local = {0.f, 0.f};
-            float v_opacity_local = 0.f;
-            //initialize everything to 0, only set if the lane is valid
-            if (valid) {
-                // Recover the transmittance before this Gaussian. Forward uses
-                // the same capped alpha, so this must also run when the 0.999
-                // cap binds or every nearer Gaussian receives a T that is
-                // 1000x too small.
-                float ra = 1.f / (1.f - alpha);
-                T *= ra;
-                const float fac = alpha * T;
-                v_rgb_local = fac * v_out;
+            // Recover the transmittance before this Gaussian. Forward uses
+            // the same capped alpha, so this must also run when the 0.999
+            // cap binds or every nearer Gaussian receives a T that is
+            // 1000x too small.
+            const float alpha = valid ? raw_alpha : 0.f;
+            const float ra = 1.f / (1.f - alpha);
+            if (valid) T *= ra;
+            const float fac = alpha * T;
+            const float3 v_rgb_local = fac * v_out;
 
-                const float rgb_dot = dot(max(b_rgb, 0.f), v_out);
-                // contribution from this pixel + background
-                const float v_alpha =
-                    fma(rgb_dot, T, -ra * (buffer_dot + T_final_bg_dot)) +
-                    v_alpha_pixel * T_final * ra;
-                // update the running sum
-                buffer_dot = fma(rgb_dot, fac, buffer_dot);
+            const float rgb_dot = dot(max(b_rgb, 0.f), v_out);
+            // contribution from this pixel + background
+            const float v_alpha =
+                fma(rgb_dot, T, -ra * (buffer_dot + T_final_bg_dot)) +
+                v_alpha_pixel * T_final * ra;
+            // update the running sum
+            buffer_dot = fma(rgb_dot, fac, buffer_dot);
 
-                // The cap makes alpha locally constant in sigma and opacity,
-                // but it does not remove the color gradient above.
-                if (alpha < 0.999f) {
-                    // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
-                    const float v_sigma = -alpha * v_alpha;
-                    v_conic_local = (0.5f * v_sigma) * float3(
-                        delta.x * delta.x, delta.x * delta.y,
-                        delta.y * delta.y);
-                    v_xy_local = v_sigma * float2(
-                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
-                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
-                    // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
-                    v_opacity_local = -v_sigma * (1.f - opac);
-                }
-            }
+            // The cap makes alpha locally constant in sigma and opacity,
+            // but it does not remove the color gradient above.
+            // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
+            const float v_sigma = alpha < 0.999f ? -alpha * v_alpha : 0.f;
+            const float3 v_conic_local = (0.5f * v_sigma) * float3(
+                delta.x * delta.x, delta.x * delta.y, delta.y * delta.y);
+            const float2 v_xy_local = v_sigma * float2(
+                fma(b_conic.x, delta.x, b_conic.y * delta.y),
+                fma(b_conic.y, delta.x, b_conic.z * delta.y));
+            // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
+            const float v_opacity_local = -v_sigma * (1.f - opac);
 
             float gradients[RASTER_GRADIENT_COUNT] = {
                 v_rgb_local.x, v_rgb_local.y, v_rgb_local.z,
@@ -4475,22 +4456,22 @@ kernel void rasterize_forward_chunked_kernel(
                 const float3 conic_local = conic_batch[t];
                 const float3 xy_opac = xy_opacity_batch[t];
                 const float2 delta = {xy_opac.x - px, xy_opac.y - py};
-                const float sigma = fma(0.5f,
-                    fma(conic_local.x, delta.x * delta.x, conic_local.z * delta.y * delta.y),
-                    conic_local.y * delta.x * delta.y);
-                if (sigma < 0.f || sigma >= 5.55f) continue;
-                const float alpha = min(0.999f, xy_opac.z * exp(-sigma));
-                if (alpha < 1.f / 255.f) continue;
+                const float sigma = raster_pixel_sigma(conic_local, delta);
+                // A miss blends with alpha 0, leaving T and the color
+                // bit-identical, so the SIMD-group stays on one path.
+                const float raw_alpha = min(0.999f, xy_opac.z * exp(-sigma));
+                const bool hit = sigma >= 0.f && sigma < 5.55f &&
+                    raw_alpha >= 1.f / 255.f;
+                const float alpha = hit ? raw_alpha : 0.f;
                 const float next_T = T * (1.f - alpha);
                 if (next_T <= 1e-4f) {
                     last_contributor = index_batch[t] - 1;
                     done = true;
                     break;
                 }
-                const float vis = alpha * T;
-                pix_out = fma(rgbs_batch[t], vis, pix_out);
+                pix_out = fma(rgbs_batch[t], alpha * T, pix_out);
                 T = next_T;
-                last_contributor = index_batch[t];
+                last_contributor = hit ? index_batch[t] : last_contributor;
             }
         }
         raster_publish_simd_done(simd_done, tr, done || !inside);
@@ -4778,29 +4759,20 @@ kernel void rasterize_backward_chunked_kernel(
             b_conic = simd_broadcast(b_conic, 0);
             b_xy_opac = simd_broadcast(b_xy_opac, 0);
 
-            int valid = inside;
-            if (index > bin_final) valid = 0;
-
-            float alpha;
-            float opac;
-            float2 delta;
-            float vis;
-            if (valid) {
-                opac = b_xy_opac.z;
-                delta = {b_xy_opac.x - px, b_xy_opac.y - py};
-                float sigma = fma(0.5f,
-                    fma(b_conic.x, delta.x * delta.x, b_conic.z * delta.y * delta.y),
-                    b_conic.y * delta.x * delta.y);
-                if (sigma < 0.f || sigma >= 5.55f) {
-                    valid = 0;
-                } else {
-                    vis = exp(-sigma);
-                    alpha = min(0.999f, opac * vis);
-                    if (alpha < 1.f / 255.f) valid = 0;
-                }
+            // Every lane evaluates the Gaussian. Lanes it misses carry alpha 0
+            // through the same arithmetic, which leaves T and buffer_dot
+            // bit-identical and every gradient zero, so the SIMD-group stays
+            // on one path.
+            const float opac = b_xy_opac.z;
+            const float2 delta = {b_xy_opac.x - px, b_xy_opac.y - py};
+            const float sigma = raster_pixel_sigma(b_conic, delta);
+            const float raw_alpha = min(0.999f, opac * exp(-sigma));
+            const bool valid = inside && index <= bin_final &&
+                sigma >= 0.f && sigma < 5.55f && raw_alpha >= 1.f / 255.f;
+            // if all threads are inactive in this warp, skip this loop
+            if (!warp_reduce_all_or(valid, warp_size)) {
+                continue;
             }
-
-            if (!warp_reduce_all_or(valid, warp_size)) continue;
 
             // RGB and the Gaussian ID are unused when the whole SIMDgroup is
             // inactive. The scattered gradient lanes need both.
@@ -4813,36 +4785,35 @@ kernel void rasterize_backward_chunked_kernel(
             b_rgb = simd_broadcast(b_rgb, 0);
             b_id = simd_broadcast(b_id, 0);
 
-            float3 v_rgb_local = {0.f, 0.f, 0.f};
-            float3 v_conic_local = {0.f, 0.f, 0.f};
-            float2 v_xy_local = {0.f, 0.f};
-            float v_opacity_local = 0.f;
+            // Recover the transmittance before this Gaussian. Forward uses
+            // the same capped alpha, so this must also run when the 0.999
+            // cap binds or every nearer Gaussian receives a T that is
+            // 1000x too small.
+            const float alpha = valid ? raw_alpha : 0.f;
+            const float ra = 1.f / (1.f - alpha);
+            if (valid) T *= ra;
+            const float fac = alpha * T;
+            const float3 v_rgb_local = fac * v_out;
 
-            if (valid) {
-                // Match the monolithic backward recurrence: the forward pass
-                // multiplied T by (1 - alpha) even when alpha hit its cap.
-                float ra = 1.f / (1.f - alpha);
-                T *= ra;
-                const float fac = alpha * T;
-                v_rgb_local = fac * v_out;
+            const float rgb_dot = dot(max(b_rgb, 0.f), v_out);
+            // contribution from this pixel + background
+            const float v_alpha =
+                fma(rgb_dot, T, -ra * (buffer_dot + T_final_bg_dot)) +
+                v_alpha_pixel * T_final * ra;
+            // update the running sum
+            buffer_dot = fma(rgb_dot, fac, buffer_dot);
 
-                const float rgb_dot = dot(max(b_rgb, 0.f), v_out);
-                const float v_alpha =
-                    fma(rgb_dot, T, -ra * (buffer_dot + T_final_bg_dot)) +
-                    v_alpha_pixel * T_final * ra;
-                buffer_dot = fma(rgb_dot, fac, buffer_dot);
-
-                if (alpha < 0.999f) {
-                    const float v_sigma = -alpha * v_alpha;
-                    v_conic_local = (0.5f * v_sigma) * float3(
-                        delta.x * delta.x, delta.x * delta.y,
-                        delta.y * delta.y);
-                    v_xy_local = v_sigma * float2(
-                        fma(b_conic.x, delta.x, b_conic.y * delta.y),
-                        fma(b_conic.y, delta.x, b_conic.z * delta.y));
-                    v_opacity_local = -v_sigma * (1.f - opac);
-                }
-            }
+            // The cap makes alpha locally constant in sigma and opacity,
+            // but it does not remove the color gradient above.
+            // v_sigma = d(loss)/d(sigma) = -alpha * v_alpha
+            const float v_sigma = alpha < 0.999f ? -alpha * v_alpha : 0.f;
+            const float3 v_conic_local = (0.5f * v_sigma) * float3(
+                delta.x * delta.x, delta.x * delta.y, delta.y * delta.y);
+            const float2 v_xy_local = v_sigma * float2(
+                fma(b_conic.x, delta.x, b_conic.y * delta.y),
+                fma(b_conic.y, delta.x, b_conic.z * delta.y));
+            // Fused sigmoid derivative: dL/d(logit) = -v_sigma * (1 - opac)
+            const float v_opacity_local = -v_sigma * (1.f - opac);
 
             float gradients[RASTER_GRADIENT_COUNT] = {
                 v_rgb_local.x, v_rgb_local.y, v_rgb_local.z,

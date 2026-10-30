@@ -54,13 +54,15 @@ extract_section(metal_source "kernel void ssim_v_bwd_kernel("
 foreach(section IN ITEMS raster_backward chunked_backward)
     require_contains("${${section}}" "constant uchar* training_mask"
         "${section} mask input")
-    require_contains("${${section}}" "if (valid) {"
+    require_contains("${${section}}"
+        "const float alpha = valid ? raw_alpha : 0.f;"
         "${section} capped-alpha outer gradient gate")
-    require_contains("${${section}}" "T *= ra;"
+    require_contains("${${section}}" "if (valid) T *= ra;"
         "${section} capped-alpha transmittance recovery")
     require_contains("${${section}}" "v_rgb_local = fac * v_out;"
         "${section} capped-alpha color gradient")
-    require_contains("${${section}}" "if (alpha < 0.999f) {"
+    require_contains("${${section}}"
+        "const float v_sigma = alpha < 0.999f ? -alpha * v_alpha : 0.f;"
         "${section} capped-alpha sigma-gradient gate")
     require_not_contains("${${section}}" "valid && alpha < 0.999f"
         "${section} whole-gradient cap gate")

@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- Forward and backward rasterization evaluate every staged Gaussian on every
+  lane and blend a missed pixel with alpha 0, which leaves transmittance, the
+  running color, and every gradient unchanged, instead of branching out per
+  lane. Backward keeps its whole-SIMD-group skip. The per-pixel exponent is
+  now one shared helper evaluated in safe math mode: hoisting it in the
+  previous backward kernel alone moved gradients by up to 1.8e-4 relative,
+  because fast math reassociated its products differently around the gradient
+  terms and forward and backward could then disagree on a pixel at the 1/255
+  threshold. Forward output changes only by float rounding (at most 1e-6 in
+  color on random scenes, contributor indices unchanged), and gradients match
+  to float rounding. On an M4 Pro (garden) `rast_bwd` fell by 12% and the step
+  from 25.4 to 24.1 ms at 1297x840, and from 3.23 to 3.12 ms at 324x210.
 - Forward and backward rasterization stage only the Gaussians that can blend a
   pixel of their own 8x8 block. Each 16x16 tile's list is shared by its four
   8x8 threadgroups, and on garden fewer than half of a tile's Gaussians reach

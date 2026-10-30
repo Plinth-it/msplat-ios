@@ -338,6 +338,17 @@ foreach(section_name IN ITEMS
     require_contains("${${section_name}}" "index_batch[slot] = idx;"
         "${section_name} original intersection index")
 endforeach()
+# Forward and backward must classify each pixel identically, so every
+# rasterizer evaluates the quadratic through one helper in safe math mode.
+require_contains("${metal_source}"
+    "inline float raster_pixel_sigma(float3 conic, float2 delta) {\n#pragma METAL fp math_mode(safe)"
+    "safe-mode per-pixel sigma")
+foreach(section_name IN ITEMS
+        raster_helper raster_forward_chunked
+        raster_backward raster_backward_chunked)
+    require_contains("${${section_name}}" "const float sigma = raster_pixel_sigma("
+        "${section_name} shared per-pixel sigma")
+endforeach()
 foreach(width IN ITEMS "8 * 8" "16 * 8" "16 * 16")
     string(REPLACE " " "" width_label "${width}")
     string(REPLACE "*" "x" width_label "${width_label}")
